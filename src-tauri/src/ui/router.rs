@@ -357,6 +357,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", "/settings/sync/save") => Some(settings_sync_save(state, req)),
         ("POST", "/settings/storage/save") => Some(settings_storage_save(state, req)),
         ("POST", "/settings/storage/clean") => Some(settings_storage_clean(state)),
+        ("POST", "/settings/storage/move") => Some(settings_storage_move(state, req)),
         _ => None,
     }
 }
@@ -1061,6 +1062,26 @@ fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
         return storage_pane(state, false);
     }
     storage_pane(state, true)
+}
+
+/// 设置·存储管理：迁移数据目录（M5；dest 由前端系统对话框选定后 POST）。
+/// 在线快照（VACUUM INTO）+ 指针写入锚点库，重启后生效；回 toast 提示
+fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
+    let form = parse_form(&req.body);
+    let dest = form.get("dest").cloned().unwrap_or_default();
+    let (ok, msg) = if dest.is_empty() {
+        (false, "未选择目标目录".to_string())
+    } else {
+        match state.move_data_dir(&dest) {
+            Ok(text) => (true, text),
+            Err(e) => (false, e),
+        }
+    };
+    Resp::html(format!(
+        r#"<div id="toast" class="toast {}" hx-swap-oob="true">{}</div>"#,
+        if ok { "ok" } else { "err" },
+        html_escape(&msg)
+    ))
 }
 
 // ---------- 上下文装配 ----------

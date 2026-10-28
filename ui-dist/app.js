@@ -1,6 +1,12 @@
 // Mailbox 前端辅助（M2：附件选择/另存，__TAURI__.dialog；设计 §2/§5.1）
 // 全局 500ms 防抖由 htmx 触发器表达式承担（hx-trigger="... once:500ms"，设计 §7）
 
+// 启动引导动画移除（M5：base.html 内联 #boot，脚本就绪即撤）
+(function removeBoot() {
+    const boot = document.getElementById('boot');
+    if (boot) boot.remove();
+})();
+
 function escapeHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
             .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -68,6 +74,21 @@ async function mbxSaveAttachment(emailId, attachId, filename) {
         });
     } catch (e) {
         console.error('[mbx] 保存对话框失败', e);
+    }
+}
+
+// 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）
+async function mbxMoveDataDir() {
+    try {
+        const dir = await window.__TAURI__.dialog.open({ directory: true });
+        if (!dir) return;
+        htmx.ajax('POST', '/settings/storage/move', {
+            target: '#toast',
+            swap: 'innerHTML',
+            values: { dest: dir }
+        });
+    } catch (e) {
+        console.error('[mbx] 打开目录对话框失败', e);
     }
 }
 

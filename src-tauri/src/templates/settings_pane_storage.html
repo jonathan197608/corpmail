@@ -6,8 +6,11 @@
             <p class="desc">附件压缩后超过内联上限的不入库，单独存文件。</p>
 
             <div class="kv">
-                <span class="k">数据目录<small>数据库与附件文件所在位置</small></span>
-                <span class="mono">{{ data_dir }}</span>
+                <span class="k">数据目录<small>数据库与附件文件所在位置；迁移后重启生效，原目录保留为备份</small></span>
+                <span class="mono">{{ data_dir }}
+                    <button type="button" class="btn small" onclick="mbxMoveDataDir()"
+                            title="选择新目录并迁移数据">更换位置</button>
+                </span>
             </div>
             <div class="kv">
                 <span class="k">内联附件上限<small>超过此大小的附件 gzip 后存独立文件</small></span>

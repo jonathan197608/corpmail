@@ -9,9 +9,43 @@
     <link rel="stylesheet" href="/app.css">
     <script src="/htmx.min.js" defer></script>
     <script src="/app.js" defer></script>
+    <style>
+        /* 启动引导动画（M5）：内联样式不依赖 app.css，首帧即显；
+           app.js 执行时移除（覆盖 HTML 注入到脚本就绪的间隙） */
+        #boot {
+            position: fixed;
+            inset: 0;
+            z-index: 99;
+            background: #f2f4f8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 14px;
+            color: #5a6478;
+            font-size: 13px;
+        }
+
+        #boot i {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            border: 3px solid #d3dbe8;
+            border-top-color: #3b6fd4;
+            display: inline-block;
+            animation: bootspin 0.8s linear infinite;
+        }
+
+        @keyframes bootspin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
 </head>
 
 <body>
+    <div id="boot"><i></i>正在启动 Mailbox…</div>
     {% block body %}{% endblock %}
 
     {# 附件预览模态（M5：img/pdf/text 三类内嵌渲染；页面共享） #}

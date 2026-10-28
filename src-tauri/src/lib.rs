@@ -48,9 +48,12 @@ pub fn run() {
             ui::to_http_response(ui::route(&state, &assets, &req, &ui::RealTester))
         })
         .setup(|app| {
-            // 状态在窗口创建前装配：协议回调依赖 AppState（设计 §2）
-            let data_dir = app.path().app_data_dir()?;
-            let state = state::AppState::open(&data_dir);
+            // 状态在窗口创建前装配：协议回调依赖 AppState（设计 §2）。
+            // M5 自定义数据目录：先开锚点（系统默认目录）库读 data_dir_override
+            // 指针，指针有效（目录存在）则定位用户目录，否则安全回退锚点目录
+            let anchor = app.path().app_data_dir()?;
+            let data_dir = state::AppState::resolve_start_dir(&anchor);
+            let state = state::AppState::open_with_anchor(&data_dir, &anchor);
             // M3 发送队列：单飞 worker（崩溃残留 queued 补发），窗口创建前就绪
             state.start_send_worker();
             app.manage(state);
@@ -107,6 +110,10 @@ pub fn run() {
                 // 默认 1440×900（M5 实测 15 页面零滚动条；内容最高需求 812px @1280 宽）
                 .inner_size(1440.0, 900.0)
                 .min_inner_size(560.0, 400.0)
+                // 启动等待动画配套（M5）：窗口底色=应用背景色，消除 WebView
+                // 初始化期（Windows 首启 1-3s）的刺眼纯白；首帧由 base.html
+                // 内联 #boot spinner 承接
+                .background_color(tauri::webview::Color(0xf2, 0xf4, 0xf8, 0xff))
                 .resizable(true)
                 .center()
                 .build()?;

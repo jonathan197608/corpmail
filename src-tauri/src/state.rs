@@ -28,6 +28,9 @@ pub mod keys {
     pub const LAST_SYNC_AT: &str = "last_sync_at";
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
     pub const LAST_UID: &str = "last_uid";
+
+    /// 自定义数据目录指针（存于 anchor 库即系统默认目录；M5 迁移功能）
+    pub const DATA_DIR: &str = "data_dir_override";
 }
 
 /// 账号域名默认值（设计确认项 K 原为固定后缀；自 v0.1.1 起作为可配置设置项）
@@ -62,6 +65,9 @@ pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）
     pub data_dir: PathBuf,
+    /// 锚点目录（系统默认目录；自定义目录指针 data_dir_override 存于此处的库，
+    /// 启动时 resolve_start_dir 先开锚点库读指针再定位实际目录，保证指针永远可寻址）
+    anchor_dir: PathBuf,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）
@@ -90,13 +96,21 @@ pub fn full_address(prefix: &str, domain: &str) -> String {
 }
 
 impl AppState {
-    /// 打开/初始化数据库（schema 幂等迁移在 db::open 内完成）
+    /// 打开/初始化数据库（schema 幂等迁移在 db::open 内完成；锚点=数据目录本身，
+    /// 适用于测试与未启用自定义目录的场景。生产入口为 open_with_anchor）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_dir: &Path) -> Self {
+        Self::open_with_anchor(data_dir, data_dir)
+    }
+
+    /// 打开/初始化数据库（lib.rs 专用：锚点目录存自定义目录指针，见 resolve_start_dir）
+    pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
         std::fs::create_dir_all(data_dir).expect("数据目录应可创建");
         let conn = crate::db::open(&data_dir.join("mailbox.db")).expect("数据库应可打开");
         Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
+            anchor_dir: anchor_dir.to_path_buf(),
             send_tx: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
@@ -105,6 +119,71 @@ impl AppState {
                 just_finished: false,
             })),
         }
+    }
+
+    /// 启动目录解析（lib.rs setup 调用）：开锚点库读 data_dir_override 指针，
+    /// 指针有效（目录存在）则用之，否则回退锚点目录（外置盘拔出等场景安全回退）
+    pub fn resolve_start_dir(anchor: &Path) -> PathBuf {
+        let probe = anchor.join("mailbox.db");
+        let over = crate::db::open(&probe)
+            .ok()
+            .and_then(|c| crate::db::settings::get(&c, keys::DATA_DIR).ok().flatten());
+        match over {
+            Some(p) if Path::new(&p).is_dir() => PathBuf::from(p),
+            _ => anchor.to_path_buf(),
+        }
+    }
+
+    /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
+    /// 成功后返回用户提示文案；原目录保留为备份（用户确认无误后可手动删除）。
+    /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
+    /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
+    pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
+        let dest_path = PathBuf::from(dest.trim_end_matches(['/', '\\']));
+        if !dest_path.is_absolute() {
+            return Err("请选择绝对路径目录".into());
+        }
+        let cur = &self.data_dir;
+        if dest_path == *cur {
+            return Err("目标目录与当前数据目录相同".into());
+        }
+        if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
+            return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
+        }
+        if dest_path.join("mailbox.db").exists() {
+            return Err("目标目录已存在 mailbox.db，请选择空目录".into());
+        }
+        std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
+        // 写入探针：目标可写
+        let probe = dest_path.join(".mailbox-write-probe");
+        std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
+        let _ = std::fs::remove_file(&probe);
+
+        // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
+        let new_db = dest_path.join("mailbox.db");
+        self.with_conn(|conn| {
+            conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
+                .map_err(|e| format!("数据库快照失败：{e}"))
+        })?;
+
+        // 2) 附件目录复制（大附件独立文件；崩溃中断则目标残留，下次迁移前有 mailbox.db 检查拦住）
+        let src_att = cur.join("attachments");
+        if src_att.is_dir() {
+            copy_dir_recursive(&src_att, &dest_path.join("attachments"))
+                .map_err(|e| format!("附件目录复制失败：{e}"))?;
+        }
+
+        // 3) 指针写入锚点库（启动 resolve_start_dir 读取处；锚点==当前目录时写当前库）
+        let anchor_db = self.anchor_dir.join("mailbox.db");
+        let anchor_conn =
+            crate::db::open(&anchor_db).map_err(|e| format!("锚点库打开失败：{e}"))?;
+        crate::db::settings::set(&anchor_conn, keys::DATA_DIR, &dest_path.to_string_lossy())
+            .map_err(|e| format!("指针写入失败：{e}"))?;
+
+        Ok(format!(
+            "数据已迁移到新目录，重启应用后生效；原目录保留为备份：{}",
+            cur.display()
+        ))
     }
 
     /// 收件状态快照（克隆；just_finished 读取后由 clear_fetch_finish 显式清除）
@@ -403,6 +482,25 @@ impl AppState {
     }
 }
 
+/// 递归复制目录（M5 迁移用：附件目录两级结构 {YYYY-MM}/{email_id}/ 文件）；
+/// 目标已存在的同名文件覆盖，缺失目录逐级创建
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("创建目录失败：{e}"))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
+        let entry = entry.map_err(|e| format!("遍历失败：{e}"))?;
+        let ty = entry
+            .file_type()
+            .map_err(|e| format!("读取类型失败：{e}"))?;
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +543,123 @@ mod tests {
             Some("smtp.example.cn")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_data_dir_snapshots_and_writes_pointer() {
+        let base = temp_dir("move-ok");
+        let anchor = base.join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let state = AppState::open(&anchor);
+        // 造数据：配置 + 一封草稿 + 一个附件独立文件
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        let id = crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "peer@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "迁移用例".into(),
+                body_text: "正文".into(),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        let att = anchor.join("attachments/2026-10").join(id.to_string());
+        std::fs::create_dir_all(&att).unwrap();
+        std::fs::write(att.join("1_a.bin.gz"), b"gz-bytes").unwrap();
+
+        let dest = base.join("moved");
+        let msg = state.move_data_dir(dest.to_str().unwrap()).unwrap();
+        assert!(msg.contains("重启"), "提示应含重启生效：{msg}");
+        // 新库可打开且数据齐全
+        let moved_db = dest.join("mailbox.db");
+        let conn = crate::db::open(&moved_db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "快照应含全部邮件");
+        let prefix = crate::db::settings::get(&conn, keys::ACCOUNT_PREFIX)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(prefix, "demo", "设置随库迁移");
+        assert!(
+            dest.join(format!("attachments/2026-10/{id}/1_a.bin.gz"))
+                .exists(),
+            "附件文件应复制"
+        );
+        // 锚点库写入指针；启动解析定位新目录
+        let anchor_conn = crate::db::open(&anchor.join("mailbox.db")).unwrap();
+        let ptr = crate::db::settings::get(&anchor_conn, keys::DATA_DIR)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(ptr, dest.to_string_lossy(), "指针应写锚点库");
+        assert_eq!(
+            AppState::resolve_start_dir(&anchor),
+            dest,
+            "启动解析应定位新目录"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_data_dir_rejects_invalid_targets() {
+        let base = temp_dir("move-bad");
+        let cur = base.join("cur");
+        std::fs::create_dir_all(&cur).unwrap();
+        let state = AppState::open(&cur);
+        assert!(
+            state.move_data_dir(cur.to_str().unwrap()).is_err(),
+            "相同目录拒绝"
+        );
+        assert!(
+            state
+                .move_data_dir(cur.join("sub").to_str().unwrap())
+                .is_err(),
+            "子目录拒绝"
+        );
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        // 已有 mailbox.db 的目录拒绝
+        std::fs::write(other.join("mailbox.db"), b"exists").unwrap();
+        assert!(
+            state.move_data_dir(other.to_str().unwrap()).is_err(),
+            "占用目录拒绝"
+        );
+        // 相对路径拒绝
+        assert!(state.move_data_dir("relative/dir").is_err());
+        // 失败不应留下指针
+        let conn = crate::db::open(&cur.join("mailbox.db")).unwrap();
+        assert!(
+            crate::db::settings::get(&conn, keys::DATA_DIR)
+                .unwrap()
+                .is_none(),
+            "失败不得写指针"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_start_dir_falls_back_safely() {
+        // 无库 / 无指针 → 回退锚点
+        let empty = temp_dir("resolve-empty");
+        assert_eq!(AppState::resolve_start_dir(&empty), empty);
+        // 指针目录不存在（外置盘拔出）→ 回退锚点
+        let anchor = temp_dir("resolve-anchor");
+        let state = AppState::open(&anchor);
+        state
+            .set_batch(&[(keys::DATA_DIR, "/nonexistent/removed-usb")])
+            .unwrap();
+        drop(state);
+        assert_eq!(
+            AppState::resolve_start_dir(&anchor),
+            anchor,
+            "指针失效应回退锚点目录"
+        );
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&anchor);
     }
 
     #[test]
