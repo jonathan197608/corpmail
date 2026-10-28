@@ -31,6 +31,11 @@
     padding: 0;
 }
 
+/* 可点击文字（链接）统一去下划线；交互反馈走颜色/背景变化 */
+a {
+    text-decoration: none;
+}
+
 html,
 body {
     height: 100%;
@@ -246,7 +251,6 @@ body {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    text-decoration: none;
     flex: none;
 }
 
@@ -345,7 +349,6 @@ body {
 
 .search-clear {
     color: var(--muted);
-    text-decoration: none;
     font-size: 15px;
     line-height: 1;
     padding: 0 2px;
@@ -399,7 +402,6 @@ body {
     padding: 8px 16px;
     background: #e9edf5;
     color: var(--ink);
-    text-decoration: none;
     transition: background 0.12s, color 0.12s, box-shadow 0.12s;
 }
 
@@ -1120,7 +1122,6 @@ body {
     border-radius: 10px;
     margin-bottom: 8px;
     background: var(--panel);
-    text-decoration: none;
     color: var(--ink);
     transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
 }
@@ -1238,7 +1239,6 @@ body {
 .pager .pg {
     font-size: 13px;
     color: var(--accent);
-    text-decoration: none;
     border: 1px solid var(--line);
     border-radius: 8px;
     padding: 5px 12px;
@@ -1258,7 +1258,6 @@ body {
 .unread-toggle {
     font-size: 12.5px;
     color: var(--muted);
-    text-decoration: none;
     border: 1px solid var(--line);
     border-radius: 8px;
     padding: 5px 10px;
@@ -1279,7 +1278,6 @@ body {
 .back {
     font-size: 13px;
     color: var(--muted);
-    text-decoration: none;
     white-space: nowrap;
     align-self: center;
     margin-right: 4px;
