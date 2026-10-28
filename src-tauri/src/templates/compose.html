@@ -49,11 +49,9 @@
                             <span class="att-clip">📎</span>
                             <span class="att-name">{{ a.filename }}</span>
                             <span class="att-size">{{ a.size_orig }} 字节</span>
-                            {% if a.preview_kind %}
                             <button type="button" class="btn small"
                                     onclick="mbxPreviewAttachment('/emails/{{ draft_id }}/attachments/{{ a.id }}/view', '{{ a.preview_kind }}', '{{ a.filename }}')"
-                                    title="内嵌预览">预览</button>
-                            {% endif %}
+                                    title="内嵌预览（图片/PDF/文本可直接查看，其他格式将提示）">预览</button>
                             <button type="button" class="btn small"
                                     onclick="mbxRemoveKept({{ a.id }}, this)">移除</button>
                         </li>

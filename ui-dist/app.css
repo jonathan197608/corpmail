@@ -460,6 +460,14 @@ body {
     color: var(--ink);
 }
 
+.pm-unsupported {
+    padding: 56px 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.8;
+}
+
 /* ============ 主区内容（M1：空状态占位） ============ */
 .mail-list {
     flex: 1;
@@ -1128,6 +1136,24 @@ body {
 
 .kv .k {
     color: var(--ink-soft);
+}
+
+/* kv 值区（M5）：目录路径单行省略 + 悬停 title 展示全文 */
+.kv-val {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    justify-content: flex-end;
+}
+
+.dir-path {
+    display: inline-block;
+    max-width: 46%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
 }
 
 .kv .k small {

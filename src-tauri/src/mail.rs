@@ -518,17 +518,38 @@ pub struct AttachView {
     pub preview_kind: String,
 }
 
-/// 附件预览方式判定：图片 / PDF / 纯文本类；text/html 归入不可预览（内嵌渲染会执行脚本）
-fn preview_kind_of(mime: &str) -> &'static str {
+/// 附件预览方式判定（M5）：MIME 优先；MIME 缺失或为 octet-stream 时按文件扩展名兜底
+/// （真实邮件附件头常不规范）；text/html 归入不可预览（内嵌渲染会执行脚本）
+fn preview_kind_of(mime: &str, filename: &str) -> &'static str {
     let m = mime.to_ascii_lowercase();
-    if m.starts_with("image/") {
-        "img"
+    let by_mime = if m.starts_with("image/") {
+        Some("img")
     } else if m == "application/pdf" {
-        "pdf"
+        Some("pdf")
     } else if m.starts_with("text/") && m != "text/html" {
-        "text"
+        Some("text")
+    } else if m.is_empty() || m == "application/octet-stream" {
+        None // 头部不可信，走扩展名兜底
     } else {
-        ""
+        Some("") // 明确不支持的类型，不再兜底
+    };
+    if let Some(kind) = by_mime {
+        if !kind.is_empty() {
+            return kind;
+        }
+        return "";
+    }
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" => "img",
+        "pdf" => "pdf",
+        "txt" | "csv" | "log" | "json" | "xml" | "md" | "yml" | "yaml" | "ini" | "conf" | "sql"
+        | "toml" | "ts" | "js" | "css" => "text",
+        _ => "",
     }
 }
 
@@ -603,10 +624,11 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
     .and_then(|mut stmt| {
         stmt.query_map([email_id], |r| {
             let mime: String = r.get(2)?;
+            let filename: String = r.get(1)?;
             Ok(AttachView {
                 id: r.get(0)?,
-                filename: r.get(1)?,
-                preview_kind: preview_kind_of(&mime).into(),
+                preview_kind: preview_kind_of(&mime, &filename).into(),
+                filename,
                 mime,
                 size_orig: r.get(3)?,
                 storage: r.get(4)?,
@@ -1710,8 +1732,8 @@ pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView,
         let bytes = gunzip(&gz)?;
         let meta = AttachView {
             id: attach_id,
+            preview_kind: preview_kind_of(&mime, &filename).into(),
             filename,
-            preview_kind: preview_kind_of(&mime).into(),
             mime,
             size_orig: bytes.len() as i64,
             storage,
@@ -1867,6 +1889,27 @@ mod tests {
             "",
             "空正文返回空串（空 data-tip 不触发气泡）"
         );
+    }
+
+    #[test]
+    fn preview_kind_falls_back_to_extension_for_octet_stream() {
+        // MIME 缺失/八进制流 → 扩展名兜底（真实邮件附件头常不规范）
+        assert_eq!(
+            preview_kind_of("application/octet-stream", "照片.png"),
+            "img"
+        );
+        assert_eq!(preview_kind_of("", "报告.pdf"), "pdf");
+        assert_eq!(
+            preview_kind_of("application/octet-stream", "日志.log"),
+            "text"
+        );
+        assert_eq!(preview_kind_of("application/octet-stream", "打包.zip"), "");
+        // 明确不支持的 MIME 不兜底（防伪装扩展名绕过）
+        assert_eq!(preview_kind_of("application/zip", "伪装.png"), "");
+        // MIME 直接命中优先于扩展名
+        assert_eq!(preview_kind_of("image/jpeg", "无扩展名"), "img");
+        // text/html 拒绝内嵌（脚本执行风险）
+        assert_eq!(preview_kind_of("text/html", "x.html"), "");
     }
 
     #[test]

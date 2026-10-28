@@ -1774,8 +1774,8 @@ mod tests {
             "txt 应有预览按钮：{html}"
         );
         assert!(
-            !html.contains("attachments/3/view"),
-            "zip 不应有预览按钮：{html}"
+            html.contains("attachments/3/view"),
+            "zip 也应有预览按钮（点击提示不支持）：{html}"
         );
         // GET 预览：原始字节 + 原 MIME + nosniff
         let resp = route(
@@ -3370,6 +3370,28 @@ mod tests {
         dump("email-failed.html", get(&format!("/emails/{failed_id}")));
         dump("email-sent.html", get(&format!("/emails/{sent_id}")));
         dump("main-sent.html", get_url("/?folder=sent"));
+
+        // M5 附件预览素材：给草稿 d1 加三类附件（png/txt/zip）→ 详情页统一预览按钮
+        {
+            let src_png = root.join("素材截图.png");
+            std::fs::write(&src_png, b"fake-png").unwrap();
+            let src_txt = root.join("说明.txt");
+            std::fs::write(&src_txt, "附件文本内容样例".as_bytes()).unwrap();
+            let src_zip = root.join("打包.zip");
+            std::fs::write(&src_zip, b"zip-bytes").unwrap();
+            crate::mail::add_attachments(
+                &state,
+                d1,
+                &[
+                    src_png.to_str().unwrap().into(),
+                    src_txt.to_str().unwrap().into(),
+                    src_zip.to_str().unwrap().into(),
+                ],
+            )
+            .unwrap();
+        }
+        dump("email-attachments.html", get(&format!("/emails/{d1}")));
+
         dump("settings-account.html", get("/settings"));
         dump("settings-sync.html", get("/settings/sync"));
         dump("settings-storage.html", get("/settings/storage"));

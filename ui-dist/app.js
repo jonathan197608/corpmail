@@ -125,6 +125,12 @@ function mbxPreviewAttachment(url, kind, name) {
             .catch(() => {
                 body.textContent = '预览加载失败';
             });
+    } else {
+        // 未支持内嵌预览的格式：统一给出可预期反馈（M5 验收反馈）
+        const tip = document.createElement('div');
+        tip.className = 'pm-unsupported';
+        tip.textContent = '该格式暂不支持内嵌预览，请使用"另存为"后用系统应用打开。';
+        body.appendChild(tip);
     }
     modal.hidden = false;
 }
