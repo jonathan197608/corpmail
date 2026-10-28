@@ -60,6 +60,9 @@ body {
 .app.on {
     display: grid;
     grid-template-columns: 216px 1fr;
+    /* 行高锁定为容器高（M5 修复）：隐式 auto 行会被内容撑开，主区失去高度约束，
+       列表/详情的内部滚动全部失效，长内容被 body overflow:hidden 裁剪且无滚动条 */
+    grid-template-rows: minmax(0, 100%);
 }
 
 /* 向导类整屏（无侧栏） */
@@ -264,6 +267,10 @@ body {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
+    /* 兑底滚动：设置/撰写等自然流页面内容超视口时主区可滚；
+       列表/详情页有自己的内部滚动容器，不会触发本层滚动 */
+    overflow-y: auto;
 }
 
 .topbar {
@@ -457,6 +464,8 @@ body {
 .mail-list {
     flex: 1;
     overflow: auto;
+    /* flex 子项默认 min-height:auto 会以内容高撑开容器，须显式归零才能在视口内滚动 */
+    min-height: 0;
     padding: 10px 12px;
 }
 
@@ -1287,6 +1296,8 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
+    /* 标题悬停预览气泡（.mr-tip）的定位基准（M5） */
+    position: relative;
 }
 
 .mr-subject {
@@ -1296,6 +1307,38 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     flex: 1;
+    position: relative;
+}
+
+/* ============ 标题悬停预览正文（M5：兄弟元素方案，超长行数截断）============ */
+/* 不用 .mr-subject::after：mr-subject 自身 overflow:hidden（省略号所需）会裁剪
+   向下展开的伪元素气泡；改由兄弟 .mr-tip 承载，脱离裁剪盒 */
+.mr-tip {
+    display: none;
+}
+
+.mr-subject:hover + .mr-tip {
+    display: -webkit-box;
+    -webkit-line-clamp: 8;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    position: absolute;
+    left: 0;
+    top: calc(100% + 6px);
+    z-index: 30;
+    width: 460px;
+    max-width: 72vw;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--ink);
+    white-space: pre-wrap;
+    word-break: break-word;
+    pointer-events: none;
 }
 
 .mr-flag {
@@ -1516,6 +1559,8 @@ body {
     margin: 4px 12px 12px;
     padding: 18px 22px;
     max-width: 760px;
+    /* 同 .settings-pane：防 flex 压缩（超视口时由 .main 兑底滚动） */
+    flex: none;
 }
 
 .compose-card form {

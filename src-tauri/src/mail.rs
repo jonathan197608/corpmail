@@ -287,6 +287,8 @@ pub struct EmailSummary {
     pub time_label: String,
     /// 标题安全 HTML：列表为转义原文，检索命中时为 <mark> 高亮版（模板 |safe 输出）
     pub subject_html: String,
+    /// 悬停预览原始正文（压缩空白 + 300 字符截断 + 省略号，模板 data-tip 属性用）
+    pub preview_tip: String,
 }
 
 /// folder 白名单校验（未知值按 all 处理；SQL 内插前必须过白名单）
@@ -350,6 +352,7 @@ fn summary_from_row(
     };
     let name: String = r.get(5)?;
     let addr: String = r.get(4)?;
+    let body: String = r.get(7)?;
     Ok(EmailSummary {
         id: r.get(0)?,
         folder: r.get(1)?,
@@ -357,7 +360,8 @@ fn summary_from_row(
         subject,
         from_display: if name.is_empty() { addr } else { name },
         to_addrs: r.get(6)?,
-        body_preview: preview(&r.get::<_, String>(7)?),
+        body_preview: preview(&body),
+        preview_tip: preview_tip(&body),
         attach_cnt: r.get(8)?,
         unread: r.get::<_, i64>(9)? == 1,
         time_label: time_label(r.get(10)?),
@@ -489,6 +493,16 @@ pub fn search(
 fn preview(text: &str) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     flat.chars().take(100).collect()
+}
+
+/// 悬停预览正文：压缩空白 + 300 字符截断 + 超长补省略号（M5 列表 tooltip）
+fn preview_tip(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut tip: String = flat.chars().take(300).collect();
+    if flat.chars().count() > 300 {
+        tip.push('…');
+    }
+    tip
 }
 
 /// 附件行（详情页/预览/另存；不携带 BLOB 本体）
@@ -1838,6 +1852,21 @@ mod tests {
         );
         assert_eq!(build_query("的了 the"), None, "全停用词应回退");
         assert_eq!(build_query("   "), None, "纯空白应回退");
+    }
+
+    #[test]
+    fn preview_tip_truncates_long_body_with_ellipsis() {
+        assert_eq!(preview_tip("简短 正文"), "简短 正文", "短文原样保留");
+        assert_eq!(preview_tip("a\r\n\t b"), "a b", "压缩空白");
+        let long: String = "字".repeat(400);
+        let tip = preview_tip(&long);
+        assert_eq!(tip.chars().count(), 301, "300 字 + 省略号");
+        assert!(tip.ends_with('…'), "超长以省略号收尾");
+        assert_eq!(
+            preview_tip(""),
+            "",
+            "空正文返回空串（空 data-tip 不触发气泡）"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
             <div class="mr-main">
                 <div class="mr-top">
                     <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
+                    {% if m.preview_tip %}<span class="mr-tip" aria-hidden="true">{{ m.preview_tip }}</span>{% endif %}
                     {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
                     {% if m.status == 'failed' %}<span class="mr-flag fail">发送失败</span>{% endif %}
                     {% if m.status == 'queued' or m.status == 'sending' %}<span class="mr-flag send">发送中</span>{% endif %}
