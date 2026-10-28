@@ -13,10 +13,12 @@
 
 ## 团队角色
 
-- **作者（Authors）**：可以直接修改源码的成员（[Members team](https://github.com/orgs/CHANGE_ME/teams/members)）
-- **评审（Reviewers）**：非作者成员提交的变更（Pull Request）须由团队成员评审
+本项目由个人维护（当前无组织团队）。
+
+- **作者（Authors）**：可以直接修改源码的成员——当前为 [@jonathan197608](https://github.com/jonathan197608)（仓库管理员）；后续协作者以仓库 [Collaborators](https://github.com/jonathan197608/mailbox/settings/access) 为准
+- **评审（Reviewers）**：非作者提交的变更（Pull Request）须由作者评审通过后合并
 - **批准人（Approvers）**：每次发布签名须由下列成员批准：
-  - `@jonathan197608`（管理员）
+  - `@jonathan197608`（仓库管理员）
 
 ## 签名产物
 
