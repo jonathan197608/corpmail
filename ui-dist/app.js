@@ -70,3 +70,52 @@ async function mbxSaveAttachment(emailId, attachId, filename) {
         console.error('[mbx] 保存对话框失败', e);
     }
 }
+
+// ---------- 附件预览（M5）：img / pdf / text 三类内嵌渲染 ----------
+// text 类服务端强制 text/plain 返回（防 text/html 脚本执行），前端 pre 渲染
+
+function mbxPreviewAttachment(url, kind, name) {
+    const modal = document.getElementById('preview-modal');
+    const body = document.getElementById('pm-body');
+    const nameEl = document.getElementById('pm-name');
+    if (!modal || !body) return;
+    if (nameEl) nameEl.textContent = name;
+    body.innerHTML = '';
+    if (kind === 'img') {
+        const img = document.createElement('img');
+        img.src = url;
+        img.alt = name;
+        body.appendChild(img);
+    } else if (kind === 'pdf') {
+        const frame = document.createElement('iframe');
+        frame.src = url;
+        frame.title = name;
+        body.appendChild(frame);
+    } else if (kind === 'text') {
+        fetch(url)
+            .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
+            .then(t => {
+                const pre = document.createElement('pre');
+                pre.className = 'pm-text';
+                pre.textContent = t;
+                body.appendChild(pre);
+            })
+            .catch(() => {
+                body.textContent = '预览加载失败';
+            });
+    }
+    modal.hidden = false;
+}
+
+function mbxClosePreview() {
+    const modal = document.getElementById('preview-modal');
+    if (!modal) return;
+    modal.hidden = true;
+    const body = document.getElementById('pm-body');
+    if (body) body.innerHTML = '';  // 释放 img/iframe 资源
+}
+
+// Esc 关闭预览
+document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') mbxClosePreview();
+});

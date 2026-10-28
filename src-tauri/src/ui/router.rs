@@ -152,6 +152,8 @@ struct MainCtx {
     total: i64,
     /// 分页链接前缀（含 folder/unread/q 参数；模板拼 page=N）
     page_base: String,
+    /// 未读开关基址（仅 folder/q，无 unread：开启/恢复链接共用，防恢复链接自带 unread）
+    plain_base: String,
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
     items: Vec<EmailSummary>,
@@ -323,6 +325,11 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
+        ("GET", p)
+            if p.starts_with("/emails/") && p.contains("/attachments/") && p.ends_with("/view") =>
+        {
+            Some(attachment_view(state, req))
+        }
         ("GET", p) if p.starts_with("/emails/") => email_detail_page(state, req),
         ("GET", "/welcome") => Some(render_html("welcome.html", &())),
         ("GET", "/welcome/setup") => Some(wizard_setup_page(state)),
@@ -402,16 +409,19 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
     };
     let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
-    let mut page_base = if folder == "inbox" {
+    // plain_base：folder+q 基址（无 unread）——未读开关开启/恢复链接共用，
+    // 恢复链接不得复用含 unread 的 page_base（否则永远跳不回全部）
+    let mut plain_base = if folder == "inbox" {
         "/?".to_string()
     } else {
         format!("/?folder={folder}&")
     };
+    if !q_input.is_empty() {
+        plain_base = format!("{plain_base}q={}&", urlencode(&q_input));
+    }
+    let mut page_base = plain_base.clone();
     if unread_only {
         page_base = format!("{page_base}unread=1&");
-    }
-    if !q_input.is_empty() {
-        page_base = format!("{page_base}q={}&", urlencode(&q_input));
     }
     let ctx = MainCtx {
         frame: frame_ctx(state, &folder),
@@ -422,6 +432,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         pages,
         total,
         page_base,
+        plain_base,
         q: q_input,
         items,
     };
@@ -683,6 +694,34 @@ fn redirect_compose(draft_id: i64, error: &str) -> Resp {
 }
 
 /// 附件另存（POST /emails/{id}/attachments/{aid}；前端 __TAURI__.dialog 选好 dest）
+/// 附件预览（GET /emails/{id}/attachments/{aid}/view，M5）：解压后按原始 MIME 内联返回。
+/// 文本类强制 text/plain（防 text/html 内嵌脚本执行）+ nosniff（防嗅探错渲染）
+fn attachment_view(state: &AppState, req: &Req) -> Resp {
+    let Some((_, aid)) = path_attach(&req.path) else {
+        return Resp::not_found();
+    };
+    match mail::attachment_bytes(state, aid) {
+        Some((view, bytes)) => {
+            let content_type = if view.preview_kind == "text" {
+                "text/plain; charset=utf-8".to_string()
+            } else {
+                view.mime.clone()
+            };
+            let mut resp = Resp {
+                status: 200,
+                content_type,
+                cache_control: "no-store",
+                body: bytes,
+                extra_headers: Vec::new(),
+            };
+            resp.extra_headers
+                .push(("X-Content-Type-Options".into(), "nosniff".into()));
+            resp
+        }
+        None => Resp::not_found(),
+    }
+}
+
 fn attachment_save(state: &AppState, req: &Req) -> Resp {
     let Some((_, aid)) = path_attach(&req.path) else {
         return Resp::not_found();
@@ -1587,6 +1626,166 @@ mod tests {
             &tester,
         ));
         assert!(html3.contains("没有匹配的邮件"), "搜索空态文案：{html3}");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn unread_toggle_restores_full_list() {
+        let (state, dir) = temp_state("m5-unread");
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        // inbox：未读 + 已读各一封（SQL 直插，绕开收件链路）
+        state.with_conn(|c| {
+            for unread in [1, 0] {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, unread,
+                                        created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', '主题', '正文',
+                             '主题', '正文', ?1, 1, 1)",
+                    [unread],
+                )
+                .unwrap();
+            }
+        });
+        let tester = FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        };
+        // 未开态：开关进入链接带 unread=1
+        let plain = body(&route(&state, &assets(), &req("GET", "/", b""), &tester));
+        assert!(
+            plain.contains("unread=1&page=1"),
+            "未开态开关链接应带 unread=1：{plain}"
+        );
+        assert!(plain.contains("只看未读"));
+        // 开启态：开关为恢复链接（不带 unread 参数）+ 明确文字
+        let unread = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "unread=1", b""),
+            &tester,
+        ));
+        assert!(unread.contains("显示全部"), "开启态应有恢复文字：{unread}");
+        // 恢复链接不带 unread 参数（minijinja 按规范将 / 转义为 &#x2f;，浏览器解码后
+        // 即 /?page=1；断言按渲染原文精确匹配）
+        assert!(
+            unread.contains(r#"href="&#x2f;?page=1""#),
+            "恢复链接不得再携带 unread 参数：{unread}"
+        );
+        assert!(
+            !unread.contains("unread=1"),
+            "开启态整页不应再出现 unread=1 链接：{unread}"
+        );
+        // 恢复链接可达且回到全部
+        let restored = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "page=1", b""),
+            &tester,
+        ));
+        assert!(
+            restored.matches("mail-row").count() >= 2,
+            "恢复后应回到全部列表"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn attachment_view_serves_bytes_with_safe_mime() {
+        let (state, dir) = temp_state("m5-preview");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let id = crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "peer@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "预览用例".into(),
+                body_text: "见附件".into(),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        let png = dir.join("截图.png");
+        std::fs::write(&png, b"fake-png-bytes").unwrap();
+        let txt = dir.join("说明.txt");
+        std::fs::write(&txt, "纯文本内容").unwrap();
+        let zip = dir.join("打包.zip");
+        std::fs::write(&zip, b"zip-bytes").unwrap();
+        crate::mail::add_attachments(
+            &state,
+            id,
+            &[
+                png.to_str().unwrap().into(),
+                txt.to_str().unwrap().into(),
+                zip.to_str().unwrap().into(),
+            ],
+        )
+        .unwrap();
+        let tester = FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        };
+        // 详情页：png/txt 有预览按钮，zip 无
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}"), b""),
+            &tester,
+        ));
+        assert!(
+            html.contains("attachments/1/view"),
+            "png 应有预览按钮：{html}"
+        );
+        assert!(
+            html.contains("attachments/2/view"),
+            "txt 应有预览按钮：{html}"
+        );
+        assert!(
+            !html.contains("attachments/3/view"),
+            "zip 不应有预览按钮：{html}"
+        );
+        // GET 预览：原始字节 + 原 MIME + nosniff
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}/attachments/1/view"), b""),
+            &tester,
+        );
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.content_type.contains("image/png"),
+            "{}",
+            resp.content_type
+        );
+        assert_eq!(resp.body, b"fake-png-bytes");
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "X-Content-Type-Options" && v == "nosniff"),
+            "应有 nosniff 头"
+        );
+        // 文本类强制 text/plain（防 text/html 内嵌脚本）
+        let resp2 = route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}/attachments/2/view"), b""),
+            &tester,
+        );
+        assert_eq!(resp2.content_type, "text/plain; charset=utf-8");
+        assert_eq!(resp2.body, "纯文本内容".as_bytes());
+        // 不存在的附件 → 404
+        let resp3 = route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}/attachments/99/view"), b""),
+            &tester,
+        );
+        assert_eq!(resp3.status, 404);
         cleanup(&dir);
     }
 

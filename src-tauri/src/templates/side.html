@@ -8,7 +8,6 @@
     <div class="side-title">文件夹</div>
     <a class="folder {% if frame.folder == 'inbox' %}on{% endif %}" href="/?folder=inbox">📥 收件箱 <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>
-    <a class="folder {% if frame.folder == 'all' %}on{% endif %}" href="/?folder=all">🗂 全部邮件 <span class="cnt">{{ frame.all_mail }}</span></a>
     <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">📤 已发送 <span class="cnt">{{ frame.sent }}</span></a>
     <a class="folder {% if frame.folder == 'draft' %}on{% endif %}" href="/?folder=draft">📝 草稿 <span class="cnt">{{ frame.draft }}</span></a>
     <div class="side-foot">

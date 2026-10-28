@@ -13,6 +13,18 @@
 
 <body>
     {% block body %}{% endblock %}
+
+    {# 附件预览模态（M5：img/pdf/text 三类内嵌渲染；页面共享） #}
+    <div id="preview-modal" class="preview-modal" hidden>
+        <div class="pm-mask" onclick="mbxClosePreview()"></div>
+        <div class="pm-panel" role="dialog" aria-label="附件预览">
+            <div class="pm-head">
+                <span id="pm-name" class="pm-name"></span>
+                <button type="button" class="pm-close" onclick="mbxClosePreview()" title="关闭预览">✕</button>
+            </div>
+            <div id="pm-body" class="pm-body"></div>
+        </div>
+    </div>
 </body>
 
 </html>

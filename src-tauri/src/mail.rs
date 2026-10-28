@@ -491,7 +491,7 @@ fn preview(text: &str) -> String {
     flat.chars().take(100).collect()
 }
 
-/// 附件行（详情页/另存；不携带 BLOB 本体）
+/// 附件行（详情页/预览/另存；不携带 BLOB 本体）
 #[derive(Serialize)]
 pub struct AttachView {
     pub id: i64,
@@ -500,6 +500,22 @@ pub struct AttachView {
     pub size_orig: i64,
     pub storage: String,
     pub detached: bool,
+    /// 预览方式（空 = 不支持内嵌预览）：img | pdf | text（text 类回显强制 text/plain 防脚本）
+    pub preview_kind: String,
+}
+
+/// 附件预览方式判定：图片 / PDF / 纯文本类；text/html 归入不可预览（内嵌渲染会执行脚本）
+fn preview_kind_of(mime: &str) -> &'static str {
+    let m = mime.to_ascii_lowercase();
+    if m.starts_with("image/") {
+        "img"
+    } else if m == "application/pdf" {
+        "pdf"
+    } else if m.starts_with("text/") && m != "text/html" {
+        "text"
+    } else {
+        ""
+    }
 }
 
 /// 邮件详情（全部展示字段 + 附件列表）
@@ -572,10 +588,12 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
     )
     .and_then(|mut stmt| {
         stmt.query_map([email_id], |r| {
+            let mime: String = r.get(2)?;
             Ok(AttachView {
                 id: r.get(0)?,
                 filename: r.get(1)?,
-                mime: r.get(2)?,
+                preview_kind: preview_kind_of(&mime).into(),
+                mime,
                 size_orig: r.get(3)?,
                 storage: r.get(4)?,
                 detached: r.get(5)?,
@@ -830,6 +848,16 @@ pub struct LastCursor {
     pub uid: u32,
 }
 
+/// 一轮收件结果（游标推进依据 = 搜索层 max_uid，解析失败/入库去重不阻塞游标）
+pub struct FetchOutcome {
+    /// 服务器 INBOX 的 UIDVALIDITY（空轮也记录，防 uidvalidity 变化后误判）
+    pub uidvalidity: u32,
+    /// 本轮 UID SEARCH 命中的最大 UID（0 = 空轮，游标保持）
+    pub max_uid: u32,
+    /// 解析成功的待入库邮件
+    pub mails: Vec<IncomingMail>,
+}
+
 /// IMAP 通道注入点（生产 imap crate + mailparse；单测注入假实现，与 MailSender 同模式）
 pub trait MailFetcher {
     /// 增量拉取：last.uid > 0 且 uidvalidity 未变时从 uid+1 续拉；
@@ -842,7 +870,7 @@ pub trait MailFetcher {
         password: &str,
         first_days: i64,
         last: LastCursor,
-    ) -> Result<Vec<IncomingMail>, String>;
+    ) -> Result<FetchOutcome, String>;
 
     /// 服务器未读回写（SELECT 校验 uidvalidity 后 STORE +Flags \Seen）
     fn mark_seen(
@@ -868,7 +896,7 @@ impl MailFetcher for RealFetcher {
         password: &str,
         first_days: i64,
         last: LastCursor,
-    ) -> Result<Vec<IncomingMail>, String> {
+    ) -> Result<FetchOutcome, String> {
         let client = imap::ClientBuilder::new(host, port)
             .mode(imap::ConnectionMode::Tls)
             .connect()
@@ -880,9 +908,11 @@ impl MailFetcher for RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则按 SINCE 天数（§6.1）
+        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则按 SINCE 天数（§6.1）。
+        // 范围写法必须是 "N:*"（UID 范围）；曾误写 "N,*"（set 语义 = UID 恰为 N 或最大值），
+        // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复
         let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
-            sess.uid_search(format!("{},*", last.uid + 1))
+            sess.uid_search(format!("{}:*", last.uid + 1))
                 .map_err(|e| format!("检索新邮件失败：{e}"))?
                 .into_iter()
                 .filter(|u| *u > last.uid)
@@ -894,8 +924,13 @@ impl MailFetcher for RealFetcher {
                 .into_iter()
                 .collect()
         };
+        eprintln!(
+            "[fetch] INBOX uidvalidity={uidvalidity} 游标 uid={} 命中 {} 封",
+            last.uid,
+            uids.len()
+        );
         let mut mails = Vec::new();
-        for uid in uids {
+        for uid in uids.iter().copied() {
             let fetches = sess
                 .uid_fetch(uid.to_string(), "(FLAGS INTERNALDATE BODY.PEEK[])")
                 .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
@@ -905,14 +940,27 @@ impl MailFetcher for RealFetcher {
                     .iter()
                     .any(|flag| flag.to_string().contains("\\Seen"));
                 let internal_date = f.internal_date().map(|dt| dt.timestamp());
-                let Some(body) = f.body() else { continue };
-                if let Some(mail) = parse_incoming(uidvalidity, uid, seen, internal_date, body) {
-                    mails.push(mail);
+                let Some(body) = f.body() else {
+                    eprintln!("[fetch] uid={uid} 无 BODY，跳过");
+                    continue;
+                };
+                match parse_incoming(uidvalidity, uid, seen, internal_date, body) {
+                    Some(mail) => mails.push(mail),
+                    None => eprintln!("[fetch] uid={uid} MIME 解析失败，跳过"),
                 }
             }
         }
         let _ = sess.logout();
-        Ok(mails)
+        eprintln!(
+            "[fetch] 拉取完成：命中 {} 封，解析成功 {} 封",
+            uids.len(),
+            mails.len()
+        );
+        Ok(FetchOutcome {
+            uidvalidity,
+            max_uid: uids.iter().copied().max().unwrap_or(0),
+            mails,
+        })
     }
 
     fn mark_seen(
@@ -1614,13 +1662,14 @@ pub fn remove_attachments_except(
     })
 }
 
-/// 附件元数据 + 字节（另存为；detached 或文件缺失 → None）
+/// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）
 pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView, Vec<u8>)> {
     let root = attach_root(state);
     state.with_conn(|conn| {
         let row = conn
             .query_row(
-                "SELECT filename, storage, COALESCE(file_path,''), data, detached = 1
+                "SELECT filename, storage, COALESCE(file_path,''), data, detached = 1,
+                        COALESCE(mime, 'application/octet-stream')
                  FROM attachments WHERE id = ?1",
                 [attach_id],
                 |r| {
@@ -1630,12 +1679,13 @@ pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView,
                         r.get::<_, String>(2)?,
                         r.get::<_, Option<Vec<u8>>>(3)?,
                         r.get::<_, bool>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()
             .ok()??;
-        let (filename, storage, file_path, data, detached) = row;
+        let (filename, storage, file_path, data, detached, mime) = row;
         if detached {
             return None; // 大附件文件已按策略清理（§5.1）
         }
@@ -1647,7 +1697,8 @@ pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView,
         let meta = AttachView {
             id: attach_id,
             filename,
-            mime: String::new(),
+            preview_kind: preview_kind_of(&mime).into(),
+            mime,
             size_orig: bytes.len() as i64,
             storage,
             detached,
@@ -2224,8 +2275,12 @@ mod tests {
             _password: &str,
             _first_days: i64,
             _last: LastCursor,
-        ) -> Result<Vec<IncomingMail>, String> {
-            Ok(Vec::new())
+        ) -> Result<FetchOutcome, String> {
+            Ok(FetchOutcome {
+                uidvalidity: 0,
+                max_uid: 0,
+                mails: Vec::new(),
+            })
         }
 
         fn mark_seen(

@@ -173,23 +173,39 @@ impl AppState {
                 first_days,
                 last,
             ) {
-                Ok(mails) => {
-                    let added =
-                        crate::mail::store_incoming_conn(&mut conn, &data_dir, &mails).unwrap_or(0);
-                    // 游标推进：取本轮最大 uid；uidvalidity 以服务器为准
+                Ok(outcome) => {
+                    let added = match crate::mail::store_incoming_conn(
+                        &mut conn,
+                        &data_dir,
+                        &outcome.mails,
+                    ) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            eprintln!("[fetch] 入库失败：{err}");
+                            0
+                        }
+                    };
+                    // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
+                    // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）
                     let set = |k: &str, v: &str| {
                         let _ = crate::db::settings::set(&conn, k, v);
                     };
-                    if let Some(m) = mails.first() {
-                        set(keys::LAST_UIDVALIDITY, &m.uidvalidity.to_string());
-                    }
-                    if let Some(max_uid) = mails.iter().map(|m| m.uid).max() {
-                        set(keys::LAST_UID, &max_uid.to_string());
+                    set(keys::LAST_UIDVALIDITY, &outcome.uidvalidity.to_string());
+                    if outcome.max_uid > 0 {
+                        set(keys::LAST_UID, &outcome.max_uid.to_string());
                     }
                     set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
+                    eprintln!(
+                        "[fetch] 完成：命中游标 uid={}，解析 {} 封，入库 {added} 封",
+                        outcome.max_uid,
+                        outcome.mails.len()
+                    );
                     finish(added as i64, String::new());
                 }
-                Err(e) => finish(0, e),
+                Err(e) => {
+                    eprintln!("[fetch] 失败：{e}");
+                    finish(0, e);
+                }
             }
         });
     }
