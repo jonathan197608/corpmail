@@ -1,5 +1,11 @@
 {# 设置·存储管理 pane（上下文：SettingsCtx）#}
 <div class="settings-pane on" id="settings-pane">
+    {% if error %}
+    <div class="card compose-note err">✕ {{ error }}</div>
+    {% endif %}
+    {% if pending_dir %}
+    <div class="card compose-note ok">✓ 数据已迁移，重启应用后启用新目录（原目录保留为备份）</div>
+    {% endif %}
     <form hx-post="/settings/storage/save" hx-target="#settings-pane" hx-swap="outerHTML">
         <div class="card settings-card">
             <h3>数据与附件</h3>
@@ -12,6 +18,12 @@
                             title="选择新目录并迁移数据">更换位置</button>
                 </span>
             </div>
+            {% if pending_dir %}
+            <div class="kv">
+                <span class="k">待生效目录<small>数据已复制到新目录，重启应用后启用</small></span>
+                <span class="mono">{{ pending_dir }}</span>
+            </div>
+            {% endif %}
             <div class="kv">
                 <span class="k">内联附件上限<small>超过此大小的附件 gzip 后存独立文件</small></span>
                 <span><input class="num" type="text" name="inline_attach_max_mb" value="{{ inline_max }}"

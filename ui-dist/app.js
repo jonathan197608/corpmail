@@ -77,14 +77,15 @@ async function mbxSaveAttachment(emailId, attachId, filename) {
     }
 }
 
-// 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）
+// 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
+// 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区
 async function mbxMoveDataDir() {
     try {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
         htmx.ajax('POST', '/settings/storage/move', {
-            target: '#toast',
-            swap: 'innerHTML',
+            target: '#settings-pane',
+            swap: 'outerHTML',
             values: { dest: dir }
         });
     } catch (e) {

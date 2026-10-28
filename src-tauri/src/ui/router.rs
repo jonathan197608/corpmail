@@ -244,6 +244,8 @@ struct SettingsCtx {
     clean_estimate_bytes: String,
     clean_estimate_detail: String,
     clean_view: Option<CleanView>,
+    // 待生效的数据目录（M5 迁移成功后展示，重启后消失）
+    pending_dir: String,
     // 关于 tab
     app_version: String,
     sqlite_version: String,
@@ -1065,23 +1067,23 @@ fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
 }
 
 /// 设置·存储管理：迁移数据目录（M5；dest 由前端系统对话框选定后 POST）。
-/// 在线快照（VACUUM INTO）+ 指针写入锚点库，重启后生效；回 toast 提示
+/// 在线快照（VACUUM INTO）+ 指针写入锚点库，重启后生效；回 pane 片段：
+/// 成功时展示"待生效目录"行，失败时 error 区展示原因（对齐立即清理的交互模式）
 fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
     let dest = form.get("dest").cloned().unwrap_or_default();
-    let (ok, msg) = if dest.is_empty() {
-        (false, "未选择目标目录".to_string())
+    let error = if dest.trim().is_empty() {
+        "未选择目标目录".to_string()
     } else {
         match state.move_data_dir(&dest) {
-            Ok(text) => (true, text),
-            Err(e) => (false, e),
+            Ok(_) => String::new(),
+            Err(e) => e,
         }
     };
-    Resp::html(format!(
-        r#"<div id="toast" class="toast {}" hx-swap-oob="true">{}</div>"#,
-        if ok { "ok" } else { "err" },
-        html_escape(&msg)
-    ))
+    render_html(
+        &pane_template("storage"),
+        &settings_ctx(state, "storage", false, &error, None),
+    )
 }
 
 // ---------- 上下文装配 ----------
@@ -1218,6 +1220,11 @@ fn settings_ctx(
         clean_estimate_bytes: est_bytes,
         clean_estimate_detail: est_detail,
         clean_view: clean,
+        pending_dir: if tab == "storage" {
+            state.pending_data_dir().unwrap_or_default()
+        } else {
+            String::new()
+        },
         app_version: env!("CARGO_PKG_VERSION").into(),
         sqlite_version: state.sqlite_version(),
     }
@@ -1861,6 +1868,60 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(left, 0, "过期邮件应已被清理");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn storage_move_returns_pane_with_pending_dir() {
+        let (state, dir) = temp_state("m5-move");
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        let dest = std::env::temp_dir().join(format!("mbx-router-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        let tester = FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        };
+        // POST 迁移成功 → 回 pane 片段：待生效目录行 + 新路径
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/storage/move",
+                &form(&[("dest", dest.to_str().unwrap())]),
+            ),
+            &tester,
+        ));
+        assert!(
+            html.contains("待生效目录"),
+            "成功后 pane 应显示待生效目录行：{html}"
+        );
+        // minijinja 按规范将 / 转义为 &#x2f;（浏览器解码后即原路径），断言按渲染原文比较
+        let dest_escaped = dest.to_str().unwrap().replace('/', "&#x2f;");
+        assert!(html.contains(&dest_escaped), "待生效目录路径应展示：{html}");
+        assert!(html.contains("重启应用后启用"), "应提示重启生效：{html}");
+        // 指针已写锚点库，启动解析定位新目录
+        assert_eq!(
+            crate::state::AppState::resolve_start_dir(&dir),
+            dest,
+            "重启后应定位新目录"
+        );
+        // 失败路径：目标已占用（已有 mailbox.db）→ pane 顶部错误区
+        let html2 = body(&route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/storage/move",
+                &form(&[("dest", dest.to_str().unwrap())]),
+            ),
+            &tester,
+        ));
+        assert!(
+            html2.contains("mailbox.db") && html2.contains("compose-note err"),
+            "失败应显示错误原因：{html2}"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
         cleanup(&dir);
     }
 
@@ -3334,6 +3395,14 @@ mod tests {
             });
         state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
         dump("settings-storage-pending.html", get("/settings/storage"));
+
+        // M5 迁移待生效素材：锚点库写指针（temp_state 的锚点=数据目录）→ pane 显示"待生效目录"行
+        let pending_target = root.join("pending-target");
+        std::fs::create_dir_all(&pending_target).unwrap();
+        state
+            .set_batch(&[(keys::DATA_DIR, pending_target.to_str().unwrap())])
+            .unwrap();
+        dump("settings-storage-moved.html", get("/settings/storage"));
 
         // 测试连接片段演示页（成功 + 失败双态 + 未保存提示）
         let frag = test_fragment(

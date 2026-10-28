@@ -455,6 +455,21 @@ impl AppState {
         crate::secrets::degraded(&conn, account)
     }
 
+    /// 待生效的数据目录（M5 迁移）：读锚点库的 data_dir_override 指针；
+    /// 重启后 resolve_start_dir 应用指针、其值 == 当前目录，提示自然消失
+    pub fn pending_data_dir(&self) -> Option<String> {
+        let conn = crate::db::open(&self.anchor_dir.join("mailbox.db")).ok()?;
+        let over = crate::db::settings::get(&conn, keys::DATA_DIR)
+            .ok()
+            .flatten()?;
+        let pending = PathBuf::from(&over);
+        if pending != self.data_dir && pending.is_dir() {
+            Some(over)
+        } else {
+            None
+        }
+    }
+
     /// 数据目录下的独立附件占用（M1 尚无附件；目录不存在 → 0）：(字节, 文件数)
     pub fn attachments_stats(&self) -> (u64, u64) {
         fn dir_stats(p: &Path) -> (u64, u64) {
