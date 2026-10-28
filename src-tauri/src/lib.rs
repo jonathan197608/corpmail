@@ -104,7 +104,8 @@ pub fn run() {
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("Mailbox")
-                .inner_size(960.0, 620.0)
+                // 默认 1440×900（M5 实测 15 页面零滚动条；内容最高需求 812px @1280 宽）
+                .inner_size(1440.0, 900.0)
                 .min_inner_size(560.0, 400.0)
                 .resizable(true)
                 .center()
