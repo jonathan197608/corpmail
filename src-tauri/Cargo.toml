@@ -24,6 +24,7 @@ aes-gcm = "0.10"                                           # keyfile 回退加�
 base64 = "0.22"                                            # keyfile/密码辅助编码
 lettre = { version = "0.11", features = ["builder", "smtp-transport", "native-tls"] }  # SMTP 测试连接（M3 发送）
 imap = "3.0.0-alpha.15"                                    # IMAP 测试连接（M4 收件；降 2.4.1 见 §13-R2）
+mailparse = "0.18"                                         # MIME 解析（M4 收件：multipart/附件/RFC2047 解码，spike 已验证）
 jiff = "0.2"                                               # 时间戳格式化（RFC2822/展示）
 jieba-rs = "0.11"                                          # 中文预分词（§4：写入影子列，FTS 索引源；M2 写入侧）
 flate2 = "1"                                               # 附件 gzip（§5.1 两级存储）

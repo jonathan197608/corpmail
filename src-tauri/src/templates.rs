@@ -39,6 +39,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "test_result.html",
         include_str!("templates/test_result.html"),
     ),
+    (
+        "fetch_status.html",
+        include_str!("templates/fetch_status.html"),
+    ),
 ];
 
 fn build_env() -> Environment<'static> {

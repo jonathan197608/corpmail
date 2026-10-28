@@ -1532,3 +1532,27 @@ body {
     color: var(--accent);
     background: var(--accent-soft);
 }
+
+/* ============ M4：收件状态区 ============ */
+.fetch-status {
+    min-height: 0;
+    padding: 0 12px 6px;
+    font-size: 12.5px;
+    color: var(--accent);
+}
+
+.fetch-status:empty {
+    display: none;
+}
+
+.fetch-status .fs-err {
+    color: var(--danger);
+}
+
+.fetch-status .fs-new {
+    color: var(--ok);
+}
+
+.fetch-status .fs-dim {
+    color: var(--muted);
+}

@@ -24,6 +24,10 @@ pub mod keys {
     pub const CLEAN_SENT_BULK_DAYS: &str = "clean_sent_bulk_days";
     pub const KEEP_INBOX_DAYS: &str = "keep_inbox_days";
     pub const KEEP_SENT_DAYS: &str = "keep_sent_days";
+    // 收件状态（M4，设计 §3 schema 注释"状态"节）
+    pub const LAST_SYNC_AT: &str = "last_sync_at";
+    pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
+    pub const LAST_UID: &str = "last_uid";
 }
 
 /// 账号域名默认值（设计确认项 K 原为固定后缀；自 v0.1.1 起作为可配置设置项）
@@ -60,6 +64,19 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
+    /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）
+    fetch_state: std::sync::Arc<Mutex<FetchState>>,
+}
+
+/// 收件状态快照（收件按钮 spinner/禁用与状态片段共用）
+#[derive(Clone, Debug)]
+pub struct FetchState {
+    pub running: bool,
+    /// 最近一轮新增封数
+    pub new_count: i64,
+    pub last_error: String,
+    /// 刚完成（状态片段读到即清，路由层据此发 HX-Refresh 刷新列表）
+    pub just_finished: bool,
 }
 
 /// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
@@ -81,7 +98,120 @@ impl AppState {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
             send_tx: Mutex::new(None),
+            fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
+                running: false,
+                new_count: 0,
+                last_error: String::new(),
+                just_finished: false,
+            })),
         }
+    }
+
+    /// 收件状态快照（克隆；just_finished 读取后由 clear_fetch_finish 显式清除）
+    pub fn fetch_snapshot(&self) -> FetchState {
+        self.fetch_state.lock().expect("收件状态锁中毒").clone()
+    }
+
+    /// 清除"刚完成"标记（状态片段消费后调用，避免重复触发列表刷新）
+    pub fn clear_fetch_finish(&self) {
+        self.fetch_state
+            .lock()
+            .expect("收件状态锁中毒")
+            .just_finished = false;
+    }
+
+    /// 启动一轮收件（§6.2：手动/启动/定时共用；进行中重复触发直接忽略——防抖）。
+    ///
+    /// 参数快照与状态 CAS 在调用线程完成后，网络拉取与入库交由独立线程执行
+    /// （独立连接，同发送 worker 模式；完成后更新游标/last_sync_at 并置 just_finished）。
+    pub fn start_fetch(&self) {
+        if !self.fetch_cas_begin() {
+            return; // 已在收件中（防抖 §6.2）
+        }
+        let d = defaults();
+        let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
+        let host = g(keys::RECV_HOST);
+        let port: u16 = g(keys::RECV_PORT).parse().unwrap_or(993);
+        let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
+        let password = match self.retrieve_password(&account) {
+            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
+            crate::secrets::GetResult::Missing => {
+                self.fetch_end(0, "凭据缺失，请先在设置中保存密码");
+                return;
+            }
+        };
+        let first_days = g(keys::FIRST_FETCH_DAYS)
+            .parse::<i64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .unwrap_or(7);
+        let last = crate::mail::LastCursor {
+            uidvalidity: g(keys::LAST_UIDVALIDITY).parse().unwrap_or(0),
+            uid: g(keys::LAST_UID).parse().unwrap_or(0),
+        };
+        let fetch_state = std::sync::Arc::clone(&self.fetch_state);
+        let db_path = self.data_dir.join("mailbox.db");
+        let data_dir = self.data_dir.clone();
+        std::thread::spawn(move || {
+            let finish = |new_count: i64, error: String| {
+                let mut s = fetch_state.lock().expect("收件状态锁中毒");
+                s.running = false;
+                s.new_count = new_count;
+                s.last_error = error;
+                s.just_finished = true;
+            };
+            let Ok(mut conn) = crate::db::open(&db_path) else {
+                finish(0, "本地数据库打开失败".into());
+                return;
+            };
+            match crate::mail::MailFetcher::fetch(
+                &crate::mail::RealFetcher,
+                &host,
+                port,
+                &account,
+                &password,
+                first_days,
+                last,
+            ) {
+                Ok(mails) => {
+                    let added =
+                        crate::mail::store_incoming_conn(&mut conn, &data_dir, &mails).unwrap_or(0);
+                    // 游标推进：取本轮最大 uid；uidvalidity 以服务器为准
+                    let set = |k: &str, v: &str| {
+                        let _ = crate::db::settings::set(&conn, k, v);
+                    };
+                    if let Some(m) = mails.first() {
+                        set(keys::LAST_UIDVALIDITY, &m.uidvalidity.to_string());
+                    }
+                    if let Some(max_uid) = mails.iter().map(|m| m.uid).max() {
+                        set(keys::LAST_UID, &max_uid.to_string());
+                    }
+                    set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
+                    finish(added as i64, String::new());
+                }
+                Err(e) => finish(0, e),
+            }
+        });
+    }
+
+    /// 收件状态 CAS：空闲→进行中（成功 true；已在收件返回 false）
+    fn fetch_cas_begin(&self) -> bool {
+        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        if s.running {
+            return false;
+        }
+        s.running = true;
+        s.just_finished = false;
+        true
+    }
+
+    /// 收件结束（凭据缺失等同步失败路径；线程路径在闭包内直接更新 Arc）
+    fn fetch_end(&self, new_count: i64, error: &str) {
+        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        s.running = false;
+        s.new_count = new_count;
+        s.last_error = error.into();
+        s.just_finished = true;
     }
 
     /// 启动发送 worker（M3，设计 §2 单飞线程；生产装配于 lib.rs，测试不启动）。

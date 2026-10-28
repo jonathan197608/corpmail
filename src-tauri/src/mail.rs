@@ -8,7 +8,7 @@
 //!   + 独立附件文件（应用层清理，空目录一并回收）
 //! - 列表分页 50/页（§8.3）；时间展示 label：今天 HH:MM / 同年 M月D日 / 跨年 YYYY-M-D
 
-use crate::state::{AppState, defaults, keys};
+use crate::state::{AppState, defaults, full_address, keys};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -35,7 +35,8 @@ pub fn tokenize(text: &str) -> String {
         .join(" ")
 }
 
-fn now_epoch() -> i64 {
+/// 当前 epoch 秒
+pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -582,6 +583,496 @@ pub fn dispatch_one(
     }
 }
 
+// ---------- IMAP 收件与未读回写（M4，设计 §6.1/§6.2） ----------
+
+/// 收件附件（内存字节；来自 MIME 解析）
+pub struct IncomingAttach {
+    pub filename: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// 收件结果单封形态（fetcher 返回；入库走 store_incoming）
+pub struct IncomingMail {
+    pub uidvalidity: u32,
+    pub uid: u32,
+    /// 未含 \Seen 则置未读（§6.1）
+    pub seen: bool,
+    pub internal_date: Option<i64>,
+    pub message_id: String,
+    pub subject: String,
+    pub from_addr: String,
+    pub from_name: String,
+    pub to_addrs: String,
+    pub body_text: String,
+    pub body_kind: String,
+    pub attachments: Vec<IncomingAttach>,
+}
+
+/// 收件游标（settings 的 last_uidvalidity/last_uid 快照）
+#[derive(Default, Clone, Copy)]
+pub struct LastCursor {
+    pub uidvalidity: u32,
+    pub uid: u32,
+}
+
+/// IMAP 通道注入点（生产 imap crate + mailparse；单测注入假实现，与 MailSender 同模式）
+pub trait MailFetcher {
+    /// 增量拉取：last.uid > 0 且 uidvalidity 未变时从 uid+1 续拉；
+    /// uidvalidity 变化或首次按 SINCE 范围（设计 §6.1：提示全量重拉由调用方清理语义）
+    fn fetch(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        password: &str,
+        first_days: i64,
+        last: LastCursor,
+    ) -> Result<Vec<IncomingMail>, String>;
+
+    /// 服务器未读回写（SELECT 校验 uidvalidity 后 STORE +Flags \Seen）
+    fn mark_seen(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        password: &str,
+        uidvalidity: u32,
+        uid: u32,
+    ) -> Result<(), String>;
+}
+
+/// 生产实现：imap 3.0.0-alpha.15（隐式 TLS）+ mailparse 0.18（MIME 解析，spike 已验证）
+pub struct RealFetcher;
+
+impl MailFetcher for RealFetcher {
+    fn fetch(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        password: &str,
+        first_days: i64,
+        last: LastCursor,
+    ) -> Result<Vec<IncomingMail>, String> {
+        let client = imap::ClientBuilder::new(host, port)
+            .mode(imap::ConnectionMode::Tls)
+            .connect()
+            .map_err(|e| format!("连接失败：{e}"))?;
+        let mut sess = client
+            .login(account, password)
+            .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        let mailbox = sess
+            .select("INBOX")
+            .map_err(|e| format!("无法打开收件箱：{e}"))?;
+        let uidvalidity = mailbox.uid_validity.unwrap_or(0);
+        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则按 SINCE 天数（§6.1）
+        let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+            sess.uid_search(format!("{},*", last.uid + 1))
+                .map_err(|e| format!("检索新邮件失败：{e}"))?
+                .into_iter()
+                .filter(|u| *u > last.uid)
+                .collect()
+        } else {
+            let since = imap_since(first_days);
+            sess.uid_search(format!("SINCE {since}"))
+                .map_err(|e| format!("检索新邮件失败：{e}"))?
+                .into_iter()
+                .collect()
+        };
+        let mut mails = Vec::new();
+        for uid in uids {
+            let fetches = sess
+                .uid_fetch(uid.to_string(), "(FLAGS INTERNALDATE BODY.PEEK[])")
+                .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
+            for f in fetches.iter() {
+                let seen = f
+                    .flags()
+                    .iter()
+                    .any(|flag| flag.to_string().contains("\\Seen"));
+                let internal_date = f.internal_date().map(|dt| dt.timestamp());
+                let Some(body) = f.body() else { continue };
+                if let Some(mail) = parse_incoming(uidvalidity, uid, seen, internal_date, body) {
+                    mails.push(mail);
+                }
+            }
+        }
+        let _ = sess.logout();
+        Ok(mails)
+    }
+
+    fn mark_seen(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        password: &str,
+        uidvalidity: u32,
+        uid: u32,
+    ) -> Result<(), String> {
+        let client = imap::ClientBuilder::new(host, port)
+            .mode(imap::ConnectionMode::Tls)
+            .connect()
+            .map_err(|e| format!("连接失败：{e}"))?;
+        let mut sess = client
+            .login(account, password)
+            .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        let mailbox = sess
+            .select("INBOX")
+            .map_err(|e| format!("无法打开收件箱：{e}"))?;
+        if mailbox.uid_validity.unwrap_or(0) != uidvalidity {
+            return Err("邮箱 UID 已重排，跳过回写（下次收件自动对齐）".into());
+        }
+        sess.uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+            .map(|_| ())
+            .map_err(|e| format!("回写已读失败：{e}"))?;
+        let _ = sess.logout();
+        Ok(())
+    }
+}
+
+/// IMAP SINCE 日期（"DD-Mon-YYYY"，epoch 换算）
+fn imap_since(days: i64) -> String {
+    let cutoff = now_epoch() - days.clamp(1, 365) * 86_400;
+    let Some(z) = zoned_of(cutoff) else {
+        return "01-Jan-2020".into();
+    };
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(z.month() as usize - 1).min(11)];
+    format!("{:02}-{month}-{}", z.day() as u32, z.year())
+}
+
+/// MIME 解析为 IncomingMail（mailparse：主题/地址自动解码 RFC2047，spike 已验证）
+fn parse_incoming(
+    uidvalidity: u32,
+    uid: u32,
+    seen: bool,
+    internal_date: Option<i64>,
+    raw: &[u8],
+) -> Option<IncomingMail> {
+    use mailparse::MailHeaderMap;
+    let mail = mailparse::parse_mail(raw).ok()?;
+    let headers = mail.get_headers();
+    // RFC2047 解码需 get_first_header + get_value（get_first_value 返回原始值不解码）
+    let header_value = |key: &str| -> String {
+        headers
+            .get_first_header(key)
+            .map(|h| h.get_value())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let subject = header_value("Subject");
+    // From/To：addrparse 解析出地址与显示名
+    let (from_addr, from_name) = headers
+        .get_first_header("From")
+        .and_then(|h| mailparse::addrparse_header(h).ok())
+        .and_then(|list| {
+            list.extract_single_info().map(|i| {
+                (
+                    i.addr.to_string(),
+                    i.display_name.clone().unwrap_or_default(),
+                )
+            })
+        })
+        .unwrap_or_default();
+    let to_addrs = headers
+        .get_first_header("To")
+        .and_then(|h| mailparse::addrparse_header(h).ok())
+        .map(|list| {
+            let mut out: Vec<String> = Vec::new();
+            for a in list.iter() {
+                match a {
+                    mailparse::MailAddr::Single(s) => out.push(s.addr.clone()),
+                    mailparse::MailAddr::Group(g) => {
+                        for s in &g.addrs {
+                            out.push(s.addr.clone());
+                        }
+                    }
+                }
+            }
+            out.join(",")
+        })
+        .unwrap_or_default();
+    let message_id = header_value("Message-Id");
+    let (body_text, body_kind) = extract_body(&mail);
+    let attachments = collect_attachments(&mail);
+    Some(IncomingMail {
+        uidvalidity,
+        uid,
+        seen,
+        internal_date,
+        message_id,
+        subject,
+        from_addr,
+        from_name,
+        to_addrs,
+        body_text,
+        body_kind: body_kind.to_string(),
+        attachments,
+    })
+}
+
+/// 正文抽取（§6.1）：multipart 递归，text/plain 优先；仅 text/html 时剥标签存纯文本
+fn extract_body(mail: &mailparse::ParsedMail) -> (String, &'static str) {
+    if let Some(p) = find_inline_part(mail, "text/plain") {
+        return (p.get_body().unwrap_or_default(), "plain");
+    }
+    if let Some(p) = find_inline_part(mail, "text/html") {
+        return (strip_html(&p.get_body().unwrap_or_default()), "html");
+    }
+    (String::new(), "plain")
+}
+
+fn find_inline_part<'a>(
+    mail: &'a mailparse::ParsedMail<'a>,
+    mime: &str,
+) -> Option<&'a mailparse::ParsedMail<'a>> {
+    if mail.ctype.mimetype == mime
+        && mail.get_content_disposition().disposition != mailparse::DispositionType::Attachment
+    {
+        return Some(mail);
+    }
+    for sub in &mail.subparts {
+        if let Some(p) = find_inline_part(sub, mime) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// HTML 剥标签（无 regex 依赖的手工实现）+ 基础实体解码
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                for t in chars.by_ref() {
+                    if t == '>' {
+                        break;
+                    }
+                }
+            }
+            '&' => {
+                let mut entity = String::new();
+                let mut terminated = false;
+                for t in chars.by_ref() {
+                    if t == ';' {
+                        terminated = true;
+                        break;
+                    }
+                    entity.push(t);
+                    if entity.len() > 8 {
+                        break;
+                    }
+                }
+                if terminated {
+                    match entity.as_str() {
+                        "nbsp" => out.push(' '),
+                        "lt" => out.push('<'),
+                        "gt" => out.push('>'),
+                        "amp" => out.push('&'),
+                        "quot" => out.push('"'),
+                        _ => out.push_str(&entity),
+                    }
+                } else {
+                    out.push('&');
+                    out.push_str(&entity);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 附件收集（§6.1：Content-Disposition attachment 或带 filename 的 part）
+fn collect_attachments(mail: &mailparse::ParsedMail) -> Vec<IncomingAttach> {
+    let mut out = Vec::new();
+    walk_attachments(mail, &mut out);
+    out
+}
+
+fn walk_attachments(mail: &mailparse::ParsedMail, out: &mut Vec<IncomingAttach>) {
+    let cd = mail.get_content_disposition();
+    let named = cd.params.contains_key("filename") || mail.ctype.params.contains_key("name");
+    if cd.disposition == mailparse::DispositionType::Attachment || named {
+        let filename = cd
+            .params
+            .get("filename")
+            .or_else(|| mail.ctype.params.get("name"))
+            .cloned()
+            .unwrap_or_else(|| "attachment".into());
+        if let Ok(data) = mail.get_body_raw() {
+            out.push(IncomingAttach {
+                filename,
+                mime: mail.ctype.mimetype.clone(),
+                data,
+            });
+        }
+        return; // 附件 part 不再递归
+    }
+    for sub in &mail.subparts {
+        walk_attachments(sub, out);
+    }
+}
+
+/// 收件入库（M4 §6.1）：remote_uid（UNIQUE）+ message_id 双重去重；分词影子列；
+/// unread 按 \Seen；附件走两级存储。返回新增封数。
+/// （生产走收件线程的 conn 版；本 AppState 薄壳服务于单测与同步调用）
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize, String> {
+    let data_dir = state.data_dir.clone();
+    state.with_conn(|conn| store_incoming_conn(conn, &data_dir, mails))
+}
+
+/// 收件入库核心（独立连接版：收件线程使用，不依赖 AppState）。
+/// 单封失败中止整批（调用方以整体事务语义报告）；逐封独立提交更稳的取舍见 §6.1。
+pub fn store_incoming_conn(
+    conn: &mut rusqlite::Connection,
+    data_dir: &Path,
+    mails: &[IncomingMail],
+) -> Result<usize, String> {
+    let mut added = 0usize;
+    for m in mails {
+        let remote = format!("{}:{}", m.uidvalidity, m.uid);
+        let st = tokenize(&m.subject);
+        let bt = tokenize(&m.body_text);
+        let now = now_epoch();
+        let attach_bytes: i64 = m.attachments.iter().map(|a| a.data.len() as i64).sum();
+        let dup_remote: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM emails WHERE remote_uid = ?1",
+                [&remote],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(e)?;
+        if dup_remote.is_some() {
+            continue;
+        }
+        if !m.message_id.is_empty() {
+            let dup_mid: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM emails WHERE message_id = ?1",
+                    [&m.message_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(e)?;
+            if dup_mid.is_some() {
+                continue;
+            }
+        }
+        let unread = !m.seen;
+        conn.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, body_kind, subject_tokens, body_tokens,
+                                attach_cnt, attach_bytes, unread, remote_uid, message_id,
+                                created_at, received_at)
+             VALUES ('in', 'inbox', 'received', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                m.from_addr,
+                m.from_name,
+                m.to_addrs,
+                m.subject,
+                m.body_text,
+                m.body_kind,
+                st,
+                bt,
+                m.attachments.len() as i64,
+                attach_bytes,
+                unread,
+                remote,
+                m.message_id,
+                now,
+                m.internal_date.unwrap_or(now),
+            ],
+        )
+        .map_err(e)?;
+        let id = conn.last_insert_rowid();
+        added += 1;
+        for a in &m.attachments {
+            store_attachment_bytes_conn(conn, data_dir, id, &a.filename, &a.mime, &a.data)?;
+        }
+    }
+    Ok(added)
+}
+
+/// 本地已读 + 服务器 \Seen 回写（§6.1）：
+/// 参数快照在调用线程（协议回调内，纯本地查询）完成后，
+/// 网络回写交由调用方 spawn 的线程执行（fetcher 不依赖 AppState）。
+/// 本地已读 + 服务器 \Seen 回写（§6.1）：同步语义版（单测验证回写参数）；
+/// 生产路径见路由 mark_read_and_sync_seen（参数快照 + 异步 spawn）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mark_seen(state: &AppState, fetcher: &dyn MailFetcher, id: i64) -> Result<(), String> {
+    // 本地置已读（幂等；无 remote_uid 时仅本地）
+    mark_read(state, id);
+    let Some(p) = seen_params_of(state, id) else {
+        return Ok(()); // 本地邮件（草稿/已发送）或凭据缺失：仅本地已读
+    };
+    fetcher.mark_seen(
+        &p.host,
+        p.port,
+        &p.account,
+        &p.password,
+        p.uidvalidity,
+        p.uid,
+    )
+}
+
+/// 已读回写的参数快照（无网络操作；路由层取快照后可自由移交线程）
+pub struct SeenParams {
+    pub host: String,
+    pub port: u16,
+    pub account: String,
+    pub password: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
+}
+
+/// 取回写参数（本地已读由 mark_read 负责；此处读 remote/服务器参数/凭据）。
+/// 无 remote_uid（本地草稿/out 已发送）或凭据缺失返回 None（静默跳过回写）。
+pub fn seen_params_of(state: &AppState, id: i64) -> Option<SeenParams> {
+    // 单层 ?：闭包返回 Option<String>（None = 非 in 邮件/已删除），None 即跳过回写
+    let remote = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT remote_uid FROM emails WHERE id = ?1 AND direction = 'in'",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    })?;
+    let (v, u) = remote.split_once(':')?;
+    let uidvalidity = v.parse().ok()?;
+    let uid = u.parse().ok()?;
+    let d = defaults();
+    let host = state.get_or(keys::RECV_HOST, &d).unwrap_or_default();
+    let port: u16 = state
+        .get_or(keys::RECV_PORT, &d)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(993);
+    let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
+    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
+    let account = full_address(&prefix, &domain);
+    let password = match state.retrieve_password(&account) {
+        crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
+        crate::secrets::GetResult::Missing => return None,
+    };
+    Some(SeenParams {
+        host,
+        port,
+        account,
+        password,
+        uidvalidity,
+        uid,
+    })
+}
+
 // ---------- 删除（§5.3 硬删：行 + FTS（触发器）+ 独立附件文件） ----------
 
 pub fn delete(state: &AppState, id: i64) -> Result<bool, String> {
@@ -644,6 +1135,26 @@ fn attach_root(state: &AppState) -> PathBuf {
     state.data_dir.join("attachments")
 }
 
+/// 附件根目录（独立连接版）
+fn attach_root_of(data_dir: &Path) -> PathBuf {
+    data_dir.join("attachments")
+}
+
+/// 附件入库上限（字节）：settings inline_attach_max_mb（默认 20MB；独立连接版）
+fn inline_limit_conn(conn: &rusqlite::Connection) -> u64 {
+    conn.query_row(
+        "SELECT v FROM settings WHERE k = 'inline_attach_max_mb'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|v| v.parse::<u64>().ok())
+    .unwrap_or(20)
+    .saturating_mul(1024 * 1024)
+}
+
 // ---------- 附件两级存储（§5.1） ----------
 
 /// 附件入库上限（字节）：settings inline_attach_max_mb（默认 20MB）
@@ -666,6 +1177,94 @@ fn safe_filename(name: &str) -> String {
         .collect()
 }
 
+/// 附件入库上下文（insert_attachment 参数组，避免超长参数列表）
+struct AttachCtx<'a> {
+    tx: &'a rusqlite::Connection,
+    root: &'a Path,
+    month: &'a str,
+    email_id: i64,
+    limit: u64,
+}
+
+/// 单附件入库核心（事务内调用，add_attachments 与收件 store_attachment_bytes_conn 共用）：
+/// gzip → 按上限分级（inline BLOB / 独立文件）→ 行插入。written 记录已写盘路径供回滚清理。
+fn insert_attachment(
+    ctx: &AttachCtx,
+    filename: &str,
+    mime: &str,
+    orig: &[u8],
+    written: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let gz = gzip(orig).map_err(e)?;
+    let sha = hex_sha256(orig);
+    let size_orig = orig.len() as i64;
+    let n: i64 = ctx
+        .tx
+        .query_row(
+            "SELECT count(*) FROM attachments WHERE email_id = ?1",
+            [ctx.email_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(e)?
+        + 1;
+    if orig.len() as u64 <= ctx.limit {
+        ctx.tx
+            .execute(
+                "INSERT INTO attachments(email_id, filename, mime, size_orig, size_gz,
+                                         storage, data, sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'inline', ?6, ?7)",
+                rusqlite::params![
+                    ctx.email_id,
+                    filename,
+                    mime,
+                    size_orig,
+                    gz.len() as i64,
+                    gz,
+                    sha
+                ],
+            )
+            .map_err(e)?;
+    } else {
+        let rel = format!("{}/{}/{}_{}.gz", ctx.month, ctx.email_id, n, filename);
+        let dest = ctx.root.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| format!("创建附件目录失败：{err}"))?;
+        }
+        std::fs::write(&dest, &gz).map_err(|err| format!("写入附件文件失败：{err}"))?;
+        written.push(dest);
+        ctx.tx
+            .execute(
+                "INSERT INTO attachments(email_id, filename, mime, size_orig, size_gz,
+                                         storage, file_path, sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'file', ?6, ?7)",
+                rusqlite::params![
+                    ctx.email_id,
+                    filename,
+                    mime,
+                    size_orig,
+                    gz.len() as i64,
+                    rel,
+                    sha
+                ],
+            )
+            .map_err(e)?;
+    }
+    Ok(())
+}
+
+/// 冗余计数回写（附件增删后同步 emails.attach_cnt/attach_bytes）
+fn sync_attach_stats(tx: &rusqlite::Connection, email_id: i64) -> Result<(), String> {
+    tx.execute(
+        "UPDATE emails SET
+             attach_cnt  = (SELECT count(*) FROM attachments WHERE email_id = ?1),
+             attach_bytes = (SELECT COALESCE(sum(size_orig), 0) FROM attachments WHERE email_id = ?1)
+         WHERE id = ?1",
+        [email_id],
+    )
+    .map_err(e)?;
+    Ok(())
+}
+
 /// 追加附件（写入方：草稿保存/M4 收件）。
 ///
 /// 读文件 → gzip → 按上限分级：≤ 上限 inline BLOB；超限独立文件（月份目录取邮件时间）。
@@ -678,90 +1277,88 @@ pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Res
     let root = attach_root(state);
     let month = month_dir_of(state, email_id);
     let mut written_files: Vec<PathBuf> = Vec::new();
-    state.with_conn(|conn| {
+    let result = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         let mut count = 0usize;
         for p in paths {
-            let orig = std::fs::read(p).map_err(|err| format!("读取附件失败 {}: {err}", safe_filename(p)))?;
+            let orig = std::fs::read(p)
+                .map_err(|err| format!("读取附件失败 {}: {err}", safe_filename(p)))?;
             if orig.is_empty() {
                 return Err("附件为空文件".into());
             }
-            let gz = gzip(&orig).map_err(e)?;
-            let sha = hex_sha256(&orig);
             let filename = std::path::Path::new(p)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(safe_filename)
                 .unwrap_or_else(|| "attachment".into());
-            let size_orig = orig.len() as i64;
-            let n: i64 = tx
-                .query_row(
-                    "SELECT count(*) FROM attachments WHERE email_id = ?1",
-                    [email_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_err(e)?
-                + 1;
-            if orig.len() as u64 <= limit {
-                tx.execute(
-                    "INSERT INTO attachments(email_id, filename, mime, size_orig, size_gz,
-                                             storage, data, sha256)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'inline', ?6, ?7)",
-                    rusqlite::params![
-                        email_id,
-                        filename,
-                        mime_of(&filename),
-                        size_orig,
-                        gz.len() as i64,
-                        gz,
-                        sha,
-                    ],
-                )
-                .map_err(e)?;
-            } else {
-                let rel = format!("{month}/{email_id}/{n}_{}.gz", filename);
-                let dest = root.join(&rel);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|err| format!("创建附件目录失败：{err}"))?;
-                }
-                std::fs::write(&dest, &gz).map_err(|err| format!("写入附件文件失败：{err}"))?;
-                written_files.push(dest);
-                tx.execute(
-                    "INSERT INTO attachments(email_id, filename, mime, size_orig, size_gz,
-                                             storage, file_path, sha256)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'file', ?6, ?7)",
-                    rusqlite::params![
-                        email_id,
-                        filename,
-                        mime_of(&filename),
-                        size_orig,
-                        gz.len() as i64,
-                        rel,
-                        sha,
-                    ],
-                )
-                .map_err(e)?;
-            }
+            insert_attachment(
+                &AttachCtx {
+                    tx: &tx,
+                    root: &root,
+                    month: &month,
+                    email_id,
+                    limit,
+                },
+                &filename,
+                mime_of(&filename),
+                &orig,
+                &mut written_files,
+            )?;
             count += 1;
         }
-        tx.execute(
-            "UPDATE emails SET
-                 attach_cnt  = (SELECT count(*) FROM attachments WHERE email_id = ?1),
-                 attach_bytes = (SELECT COALESCE(sum(size_orig), 0) FROM attachments WHERE email_id = ?1)
-             WHERE id = ?1",
-            [email_id],
-        )
-        .map_err(e)?;
+        sync_attach_stats(&tx, email_id)?;
         tx.commit().map_err(e)?;
         Ok(count)
-    })
-    .inspect_err(|_| {
+    });
+    if result.is_err() {
         // 事务失败：清理本次已写盘的独立文件（防残留）
         for f in &written_files {
             let _ = std::fs::remove_file(f);
         }
-    })
+    }
+    result
+}
+
+/// 收件附件入库核心（独立连接版，M4 §6.1，不落临时文件）
+pub fn store_attachment_bytes_conn(
+    conn: &mut rusqlite::Connection,
+    data_dir: &Path,
+    email_id: i64,
+    filename: &str,
+    mime: &str,
+    orig: &[u8],
+) -> Result<(), String> {
+    let limit = inline_limit_conn(conn);
+    let root = attach_root_of(data_dir);
+    let month = month_dir_conn(conn, email_id);
+    let mut written_files: Vec<PathBuf> = Vec::new();
+    let tx = conn.transaction().map_err(e)?;
+    let result = (|| {
+        insert_attachment(
+            &AttachCtx {
+                tx: &tx,
+                root: &root,
+                month: &month,
+                email_id,
+                limit,
+            },
+            &safe_filename(filename),
+            mime,
+            orig,
+            &mut written_files,
+        )?;
+        sync_attach_stats(&tx, email_id)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => tx.commit().map_err(e),
+        Err(err) => {
+            for f in &written_files {
+                let _ = std::fs::remove_file(f);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// 草稿重存时按 keep 列表裁剪附件（删除行 + 独立文件；attach_cnt/bytes 回写）
@@ -853,6 +1450,20 @@ pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Resul
 }
 
 // ---------- 内部辅助 ----------
+
+/// 附件独立文件的月份目录（§5.1：邮件时间所在月；独立连接版）
+fn month_dir_conn(conn: &rusqlite::Connection, email_id: i64) -> String {
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT COALESCE(received_at, sent_at, created_at) FROM emails WHERE id = ?1",
+            [email_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    zoned_of(epoch)
+        .map(|z| format!("{:04}-{:02}", z.year(), z.month() as u32))
+        .unwrap_or_else(|| "unknown".into())
+}
 
 /// 附件独立文件的月份目录（§5.1：邮件时间所在月；在 with_conn 外调用）
 fn month_dir_of(state: &AppState, email_id: i64) -> String {
@@ -1279,6 +1890,240 @@ mod tests {
         });
         assert_eq!(status, "queued");
         cleanup(&dir);
+    }
+
+    /// 假收件器：记录 mark_seen 调用参数（fetch 路径由真实 fetcher 单独覆盖，不测网络）
+    type SeenCall = (String, u16, String, u32, u32);
+
+    struct FakeFetcher {
+        seen_marks: std::sync::Mutex<Vec<SeenCall>>,
+    }
+
+    impl FakeFetcher {
+        fn new() -> Self {
+            Self {
+                seen_marks: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MailFetcher for FakeFetcher {
+        fn fetch(
+            &self,
+            _host: &str,
+            _port: u16,
+            _account: &str,
+            _password: &str,
+            _first_days: i64,
+            _last: LastCursor,
+        ) -> Result<Vec<IncomingMail>, String> {
+            Ok(Vec::new())
+        }
+
+        fn mark_seen(
+            &self,
+            host: &str,
+            port: u16,
+            account: &str,
+            _password: &str,
+            uidvalidity: u32,
+            uid: u32,
+        ) -> Result<(), String> {
+            self.seen_marks.lock().unwrap().push((
+                host.into(),
+                port,
+                account.into(),
+                uidvalidity,
+                uid,
+            ));
+            Ok(())
+        }
+    }
+
+    fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMail {
+        IncomingMail {
+            uidvalidity: 42,
+            uid,
+            seen,
+            internal_date: Some(1_700_000_000),
+            message_id: message_id.into(),
+            subject: subject.into(),
+            from_addr: "boss@x.cn".into(),
+            from_name: "部门领导".into(),
+            to_addrs: "demo@chinatelecom.cn".into(),
+            body_text: "请查收本月激励清单。".into(),
+            body_kind: "plain".into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn store_incoming_dedupes_and_sets_unread() {
+        let (state, dir) = temp_state("m4-store");
+        let mails = vec![
+            incoming(1, false, "激励清单", "<m-1@x.cn>"),
+            incoming(2, true, "已读通知", "<m-2@x.cn>"),
+            // 同 uid（同 remote_uid）重复：应跳过
+            incoming(1, false, "激励清单", "<m-1@x.cn>"),
+            // 新 uid 但 message_id 已存在：应跳过
+            incoming(9, false, "清单转发", "<m-1@x.cn>"),
+        ];
+        let added = store_incoming(&state, &mails).unwrap();
+        assert_eq!(added, 2, "去重后仅入库两封");
+        let rows: Vec<(String, bool, String)> = state.with_conn(|c| {
+            c.prepare("SELECT remote_uid, unread = 1, message_id FROM emails ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "42:1");
+        assert!(rows[0].1, "\\Seen 缺失应置未读");
+        assert!(!rows[1].1, "含 \\Seen 应置已读");
+        // FTS 索引同步（分词影子列由触发器搬运；列限定避免正文命中干扰断言）
+        let hit: i64 = state.with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM email_fts WHERE email_fts MATCH 'subject:激励'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(hit, 1, "收件应同步入 FTS 索引");
+        // 附件入库（conn 版两级存储路径）
+        let with_attach = IncomingMail {
+            attachments: vec![IncomingAttach {
+                filename: "清单.xlsx".into(),
+                mime: "application/vnd.ms-excel".into(),
+                data: b"xlsx-bytes".to_vec(),
+            }],
+            ..incoming(3, false, "带附件来件", "<m-3@x.cn>")
+        };
+        let added = store_incoming(&state, &[with_attach]).unwrap();
+        assert_eq!(added, 1);
+        let d = get(&state, 3).unwrap();
+        assert_eq!(d.attach_cnt, 1);
+        assert_eq!(d.attachments[0].filename, "清单.xlsx");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn mark_seen_local_and_delegates_to_fetcher() {
+        let (state, dir) = temp_state("m4-seen");
+        state
+            .set_batch(&[
+                (keys::RECV_HOST, "imap.test.cn"),
+                (keys::RECV_PORT, "993"),
+                (keys::ACCOUNT_PREFIX, "demo"),
+                (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            ])
+            .unwrap();
+        state
+            .store_password("demo@chinatelecom.cn", "pw-m4")
+            .unwrap();
+        let mails = vec![incoming(7, false, "未读来件", "<m-7@x.cn>")];
+        store_incoming(&state, &mails).unwrap();
+        let fetcher = FakeFetcher::new();
+        mark_seen(&state, &fetcher, 1).unwrap();
+        let unread: i64 = state.with_conn(|c| {
+            c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(unread, 0, "本地应置已读");
+        let calls = fetcher.seen_marks.lock().unwrap();
+        assert_eq!(calls.len(), 1, "应回写服务器一次");
+        assert_eq!(
+            (
+                calls[0].0.as_str(),
+                calls[0].1,
+                calls[0].2.as_str(),
+                calls[0].3,
+                calls[0].4
+            ),
+            ("imap.test.cn", 993, "demo@chinatelecom.cn", 42, 7),
+            "回写参数应来自设置与 remote_uid"
+        );
+        // 已读后再次调用：本地无变化、不再回写
+        drop(calls);
+        let fetcher2 = FakeFetcher::new();
+        // mark_seen 幂等语义：显式再调仍会尝试回写（服务器对齐），本地不变
+        mark_seen(&state, &fetcher2, 1).unwrap();
+        assert_eq!(
+            fetcher2.seen_marks.lock().unwrap().len(),
+            1,
+            "重复调用仍对齐服务器"
+        );
+        // 本地草稿（无 remote_uid）：仅本地，不回写
+        let draft_id = save_draft(&state, &draft("本地草稿", "体")).unwrap();
+        let fetcher3 = FakeFetcher::new();
+        mark_seen(&state, &fetcher3, draft_id).unwrap();
+        assert_eq!(
+            fetcher3.seen_marks.lock().unwrap().len(),
+            0,
+            "本地邮件不应触发回写"
+        );
+        state.clear_password("demo@chinatelecom.cn");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn strip_html_removes_tags_and_decodes_entities() {
+        let out = strip_html("<p>月租<b>清单</b>&nbsp;&amp;&nbsp;报表</p>");
+        assert_eq!(out, "月租清单 & 报表");
+        assert_eq!(strip_html("无标签"), "无标签");
+        assert_eq!(strip_html("a & lt"), "a & lt", "未闭合实体原样保留");
+    }
+
+    #[test]
+    fn imap_since_produces_imap_date_format() {
+        let s = imap_since(7);
+        // 形如 21-Oct-2026（DD-Mon-YYYY）
+        let parts: Vec<&str> = s.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 2);
+        assert_eq!(parts[1].len(), 3, "月份缩写三字母：{s}");
+        assert!(parts[2].len() == 4, "年份四位：{s}");
+    }
+
+    #[test]
+    fn extract_body_prefers_plain_and_falls_back_to_html() {
+        let plain_mime = b"Content-Type: text/plain; charset=utf-8\r\n\r\nplain content";
+        let mail = mailparse::parse_mail(plain_mime).unwrap();
+        assert_eq!(extract_body(&mail).0, "plain content");
+        let html_mime = b"Content-Type: text/html\r\n\r\n<h1>heading</h1>";
+        let mail = mailparse::parse_mail(html_mime).unwrap();
+        let (body, kind) = extract_body(&mail);
+        assert_eq!((body.as_str(), kind), ("heading", "html"));
+        // multipart/alternative：plain 优先
+        let mp = b"Content-Type: multipart/alternative; boundary=BOUND\r\n\r\n--BOUND\r\nContent-Type: text/html\r\n\r\n<html>hi</html>\r\n--BOUND\r\nContent-Type: text/plain\r\n\r\nhi plain\r\n--BOUND--\r\n";
+        let mail = mailparse::parse_mail(mp).unwrap();
+        let (body, kind) = extract_body(&mail);
+        assert_eq!((body.trim(), kind), ("hi plain", "plain"));
+        // 附件识别
+        let att = b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody here\r\n--B\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"data.bin\"\r\n\r\nBINARY\r\n--B--\r\n";
+        let mail = mailparse::parse_mail(att).unwrap();
+        let attachments = collect_attachments(&mail);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "data.bin");
+        assert_eq!(attachments[0].data, b"BINARY");
+    }
+
+    #[test]
+    fn parse_incoming_extracts_headers_and_body() {
+        let raw = b"From: =?utf-8?B?6YOo6Zeo6aKG5a+8?=<boss@x.cn>\r\n\
+                    To: demo@chinatelecom.cn\r\n\
+                    Subject: =?utf-8?B?5pyI5bqm6YWN5qGI?=\r\n\
+                    Message-Id: <abc@x.cn>\r\n\
+                    Content-Type: text/plain\r\n\r\nbody line";
+        let mail = parse_incoming(7, 99, false, Some(1234), raw).unwrap();
+        assert_eq!(mail.subject, "月度配案");
+        assert_eq!(mail.from_addr, "boss@x.cn");
+        assert_eq!(mail.body_text, "body line");
+        assert_eq!(mail.message_id, "<abc@x.cn>");
+        assert!(!mail.seen);
+        assert_eq!(mail.uid, 99);
     }
 
     #[test]

@@ -249,6 +249,15 @@ struct TestResultCtx {
     note_ok: bool,
 }
 
+/// 收件状态片段（顶栏收取按钮反馈区 + /emails/fetch/status 轮询共用）
+#[derive(Serialize)]
+struct FetchStatusCtx {
+    running: bool,
+    new_count: i64,
+    error: String,
+    last_sync_label: String,
+}
+
 #[derive(Serialize)]
 struct TestView {
     label: String,
@@ -292,6 +301,8 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/read") => {
             Some(email_read(state, req))
         }
+        ("GET", "/emails/fetch") => Some(fetch_start(state)),
+        ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
@@ -396,7 +407,8 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     if !state.configured() {
         return Some(render_html("welcome.html", &()));
     }
-    mail::mark_read(state, id);
+    // 打开详情即阅读：本地置已读 + 服务器 \Seen 异步回写（M4 §6.1）
+    mark_read_and_sync_seen(state, id);
     let email = mail::get(state, id)?;
     let folder = email.folder.clone();
     let notice = req
@@ -430,13 +442,72 @@ fn email_delete(state: &AppState, req: &Req) -> Resp {
     }
 }
 
-/// 标记已读（POST /emails/{id}/read；本地置 0，服务器回写 M4 接入）
+/// 标记已读（POST /emails/{id}/read）：本地置 0 + 服务器 \Seen 异步回写（§6.1，M4）
 fn email_read(state: &AppState, req: &Req) -> Resp {
     let Some(id) = path_id(&req.path, "/emails/") else {
         return Resp::not_found();
     };
-    mail::mark_read(state, id);
+    mark_read_and_sync_seen(state, id);
     Resp::html(String::new())
+}
+
+/// 本地置已读（从未读翻转时）+ 服务器 \Seen 异步回写。
+/// 参数快照在调用线程（协议回调内），网络回写交独立线程，不阻塞回调。
+fn mark_read_and_sync_seen(state: &AppState, id: i64) {
+    if !mail::mark_read(state, id) {
+        return; // 原本已读：无需回写
+    }
+    let Some(p) = mail::seen_params_of(state, id) else {
+        return; // 非 in 邮件或凭据缺失：仅本地已读
+    };
+    std::thread::spawn(move || {
+        let _ = mail::MailFetcher::mark_seen(
+            &mail::RealFetcher,
+            &p.host,
+            p.port,
+            &p.account,
+            &p.password,
+            p.uidvalidity,
+            p.uid,
+        );
+    });
+}
+
+/// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
+fn fetch_start(state: &AppState) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    state.start_fetch();
+    fetch_status(state, false)
+}
+
+/// 收件状态片段（GET /emails/fetch/status 轮询）：进行中每 2s 自轮询；
+/// 刚完成时消费标记并回 HX-Refresh 整页刷新（列表/计数全新）
+fn fetch_status(state: &AppState, consume: bool) -> Resp {
+    let s = state.fetch_snapshot();
+    let d = defaults();
+    let last_sync = state
+        .get_or(keys::LAST_SYNC_AT, &d)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let ctx = FetchStatusCtx {
+        running: s.running,
+        new_count: s.new_count,
+        error: s.last_error.clone(),
+        last_sync_label: if last_sync > 0 {
+            format!("上次收取：{}", mail::time_full(last_sync))
+        } else {
+            "尚未收取".into()
+        },
+    };
+    let mut resp = render_html("fetch_status.html", &ctx);
+    if consume && s.just_finished {
+        state.clear_fetch_finish();
+        resp.extra_headers
+            .push(("HX-Refresh".into(), "true".into()));
+    }
+    resp
 }
 
 /// 撰写页（GET /compose：空表单 / ?reply_to=N 回复预填 / ?draft_id=M 草稿编辑）
@@ -1014,7 +1085,14 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
         sync_on_start: g(keys::SYNC_ON_START) == "true",
         sync_interval_min: g(keys::SYNC_INTERVAL_MIN),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
-        last_sync_label: "收件功能将在后续版本开放，以下参数保存后随之生效。".into(),
+        last_sync_label: {
+            let at = g(keys::LAST_SYNC_AT).parse::<i64>().unwrap_or(0);
+            if at > 0 {
+                format!("上次收取：{}", crate::mail::time_full(at))
+            } else {
+                "尚未收取过邮件".into()
+            }
+        },
         data_dir: state.data_dir.display().to_string(),
         inline_max: g(keys::INLINE_ATTACH_MAX_MB),
         db_size: human_bytes(db_bytes),
@@ -1872,6 +1950,127 @@ mod tests {
                 .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/emails/1?error=")),
             "非 failed 重发应被拒并提示"
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn fetch_flow_without_credential_shows_error_and_refresh() {
+        let (state, dir) = temp_state("m4-fetch");
+        // 配置账号但凭据缺失：start_fetch 同步置失败态（无网络、无线程泄漏到断言之后）
+        state
+            .set_batch(&[
+                (keys::ACCOUNT_PREFIX, "demo"),
+                (keys::DISPLAY_NAME, "张伟"),
+                (keys::RECV_HOST, "imap.test.cn"),
+                (keys::RECV_PORT, "993"),
+            ])
+            .unwrap();
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/fetch", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let frag = body(&resp);
+        assert!(frag.contains("凭据缺失"), "凭据缺失应在片段中提示：{frag}");
+        assert!(!frag.contains("every 2s"), "失败态不应轮询");
+        // 状态轮询（consume）：首次读到 just_finished → HX-Refresh 整页刷新
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/fetch/status", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Refresh" && v == "true"),
+            "刚完成应触发整页刷新：{:?}",
+            resp.extra_headers
+        );
+        // 再次轮询：just_finished 已消费，不再刷新
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/fetch/status", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            !resp.extra_headers.iter().any(|(k, _)| k == "HX-Refresh"),
+            "完成标记消费后不应重复刷新"
+        );
+        // 设置页同步 tab 展示真实收取时间线
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/settings/sync", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("尚未收取过邮件"), "未收取过应展示占位");
+        state
+            .set_batch(&[(keys::LAST_SYNC_AT, "1774500000")])
+            .unwrap();
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/settings/sync", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("上次收取："), "有记录应展示上次收取时间");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn read_endpoint_marks_local_unread() {
+        let (state, dir) = temp_state("m4-read");
+        state
+            .set_batch(&[
+                (keys::ACCOUNT_PREFIX, "demo"),
+                (keys::RECV_HOST, "imap.invalid.local"),
+            ])
+            .unwrap();
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, unread, created_at,
+                                        remote_uid, received_at)
+                     VALUES ('in', 'inbox', 'received', 'a@x.cn', 'demo@chinatelecom.cn', '来件',
+                             '来件', '体', 1, 1, '42:5', 1)",
+                [],
+            )
+            .unwrap();
+        });
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/emails/1/read", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert_eq!(resp.status, 200);
+        let unread: i64 = state.with_conn(|c| {
+            c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(unread, 0, "已读接口应本地置 0");
+        // 未配置时拒绝（配置强制入口原则）
         cleanup(&dir);
     }
 

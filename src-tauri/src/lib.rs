@@ -54,6 +54,37 @@ pub fn run() {
             state.start_send_worker();
             app.manage(state);
 
+            // M4 收件调度（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。
+            // 调度线程持 AppHandle 取 State（设置每轮重读，改参数即时生效；0=仅手动）
+            let handle = app.app_handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let state = handle.state::<state::AppState>();
+                let on_start = state
+                    .get(state::keys::SYNC_ON_START)
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                if on_start {
+                    state.start_fetch();
+                }
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let state = handle.state::<state::AppState>();
+                    let only_manual = state
+                        .get(state::keys::SYNC_INTERVAL_MIN)
+                        .flatten()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(30);
+                    if only_manual > 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            only_manual.saturating_sub(1).saturating_mul(60),
+                        ));
+                        state.start_fetch();
+                    }
+                }
+            });
+
             let url: tauri::Url = APP_URL.parse().expect("入口 URL 为常量，恒合法");
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))

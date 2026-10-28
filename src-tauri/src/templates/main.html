@@ -8,12 +8,15 @@
             <a class="unread-toggle {% if unread_only %}on{% endif %}"
                href="{% if unread_only %}{{ page_base }}page={{ page }}{% else %}{{ page_base }}unread=1&page=1{% endif %}"
                {% if folder != 'inbox' %}hidden{% endif %}>● 只看未读</a>
-            <button class="sync-btn" type="button" disabled title="收件功能将在后续版本开放">⟳ 收取新邮件</button>
+            <button class="sync-btn" type="button"
+                    hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
+                    hx-trigger="click throttle:3000ms" hx-disabled-elt="this">⟳ 收取新邮件</button>
             <div class="search" title="检索功能将在后续版本开放">
                 <span>🔍</span>
                 <input type="search" placeholder="搜索邮件…" disabled>
             </div>
         </div>
+        <div id="fetch-status" class="fetch-status"></div>
 
         {% include "mail_list.html" %}
     </main>
