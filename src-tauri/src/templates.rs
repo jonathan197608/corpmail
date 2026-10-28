@@ -14,6 +14,9 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("setup.html", include_str!("templates/setup.html")),
     ("done.html", include_str!("templates/done.html")),
     ("main.html", include_str!("templates/main.html")),
+    ("mail_list.html", include_str!("templates/mail_list.html")),
+    ("email.html", include_str!("templates/email.html")),
+    ("compose.html", include_str!("templates/compose.html")),
     ("side.html", include_str!("templates/side.html")),
     ("settings.html", include_str!("templates/settings.html")),
     (

@@ -1,0 +1,11 @@
+{
+  "$schema": "gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口能力：ui:// 自定义协议页面 + 系统文件/保存对话框（M2：附件选择与另存，设计 §2/§5.1）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
+}

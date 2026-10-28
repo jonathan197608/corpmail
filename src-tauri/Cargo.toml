@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"                                          # 表单 JSON 数组字段（M2 附件 keep_ids/attach_paths）
 minijinja = { version = "3", features = ["serde"] }
 url = "2"
 
@@ -24,6 +25,10 @@ base64 = "0.22"                                            # keyfile/密码辅�
 lettre = { version = "0.11", features = ["builder", "smtp-transport", "native-tls"] }  # SMTP 测试连接（M3 发送）
 imap = "3.0.0-alpha.15"                                    # IMAP 测试连接（M4 收件；降 2.4.1 见 §13-R2）
 jiff = "0.2"                                               # 时间戳格式化（RFC2822/展示）
+jieba-rs = "0.11"                                          # 中文预分词（§4：写入影子列，FTS 索引源；M2 写入侧）
+flate2 = "1"                                               # 附件 gzip（§5.1 两级存储）
+sha2 = "0.10"                                              # 附件指纹（§5.1 sha256 列）
+tauri-plugin-dialog = "2"                                  # 系统文件/保存对话框（M2：附件选择与另存）
 
 # --- Windows 交付（设计 §11.2/11.3 v3.4：官方 NSIS 安装器）---
 # 零 vendor：上游 webview2-com-sys 0.39.1 gnu 目标动态链接 WebView2Loader.dll，

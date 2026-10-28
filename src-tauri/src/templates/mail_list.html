@@ -1,0 +1,43 @@
+{# 邮件列表（主界面整页内嵌 + htmx 片段共用；上下文：MainCtx）#}
+<div class="mail-list" id="mail-list">
+    {% if items %}
+        {% for m in items %}
+        <a class="mail-row {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
+           href="/emails/{{ m.id }}">
+            <div class="mr-side">
+                <span class="mr-dot" aria-hidden="true"></span>
+                <span class="mr-who">{{ m.from_display }}</span>
+                <span class="mr-time">{{ m.time_label }}</span>
+            </div>
+            <div class="mr-main">
+                <div class="mr-top">
+                    <span class="mr-subject">{% if m.subject %}{{ m.subject }}{% else %}（无主题）{% endif %}</span>
+                    {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
+                    {% if m.attach_cnt > 0 %}<span class="mr-clip" title="{{ m.attach_cnt }} 个附件">📎 {{ m.attach_cnt }}</span>{% endif %}
+                </div>
+                <div class="mr-preview">{{ m.body_preview }}</div>
+            </div>
+        </a>
+        {% endfor %}
+        {% if pages > 1 %}
+        <div class="pager">
+            {% if page > 1 %}<a class="pg" href="{{ page_base }}page={{ page - 1 }}">‹ 上一页</a>{% endif %}
+            <span class="pg-cur">{{ page }} / {{ pages }}</span>
+            {% if page < pages %}<a class="pg" href="{{ page_base }}page={{ page + 1 }}">下一页 ›</a>{% endif %}
+        </div>
+        {% endif %}
+    {% else %}
+        <div class="card empty-state">
+            {% if unread_only %}
+            <div class="empty-mark">✅</div>
+            <h2>没有未读邮件</h2>
+            <p>太好了，收件箱已全部读完。</p>
+            {% else %}
+            <div class="empty-mark">📭</div>
+            <h2>这里还没有邮件</h2>
+            <p>撰写并保存的草稿会出现在这里，<br>收取与发送功能将在后续版本开放。</p>
+            <a class="btn" href="/compose">✎ 撰写邮件</a>
+            {% endif %}
+        </div>
+    {% endif %}
+</div>

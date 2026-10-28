@@ -88,6 +88,12 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// 借出连接执行闭包（邮件存储层 mail 模块使用；锁随闭包返回释放）
+    pub fn with_conn<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+        let mut conn = self.db.lock().expect("数据库锁中毒");
+        f(&mut conn)
+    }
+
     /// 读 settings 键（None = 未设置；库错误按未设置处理，页面回退默认值）
     pub fn get(&self, key: &str) -> Option<Option<String>> {
         let conn = self.db.lock().expect("数据库锁中毒");

@@ -1085,3 +1085,408 @@ body {
 ::-webkit-scrollbar-track {
     background: transparent;
 }
+
+/* ============ M2：邮件列表 / 详情 / 撰写 ============ */
+
+/* ---------- 列表行 ---------- */
+.mail-row {
+    display: flex;
+    align-items: stretch;
+    gap: 12px;
+    padding: 11px 14px;
+    border: 1px solid var(--line-soft);
+    border-left: 3px solid transparent;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    background: var(--panel);
+    text-decoration: none;
+    color: var(--ink);
+    transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
+}
+
+.mail-row:hover {
+    border-color: var(--line);
+    background: #f8fafd;
+    box-shadow: 0 1px 6px rgba(21, 34, 56, 0.06);
+}
+
+.mail-row.unread {
+    border-left-color: var(--accent);   /* 状态脊线：未读蓝脊 */
+    background: #fbfdff;
+}
+
+.mail-row.unread .mr-subject,
+.mail-row.unread .mr-who {
+    font-weight: 700;
+}
+
+.mail-row.is-draft {
+    background: #fbfaf6;
+}
+
+.mr-side {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 132px;
+    max-width: 168px;
+    overflow: hidden;
+}
+
+.mr-dot {
+    display: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    align-self: flex-start;
+}
+
+.mail-row.unread .mr-dot {
+    display: block;                     /* 未读蓝点 */
+}
+
+.mr-who {
+    font-size: 13px;
+    color: var(--ink-soft);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mr-time {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.mr-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.mr-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.mr-subject {
+    font-size: 14px;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+}
+
+.mr-flag {
+    font-size: 11px;
+    color: #8a6d1a;
+    background: #f6efdc;
+    border-radius: 5px;
+    padding: 1px 7px;
+    white-space: nowrap;
+}
+
+.mr-clip {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.mr-preview {
+    font-size: 12.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ---------- 分页 ---------- */
+.pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 12px 0 4px;
+}
+
+.pager .pg {
+    font-size: 13px;
+    color: var(--accent);
+    text-decoration: none;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 12px;
+    background: var(--panel);
+}
+
+.pager .pg:hover {
+    background: var(--accent-soft);
+}
+
+.pg-cur {
+    font-size: 12.5px;
+    color: var(--muted);
+}
+
+/* ---------- 顶栏：未读过滤 / 返回 ---------- */
+.unread-toggle {
+    font-size: 12.5px;
+    color: var(--muted);
+    text-decoration: none;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 10px;
+    white-space: nowrap;
+}
+
+.unread-toggle:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.unread-toggle.on {
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-color: var(--accent);
+}
+
+.back {
+    font-size: 13px;
+    color: var(--muted);
+    text-decoration: none;
+    white-space: nowrap;
+    align-self: center;
+    margin-right: 4px;
+}
+
+.back:hover {
+    color: var(--accent);
+}
+
+/* ---------- 详情页 ---------- */
+.md-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mail-detail {
+    margin: 4px 12px 12px;
+    padding: 18px 22px;
+}
+
+.md-head {
+    border-bottom: 1px solid var(--line-soft);
+    padding-bottom: 12px;
+    margin-bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.md-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 13px;
+}
+
+.md-row .k {
+    color: var(--muted);
+    min-width: 52px;
+}
+
+.md-addr {
+    color: var(--ink-soft);
+    word-break: break-all;
+}
+
+.md-time {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.md-error {
+    color: var(--danger);
+    word-break: break-all;
+}
+
+.md-body {
+    font-family: inherit;
+    font-size: 14px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--ink);
+    min-height: 120px;
+}
+
+.md-attach {
+    border-top: 1px solid var(--line-soft);
+    padding-top: 12px;
+    margin-top: 14px;
+}
+
+.md-attach-title,
+.kept-title {
+    font-size: 13px;
+    color: var(--ink-soft);
+    margin-bottom: 8px;
+}
+
+.att-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.att-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    padding: 7px 10px;
+    background: #fafbfd;
+}
+
+.att-row.kept {
+    background: #fbfaf6;
+}
+
+.att-clip {
+    font-size: 14px;
+}
+
+.att-name {
+    color: var(--ink);
+    word-break: break-all;
+}
+
+.att-size {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.att-gone {
+    color: #9a8f74;
+    font-size: 12px;
+}
+
+.md-actions {
+    display: flex;
+    gap: 10px;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 14px;
+    margin-top: 6px;
+}
+
+/* ---------- 撰写页 ---------- */
+.compose-card {
+    margin: 4px 12px 12px;
+    padding: 18px 22px;
+    max-width: 760px;
+}
+
+.compose-card form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.compose-card textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 220px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--ink);
+    background: #fff;
+}
+
+.compose-note {
+    border-radius: 9px;
+    padding: 8px 12px;
+    font-size: 13px;
+    margin-bottom: 12px;
+}
+
+.compose-note.ok {
+    background: var(--ok-soft);
+    color: var(--ok);
+}
+
+.compose-note.err {
+    background: #f9eef1;
+    color: var(--danger);
+}
+
+.attach-area {
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.compose-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+/* ---------- 轻提示（另存结果等） ---------- */
+.toast-slot:empty {
+    display: none;
+}
+
+.toast {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    max-width: 420px;
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-size: 13px;
+    box-shadow: 0 6px 22px rgba(21, 34, 56, 0.18);
+    word-break: break-all;
+}
+
+.toast.ok {
+    background: var(--ok-soft);
+    color: var(--ok);
+    border: 1px solid #bfe5d5;
+}
+
+.toast.err {
+    background: #f9eef1;
+    color: var(--danger);
+    border: 1px solid #f0dbe0;
+}
+
+.btn.small {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 7px;
+    margin-left: auto;
+}
+
+.att-row .btn.small {
+    margin-left: auto;
+}

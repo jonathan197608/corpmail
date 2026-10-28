@@ -4,8 +4,10 @@
     {% include "side.html" %}
     <main class="main">
         <div class="topbar">
-            <h1>收件箱</h1>
-            <span class="sub">双击邮件查看详情</span>
+            <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
+            <a class="unread-toggle {% if unread_only %}on{% endif %}"
+               href="{% if unread_only %}{{ page_base }}page={{ page }}{% else %}{{ page_base }}unread=1&page=1{% endif %}"
+               {% if folder != 'inbox' %}hidden{% endif %}>● 只看未读</a>
             <button class="sync-btn" type="button" disabled title="收件功能将在后续版本开放">⟳ 收取新邮件</button>
             <div class="search" title="检索功能将在后续版本开放">
                 <span>🔍</span>
@@ -13,14 +15,7 @@
             </div>
         </div>
 
-        <div class="mail-list">
-            <div class="card empty-state">
-                <div class="empty-mark">📭</div>
-                <h2>还没有邮件</h2>
-                <p>当前版本已完成账号配置与设置功能，<br>邮件收取、撰写与检索将在后续版本开放。</p>
-                <a class="btn" href="/settings">打开设置</a>
-            </div>
-        </div>
+        {% include "mail_list.html" %}
     </main>
 </div>
 {% endblock %}

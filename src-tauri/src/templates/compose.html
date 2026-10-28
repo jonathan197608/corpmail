@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="app on">
+    {% include "side.html" %}
+    <main class="main">
+        <div class="topbar">
+            <a class="back" href="/?folder=draft">‹ 返回列表</a>
+            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to %}回复邮件{% else %}撰写新邮件{% endif %}</h1>
+        </div>
+
+        <div class="card compose-card">
+            {% if saved %}<div class="compose-note ok">✓ 草稿已保存</div>{% endif %}
+            {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
+
+            <form hx-post="/compose/draft" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button[type=submit]">
+                <input type="hidden" name="draft_id" value="{{ draft_id }}">
+                <input type="hidden" name="in_reply_to" value="{{ in_reply_to }}">
+                <input type="hidden" name="keep_ids" id="keep-ids"
+                       value="{{ keep_ids_json }}">
+                <input type="hidden" name="attach_paths" id="attach-paths" value="[]">
+
+                <div class="sfield">
+                    <label>收件人<small class="hint">多个地址以逗号分隔</small></label>
+                    <input type="text" name="to_addrs" value="{{ to_addrs }}" autocomplete="off"
+                        autocapitalize="none" spellcheck="false">
+                </div>
+                <div class="sfield">
+                    <label>抄送<small class="hint">可选</small></label>
+                    <input type="text" name="cc_addrs" value="{{ cc_addrs }}" autocomplete="off"
+                        autocapitalize="none" spellcheck="false">
+                </div>
+                <div class="sfield">
+                    <label>主题</label>
+                    <input type="text" name="subject" value="{{ subject }}">
+                </div>
+                <div class="sfield">
+                    <label>正文</label>
+                    <textarea name="body_text" rows="14">{{ body_text }}</textarea>
+                </div>
+
+                <div class="attach-area">
+                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎 添加附件</button>
+                    <ul id="picked-list" class="att-list"></ul>
+                    {% if attachments %}
+                    <div class="kept-title">已保存的附件（保存草稿时保留）</div>
+                    <ul class="att-list">
+                        {% for a in attachments %}
+                        <li class="att-row kept">
+                            <span class="att-clip">📎</span>
+                            <span class="att-name">{{ a.filename }}</span>
+                            <span class="att-size">{{ a.size_orig }} 字节</span>
+                            <button type="button" class="btn small"
+                                    onclick="mbxRemoveKept({{ a.id }}, this)">移除</button>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
+                </div>
+
+                <div class="compose-actions">
+                    <button type="submit" class="btn primary big">💾 存草稿</button>
+                    <span class="hint">正式发送功能将在后续版本开放</span>
+                </div>
+            </form>
+        </div>
+        <div id="toast" class="toast-slot"></div>
+    </main>
+</div>
+{% endblock %}

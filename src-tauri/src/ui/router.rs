@@ -7,6 +7,7 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use crate::conncheck::TestOutcome;
+use crate::mail::{self, AttachView, EmailSummary};
 use crate::state::{self, AppState, defaults, full_address, keys};
 use crate::templates;
 use crate::ui::Assets;
@@ -38,9 +39,10 @@ pub struct Req {
     pub method: String,
     /// 以 `/` 开头、不含查询串
     pub path: String,
+    /// 查询串（不含 `?`；M2 起 `/` 列表按 folder/page/unread 取参）
+    pub query: String,
     /// 是否带 `HX-Request` 头（htmx 发起的片段请求）。
-    /// M1 仅 debug 日志读取（release 下无读者）；M2 起 `/` 等整页路由将按它区分片段响应
-    #[allow(dead_code)]
+    /// 列表页按它区分整页/片段响应（片段=mail_list 单交换）
     pub is_htmx_request: bool,
     pub body: Vec<u8>,
 }
@@ -52,9 +54,17 @@ impl Req {
         Self {
             method: request.method().as_str().to_string(),
             path: request.uri().path().to_string(),
+            query: request.uri().query().unwrap_or("").to_string(),
             is_htmx_request: request.headers().get("hx-request").is_some(),
             body: request.body().clone(),
         }
+    }
+
+    /// 取查询参数（首个命中；无则 None）
+    pub fn query_param(&self, name: &str) -> Option<String> {
+        form_urlencoded::parse(self.query.as_bytes())
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.to_string())
     }
 }
 
@@ -127,11 +137,46 @@ struct FrameCtx {
     all_mail: i64,
     sent: i64,
     draft: i64,
+    /// 当前列表 folder（inbox|all|sent|draft；side.html 高亮与列表页标题用）
+    folder: String,
 }
 
 #[derive(Serialize)]
 struct MainCtx {
     frame: FrameCtx,
+    folder: String,
+    folder_label: String,
+    unread_only: bool,
+    page: i64,
+    pages: i64,
+    total: i64,
+    /// 分页链接前缀（含 folder/unread 参数；模板拼 page=N）
+    page_base: String,
+    items: Vec<EmailSummary>,
+}
+
+/// 邮件详情页
+#[derive(Serialize)]
+struct EmailCtx {
+    frame: FrameCtx,
+    email: mail::EmailDetail,
+}
+
+/// 撰写页（新邮件 / 回复预填 / 草稿编辑共用）
+#[derive(Serialize)]
+struct ComposeCtx {
+    frame: FrameCtx,
+    draft_id: i64,
+    in_reply_to: i64,
+    to_addrs: String,
+    cc_addrs: String,
+    subject: String,
+    body_text: String,
+    attachments: Vec<AttachView>,
+    /// 已入库附件 id 的 JSON 数组（keep_ids 隐藏域初值；JS 维护移除）
+    keep_ids_json: String,
+    saved: bool,
+    error: String,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -232,7 +277,19 @@ pub fn route<A: Assets>(state: &AppState, assets: &A, req: &Req, tester: &dyn Co
 /// 动态路由（页面与片段），未命中返回 None 交给静态资源
 fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp> {
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => Some(root(state)),
+        ("GET", "/") => Some(list_root(state, req)),
+        ("GET", "/compose") => Some(compose_page(state, req)),
+        ("POST", "/compose/draft") => Some(compose_draft_save(state, req)),
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/delete") => {
+            Some(email_delete(state, req))
+        }
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/read") => {
+            Some(email_read(state, req))
+        }
+        ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
+            Some(attachment_save(state, req))
+        }
+        ("GET", p) if p.starts_with("/emails/") => email_detail_page(state, req),
         ("GET", "/welcome") => Some(render_html("welcome.html", &())),
         ("GET", "/welcome/setup") => Some(wizard_setup_page(state)),
         ("POST", "/welcome/setup/save") => Some(wizard_save(state, req, tester)),
@@ -268,18 +325,297 @@ fn valid_tab(tab: &str) -> bool {
 
 // ---------- 页面 ----------
 
-fn root(state: &AppState) -> Resp {
-    if state.configured() {
-        render_html(
-            "main.html",
-            &MainCtx {
-                frame: frame_ctx(state),
-            },
-        )
-    } else {
-        // 首启未配置：配置为强制入口（设计 §8.1，无"稍后再说"）
-        render_html("welcome.html", &())
+fn folder_label(folder: &str) -> &'static str {
+    match folder {
+        "inbox" => "收件箱",
+        "sent" => "已发送",
+        "draft" => "草稿",
+        _ => "全部邮件",
     }
+}
+
+/// 主列表（GET /?folder=&page=&unread=；htmx 请求回 mail_list 片段，普通请求回整页）
+fn list_root(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        // 首启未配置：配置为强制入口（设计 §8.1，无"稍后再说"）
+        return render_html("welcome.html", &());
+    }
+    let folder = match req.query_param("folder").as_deref() {
+        Some("all") | Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
+        _ => "inbox".to_string(),
+    };
+    let page = req
+        .query_param("page")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let unread_only = req.query_param("unread").map(|v| v == "1").unwrap_or(false);
+    let q = mail::ListQuery {
+        folder: folder.clone(),
+        page,
+        unread_only,
+    };
+    let (items, total) = mail::list(state, &q).unwrap_or_default();
+    let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
+    let mut page_base = if folder == "inbox" {
+        "/?".to_string()
+    } else {
+        format!("/?folder={folder}&")
+    };
+    if unread_only {
+        page_base = format!("{page_base}unread=1&");
+    }
+    let ctx = MainCtx {
+        frame: frame_ctx(state, &folder),
+        folder: folder.clone(),
+        folder_label: folder_label(&folder).into(),
+        unread_only,
+        page,
+        pages,
+        total,
+        page_base,
+        items,
+    };
+    if req.is_htmx_request {
+        render_html("mail_list.html", &ctx)
+    } else {
+        render_html("main.html", &ctx)
+    }
+}
+
+/// 详情页（GET /emails/{id}；打开即本地置已读，IMAP 服务器回写为 M4 §6.1）
+fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
+    // 无效路径先 404（与未配置欢迎页语义区分），再走"配置为强制入口"分支
+    let id = path_id(&req.path, "/emails/")?;
+    if !state.configured() {
+        return Some(render_html("welcome.html", &()));
+    }
+    mail::mark_read(state, id);
+    let email = mail::get(state, id)?;
+    let folder = email.folder.clone();
+    Some(render_html(
+        "email.html",
+        &EmailCtx {
+            frame: frame_ctx(state, &folder),
+            email,
+        },
+    ))
+}
+
+/// 删除（POST /emails/{id}/delete；§5.3 硬删）——详情页按钮，删完整页回列表
+fn email_delete(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    let folder = mail::get(state, id)
+        .map(|d| d.folder)
+        .unwrap_or_else(|| "inbox".into());
+    match mail::delete(state, id) {
+        Ok(_) => Resp::hx_redirect(&format!("/?folder={folder}")),
+        Err(e) => Resp::hx_redirect(&format!(
+            "/emails/{id}?error={}",
+            urlencode(&format!("删除失败：{e}"))
+        )),
+    }
+}
+
+/// 标记已读（POST /emails/{id}/read；本地置 0，服务器回写 M4 接入）
+fn email_read(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    mail::mark_read(state, id);
+    Resp::html(String::new())
+}
+
+/// 撰写页（GET /compose：空表单 / ?reply_to=N 回复预填 / ?draft_id=M 草稿编辑）
+fn compose_page(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let saved = req.query_param("saved").map(|v| v == "1").unwrap_or(false);
+    let error = req
+        .query_param("error")
+        .map(|v| urldecode(&v))
+        .unwrap_or_default();
+    let mut ctx = ComposeCtx {
+        frame: frame_ctx(state, "draft"),
+        draft_id: 0,
+        in_reply_to: 0,
+        to_addrs: String::new(),
+        cc_addrs: String::new(),
+        subject: String::new(),
+        body_text: String::new(),
+        attachments: Vec::new(),
+        keep_ids_json: "[]".into(),
+        saved,
+        error,
+    };
+    if let Some(id) = req
+        .query_param("draft_id")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        if let Some(draft) = mail::get(state, id).filter(|d| d.folder == "draft") {
+            ctx.draft_id = id;
+            ctx.in_reply_to = draft.in_reply_to.unwrap_or(0);
+            ctx.to_addrs = draft.to_addrs;
+            ctx.cc_addrs = draft.cc_addrs;
+            ctx.subject = draft.subject;
+            ctx.body_text = draft.body_text;
+            ctx.attachments = draft.attachments;
+            ctx.keep_ids_json =
+                serde_json::to_string(&ctx.attachments.iter().map(|a| a.id).collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".into());
+        }
+    } else if let Some(rid) = req
+        .query_param("reply_to")
+        .and_then(|v| v.parse::<i64>().ok())
+        && let Some(src) = mail::get(state, rid)
+    {
+        ctx.in_reply_to = rid;
+        ctx.to_addrs = src.from_addr.clone();
+        ctx.subject = if src.subject.starts_with("Re:") {
+            src.subject.clone()
+        } else {
+            format!("Re: {}", src.subject)
+        };
+        let quoted = src
+            .body_text
+            .lines()
+            .map(|l| format!("· {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.body_text = format!("\n\n----- 原文 -----\n{quoted}\n");
+    }
+    render_html("compose.html", &ctx)
+}
+
+/// 存/覆盖草稿（POST /compose/draft）：表单含 keep_ids/attach_paths（JSON 数组）
+fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let form = parse_form(&req.body);
+    let d = defaults();
+    let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
+    let input = mail::DraftInput {
+        id: form_i64(&form, "draft_id"),
+        from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
+        from_name: g(keys::DISPLAY_NAME),
+        to_addrs: trimmed_field(&form, "to_addrs").unwrap_or_default(),
+        cc_addrs: trimmed_field(&form, "cc_addrs").unwrap_or_default(),
+        subject: form.get("subject").cloned().unwrap_or_default(),
+        body_text: form.get("body_text").cloned().unwrap_or_default(),
+        in_reply_to: form_i64(&form, "in_reply_to"),
+    };
+    let keep_ids = form_json_i64s(&form, "keep_ids");
+    let paths = form_json_strings(&form, "attach_paths");
+    match mail::save_draft(state, &input) {
+        Ok(id) => {
+            if let Err(e) = mail::remove_attachments_except(state, id, &keep_ids) {
+                return redirect_compose(id, &format!("附件裁剪失败：{e}"));
+            }
+            if !paths.is_empty()
+                && let Err(e) = mail::add_attachments(state, id, &paths)
+            {
+                return redirect_compose(id, &format!("附件保存失败：{e}"));
+            }
+            Resp::hx_redirect(&format!("/compose?draft_id={id}&saved=1"))
+        }
+        Err(e) => redirect_compose(input.id.unwrap_or(0), &e),
+    }
+}
+
+fn redirect_compose(draft_id: i64, error: &str) -> Resp {
+    Resp::hx_redirect(&format!(
+        "/compose?draft_id={draft_id}&error={}",
+        urlencode(error)
+    ))
+}
+
+/// 附件另存（POST /emails/{id}/attachments/{aid}；前端 __TAURI__.dialog 选好 dest）
+fn attachment_save(state: &AppState, req: &Req) -> Resp {
+    let Some((_, aid)) = path_attach(&req.path) else {
+        return Resp::not_found();
+    };
+    let form = parse_form(&req.body);
+    let Some(dest) = trimmed_field(&form, "dest") else {
+        return Resp::html(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
+        );
+    };
+    match mail::save_attachment_to(state, aid, &dest) {
+        Ok(()) => Resp::html(format!(
+            r#"<div id="toast" class="toast ok" hx-swap-oob="true">已另存到 {}</div>"#,
+            html_escape(&dest)
+        )),
+        Err(e) => Resp::html(format!(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
+            html_escape(&e)
+        )),
+    }
+}
+
+// ---------- M2 辅助 ----------
+
+/// 路径首段正整数 id（/emails/{id}...）
+fn path_id(path: &str, prefix: &str) -> Option<i64> {
+    path.strip_prefix(prefix)?
+        .split('/')
+        .next()?
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v > 0)
+}
+
+/// 附件路径二元组（/emails/{id}/attachments/{aid}）
+fn path_attach(path: &str) -> Option<(i64, i64)> {
+    let rest = path.strip_prefix("/emails/")?;
+    let mut it = rest.split('/');
+    let id = it.next()?.parse::<i64>().ok()?;
+    if it.next()? != "attachments" {
+        return None;
+    }
+    let aid = it.next()?.parse::<i64>().ok()?;
+    Some((id, aid))
+}
+
+fn form_i64(form: &HashMap<String, String>, name: &str) -> Option<i64> {
+    form.get(name)
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// 表单 JSON 数组字段 → i64 列表（空/缺省 → 空）
+fn form_json_i64s(form: &HashMap<String, String>, name: &str) -> Vec<i64> {
+    form.get(name)
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default()
+}
+
+/// 表单 JSON 数组字段 → 字符串列表（附件路径）
+fn form_json_strings(form: &HashMap<String, String>, name: &str) -> Vec<String> {
+    form.get(name)
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default()
+}
+
+fn urlencode(s: &str) -> String {
+    form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+fn urldecode(s: &str) -> String {
+    form_urlencoded::parse(s.as_bytes())
+        .map(|(k, _)| k.to_string())
+        .next()
+        .unwrap_or_default()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn wizard_setup_page(state: &AppState) -> Resp {
@@ -545,7 +881,7 @@ fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
 
 // ---------- 上下文装配 ----------
 
-fn frame_ctx(state: &AppState) -> FrameCtx {
+fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {
     let d = defaults();
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
@@ -575,6 +911,7 @@ fn frame_ctx(state: &AppState) -> FrameCtx {
         all_mail: c["all"],
         sent: c["sent"],
         draft: c["draft"],
+        folder: folder.into(),
     }
 }
 
@@ -612,6 +949,7 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
             all_mail: counts["all"],
             sent: counts["sent"],
             draft: counts["draft"],
+            folder: String::new(),
         },
         tab: tab.into(),
         smtp_host: g(keys::SMTP_HOST),
@@ -877,8 +1215,17 @@ mod tests {
         Req {
             method: method.to_string(),
             path: path.to_string(),
+            query: String::new(),
             is_htmx_request: false,
             body: body.to_vec(),
+        }
+    }
+
+    /// 带查询串的 GET 构造（M2 列表 folder/page/unread 取参）
+    fn req_q(method: &str, path: &str, query: &str, body: &[u8]) -> Req {
+        Req {
+            query: query.to_string(),
+            ..req(method, path, body)
         }
     }
 
@@ -938,8 +1285,371 @@ mod tests {
         );
         let html = body(&resp);
         assert!(html.contains("企业邮箱客户端"), "已配置应渲染主界面框架");
-        assert!(html.contains("还没有邮件"), "M1 主界面为空列表占位");
+        assert!(html.contains("收件箱"), "主界面应展示当前文件夹标题");
+        assert!(html.contains("这里还没有邮件"), "无邮件时应渲染空态");
         assert!(html.contains("demo@chinatelecom.cn"), "侧栏应展示完整账号");
+        assert!(html.contains("撰写邮件"), "侧栏撰写入口应可用");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn list_page_shows_drafts_with_sidebar_counts() {
+        let (state, dir) = temp_state("m2-list");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let draft = |s: &str| crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            subject: s.into(),
+            body_text: "配案正文预览".into(),
+            in_reply_to: None,
+        };
+        crate::mail::save_draft(&state, &draft("第一封草稿主题")).unwrap();
+        crate::mail::save_draft(&state, &draft("第二封草稿主题")).unwrap();
+        let resp = route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "folder=draft", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let html = body(&resp);
+        assert!(html.contains("第一封草稿主题"), "列表应含草稿主题");
+        assert!(html.contains("第二封草稿主题"), "列表应含第二封");
+        assert!(html.contains("配案正文预览"), "列表应含正文预览");
+        assert!(html.contains("草稿"), "列表应渲染 folder 标题与草稿徽标");
+        assert!(!html.contains("这里还没有邮件"), "有数据不应空态");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn compose_save_and_edit_roundtrip() {
+        let (state, dir) = temp_state("m2-compose");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        // 空表单
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/compose", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("撰写新邮件"), "无参数应渲染空白撰写页");
+        assert!(html.contains("存草稿"), "应有存草稿按钮");
+        // 存草稿
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/compose/draft",
+                &form(&[
+                    ("to_addrs", "peer@x.cn"),
+                    ("cc_addrs", ""),
+                    ("subject", "草稿主题甲"),
+                    ("body_text", "草稿正文"),
+                    ("keep_ids", "[]"),
+                    ("attach_paths", "[]"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/compose?draft_id=1&saved=1")),
+            "存草稿应跳转草稿编辑页：{:?}",
+            resp.extra_headers
+        );
+        // 回显编辑
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/compose", "draft_id=1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("编辑草稿"), "草稿 id 应进入编辑态");
+        assert!(html.contains("草稿主题甲"), "主题应回显");
+        assert!(html.contains("草稿正文"), "正文应回显");
+        // 覆盖（幂等：同 id 更新不新增）
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/compose/draft",
+                &form(&[
+                    ("draft_id", "1"),
+                    ("to_addrs", "peer@x.cn"),
+                    ("cc_addrs", ""),
+                    ("subject", "改题"),
+                    ("body_text", "改文"),
+                    ("keep_ids", "[]"),
+                    ("attach_paths", "[]"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/compose?draft_id=1&saved=1"),
+            "覆盖保存应保持同一草稿 id"
+        );
+        let total: i64 = state.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(total, 1, "覆盖不应新增行");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn reply_prefills_and_in_reply_to_persisted() {
+        let (state, dir) = temp_state("m2-reply");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        state
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, unread,
+                                        created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', 'boss@x.cn', '领导', 'demo@chinatelecom.cn',
+                             '激励清单', '请按清单执行。', '激励 清单', '请 按 清单 执行', 1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            });
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/compose", "reply_to=1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("回复邮件"), "回复应进入回复态标题");
+        assert!(html.contains("Re: 激励清单"), "主题应加 Re: 前缀");
+        assert!(html.contains("boss@x.cn"), "收件人应预填原发件人");
+        assert!(html.contains("----- 原文 -----"), "正文应引用原文");
+        assert!(
+            html.contains("name=\"in_reply_to\" value=\"1\""),
+            "回复链应写入隐藏域"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn detail_marks_read_and_delete_redirects() {
+        let (state, dir) = temp_state("m2-detail");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, unread,
+                                        created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', 'a@x.cn', '', 'demo@chinatelecom.cn',
+                             '来件主题', '来件正文。', '来件 主题', '来件 正文', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        });
+        // 打开详情：未读清零 + 页面渲染
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let html = body(&resp);
+        assert!(html.contains("来件主题"), "详情页应渲染主题");
+        assert!(html.contains("a@x.cn"), "详情页应渲染发件人");
+        let unread: i64 = state.with_conn(|c| {
+            c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(unread, 0, "打开详情应本地置已读");
+        // 删除 → HX-Redirect 列表
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/emails/1/delete", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/?folder=inbox"),
+            "删除应整页回列表：{:?}",
+            resp.extra_headers
+        );
+        // 二次访问 404
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert_eq!(resp.status, 404, "删除后详情应 404");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn attachment_save_via_post_writes_file() {
+        let (state, dir) = temp_state("m2-attach");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let id = crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "peer@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "带附件草稿".into(),
+                body_text: "见附件".into(),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        let src = dir.join("源数据.txt");
+        std::fs::write(&src, "attachment-content-123").unwrap();
+        crate::mail::add_attachments(&state, id, &[src.to_str().unwrap().into()]).unwrap();
+        // 详情页渲染附件行
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}"), b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(html.contains("源数据.txt"), "详情页应渲染附件名");
+        assert!(html.contains("另存为"), "详情页应提供另存按钮");
+        // POST 另存
+        let dest = dir.join("另存结果.txt");
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                &format!("/emails/{id}/attachments/1"),
+                &form(&[("dest", dest.to_str().unwrap())]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let frag = body(&resp);
+        assert!(frag.contains("toast ok"), "另存成功应回 toast：{frag}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"attachment-content-123",
+            "另存内容应解压回原文"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn compose_draft_with_attachments_and_keep_ids() {
+        let (state, dir) = temp_state("m2-draft-att");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let f1 = dir.join("甲.txt");
+        std::fs::write(&f1, b"one").unwrap();
+        // 存草稿 + 新附件（attach_paths JSON）
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/compose/draft",
+                &form(&[
+                    ("to_addrs", "peer@x.cn"),
+                    ("subject", "带附件"),
+                    ("body_text", "正文"),
+                    ("keep_ids", "[]"),
+                    (
+                        "attach_paths",
+                        &serde_json::to_string(&[f1.to_str().unwrap()]).unwrap(),
+                    ),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/compose?draft_id=1&saved=1"),
+            "附件随草稿保存成功"
+        );
+        let detail = crate::mail::get(&state, 1).unwrap();
+        assert_eq!(detail.attach_cnt, 1, "附件应入库");
+        assert_eq!(detail.attachments[0].filename, "甲.txt");
+        // 再次保存：keep_ids 空 → 裁剪既有附件
+        let _ = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/compose/draft",
+                &form(&[
+                    ("draft_id", "1"),
+                    ("to_addrs", "peer@x.cn"),
+                    ("subject", "带附件"),
+                    ("body_text", "正文"),
+                    ("keep_ids", "[]"),
+                    ("attach_paths", "[]"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let detail = crate::mail::get(&state, 1).unwrap();
+        assert_eq!(detail.attach_cnt, 0, "keep_ids 空应裁剪全部既有附件");
         cleanup(&dir);
     }
 
@@ -1529,7 +2239,7 @@ mod tests {
     #[test]
     fn traversal_and_unknown_paths_are_404() {
         let (state, dir) = temp_state("404");
-        for path in ["/../Cargo.toml", "/nope", "/emails/1"] {
+        for path in ["/../Cargo.toml", "/nope", "/emails/abc", "/emails/0"] {
             let resp = route(
                 &state,
                 &assets(),
@@ -1563,10 +2273,16 @@ mod tests {
         let a = assets();
 
         let get = |path: &str| body(&route(&state, &a, &req("GET", path, b""), &t));
+        // 带 query 的 GET（拆 path/query 两段后走 req_q）
+        let get_url = |url: &str| {
+            let (p, q) = url.split_once('?').unwrap_or((url, ""));
+            body(&route(&state, &a, &req_q("GET", p, q, b""), &t))
+        };
         let dump = |name: &str, html: String| {
             let html = html
                 .replace("href=\"/app.css\"", "href=\"app.css\"")
                 .replace("src=\"/htmx.min.js\"", "src=\"htmx.min.js\"")
+                .replace("src=\"/app.js\"", "src=\"app.js\"")
                 .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"");
             std::fs::write(root.join(name), html).unwrap();
         };
@@ -1589,7 +2305,67 @@ mod tests {
 
         // 已配置：完成页 + 主界面 + 设置四 tab
         dump("done.html", get("/welcome/done"));
+
+        // M2 种子数据：草稿 ×2 + 收件 ×1（列表/详情/撰写冒烟用）
+        let d1 = crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "peer@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "关于宽带提速配案的意见反馈".into(),
+                body_text: "各位领导：\n请查阅本月配案清单，重点客户需在月底前完成提速交付。"
+                    .into(),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        let d2 = crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "ops@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "Re: 月度激励汇总表".into(),
+                body_text: "收到，我这边同步核对一遍数据口径。".into(),
+                in_reply_to: Some(d1),
+            },
+        )
+        .unwrap();
+        state
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, unread,
+                                        created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', 'boss@x.cn', '部门领导', 'demo@chinatelecom.cn',
+                             '激励清单已批复', '请按清单执行，月底前完成发放。', '激励 清单 已 批复',
+                             '请 按 清单 执行 月底 前 完成 发放', 1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            });
+        let inbox_id = d2 + 1;
+
         dump("main.html", get("/"));
+        dump("main-inbox-unread.html", get_url("/?unread=1"));
+        dump("main-draft.html", get_url("/?folder=draft"));
+        dump("main-all.html", get_url("/?folder=all"));
+        dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
+        dump("email-draft.html", get(&format!("/emails/{d1}")));
+        dump("compose.html", get("/compose"));
+        dump(
+            "compose-reply.html",
+            get_url(&format!("/compose?reply_to={inbox_id}")),
+        );
+        dump(
+            "compose-draft.html",
+            get_url(&format!("/compose?draft_id={d2}")),
+        );
         dump("settings-account.html", get("/settings"));
         dump("settings-sync.html", get("/settings/sync"));
         dump("settings-storage.html", get("/settings/storage"));
@@ -1630,7 +2406,7 @@ mod tests {
 
         // 复制真实静态资源（与发行物同源）
         let ui_dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-dist");
-        for f in ["app.css", "htmx.min.js", "favicon.svg"] {
+        for f in ["app.css", "htmx.min.js", "app.js", "favicon.svg"] {
             std::fs::copy(ui_dist.join(f), root.join(f)).unwrap();
         }
         let _ = std::fs::remove_dir_all(&db_dir);

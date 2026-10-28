@@ -11,6 +11,7 @@
 
 mod conncheck;
 mod db;
+mod mail;
 mod secrets;
 mod state;
 mod templates;
@@ -31,6 +32,7 @@ const APP_URL: &str = "ui://localhost/";
 /// 应用主入口
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol("ui", |ctx, request| {
             let app = ctx.app_handle();
             let state = app.state::<state::AppState>();
@@ -39,8 +41,8 @@ pub fn run() {
             // debug 构建打印协议层请求（GUI 无控制台时也可用 stderr 日志观察）
             #[cfg(debug_assertions)]
             eprintln!(
-                "[ui] {} {} hx={}",
-                req.method, req.path, req.is_htmx_request
+                "[ui] {} {}?{} hx={}",
+                req.method, req.path, req.query, req.is_htmx_request
             );
             ui::to_http_response(ui::route(&state, &assets, &req, &ui::RealTester))
         })
