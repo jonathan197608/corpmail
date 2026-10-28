@@ -891,6 +891,14 @@ body {
     width: 84px;
 }
 
+.port-row input.domain {
+    /* 账号域名输入框（v0.1.1 起后缀可配置）：固定 240px 不伸缩，等宽字体与主机框一致 */
+    flex: 0 0 240px;
+    width: 240px;
+    font-family: var(--mono);
+    font-size: 13px;
+}
+
 .suffix {
     display: inline-flex;
     align-items: center;

@@ -11,6 +11,7 @@ use std::sync::Mutex;
 /// settings 键名（设计 §3；新增键须同步设计文档）
 pub mod keys {
     pub const ACCOUNT_PREFIX: &str = "account_prefix";
+    pub const ACCOUNT_DOMAIN: &str = "account_domain";
     pub const DISPLAY_NAME: &str = "display_name";
     pub const SMTP_HOST: &str = "smtp_host";
     pub const SMTP_PORT: &str = "smtp_port";
@@ -25,8 +26,8 @@ pub mod keys {
     pub const KEEP_SENT_DAYS: &str = "keep_sent_days";
 }
 
-/// 账号后缀（设计确认项 K：固定 @chinatelecom.cn，输入框只填前缀）
-pub const ACCOUNT_DOMAIN: &str = "@chinatelecom.cn";
+/// 账号域名默认值（设计确认项 K 原为固定后缀；自 v0.1.1 起作为可配置设置项）
+pub const ACCOUNT_DOMAIN_DEFAULT: &str = "@chinatelecom.cn";
 
 /// 预填默认值（设计 §8；向导中可改）
 pub const SMTP_HOST_DEFAULT: &str = "smtp.chinatelecom.cn";
@@ -37,6 +38,7 @@ pub const RECV_PORT_DEFAULT: &str = "993";
 /// 全部 settings 键的默认值（未配置时表单回显用）
 pub fn defaults() -> Vec<(&'static str, &'static str)> {
     vec![
+        (keys::ACCOUNT_DOMAIN, ACCOUNT_DOMAIN_DEFAULT),
         (keys::SMTP_HOST, SMTP_HOST_DEFAULT),
         (keys::SMTP_PORT, SMTP_PORT_DEFAULT),
         (keys::RECV_HOST, RECV_HOST_DEFAULT),
@@ -58,9 +60,14 @@ pub struct AppState {
     pub data_dir: PathBuf,
 }
 
-/// 拼接完整邮箱地址：前缀 + 固定后缀（§8）
-pub fn full_address(prefix: &str) -> String {
-    format!("{prefix}{ACCOUNT_DOMAIN}")
+/// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
+pub fn full_address(prefix: &str, domain: &str) -> String {
+    let d = domain.trim().trim_start_matches('@');
+    if d.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}@{d}")
+    }
 }
 
 impl AppState {
@@ -281,9 +288,15 @@ mod tests {
     #[test]
     fn full_address_appends_domain() {
         assert_eq!(
-            full_address("demo"),
+            full_address("demo", "@chinatelecom.cn"),
             "demo@chinatelecom.cn",
-            "后缀固定拼接（设计确认项 K）"
+            "默认域名拼接"
         );
+        assert_eq!(
+            full_address("demo", "chinatelecom.cn"),
+            "demo@chinatelecom.cn",
+            "缺前导 @ 自动补齐"
+        );
+        assert_eq!(full_address("demo", ""), "demo", "空域名退化为前缀");
     }
 }

@@ -138,6 +138,7 @@ struct MainCtx {
 #[derive(Serialize)]
 struct SetupCtx {
     account_prefix: String,
+    account_domain: String,
     display_name: String,
     smtp_host: String,
     smtp_port: String,
@@ -165,6 +166,7 @@ struct SettingsCtx {
     smtp_host: String,
     smtp_port: String,
     account_prefix: String,
+    account_domain: String,
     display_name: String,
     recv_host: String,
     recv_port: String,
@@ -285,6 +287,7 @@ fn wizard_setup_page(state: &AppState) -> Resp {
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let ctx = SetupCtx {
         account_prefix: g(keys::ACCOUNT_PREFIX),
+        account_domain: g(keys::ACCOUNT_DOMAIN),
         display_name: g(keys::DISPLAY_NAME),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
@@ -302,7 +305,7 @@ fn wizard_done(state: &AppState) -> Resp {
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let ctx = DoneCtx {
-        account: full_address(&g(keys::ACCOUNT_PREFIX)),
+        account: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
         display_name: g(keys::DISPLAY_NAME),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
@@ -330,12 +333,13 @@ fn pane_template(tab: &str) -> String {
 fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
     let form = parse_form(&req.body);
     let prefix = trimmed_field(&form, "account_prefix");
+    let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
     let password = form.get("password").cloned().unwrap_or_default();
     let (Some(prefix), true) = (prefix, !password.is_empty()) else {
         return test_fragment(Vec::new(), "请填写邮箱账号与密码", false);
     };
 
-    let account = full_address(&prefix);
+    let account = full_address(&prefix, &domain);
     let smtp_host = host_or(&form, "smtp_host", state::SMTP_HOST_DEFAULT);
     let smtp_port = port_or(&form, "smtp_port", SMTP_PORT_DEFAULT);
     let recv_host = host_or(&form, "recv_host", state::RECV_HOST_DEFAULT);
@@ -349,6 +353,7 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         let recv_port_s = recv_port.to_string();
         let pairs = [
             (keys::ACCOUNT_PREFIX, prefix.as_str()),
+            (keys::ACCOUNT_DOMAIN, domain.as_str()),
             (keys::DISPLAY_NAME, display.as_str()),
             (keys::SMTP_HOST, smtp_host.as_str()),
             (keys::SMTP_PORT, smtp_port_s.as_str()),
@@ -379,7 +384,8 @@ fn settings_account_test(
     let Some(prefix) = trimmed_field(&form, "account_prefix") else {
         return test_fragment(Vec::new(), "请先填写登录账号", false);
     };
-    let account = full_address(&prefix);
+    let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
+    let account = full_address(&prefix, &domain);
     let password = match trimmed_field(&form, "password") {
         Some(p) => p,
         None => match state.retrieve_password(&account) {
@@ -418,10 +424,12 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     };
     let d = defaults();
     let old_prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
-    let new_account = full_address(&prefix);
+    let old_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
+    let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
+    let new_account = full_address(&prefix, &domain);
     let new_password = trimmed_field(&form, "password");
 
-    if prefix != old_prefix {
+    if prefix != old_prefix || domain != old_domain {
         // 账号变更：迁移凭据（密码框有值则直接写新账号；无值则搬旧凭据）
         match new_password {
             Some(p) => {
@@ -429,7 +437,7 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
                     return account_pane(state, false, &format!("密码保存失败：{e}"));
                 }
             }
-            None => match state.retrieve_password(&full_address(&old_prefix)) {
+            None => match state.retrieve_password(&full_address(&old_prefix, &old_domain)) {
                 crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => {
                     if let Err(e) = state.store_password(&new_account, &p) {
                         return account_pane(state, false, &format!("密码迁移失败：{e}"));
@@ -441,7 +449,7 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
             },
         }
         if !old_prefix.is_empty() {
-            state.clear_password(&full_address(&old_prefix));
+            state.clear_password(&full_address(&old_prefix, &old_domain));
         }
     } else if let Some(p) = &new_password
         && let Err(e) = state.store_password(&new_account, p)
@@ -456,6 +464,7 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let display = trimmed_field(&form, "display_name").unwrap_or_default();
     let pairs = [
         (keys::ACCOUNT_PREFIX, prefix.as_str()),
+        (keys::ACCOUNT_DOMAIN, domain.as_str()),
         (keys::DISPLAY_NAME, display.as_str()),
         (keys::SMTP_HOST, smtp_host.as_str()),
         (keys::SMTP_PORT, smtp_port_s.as_str()),
@@ -539,11 +548,12 @@ fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
 fn frame_ctx(state: &AppState) -> FrameCtx {
     let d = defaults();
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
+    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let display = state.get_or(keys::DISPLAY_NAME, &d).unwrap_or_default();
     let full = if prefix.is_empty() {
         "未配置账号".to_string()
     } else {
-        full_address(&prefix)
+        full_address(&prefix, &domain)
     };
     let avatar = display
         .chars()
@@ -589,7 +599,7 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
             full_addr: if g(keys::ACCOUNT_PREFIX).is_empty() {
                 "未配置账号".into()
             } else {
-                full_address(&g(keys::ACCOUNT_PREFIX))
+                full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN))
             },
             avatar: g(keys::DISPLAY_NAME)
                 .chars()
@@ -607,10 +617,14 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
         account_prefix: g(keys::ACCOUNT_PREFIX),
+        account_domain: g(keys::ACCOUNT_DOMAIN),
         display_name: g(keys::DISPLAY_NAME),
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
-        degraded: state.secrets_degraded(&full_address(&g(keys::ACCOUNT_PREFIX))),
+        degraded: state.secrets_degraded(&full_address(
+            &g(keys::ACCOUNT_PREFIX),
+            &g(keys::ACCOUNT_DOMAIN),
+        )),
         saved,
         error: error.into(),
         sync_on_start: g(keys::SYNC_ON_START) == "true",
@@ -708,6 +722,16 @@ fn trimmed_field(form: &HashMap<String, String>, name: &str) -> Option<String> {
     form.get(name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 账号域名字段：表单值优先（统一带前导 @ 存储），空则取 fallback
+fn domain_or(form: &HashMap<String, String>, fallback: &str) -> String {
+    let v = trimmed_field(form, "account_domain").unwrap_or_else(|| fallback.to_string());
+    if v.starts_with('@') {
+        v
+    } else {
+        format!("@{v}")
+    }
 }
 
 /// 主机字段：表单值优先，空则取参数 fallback
@@ -1288,6 +1312,117 @@ mod tests {
             Some("smtp.new.cn")
         );
         state.clear_password("unit.router@chinatelecom.cn");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn wizard_save_with_custom_domain() {
+        let (state, dir) = temp_state("wiz-domain");
+        let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+        pairs.push(("account_domain", "@custom.cn"));
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/welcome/setup/save", &form(&pairs)),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+            "自定义域名保存应跳转完成页"
+        );
+        let d = defaults();
+        assert_eq!(
+            state.get_or(keys::ACCOUNT_DOMAIN, &d).as_deref(),
+            Some("@custom.cn"),
+            "域名应落库"
+        );
+        assert!(
+            matches!(
+                state.retrieve_password("unit.router@custom.cn"),
+                crate::secrets::GetResult::Keychain(_) | crate::secrets::GetResult::Keyfile(_)
+            ),
+            "凭据应存到自定义域名账号下"
+        );
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", "/welcome/done", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            body(&resp).contains("unit.router@custom.cn"),
+            "完成页应展示自定义域名账号"
+        );
+        state.clear_password("unit.router@custom.cn");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn settings_domain_change_migrates_credential() {
+        let (state, dir) = temp_state("acc-domain-chg");
+        // 先经向导写入凭据（默认 @chinatelecom.cn）
+        let _ = route(
+            &state,
+            &assets(),
+            &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        // 设置页仅改域名、密码留空 → 凭据随迁
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/account/save",
+                &form(&[
+                    ("account_prefix", "unit.router"),
+                    ("account_domain", "@custom.cn"),
+                    ("password", ""),
+                    ("display_name", "单测用户"),
+                    ("smtp_host", "smtp.test.cn"),
+                    ("smtp_port", "465"),
+                    ("recv_host", "imap.test.cn"),
+                    ("recv_port", "993"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(body(&resp).contains("✓ 已保存"));
+        assert!(
+            matches!(
+                state.retrieve_password("unit.router@custom.cn"),
+                crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p)
+                    if p == "pw-test"
+            ),
+            "旧凭据应迁移到新域名账号"
+        );
+        assert!(
+            matches!(
+                state.retrieve_password("unit.router@chinatelecom.cn"),
+                crate::secrets::GetResult::Missing
+            ),
+            "旧账号凭据应清除"
+        );
+        let d = defaults();
+        assert_eq!(
+            state.get_or(keys::ACCOUNT_DOMAIN, &d).as_deref(),
+            Some("@custom.cn")
+        );
+        state.clear_password("unit.router@custom.cn");
         cleanup(&dir);
     }
 

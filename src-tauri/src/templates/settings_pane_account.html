@@ -13,11 +13,12 @@
                 </div>
             </div>
             <div class="sfield">
-                <label>登录账号<small class="hint">后缀固定</small></label>
+                <label>登录账号<small class="hint">域名可按需修改</small></label>
                 <div class="port-row">
                     <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
                         autocomplete="off" autocapitalize="none" spellcheck="false">
-                    <span class="suffix">@chinatelecom.cn</span>
+                    <input class="domain" type="text" name="account_domain" value="{{ account_domain }}"
+                        autocomplete="off" autocapitalize="none" spellcheck="false">
                 </div>
             </div>
             <div class="pair">
