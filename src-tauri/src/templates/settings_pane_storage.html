@@ -73,4 +73,29 @@
             </div>
         </div>
     </form>
+
+    <div class="card settings-card">
+        <h3>空间回收</h3>
+        <p class="desc">按上方策略预估；孤儿文件为异常残留。立即清理与启动/每日自动清理同逻辑。</p>
+
+        <div class="kv">
+            <span class="k">预计可释放{% if clean_estimate_detail %}<small>{{ clean_estimate_detail }}</small>{% endif %}</span>
+            <b>{{ clean_estimate_bytes }}</b>
+        </div>
+        {% if clean_view %}
+        <div class="test-result {% if clean_view.ok %}ok{% else %}fail{% endif %}">
+            {% if clean_view.ok %}
+            ✓ 清理完成：释放 {{ clean_view.freed }}（大附件 {{ clean_view.detached }} · 过期邮件 {{ clean_view.removed }} · 孤儿文件 {{ clean_view.orphans }}）
+            {% else %}
+            ✗ 清理失败：{{ clean_view.error }}
+            {% endif %}
+        </div>
+        {% endif %}
+        <div class="settings-actions">
+            <button type="button" class="btn" hx-post="/settings/storage/clean"
+                    hx-target="#settings-pane" hx-swap="outerHTML"
+                    hx-confirm="立即执行清理？超期的附件文件与过期邮件将被删除，草稿不受影响。"
+                    hx-disabled-elt="this">立即清理</button>
+        </div>
+    </div>
 </div>

@@ -335,6 +335,27 @@ body {
     cursor: not-allowed;
 }
 
+/* ============ 检索（M5：命中高亮 + 清除按钮） ============ */
+.mr-subject mark {
+    background: rgba(252, 211, 77, 0.45);
+    color: inherit;
+    border-radius: 3px;
+    padding: 0 1px;
+}
+
+.search-clear {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 15px;
+    line-height: 1;
+    padding: 0 2px;
+    flex: none;
+}
+
+.search-clear:hover {
+    color: var(--ink);
+}
+
 /* ============ 主区内容（M1：空状态占位） ============ */
 .mail-list {
     flex: 1;

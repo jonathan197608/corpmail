@@ -25,14 +25,83 @@ pub const PAGE_SIZE: i64 = 50;
 
 static JIEBA: std::sync::LazyLock<jieba_rs::Jieba> = std::sync::LazyLock::new(jieba_rs::Jieba::new);
 
-/// jieba 精确模式预分词：空格拼接（空文本返回空串，FTS 无 term 亦合法）
-pub fn tokenize(text: &str) -> String {
+/// 停用词（高频虚词，整词全等过滤；"等级"等含单字词不受影响）
+const STOPWORDS: &[&str] = &[
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "上", "也", "很", "到",
+    "说", "要", "去", "你", "会", "着", "看", "好", "这", "那", "他", "她", "它", "个", "们", "么",
+    "什", "吗", "呢", "吧", "啊", "哦", "呀", "嗯", "把", "被", "让", "与", "及", "或", "等", "最",
+    "再", "又", "才", "只", "没", "还", "如", "啥", "于", "以", "从", "向", "之", "其", "为", "地",
+    "得", "而", "所", "请", "对", "中", "the", "a", "an", "of", "and", "or", "to", "in", "on",
+    "for", "is", "are", "be", "with", "by", "as", "at", "from", "this", "that", "it",
+];
+
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+/// 检索分词（索引影子列与查询语句同源，§4.1）：
+/// - ASCII 连字串（字母数字 + 夹在字母数字间的 `-` `.` `_`）整词保留并小写化，
+///   编号/日期/版本号不被切碎；词尾句点、省略号不并入
+/// - 其余文本 jieba 精确模式 + 停用词过滤 + ASCII 小写化
+/// - 丢弃纯标点/空白词（须含 CJK 或字母数字）
+pub fn tokenize_words(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut rest_start = 0; // 当前未结算的非 ASCII 连字串段起点（交 jieba）
+    while i < bytes.len() {
+        if is_ascii_word_byte(bytes[i]) {
+            if i > rest_start {
+                words.extend(jieba_words(&text[rest_start..i]));
+            }
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if is_ascii_word_byte(c) {
+                    i += 1;
+                } else if (c == b'-' || c == b'.' || c == b'_')
+                    && i + 1 < bytes.len()
+                    && is_ascii_word_byte(bytes[i + 1])
+                {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            let word = text[start..i].to_ascii_lowercase();
+            if !STOPWORDS.contains(&word.as_str()) {
+                words.push(word);
+            }
+            rest_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if rest_start < bytes.len() {
+        words.extend(jieba_words(&text[rest_start..]));
+    }
+    words
+}
+
+/// jieba 精确模式分词 + 停用词过滤 + 小写化 + 有效性过滤
+fn jieba_words(text: &str) -> Vec<String> {
     JIEBA
         .cut(text, true)
         .iter()
-        .map(|t| t.word)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|t| t.word.to_ascii_lowercase())
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .filter(|w| w.chars().any(|c| is_cjk(c) || c.is_ascii_alphanumeric()))
+        .collect()
+}
+
+/// jieba 分词结果空格拼接（FTS 影子列写入格式；空文本返回空串，FTS 无 term 亦合法）
+pub fn tokenize(text: &str) -> String {
+    tokenize_words(text).join(" ")
 }
 
 /// 当前 epoch 秒
@@ -45,6 +114,14 @@ pub fn now_epoch() -> i64 {
 
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+/// HTML 转义（展示层通用；router.rs 复用本实现，避免双份漂移）
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -208,6 +285,8 @@ pub struct EmailSummary {
     pub attach_cnt: i64,
     pub unread: bool,
     pub time_label: String,
+    /// 标题安全 HTML：列表为转义原文，检索命中时为 <mark> 高亮版（模板 |safe 输出）
+    pub subject_html: String,
 }
 
 /// folder 白名单校验（未知值按 all 处理；SQL 内插前必须过白名单）
@@ -250,24 +329,159 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
             .map_err(e)?;
         let rows = stmt
             .query_map(rusqlite::params![PAGE_SIZE, offset], |r| {
-                let name: String = r.get(5)?;
-                let addr: String = r.get(4)?;
-                Ok(EmailSummary {
-                    id: r.get(0)?,
-                    folder: r.get(1)?,
-                    status: r.get(2)?,
-                    subject: r.get(3)?,
-                    from_display: if name.is_empty() { addr } else { name },
-                    to_addrs: r.get(6)?,
-                    body_preview: preview(&r.get::<_, String>(7)?),
-                    attach_cnt: r.get(8)?,
-                    unread: r.get::<_, i64>(9)? == 1,
-                    time_label: time_label(r.get(10)?),
-                })
+                summary_from_row(r, None)
             })
             .map_err(e)?;
         let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         Ok((items, total))
+    })
+}
+
+/// 列表行映射（list/search 共用；列序：id,folder,status,subject,from_addr,from_name,
+/// to_addrs,body_text,attach_cnt,unread,t）。highlight_words=Some 时标题做命中高亮
+fn summary_from_row(
+    r: &rusqlite::Row<'_>,
+    highlight_words: Option<&[String]>,
+) -> rusqlite::Result<EmailSummary> {
+    let subject: String = r.get(3)?;
+    let subject_html = match highlight_words {
+        Some(words) => highlight_html(&subject, words),
+        None => html_escape(&subject),
+    };
+    let name: String = r.get(5)?;
+    let addr: String = r.get(4)?;
+    Ok(EmailSummary {
+        id: r.get(0)?,
+        folder: r.get(1)?,
+        status: r.get(2)?,
+        subject,
+        from_display: if name.is_empty() { addr } else { name },
+        to_addrs: r.get(6)?,
+        body_preview: preview(&r.get::<_, String>(7)?),
+        attach_cnt: r.get(8)?,
+        unread: r.get::<_, i64>(9)? == 1,
+        time_label: time_label(r.get(10)?),
+        subject_html,
+    })
+}
+
+/// 标题命中高亮（应用层实现，§4.3）：先在原文定位命中区间再分段转义，
+/// 避免 escape 实体（&amp; 等）内字母被误高亮；大小写折叠仅 ASCII（中文恒等、偏移不错位）
+fn highlight_html(subject: &str, words: &[String]) -> String {
+    if subject.is_empty() || words.is_empty() {
+        return html_escape(subject);
+    }
+    let lower = subject.to_ascii_lowercase();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for word in words {
+        if word.is_empty() {
+            continue;
+        }
+        let target = word.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(&target) {
+            let start = from + pos;
+            let end = start + target.len();
+            spans.push((start, end));
+            from = end;
+        }
+    }
+    if spans.is_empty() {
+        return html_escape(subject);
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = String::with_capacity(subject.len() + merged.len() * 13);
+    let mut pos = 0;
+    for (start, end) in merged {
+        out.push_str(&html_escape(&subject[pos..start]));
+        out.push_str("<mark>");
+        out.push_str(&html_escape(&subject[start..end]));
+        out.push_str("</mark>");
+        pos = end;
+    }
+    out.push_str(&html_escape(&subject[pos..]));
+    out
+}
+
+/// 检索语句构造（§4.3）：与索引同源的 tokenize_words 分词，
+/// 每词双引号包裹后 AND 拼接（词内无语法字符，双引号隔离 FTS 注入）；
+/// 全部为停用词/无有效词 → None（调用方回退普通列表）
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn build_query(input: &str) -> Option<String> {
+    let terms: Vec<String> = tokenize_words(input)
+        .into_iter()
+        .filter(|w| !w.contains('"'))
+        .map(|w| format!("\"{w}\""))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
+/// 全文检索列表（§4.3）：FTS5 MATCH + BM25 排序（标题 5 倍权重），
+/// folder/unread 过滤与 list 一致；返回 Ok(None) 表示输入无有效词（调用方回退 list）
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn search(
+    state: &AppState,
+    input: &str,
+    q: &ListQuery,
+) -> Result<Option<(Vec<EmailSummary>, i64)>, String> {
+    let Some(match_expr) = build_query(input) else {
+        return Ok(None);
+    };
+    let folder = folder_of(&q.folder);
+    let folder_sql = if folder == "all" {
+        String::new()
+    } else {
+        format!(" AND e.folder = '{folder}'")
+    };
+    let unread_sql = if q.unread_only {
+        " AND e.unread = 1"
+    } else {
+        ""
+    };
+    let page = q.page.max(1);
+    let offset = (page - 1) * PAGE_SIZE;
+    let words = tokenize_words(input);
+    state.with_conn(|conn| {
+        let total: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)
+                     FROM email_fts JOIN emails e ON e.id = email_fts.rowid
+                     WHERE email_fts MATCH ?1{folder_sql}{unread_sql}"
+                ),
+                rusqlite::params![match_expr],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
+                        e.to_addrs, e.body_text, e.attach_cnt, e.unread,
+                        COALESCE(e.received_at, e.sent_at, e.created_at) AS t
+                 FROM email_fts JOIN emails e ON e.id = email_fts.rowid
+                 WHERE email_fts MATCH ?1{folder_sql}{unread_sql}
+                 ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
+                 LIMIT ?2 OFFSET ?3"
+            ))
+            .map_err(e)?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expr, PAGE_SIZE, offset], |r| {
+                summary_from_row(r, Some(&words))
+            })
+            .map_err(e)?;
+        let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+        Ok(Some((items, total)))
     })
 }
 
@@ -1103,8 +1317,8 @@ pub fn delete(state: &AppState, id: i64) -> Result<bool, String> {
     })
 }
 
-/// 回收空目录（崩溃残留防护的轻量版；孤儿文件全量回收为 M5 清理器职责）
-fn prune_empty_dirs(root: &Path) {
+/// 回收空目录（删邮件/清理器共用；孤儿文件全量回收为 M5 清理器职责）
+pub fn prune_empty_dirs(root: &Path) {
     if let Ok(months) = std::fs::read_dir(root) {
         for m in months.flatten() {
             if !m.path().is_dir() {
@@ -1540,6 +1754,100 @@ mod tests {
         assert!(t.contains("配案"), "分词应含领域词：{t}");
         assert!(t.split(' ').any(|w| w == "清单"), "分词应含完整词：{t}");
         assert_eq!(tokenize(""), "");
+    }
+
+    #[test]
+    fn tokenize_words_keeps_ascii_compound_and_filters_stopwords() {
+        let w = tokenize_words("SP-2026-1023 报价 v2.0 的了 the Invoice");
+        assert!(
+            w.contains(&"sp-2026-1023".to_string()),
+            "编号整词保留并小写：{w:?}"
+        );
+        assert!(w.contains(&"v2.0".to_string()), "版本号整词：{w:?}");
+        assert!(w.contains(&"invoice".to_string()), "英文小写化：{w:?}");
+        assert!(w.iter().any(|x| x.contains("报价")), "中文词保留：{w:?}");
+        assert!(
+            !w.contains(&"的".to_string()) && !w.contains(&"了".to_string()),
+            "中文停用词过滤：{w:?}"
+        );
+        assert!(!w.contains(&"the".to_string()), "英文停用词过滤：{w:?}");
+        assert!(w.iter().all(|x| !x.contains(' ')), "词内无空白");
+    }
+
+    #[test]
+    fn tokenize_words_drops_trailing_punctuation_from_ascii_words() {
+        let w = tokenize_words("宽带提速，清单。 fox.");
+        assert!(w.contains(&"fox".to_string()), "词尾句点不并入：{w:?}");
+        assert!(!w.contains(&"fox.".to_string()), "{w:?}");
+        assert!(w.contains(&"宽带".to_string()), "{w:?}");
+        assert!(w.iter().any(|x| x == "清单"), "中文词不受影响：{w:?}");
+        assert_eq!(
+            build_query("SP-2026-1023"),
+            Some("\"sp-2026-1023\"".to_string())
+        );
+        assert_eq!(build_query("的了 the"), None, "全停用词应回退");
+        assert_eq!(build_query("   "), None, "纯空白应回退");
+    }
+
+    #[test]
+    fn highlight_html_is_case_insensitive_and_escape_safe() {
+        // ASCII 大小写不敏感 + 中文命中
+        let out = highlight_html(
+            "Invoice SP-2026 激励",
+            &["invoice".into(), "激励".into(), "sp-2026".into()],
+        );
+        assert!(out.contains("<mark>Invoice</mark>"), "{out}");
+        assert!(out.contains("<mark>激励</mark>"), "{out}");
+        assert!(out.contains("<mark>SP-2026</mark>"), "{out}");
+        // 转义实体内字母不误高亮（原文只有 &，无 amp）
+        let out2 = highlight_html("A&B 报告", &["amp".into()]);
+        assert!(!out2.contains("<mark>"), "原文无 amp 不应高亮：{out2}");
+        // HTML 注入防御：原文先转义再包 mark
+        let out3 = highlight_html("<script>x</script>", &["script".into()]);
+        assert!(out3.contains("&lt;"), "原文已转义：{out3}");
+        assert!(!out3.contains("<script"), "不得出现未转义标签：{out3}");
+        // 重叠区间合并不产生嵌套 mark
+        let out4 = highlight_html("激励激励", &["激励".into()]);
+        assert_eq!(out4, "<mark>激励激励</mark>");
+    }
+
+    #[test]
+    fn search_ranks_matches_and_highlights_subject() {
+        let (state, dir) = temp_state("search");
+        save_draft(&state, &draft("激励配案通知", "正文与关键词无关")).unwrap();
+        save_draft(&state, &draft("别的主题", "完全无关正文")).unwrap();
+        let q = ListQuery {
+            folder: "all".into(),
+            page: 1,
+            unread_only: false,
+        };
+        let (items, total) = search(&state, "激励", &q).unwrap().unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subject, "激励配案通知");
+        assert!(
+            items[0].subject_html.contains("<mark>激励</mark>"),
+            "{}",
+            items[0].subject_html
+        );
+        // 多词 AND：两词须命中同一封
+        let (items2, _) = search(&state, "激励 配案", &q).unwrap().unwrap();
+        assert_eq!(items2.len(), 1);
+        // 输入全为停用词 → None 回退
+        assert!(search(&state, "的了", &q).unwrap().is_none());
+        // 无命中
+        let (items3, total3) = search(&state, "zzqqxy", &q).unwrap().unwrap();
+        assert_eq!(total3, 0);
+        assert!(items3.is_empty());
+        // folder 过滤：草稿 folder 内检索
+        let q_inbox = ListQuery {
+            folder: "inbox".into(),
+            page: 1,
+            unread_only: false,
+        };
+        let inbox_result = search(&state, "激励", &q_inbox).unwrap().unwrap();
+        assert_eq!(inbox_result.1, 0, "inbox 无邮件");
+        cleanup(&dir);
     }
 
     #[test]

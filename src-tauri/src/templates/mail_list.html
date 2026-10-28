@@ -11,7 +11,7 @@
             </div>
             <div class="mr-main">
                 <div class="mr-top">
-                    <span class="mr-subject">{% if m.subject %}{{ m.subject }}{% else %}（无主题）{% endif %}</span>
+                    <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
                     {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
                     {% if m.status == 'failed' %}<span class="mr-flag fail">发送失败</span>{% endif %}
                     {% if m.status == 'queued' or m.status == 'sending' %}<span class="mr-flag send">发送中</span>{% endif %}
@@ -30,7 +30,12 @@
         {% endif %}
     {% else %}
         <div class="card empty-state">
-            {% if unread_only %}
+            {% if q %}
+            <div class="empty-mark">🔍</div>
+            <h2>没有匹配的邮件</h2>
+            <p>换个关键词试试，标题命中的邮件会排在前面。</p>
+            <a class="btn" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}">清除搜索</a>
+            {% elif unread_only %}
             <div class="empty-mark">✅</div>
             <h2>没有未读邮件</h2>
             <p>太好了，收件箱已全部读完。</p>

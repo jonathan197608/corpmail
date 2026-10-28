@@ -7,7 +7,7 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use crate::conncheck::TestOutcome;
-use crate::mail::{self, AttachView, EmailSummary};
+use crate::mail::{self, AttachView, EmailSummary, html_escape};
 use crate::state::{self, AppState, defaults, full_address, keys};
 use crate::templates;
 use crate::ui::Assets;
@@ -150,8 +150,10 @@ struct MainCtx {
     page: i64,
     pages: i64,
     total: i64,
-    /// 分页链接前缀（含 folder/unread 参数；模板拼 page=N）
+    /// 分页链接前缀（含 folder/unread/q 参数；模板拼 page=N）
     page_base: String,
+    /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
+    q: String,
     items: Vec<EmailSummary>,
 }
 
@@ -236,9 +238,24 @@ struct SettingsCtx {
     clean_days: String,
     keep_inbox: String,
     keep_sent: String,
+    // 存储管理 tab（M5 清理器）：预估 + 手动清理报告
+    clean_estimate_bytes: String,
+    clean_estimate_detail: String,
+    clean_view: Option<CleanView>,
     // 关于 tab
     app_version: String,
     sqlite_version: String,
+}
+
+/// 手动清理结果展示（存储页报告区；ok=false 时仅展示 error）
+#[derive(Serialize)]
+struct CleanView {
+    ok: bool,
+    freed: String,
+    detached: u64,
+    removed: u64,
+    orphans: u64,
+    error: String,
 }
 
 /// 连接测试结果片段
@@ -332,6 +349,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         }
         ("POST", "/settings/sync/save") => Some(settings_sync_save(state, req)),
         ("POST", "/settings/storage/save") => Some(settings_storage_save(state, req)),
+        ("POST", "/settings/storage/clean") => Some(settings_storage_clean(state)),
         _ => None,
     }
 }
@@ -351,7 +369,8 @@ fn folder_label(folder: &str) -> &'static str {
     }
 }
 
-/// 主列表（GET /?folder=&page=&unread=；htmx 请求回 mail_list 片段，普通请求回整页）
+/// 主列表（GET /?folder=&page=&unread=&q=；q 非空时全文检索，无效词回退普通列表；
+/// htmx 请求回 mail_list 片段，普通请求回整页）
 fn list_root(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
         // 首启未配置：配置为强制入口（设计 §8.1，无"稍后再说"）
@@ -367,12 +386,21 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         .unwrap_or(1)
         .max(1);
     let unread_only = req.query_param("unread").map(|v| v == "1").unwrap_or(false);
+    let q_input = req.query_param("q").unwrap_or_default().trim().to_string();
     let q = mail::ListQuery {
         folder: folder.clone(),
         page,
         unread_only,
     };
-    let (items, total) = mail::list(state, &q).unwrap_or_default();
+    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词/检索异常回退普通列表
+    let (items, total) = if q_input.is_empty() {
+        mail::list(state, &q).unwrap_or_default()
+    } else {
+        match mail::search(state, &q_input, &q) {
+            Ok(Some(res)) => res,
+            Ok(None) | Err(_) => mail::list(state, &q).unwrap_or_default(),
+        }
+    };
     let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
     let mut page_base = if folder == "inbox" {
         "/?".to_string()
@@ -381,6 +409,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     };
     if unread_only {
         page_base = format!("{page_base}unread=1&");
+    }
+    if !q_input.is_empty() {
+        page_base = format!("{page_base}q={}&", urlencode(&q_input));
     }
     let ctx = MainCtx {
         frame: frame_ctx(state, &folder),
@@ -391,6 +422,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         pages,
         total,
         page_base,
+        q: q_input,
         items,
     };
     if req.is_htmx_request {
@@ -728,13 +760,6 @@ fn urldecode(s: &str) -> String {
         .unwrap_or_default()
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn wizard_setup_page(state: &AppState) -> Resp {
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
@@ -769,11 +794,14 @@ fn wizard_done(state: &AppState) -> Resp {
 }
 
 fn settings_page(state: &AppState, tab: &str) -> Resp {
-    render_html("settings.html", &settings_ctx(state, tab, false, ""))
+    render_html("settings.html", &settings_ctx(state, tab, false, "", None))
 }
 
 fn settings_pane_fragment(state: &AppState, tab: &str) -> Resp {
-    render_html(&pane_template(tab), &settings_ctx(state, tab, false, ""))
+    render_html(
+        &pane_template(tab),
+        &settings_ctx(state, tab, false, "", None),
+    )
 }
 
 fn pane_template(tab: &str) -> String {
@@ -1032,10 +1060,33 @@ fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {
     }
 }
 
-fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> SettingsCtx {
+fn settings_ctx(
+    state: &AppState,
+    tab: &str,
+    saved: bool,
+    error: &str,
+    clean: Option<CleanView>,
+) -> SettingsCtx {
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let counts = state.folder_counts();
+    // M5 清理预估：仅存储 tab 计算（含孤儿 fs 扫描，其他 tab 免开销）
+    let (est_bytes, est_detail) = if tab == "storage" {
+        let est = crate::clean::estimate(state);
+        let mut parts: Vec<String> = Vec::new();
+        if est.detach_files > 0 {
+            parts.push(format!("大附件 {} 个", est.detach_files));
+        }
+        if est.expire_emails > 0 {
+            parts.push(format!("过期邮件 {} 封", est.expire_emails));
+        }
+        if est.orphan_files > 0 {
+            parts.push(format!("孤儿文件 {} 个", est.orphan_files));
+        }
+        (human_bytes(est.bytes), parts.join(" · "))
+    } else {
+        (human_bytes(0), String::new())
+    };
     let (attach_bytes, attach_files) = state.attachments_stats();
     let db_bytes = state.db_size_bytes();
     let total = db_bytes + attach_bytes;
@@ -1103,6 +1154,10 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
         clean_days: g(keys::CLEAN_SENT_BULK_DAYS),
         keep_inbox: g(keys::KEEP_INBOX_DAYS),
         keep_sent: g(keys::KEEP_SENT_DAYS),
+        // M5 清理预估与手动清理报告（仅存储 tab 有意义）
+        clean_estimate_bytes: est_bytes,
+        clean_estimate_detail: est_detail,
+        clean_view: clean,
         app_version: env!("CARGO_PKG_VERSION").into(),
         sqlite_version: state.sqlite_version(),
     }
@@ -1111,21 +1166,47 @@ fn settings_ctx(state: &AppState, tab: &str, saved: bool, error: &str) -> Settin
 fn account_pane(state: &AppState, saved: bool, error: &str) -> Resp {
     render_html(
         &pane_template("account"),
-        &settings_ctx(state, "account", saved, error),
+        &settings_ctx(state, "account", saved, error, None),
     )
 }
 
 fn sync_pane(state: &AppState, saved: bool) -> Resp {
     render_html(
         &pane_template("sync"),
-        &settings_ctx(state, "sync", saved, ""),
+        &settings_ctx(state, "sync", saved, "", None),
     )
 }
 
 fn storage_pane(state: &AppState, saved: bool) -> Resp {
     render_html(
         &pane_template("storage"),
-        &settings_ctx(state, "storage", saved, ""),
+        &settings_ctx(state, "storage", saved, "", None),
+    )
+}
+
+/// 设置·存储管理：立即清理（手动触发，同步执行；回 pane 带报告）
+fn settings_storage_clean(state: &AppState) -> Resp {
+    let view = match crate::clean::run(state) {
+        Ok(report) => CleanView {
+            ok: true,
+            freed: human_bytes(report.freed_bytes),
+            detached: report.detached_attachments,
+            removed: report.removed_emails,
+            orphans: report.orphan_files,
+            error: String::new(),
+        },
+        Err(err) => CleanView {
+            ok: false,
+            freed: String::new(),
+            detached: 0,
+            removed: 0,
+            orphans: 0,
+            error: err,
+        },
+    };
+    render_html(
+        &pane_template("storage"),
+        &settings_ctx(state, "storage", false, "", Some(view)),
     )
 }
 
@@ -1449,6 +1530,117 @@ mod tests {
         assert!(html.contains("配案正文预览"), "列表应含正文预览");
         assert!(html.contains("草稿"), "列表应渲染 folder 标题与草稿徽标");
         assert!(!html.contains("这里还没有邮件"), "有数据不应空态");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn root_search_highlights_and_falls_back_on_stopwords() {
+        let (state, dir) = temp_state("m5-search");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let draft = |s: &str| crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            subject: s.into(),
+            body_text: "配案正文预览".into(),
+            in_reply_to: None,
+        };
+        crate::mail::save_draft(&state, &draft("激励配案通知")).unwrap();
+        crate::mail::save_draft(&state, &draft("无关主题邮件")).unwrap();
+        let tester = FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        };
+        // 检索命中：命中词高亮、未命中不出列表、分页基址携带 q
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "folder=all&q=%E6%BF%80%E5%8A%B1", b""),
+            &tester,
+        ));
+        assert!(html.contains("<mark>激励</mark>"), "命中词应高亮：{html}");
+        assert!(!html.contains("无关主题"), "未命中邮件不应出现在列表");
+        assert!(
+            html.contains("q=%E6%BF%80%E5%8A%B1"),
+            "分页基址应携带检索词"
+        );
+        // 全停用词：回退普通列表（两封都在）
+        let html2 = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "folder=all&q=%E7%9A%84%E4%BA%86", b""),
+            &tester,
+        ));
+        assert!(
+            html2.contains("无关主题邮件"),
+            "无效词应回退普通列表：{html2}"
+        );
+        // 无命中：空态为检索文案
+        let html3 = body(&route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "folder=all&q=zzqqxy", b""),
+            &tester,
+        ));
+        assert!(html3.contains("没有匹配的邮件"), "搜索空态文案：{html3}");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn storage_pane_shows_estimate_and_clean_runs() {
+        let (state, dir) = temp_state("m5-clean");
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        // 过期 inbox 邮件（30 天策略，40 天前收到）
+        let now = crate::mail::now_epoch();
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                     subject_tokens, body_tokens, created_at)
+                 VALUES ('in', 'inbox', 'received', '过期主题', 'a@x.cn', 'b@x.cn',
+                         '过期 主题', '正文', ?1)",
+                [now - 40 * 86_400],
+            )
+            .unwrap();
+        });
+        state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
+        let tester = FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        };
+
+        // pane：预估区展示待清理明细
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/settings/panes/storage", b""),
+            &tester,
+        ));
+        assert!(html.contains("预计可释放"), "应有预估区：{html}");
+        assert!(html.contains("过期邮件 1 封"), "预估应含过期邮件数：{html}");
+        assert!(html.contains("立即清理"), "应有清理按钮：{html}");
+
+        // 手动清理：报告回显 + 预估归零
+        let html2 = body(&route(
+            &state,
+            &assets(),
+            &req("POST", "/settings/storage/clean", b""),
+            &tester,
+        ));
+        assert!(html2.contains("清理完成"), "应展示清理报告：{html2}");
+        assert!(html2.contains("过期邮件 1"), "报告应含删除数：{html2}");
+        assert!(
+            !html2.contains("过期邮件 1 封"),
+            "清理后预估应归零：{html2}"
+        );
+        let left: i64 = state.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(left, 0, "过期邮件应已被清理");
         cleanup(&dir);
     }
 
@@ -2901,6 +3093,27 @@ mod tests {
         dump("settings-sync.html", get("/settings/sync"));
         dump("settings-storage.html", get("/settings/storage"));
         dump("settings-about.html", get("/settings/about"));
+
+        // M5 检索素材："激励"命中收件与草稿（标题 <mark> 高亮）/ 无命中空态
+        dump("main-search.html", get_url("/?q=%E6%BF%80%E5%8A%B1"));
+        dump("main-search-none.html", get_url("/?q=zzqqxy"));
+
+        // M5 清理素材：40 天前收件 + 30 天保留策略 → 存储页预估非零
+        state
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, unread,
+                                        created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', 'old@x.cn', '历史归档', 'demo@chinatelecom.cn',
+                             '40天前的存量通知', '已超期的旧内容。', '40 天 前 的 存量 通知',
+                             '已 超期 的 旧 内容', 0, ?1, ?1)",
+                    [crate::mail::now_epoch() - 40 * 86_400],
+                )
+                .unwrap();
+            });
+        state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
+        dump("settings-storage-pending.html", get("/settings/storage"));
 
         // 测试连接片段演示页（成功 + 失败双态 + 未保存提示）
         let frag = test_fragment(

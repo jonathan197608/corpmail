@@ -11,10 +11,12 @@
             <button class="sync-btn" type="button"
                     hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
                     hx-trigger="click throttle:3000ms" hx-disabled-elt="this">⟳ 收取新邮件</button>
-            <div class="search" title="检索功能将在后续版本开放">
+            <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
                 <span>🔍</span>
-                <input type="search" placeholder="搜索邮件…" disabled>
-            </div>
+                <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
+                <input type="hidden" name="folder" value="{{ folder }}">
+                {% if q %}<a class="search-clear" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索">×</a>{% endif %}
+            </form>
         </div>
         <div id="fetch-status" class="fetch-status"></div>
 

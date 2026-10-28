@@ -9,6 +9,7 @@
 //! Windows 平台上，wry/WebView2 将自定义协议映射为 `http://<scheme>.localhost`，
 //! macOS/Linux 直接使用原生 scheme，二者对页面同源、无 CORS 差异。
 
+mod clean;
 mod conncheck;
 mod db;
 mod mail;
@@ -82,6 +83,20 @@ pub fn run() {
                         ));
                         state.start_fetch();
                     }
+                }
+            });
+
+            // M5 存储清理器（§5.2）：启动 30s 首清（避开启动高峰）+ 每 24h 循环；
+            // 策略每轮重读（设置页改保留天数即时生效）；失败仅记日志，下轮再试
+            let clean_handle = app.app_handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                loop {
+                    let state = clean_handle.state::<state::AppState>();
+                    if let Err(err) = clean::run(&state) {
+                        eprintln!("[clean] 清理器执行失败：{err}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
                 }
             });
 
