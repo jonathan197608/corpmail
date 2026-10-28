@@ -1,0 +1,24 @@
+{# 侧栏（主界面 / 设置页共用；上下文：frame）#}
+<aside class="side">
+    <div class="brand">
+        <span class="brand-mark">✉</span>
+        <div><b>Mailbox</b><small>企业邮箱客户端</small></div>
+    </div>
+    <button class="compose-btn" type="button" disabled title="撰写功能将在后续版本开放">✎ 撰写邮件</button>
+    <div class="side-title">文件夹</div>
+    <div class="folder on">📥 收件箱 <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
+        <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></div>
+    <div class="folder">🗂 全部邮件 <span class="cnt">{{ frame.all_mail }}</span></div>
+    <div class="folder">📤 已发送 <span class="cnt">{{ frame.sent }}</span></div>
+    <div class="folder">📝 草稿 <span class="cnt">{{ frame.draft }}</span></div>
+    <div class="side-foot">
+        <div class="account">
+            <span class="avatar">{{ frame.avatar }}</span>
+            <div>
+                <div class="who">{{ frame.display_name }}</div>
+                <div class="addr">{{ frame.full_addr }}</div>
+            </div>
+            <a class="gear" href="/settings" title="设置">⚙</a>
+        </div>
+    </div>
+</aside>

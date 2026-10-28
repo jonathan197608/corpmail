@@ -1,0 +1,6 @@
+{# 测试连接结果片段（上下文：tests: [{label, ok, elapsed_ms, detail}] + note 可选）#}
+{% for t in tests %}
+<span class="test-result {% if t.ok %}ok{% else %}fail{% endif %}">{% if t.ok %}✓{% else %}✗{% endif %}
+    {{ t.label }} · {{ t.elapsed_ms }}ms{% if not t.ok %} · {{ t.detail }}{% endif %}</span>
+{% endfor %}
+{% if note %}<span class="test-result {% if note_ok %}ok{% else %}fail{% endif %}">{{ note }}</span>{% endif %}

@@ -1,0 +1,67 @@
+{# 设置·账号 pane（上下文：SettingsCtx）#}
+<div class="settings-pane on" id="settings-pane">
+    <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML">
+        <div class="card settings-card">
+            <h3>发信（SMTP）</h3>
+            <p class="desc">修改后请重新测试连接。凭据保存在操作系统凭据保管中。</p>
+
+            <div class="sfield">
+                <label>SMTP 服务器</label>
+                <div class="port-row">
+                    <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false">
+                    <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric">
+                </div>
+            </div>
+            <div class="sfield">
+                <label>登录账号<small class="hint">后缀固定</small></label>
+                <div class="port-row">
+                    <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
+                        autocomplete="off" autocapitalize="none" spellcheck="false">
+                    <span class="suffix">@chinatelecom.cn</span>
+                </div>
+            </div>
+            <div class="pair">
+                <div class="pf">
+                    <label>密码 / 授权码（留空 = 保持不变）</label>
+                    <input type="password" name="password" autocomplete="new-password">
+                </div>
+                <div class="pf">
+                    <label>发件显示名</label>
+                    <input type="text" name="display_name" value="{{ display_name }}">
+                </div>
+            </div>
+
+            <div class="settings-actions">
+                <button type="button" class="btn" hx-post="/settings/account/test-smtp" hx-target="#smtp-result"
+                    hx-swap="innerHTML" hx-disabled-elt="this">测试连接</button>
+                <button type="submit" class="btn primary" hx-disabled-elt="this">保存</button>
+                {% if saved %}<span class="test-result ok">✓ 已保存</span>{% endif %}
+                {% if error %}<span class="test-result fail">{{ error }}</span>{% endif %}
+                <span id="smtp-result" class="test-inline"></span>
+            </div>
+        </div>
+
+        <div class="card settings-card">
+            <h3>收信（IMAP）</h3>
+            <p class="desc">IMAP 增量同步，本地阅读后回写已读状态。与发信共用同一账号与密码。</p>
+
+            <div class="sfield">
+                <label>收信服务器</label>
+                <div class="port-row">
+                    <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
+                    <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
+                </div>
+            </div>
+
+            <div class="settings-actions">
+                <button type="button" class="btn" hx-post="/settings/account/test-imap" hx-target="#imap-result"
+                    hx-swap="innerHTML" hx-disabled-elt="this">测试收信</button>
+                <span id="imap-result" class="test-inline"></span>
+            </div>
+        </div>
+
+        {% if degraded %}
+        <div class="sec-note">⚠ 系统凭据服务不可用，密码已降级保存为本机加密文件（随数据库存储）。</div>
+        {% endif %}
+    </form>
+</div>

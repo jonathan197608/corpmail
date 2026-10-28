@@ -1,0 +1,46 @@
+{# 设置·收件同步 pane（上下文：SettingsCtx）#}
+<div class="settings-pane on" id="settings-pane">
+    <form hx-post="/settings/sync/save" hx-target="#settings-pane" hx-swap="outerHTML">
+        <div class="card settings-card">
+            <h3>收件同步</h3>
+            <p class="desc">收件为手动 + 定时模式，均带防抖，避免频繁连接服务器。</p>
+
+            <div class="tline">
+                <div class="tl-main">
+                    <b>启动时自动收取</b>
+                    <span>应用启动后台拉取新邮件，不打断列表浏览</span>
+                </div>
+                <input type="hidden" name="sync_on_start" id="sync-on-start" value="{% if sync_on_start %}true{% else %}false{% endif %}">
+                <button type="button" class="toggle{% if sync_on_start %} on{% endif %}"
+                    onclick="var h=document.getElementById('sync-on-start');var on=this.classList.toggle('on');h.value=on?'true':'false';"></button>
+            </div>
+            <div class="tline">
+                <div class="tl-main">
+                    <b>定时自动收取</b>
+                    <span>每 N 分钟后台拉取一次（设为 0 表示仅手动）</span>
+                </div>
+                <input class="num" type="text" name="sync_interval_min" value="{{ sync_interval_min }}" inputmode="numeric">
+            </div>
+            <div class="sfield" style="margin-top:10px">
+                <label>首次拉取范围</label>
+                <div class="radio-row">
+                    <label class="radio"><input type="radio" name="first_fetch_days" value="7"
+                        {% if first_fetch_days == "7" %}checked{% endif %}><span class="dot"></span>最近 7 天</label>
+                    <label class="radio"><input type="radio" name="first_fetch_days" value="30"
+                        {% if first_fetch_days == "30" %}checked{% endif %}><span class="dot"></span>30 天</label>
+                    <label class="radio"><input type="radio" name="first_fetch_days" value="90"
+                        {% if first_fetch_days == "90" %}checked{% endif %}><span class="dot"></span>90 天</label>
+                    <label class="radio"><input type="radio" name="first_fetch_days" value="0"
+                        {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
+                </div>
+            </div>
+
+            <div class="sec-note">{{ last_sync_label }}</div>
+
+            <div class="settings-actions">
+                <button type="submit" class="btn primary" hx-disabled-elt="this">保存</button>
+                {% if saved %}<span class="test-result ok">✓ 已保存</span>{% endif %}
+            </div>
+        </div>
+    </form>
+</div>

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="app on full">
+    <div class="onboard">
+        <div class="onboard-inner">
+            <div class="steps">
+                <span class="step done"><span class="n">✓</span> 欢迎</span>
+                <span class="step-arrow">—</span>
+                <span class="step on"><span class="n">2</span> 账号配置</span>
+                <span class="step-arrow">—</span>
+                <span class="step"><span class="n">3</span> 完成</span>
+            </div>
+
+            <form class="setup-card" hx-post="/welcome/setup/save" hx-target="#test-results" hx-swap="innerHTML">
+                <h3>配置邮箱账号</h3>
+                <p class="desc">填写后会自动测试发信与收信通道，全部通过才会保存。</p>
+
+                <div class="sfield">
+                    <label>邮箱账号<small class="hint">后缀固定，只需填写前缀</small></label>
+                    <div class="port-row">
+                        <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}"
+                            placeholder="demo" required autocomplete="off" autocapitalize="none" spellcheck="false">
+                        <span class="suffix">@chinatelecom.cn</span>
+                    </div>
+                </div>
+                <div class="sfield">
+                    <label>密码 / 授权码</label>
+                    <input type="password" name="password" required autocomplete="new-password">
+                </div>
+                <div class="sfield">
+                    <label>发件显示名</label>
+                    <input type="text" name="display_name" placeholder="选填，如：张伟">
+                </div>
+
+                <div class="adv">
+                    <div class="adv-title">服务器（已按公司邮箱预填，一般无需修改）</div>
+                    <div class="sfield">
+                        <label>SMTP 发信</label>
+                        <div class="port-row">
+                            <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false">
+                            <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric">
+                        </div>
+                    </div>
+                    <div class="sfield">
+                        <label>收信服务器（IMAP）</label>
+                        <div class="port-row">
+                            <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
+                            <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sec-note">🔒 密码保存进本机凭据保管（Windows 凭据管理器 / macOS 钥匙串），服务器与邮件数据保存在本机数据库。</div>
+
+                <div id="test-results" class="test-row"></div>
+
+                <div class="setup-actions">
+                    <a class="btn link" href="/welcome">上一步</a>
+                    <button type="submit" class="btn primary" hx-disabled-elt="this">测试并保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

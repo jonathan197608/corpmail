@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="app on full">
+    <div class="onboard">
+        <div class="onboard-inner">
+            <div class="steps">
+                <span class="step done"><span class="n">✓</span> 欢迎</span>
+                <span class="step-arrow">—</span>
+                <span class="step done"><span class="n">✓</span> 账号配置</span>
+                <span class="step-arrow">—</span>
+                <span class="step done"><span class="n">✓</span> 完成</span>
+            </div>
+
+            <div class="setup-card">
+                <h3>配置完成</h3>
+                <p class="desc">账号与服务器已保存，密码已存入本机凭据保管。</p>
+
+                <div class="kv"><span class="k">邮箱账号</span><b>{{ account }}</b></div>
+                <div class="kv"><span class="k">发件显示名</span><b>{{ display_name }}</b></div>
+                <div class="kv"><span class="k">发信（SMTP）</span><b>{{ smtp_host }}:{{ smtp_port }}</b></div>
+                <div class="kv"><span class="k">收信（IMAP）</span><b>{{ recv_host }}:{{ recv_port }}</b></div>
+
+                <div class="onboard-actions">
+                    <a class="btn primary big" href="/">进入主界面</a>
+                </div>
+            </div>
+
+            <div class="onboard-foot">如需调整服务器或清理策略，可随时从主界面侧栏底部 ⚙ 进入设置</div>
+        </div>
+    </div>
+</div>
+{% endblock %}

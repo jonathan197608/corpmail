@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="app on full">
+    <div class="onboard">
+        <div class="onboard-inner">
+            <div class="onboard-hero">
+                <div class="onboard-mark">✉</div>
+                <h1>欢迎使用 Mailbox</h1>
+                <p>企业邮箱收发一体 · 本地存档 · 中文全文检索</p>
+            </div>
+
+            <div class="card">
+                <div class="feature-row">
+                    <span class="fi">🔒</span>
+                    <div>
+                        <b>凭据交由操作系统保管</b>
+                        <span>密码存入 Windows 凭据管理器 / macOS 钥匙串，数据库不留明文</span>
+                    </div>
+                </div>
+                <div class="feature-row">
+                    <span class="fi">🗄</span>
+                    <div>
+                        <b>全部邮件本地存档</b>
+                        <span>SQLite 单文件数据库，附件 gzip 压缩，标题正文支持中文搜索</span>
+                    </div>
+                </div>
+                <div class="feature-row">
+                    <span class="fi">📡</span>
+                    <div>
+                        <b>标准协议直连公司邮件服务器</b>
+                        <span>发信 smtp.chinatelecom.cn:465 · 收信 IMAP（993）</span>
+                    </div>
+                </div>
+
+                <div class="onboard-actions">
+                    <a class="btn primary big" href="/welcome/setup">开始配置（约 1 分钟）</a>
+                </div>
+            </div>
+
+            <div class="onboard-foot">数据仅保存在本机，不经过任何第三方服务器</div>
+        </div>
+    </div>
+</div>
+{% endblock %}

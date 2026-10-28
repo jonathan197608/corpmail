@@ -1,0 +1,10 @@
+{# 设置·关于 pane（上下文：SettingsCtx）#}
+<div class="settings-pane on" id="settings-pane">
+    <div class="card settings-card">
+        <h3>关于</h3>
+        <p class="desc">Mailbox v{{ app_version }} · Tauri 2 + htmx + SQLite（本地单机应用）</p>
+        <div class="kv"><span class="k">版本</span><b>v{{ app_version }}</b></div>
+        <div class="kv"><span class="k">存储引擎</span><b>SQLite {{ sqlite_version }} · FTS5</b></div>
+        <div class="kv"><span class="k">数据目录</span><span class="mono">{{ data_dir }}</span></div>
+    </div>
+</div>

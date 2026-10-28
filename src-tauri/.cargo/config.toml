@@ -1,0 +1,14 @@
+# crates.io 官方源被内网拦截，走中科大 sparse 镜像（实测可达，rsproxy.cn 当前 DNS 解析失败）
+[source.crates-io]
+replace-with = "ustc-sparse"
+
+[source.ustc-sparse]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+# Windows 交叉编译：mingw-w64 + 静态链接 CRT（单 exe，不依赖 mingw 运行时 DLL）
+# 说明：linker/ar 与全局 ~/.cargo/config.toml 一致（写入此处保证项目自包含）；
+# crt-static 让 UCRT/winpthread 全部静态编入，拷到干净 Win10/11 即可运行。
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-gcc-ar"
+rustflags = ["-C", "target-feature=+crt-static"]

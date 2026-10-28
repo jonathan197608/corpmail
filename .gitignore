@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+
+# Rust / Cargo 构建产物
+src-tauri/target/
+
+# 本地中间产物（.temp/ 含构建工具链、冒烟素材与 spike，不进公开仓库）
+.temp/
+
+# 内部文档与设计稿：docs/ 与 design/ 含企业内网细节与账号示例，
+# 不随公开仓库分发（如需可放置于私有仓库）
+docs/
+design/
+
+# 数据库与凭据文件（运行期产生）
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+*.pfx
+
+# 本地环境
+*.local
+.env

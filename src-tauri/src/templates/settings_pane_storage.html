@@ -1,0 +1,76 @@
+{# 设置·存储管理 pane（上下文：SettingsCtx）#}
+<div class="settings-pane on" id="settings-pane">
+    <form hx-post="/settings/storage/save" hx-target="#settings-pane" hx-swap="outerHTML">
+        <div class="card settings-card">
+            <h3>数据与附件</h3>
+            <p class="desc">附件压缩后超过内联上限的不入库，单独存文件。</p>
+
+            <div class="kv">
+                <span class="k">数据目录<small>数据库与附件文件所在位置</small></span>
+                <span class="mono">{{ data_dir }}</span>
+            </div>
+            <div class="kv">
+                <span class="k">内联附件上限<small>超过此大小的附件 gzip 后存独立文件</small></span>
+                <span><input class="num" type="text" name="inline_attach_max_mb" value="{{ inline_max }}"
+                        inputmode="numeric"> MB</span>
+            </div>
+            <div class="kv">
+                <span class="k">邮箱数据库大小</span>
+                <b>{{ db_size }}</b>
+            </div>
+            <div class="kv">
+                <span class="k">独立大附件目录</span>
+                <b>{{ attach_size }}{% if attach_files > 0 %} · {{ attach_files }} 个文件{% endif %}</b>
+            </div>
+
+            <div class="hbar"><i style="width:{{ db_pct }}%"></i></div>
+            <div class="space-legend">
+                <span class="lg"><i style="background:var(--accent)"></i>数据库 {{ db_size }}</span>
+                <span class="lg"><i style="background:#7fb0e8"></i>独立附件 {{ attach_size }}</span>
+            </div>
+        </div>
+
+        <div class="card settings-card">
+            <h3>自动清理</h3>
+            <p class="desc">后台定期执行；留空表示永久保留，草稿永不自动清理。删除均连带附件与索引。</p>
+
+            <div class="clean-grid">
+                <div class="tline">
+                    <div class="tl-main">
+                        <b>已发送邮件的大附件</b>
+                        <span>发送成功 N 天后清理独立附件文件</span>
+                    </div>
+                    <input class="num" type="text" name="clean_sent_bulk_days" value="{{ clean_days }}"
+                        inputmode="numeric"> 天
+                </div>
+                <div class="tline">
+                    <div class="tl-main">
+                        <b>收件保留时长</b>
+                        <span>超期删除整封邮件（含附件索引）</span>
+                    </div>
+                    <input class="num" type="text" name="keep_inbox_days" value="{{ keep_inbox }}"
+                        inputmode="numeric"> 天
+                </div>
+                <div class="tline">
+                    <div class="tl-main">
+                        <b>已发送保留时长</b>
+                        <span>超期删除整封邮件（含附件索引）</span>
+                    </div>
+                    <input class="num" type="text" name="keep_sent_days" value="{{ keep_sent }}"
+                        inputmode="numeric"> 天
+                </div>
+                <div class="tline">
+                    <div class="tl-main">
+                        <b>草稿</b>
+                        <span>永不自动清理</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="settings-actions">
+                <button type="submit" class="btn primary" hx-disabled-elt="this">保存</button>
+                {% if saved %}<span class="test-result ok">✓ 已保存</span>{% endif %}
+            </div>
+        </div>
+    </form>
+</div>

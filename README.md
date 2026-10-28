@@ -1,0 +1,54 @@
+# Mailbox
+
+Mailbox 是一款面向中国电信企业邮箱的桌面客户端（Tauri 2 + htmx，Rust 端渲染，无 Node 构建链）。
+
+## 功能特性
+
+- **收发一体**：IMAP 收信 + SMTP 发信，本地 SQLite 存储（FTS5 全文检索 + jieba 中文分词）
+- **凭据安全**：密码保存于操作系统凭据保管（Windows 凭据管理器 / macOS 钥匙串），本地加密回退
+- **增量同步**：IMAP 增量同步，本地阅读后回写已读状态
+- **纯净运行时**：零 Node 依赖，原生性能，Windows 单机安装（NSIS 安装器）
+
+## 快速开始
+
+### Windows 安装
+
+1. 从 [Releases](https://github.com/jonathan197608/mailbox/releases) 下载 `Mailbox_x64-setup.exe`
+2. 运行安装（默认安装到 `C:\Program Files\Mailbox`）
+3. 首次启动按向导填写邮箱账号（默认服务器已按中国电信企业邮箱预填：IMAP `imap.chinatelecom.cn:993` / SMTP `smtp.chinatelecom.cn:465`）
+
+> 安装器内嵌 WebView2 官方引导器（静默模式），无 WebView2 Runtime 的机器会自动安装（约 150MB，需联网）。
+
+### 从源码构建
+
+要求：Rust stable、macOS/Linux（交叉编译 Windows 产物需 mingw-w64）或 Windows 原生。
+
+```bash
+# macOS 交叉编译 Windows NSIS 安装器
+cargo install tauri-cli --version 2.12.4
+cargo tauri build --target x86_64-pc-windows-gnu \
+  --config '{"bundle":{"targets":["nsis"]}}'
+```
+
+> macOS 宿主构建 NSIS 需自建 patched makensis（macOS libiconv 对 "wchar_t" 转换通道存在 EILSEQ 回归，详见设计文档 §11.4——该问题在 Linux/Windows 宿主不存在）。Linux 宿主直接 `apt install nsis` 即可。
+
+## 技术栈
+
+| 组件 | 选型 |
+|---|---|
+| 桌面框架 | Tauri 2（Rust 后端 + 系统 WebView） |
+| 前端 | htmx + 服务端渲染（minijinja 模板） |
+| 存储 | SQLite（rusqlite bundled，FTS5 + jieba 预分词） |
+| 协议 | IMAP 3.0（收件）、lettre/SMTP（发件） |
+
+## 隐私声明
+
+[隐私声明](PRIVACY.md)：数据仅存储于本机，网络传输仅发往您配置的 IMAP/SMTP 服务器。
+
+## 代码签名
+
+本项目的 Windows 发布物由 SignPath Foundation 免费提供代码签名，详见 [代码签名政策](CODE_SIGNING.md)。
+
+## 许可证
+
+[MIT](LICENSE)
