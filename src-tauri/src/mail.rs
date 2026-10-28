@@ -946,13 +946,26 @@ impl MailFetcher for RealFetcher {
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
         // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则按 SINCE 天数（§6.1）。
         // 范围写法必须是 "N:*"（UID 范围）；曾误写 "N,*"（set 语义 = UID 恰为 N 或最大值），
-        // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复
+        // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复。
+        // 增量命中 0 封时再以 SINCE 兜底重查（个别服务器对 UID 范围的返回仍有 quirk；
+        // 入库按 remote_uid/message_id 幂等去重，重复拉取无害）
         let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
-            sess.uid_search(format!("{}:*", last.uid + 1))
+            let inc: Vec<u32> = sess
+                .uid_search(format!("{}:*", last.uid + 1))
                 .map_err(|e| format!("检索新邮件失败：{e}"))?
                 .into_iter()
                 .filter(|u| *u > last.uid)
-                .collect()
+                .collect();
+            if inc.is_empty() {
+                let since = imap_since(first_days);
+                eprintln!("[fetch] 增量命中 0 封，SINCE {since} 兜底重查");
+                sess.uid_search(format!("SINCE {since}"))
+                    .map_err(|e| format!("检索新邮件失败：{e}"))?
+                    .into_iter()
+                    .collect()
+            } else {
+                inc
+            }
         } else {
             let since = imap_since(first_days);
             sess.uid_search(format!("SINCE {since}"))

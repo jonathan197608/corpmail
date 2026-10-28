@@ -243,15 +243,28 @@ impl AppState {
                 finish(0, "本地数据库打开失败".into());
                 return;
             };
-            match crate::mail::MailFetcher::fetch(
-                &crate::mail::RealFetcher,
-                &host,
-                port,
-                &account,
-                &password,
-                first_days,
-                last,
-            ) {
+            // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析等任何 panic
+            // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
+            // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
+            let outcome: Result<crate::mail::FetchOutcome, String> =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::mail::MailFetcher::fetch(
+                        &crate::mail::RealFetcher,
+                        &host,
+                        port,
+                        &account,
+                        &password,
+                        first_days,
+                        last,
+                    )
+                })) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
+                        Err("收件内部异常终止，请重试收取".into())
+                    }
+                };
+            match outcome {
                 Ok(outcome) => {
                     let added = match crate::mail::store_incoming_conn(
                         &mut conn,
