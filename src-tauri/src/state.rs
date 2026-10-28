@@ -58,6 +58,8 @@ pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）
     pub data_dir: PathBuf,
+    /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
+    send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
 }
 
 /// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
@@ -78,6 +80,46 @@ impl AppState {
         Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
+            send_tx: Mutex::new(None),
+        }
+    }
+
+    /// 启动发送 worker（M3，设计 §2 单飞线程；生产装配于 lib.rs，测试不启动）。
+    ///
+    /// 独立连接 + MPSC 队列逐封派发（企业 SMTP 串行更稳）；
+    /// 启动时扫描残留 queued 一并补发（崩溃恢复）。
+    pub fn start_send_worker(&self) {
+        let mut guard = self.send_tx.lock().expect("发送队列锁中毒");
+        if guard.is_some() {
+            return;
+        }
+        let Ok(conn) = crate::db::open(&self.data_dir.join("mailbox.db")) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<i64>();
+        // 崩溃恢复：残留 queued 补发（按 id 升序）
+        let stale: Vec<i64> = conn
+            .prepare("SELECT id FROM emails WHERE status = 'queued' ORDER BY id")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, i64>(0))
+                    .map(|rows| rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+        std::thread::spawn(move || {
+            for id in rx {
+                let _ = crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id);
+            }
+        });
+        for id in stale {
+            let _ = tx.send(id);
+        }
+        *guard = Some(tx);
+    }
+
+    /// 入队发送（无 worker 时为空操作：邮件停留 queued 态，下次启动补发）
+    pub fn enqueue_send(&self, id: i64) {
+        if let Some(tx) = self.send_tx.lock().expect("发送队列锁中毒").as_ref() {
+            let _ = tx.send(id);
         }
     }
 

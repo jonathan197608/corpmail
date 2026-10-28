@@ -58,8 +58,10 @@
                 </div>
 
                 <div class="compose-actions">
-                    <button type="submit" class="btn primary big">💾 存草稿</button>
-                    <span class="hint">正式发送功能将在后续版本开放</span>
+                    <button type="button" class="btn primary big"
+                            hx-post="/compose/send" hx-include="closest form"
+                            hx-trigger="click throttle:500ms" hx-disabled-elt="this">✉ 发送</button>
+                    <button type="submit" class="btn big">💾 存草稿</button>
                 </div>
             </form>
         </div>

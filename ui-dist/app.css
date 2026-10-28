@@ -1490,3 +1490,45 @@ body {
 .att-row .btn.small {
     margin-left: auto;
 }
+
+/* ============ M3：发送状态徽标 ============ */
+.md-status {
+    margin: 4px 12px 10px;
+    border-radius: 9px;
+    padding: 9px 14px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.md-status.sending {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.md-status.failed {
+    background: #f9eef1;
+    color: var(--danger);
+    word-break: break-all;
+}
+
+.md-status.failed .btn.small {
+    margin-left: auto;
+    white-space: nowrap;
+}
+
+.md-status.sent {
+    background: var(--ok-soft);
+    color: var(--ok);
+}
+
+.mr-flag.fail {
+    color: var(--danger);
+    background: #f9eef1;
+}
+
+.mr-flag.send {
+    color: var(--accent);
+    background: var(--accent-soft);
+}

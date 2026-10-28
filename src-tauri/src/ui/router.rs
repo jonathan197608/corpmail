@@ -160,6 +160,8 @@ struct MainCtx {
 struct EmailCtx {
     frame: FrameCtx,
     email: mail::EmailDetail,
+    /// 页面轻提示（error query 回显，如重发被拒）
+    notice: String,
 }
 
 /// 撰写页（新邮件 / 回复预填 / 草稿编辑共用）
@@ -280,6 +282,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/") => Some(list_root(state, req)),
         ("GET", "/compose") => Some(compose_page(state, req)),
         ("POST", "/compose/draft") => Some(compose_draft_save(state, req)),
+        ("POST", "/compose/send") => Some(compose_send(state, req)),
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/resend") => {
+            Some(email_resend(state, req))
+        }
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/delete") => {
             Some(email_delete(state, req))
         }
@@ -393,11 +399,16 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     mail::mark_read(state, id);
     let email = mail::get(state, id)?;
     let folder = email.folder.clone();
+    let notice = req
+        .query_param("error")
+        .map(|v| urldecode(&v))
+        .unwrap_or_default();
     Some(render_html(
         "email.html",
         &EmailCtx {
             frame: frame_ctx(state, &folder),
             email,
+            notice,
         },
     ))
 }
@@ -495,11 +506,21 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
     }
+    match save_compose_form(state, req) {
+        Ok(id) => Resp::hx_redirect(&format!("/compose?draft_id={id}&saved=1")),
+        Err((draft_id, e)) => redirect_compose(draft_id, &e),
+    }
+}
+
+/// 撰写表单公共保存（存草稿与发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
+/// 失败返回 (原 draft_id, 原因) 供回撰写页提示。
+fn save_compose_form(state: &AppState, req: &Req) -> Result<i64, (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
+    let draft_id = form_i64(&form, "draft_id");
     let input = mail::DraftInput {
-        id: form_i64(&form, "draft_id"),
+        id: draft_id,
         from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
         from_name: g(keys::DISPLAY_NAME),
         to_addrs: trimmed_field(&form, "to_addrs").unwrap_or_default(),
@@ -510,19 +531,44 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
     };
     let keep_ids = form_json_i64s(&form, "keep_ids");
     let paths = form_json_strings(&form, "attach_paths");
-    match mail::save_draft(state, &input) {
+    let id = mail::save_draft(state, &input).map_err(|e| (draft_id.unwrap_or(0), e))?;
+    mail::remove_attachments_except(state, id, &keep_ids)
+        .map_err(|e| (id, format!("附件裁剪失败：{e}")))?;
+    if !paths.is_empty() {
+        mail::add_attachments(state, id, &paths).map_err(|e| (id, format!("附件保存失败：{e}")))?;
+    }
+    Ok(id)
+}
+
+/// 发送（POST /compose/send §9）：先存最新内容 → 原子排队（重复提交 0 行，幂等 §7）
+/// → 入发送队列 → 跳详情页轮询至终态（§2 异步原则）
+fn compose_send(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    match save_compose_form(state, req) {
         Ok(id) => {
-            if let Err(e) = mail::remove_attachments_except(state, id, &keep_ids) {
-                return redirect_compose(id, &format!("附件裁剪失败：{e}"));
+            if mail::enqueue_draft(state, id) {
+                state.enqueue_send(id);
             }
-            if !paths.is_empty()
-                && let Err(e) = mail::add_attachments(state, id, &paths)
-            {
-                return redirect_compose(id, &format!("附件保存失败：{e}"));
-            }
-            Resp::hx_redirect(&format!("/compose?draft_id={id}&saved=1"))
+            Resp::hx_redirect(&format!("/emails/{id}"))
         }
-        Err(e) => redirect_compose(input.id.unwrap_or(0), &e),
+        Err((draft_id, e)) => redirect_compose(draft_id, &e),
+    }
+}
+
+/// 重发入口（POST /emails/{id}/resend §9）：failed → draft 回撰写页编辑后重发
+fn email_resend(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    if mail::reopen_failed(state, id) {
+        Resp::hx_redirect(&format!("/compose?draft_id={id}"))
+    } else {
+        Resp::hx_redirect(&format!(
+            "/emails/{id}?error={}",
+            urlencode("仅发送失败的邮件可重发")
+        ))
     }
 }
 
@@ -1654,6 +1700,252 @@ mod tests {
     }
 
     #[test]
+    fn compose_send_enqueues_and_redirects() {
+        let (state, dir) = temp_state("m3-send");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        // 直接发送（无草稿 id：先建行再排队）
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/compose/send",
+                &form(&[
+                    ("to_addrs", "peer@x.cn"),
+                    ("cc_addrs", ""),
+                    ("subject", "发信主题"),
+                    ("body_text", "发信正文"),
+                    ("keep_ids", "[]"),
+                    ("attach_paths", "[]"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
+            "发送应跳转详情页轮询：{:?}",
+            resp.extra_headers
+        );
+        let (status, folder): (String, String) = state.with_conn(|c| {
+            c.query_row("SELECT status, folder FROM emails WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        });
+        assert_eq!(
+            status, "queued",
+            "发送应将草稿置排队（worker 侧未启动，状态保持）"
+        );
+        assert_eq!(folder, "draft", "排队态仍在草稿箱，sent 终态才迁移");
+        // 详情页（排队中）应带 2s 轮询属性与状态条
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(
+            html.contains("hx-trigger=\"every 2s\""),
+            "排队态详情页应轮询"
+        );
+        assert!(html.contains("排队中"), "排队态应显示状态条");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn compose_send_is_idempotent_on_repeat() {
+        let (state, dir) = temp_state("m3-send-2");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        // 第一轮：不带 draft_id（新建后入队）；第二轮：带 draft_id=1（覆盖后重复入队被拒）
+        for i in 0..2 {
+            let mut pairs = vec![
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "重发主题"),
+                ("body_text", "重发正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ];
+            if i > 0 {
+                pairs.insert(0, ("draft_id", "1"));
+            }
+            let resp = route(
+                &state,
+                &assets(),
+                &req("POST", "/compose/send", &form(&pairs)),
+                &FakeTester {
+                    smtp_ok: true,
+                    imap_ok: true,
+                },
+            );
+            assert!(
+                resp.extra_headers
+                    .iter()
+                    .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
+                "重复提交仍应跳转详情页"
+            );
+        }
+        let total: i64 = state.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(total, 1, "重复发送不应新增行（先存草稿覆盖同一封）");
+        let (status, error): (String, Option<String>) = state.with_conn(|c| {
+            c.query_row("SELECT status, error FROM emails WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        });
+        assert_eq!(
+            status, "queued",
+            "第二次提交不应把 queued 拉回 draft 后再入队失败"
+        );
+        assert!(error.is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn resend_failed_returns_to_compose_and_rejects_others() {
+        let (state, dir) = temp_state("m3-resend");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        // 造一封 failed 邮件
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, created_at, error)
+                     VALUES ('out', 'sent', 'failed', 'demo@chinatelecom.cn', 'peer@x.cn', '失败件',
+                             '失败 件', '体', 1, '服务器拒收')",
+                [],
+            )
+            .unwrap();
+        });
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/emails/1/resend", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/compose?draft_id=1"),
+            "failed 重发应回撰写页：{:?}",
+            resp.extra_headers
+        );
+        let (status, folder): (String, String) = state.with_conn(|c| {
+            c.query_row("SELECT status, folder FROM emails WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        });
+        assert_eq!((status.as_str(), folder.as_str()), ("draft", "draft"));
+        // 非 failed（已是 draft）再重发 → 带错误回详情页
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/emails/1/resend", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/emails/1?error=")),
+            "非 failed 重发应被拒并提示"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn compose_page_shows_send_button_and_failed_detail_shows_resend() {
+        let (state, dir) = temp_state("m3-ui");
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/compose", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(
+            html.contains("hx-post=\"/compose/send\""),
+            "撰写页应有发送动作"
+        );
+        assert!(html.contains("存草稿"), "存草稿按钮应保留");
+        // failed 详情页：状态条 + 重发按钮；sent 详情页：已发送徽标且无轮询
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, created_at, error, sent_at)
+                     VALUES ('out', 'sent', 'failed', 'demo@chinatelecom.cn', 'peer@x.cn', '失败件',
+                             '失败 件', '体', 1, '连接超时', 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, created_at, sent_at)
+                     VALUES ('out', 'sent', 'sent', 'demo@chinatelecom.cn', 'peer@x.cn', '成功件',
+                             '成功 件', '体', 1, 1)",
+                [],
+            )
+            .unwrap();
+        });
+        let failed_html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/1", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(
+            failed_html.contains("发送失败：连接超时"),
+            "失败详情应展示原因"
+        );
+        assert!(
+            failed_html.contains("hx-post=\"/emails/1/resend\""),
+            "失败详情应有重发按钮"
+        );
+        let sent_html = body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/emails/2", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ));
+        assert!(sent_html.contains("已发送"), "sent 详情应显示终态徽标");
+        assert!(!sent_html.contains("every 2s"), "终态不应再轮询");
+        cleanup(&dir);
+    }
+
+    #[test]
     fn wizard_setup_form_prefills_defaults() {
         let (state, dir) = temp_state("setup");
         let resp = route(
@@ -2366,6 +2658,46 @@ mod tests {
             "compose-draft.html",
             get_url(&format!("/compose?draft_id={d2}")),
         );
+
+        // M3 发送状态素材：sending 轮询态 / failed 重发态 / sent 终态 + 已发送列表
+        let sending_id = d2 + 2;
+        let failed_id = d2 + 3;
+        let sent_id = d2 + 4;
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, created_at)
+                     VALUES ('out', 'draft', 'sending', 'demo@chinatelecom.cn', '张伟', 'ops@x.cn',
+                             '发送中的月度报表', '正在投递，请稍候。', '发送 中 的 月度 报表',
+                             '正在 投递 请 稍候', 2)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, created_at,
+                                        error, sent_at)
+                     VALUES ('out', 'sent', 'failed', 'demo@chinatelecom.cn', '张伟', 'ops@x.cn',
+                             '投递失败的巡检报告', '重试一次仍未送达。', '投递 失败 的 巡检 报告',
+                             '重试 一次 仍未 送达', 2, '服务器 535 拒绝：发信认证失败', 2)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, created_at,
+                                        sent_at)
+                     VALUES ('out', 'sent', 'sent', 'demo@chinatelecom.cn', '张伟', 'ops@x.cn',
+                             '已送达的周报', '本周完成情况详见正文。', '已 送达 的 周报',
+                             '本周 完成 情况 详见 正文', 2, 2)",
+                [],
+            )
+            .unwrap();
+        });
+        dump("email-sending.html", get(&format!("/emails/{sending_id}")));
+        dump("email-failed.html", get(&format!("/emails/{failed_id}")));
+        dump("email-sent.html", get(&format!("/emails/{sent_id}")));
+        dump("main-sent.html", get_url("/?folder=sent"));
         dump("settings-account.html", get("/settings"));
         dump("settings-sync.html", get("/settings/sync"));
         dump("settings-storage.html", get("/settings/storage"));

@@ -49,7 +49,10 @@ pub fn run() {
         .setup(|app| {
             // 状态在窗口创建前装配：协议回调依赖 AppState（设计 §2）
             let data_dir = app.path().app_data_dir()?;
-            app.manage(state::AppState::open(&data_dir));
+            let state = state::AppState::open(&data_dir);
+            // M3 发送队列：单飞 worker（崩溃残留 queued 补发），窗口创建前就绪
+            state.start_send_worker();
+            app.manage(state);
 
             let url: tauri::Url = APP_URL.parse().expect("入口 URL 为常量，恒合法");
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
