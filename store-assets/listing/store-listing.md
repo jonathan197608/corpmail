@@ -162,12 +162,12 @@ v0.2.4
 
 ## 10. 隐私政策 URL（Privacy policy URL）
 
-- URL：`https://github.com/jonathan197608/mailbox/blob/main/docs/PRIVACY.zh-CN.md`
-- **注意**：上架前须先在仓库创建该文档并随仓库公开。文案备好（见 store-assets/listing/PRIVACY.zh-CN.md 同名文件），提交清单里含「推仓库」步骤。
+- URL：`https://github.com/jonathan197608/mailbox/blob/main/PRIVACY.zh-CN.md`
+- **注意**：隐私文档已随仓库根目录公开（`PRIVACY.zh-CN.md`/`PRIVACY.en-US.md`），链接推送即生效。
 
 ## 11. 支持联系方式（Support contact info）
 
-- 电子邮件：`（填写你的对外邮箱，如 Gmail/Outlook，不建议用公司邮箱）`
+- 电子邮件：`18988991633@189.cn`
 - 网站：`https://github.com/jonathan197608/mailbox/issues`
 
 ## 12. 商店徽标（Store logos）

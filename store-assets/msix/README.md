@@ -12,17 +12,17 @@ store-assets/
 │   └── （out/ 构建产物，不入库）
 ├── listing/
 │   ├── store-listing.md     # Partner Center 逐字段对照表（中英双语）
-│   ├── PRIVACY.zh-CN.md     # 隐私声明（提交前发布到仓库 docs/ 并公开链接）
+│   ├── PRIVACY.zh-CN.md     # 隐私声明草稿（正式版已发布在仓库根 PRIVACY.zh-CN.md）
 │   └── PRIVACY.en-US.md
 └── screenshots/             # 1920×1080 商店截图 ×5（真实页面渲染）
 ```
 
-## 上架前唯一阻塞项
+## 上架身份（已定稿）
 
-1. **Publisher**：Partner Center → 应用「产品管理 → 查看应用标识详细信息」复制 Publisher 串，
-   替换 `AppxManifest.xml` 中的 `CN=PLACEHOLDER-Publisher`。
-2. **隐私政策 URL**：将 `listing/PRIVACY.zh-CN.md` 复制到仓库 `docs/PRIVACY.zh-CN.md` 并推送，
-   listing 提交时填 GitHub 链接。
+- **Publisher**：`CN=3DAC9C91-AE75-4F8D-A413-16DBAF29757A`（已写入 manifest）
+- **隐私政策 URL**：`https://github.com/jonathan197608/mailbox/blob/main/PRIVACY.zh-CN.md`
+ （隐私文档已随仓库根目录公开）
+- 内部文档（设计稿等）位于 `docs-private/`，不公开（.gitignore 拦截）
 
 ## 渠道共存说明（重要，写进提交备注已备）
 
