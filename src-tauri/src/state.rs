@@ -86,7 +86,15 @@ pub struct FetchState {
     pub last_error: String,
     /// 刚完成（状态片段读到即清，路由层据此发 HX-Refresh 刷新列表）
     pub just_finished: bool,
+    /// 轮次代际：每次开始新轮 +1；挂起轮的迟到 finish（epoch 不匹配）不得写状态
+    pub epoch: u64,
+    /// 当前轮开始时间（epoch 秒）：看门狗判定挂起依据
+    pub started_at: i64,
 }
+
+/// 收件轮看门狗上限（秒）：imap 无网络超时，挂起轮超过此时长由轮询链复位，
+/// 避免收件按钮永久卡死（挂起线程自身因 epoch 失配无法再污染新一轮状态）
+const FETCH_WATCHDOG_SECS: i64 = 300;
 
 /// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
 pub fn full_address(prefix: &str, domain: &str) -> String {
@@ -122,6 +130,8 @@ impl AppState {
                 new_count: 0,
                 last_error: String::new(),
                 just_finished: false,
+                epoch: 0,
+                started_at: 0,
             })),
         }
     }
@@ -277,7 +287,25 @@ impl AppState {
 
     /// 收件状态快照（克隆；just_finished 读取后由 clear_fetch_finish 显式清除）
     pub fn fetch_snapshot(&self) -> FetchState {
+        self.fetch_guard_hung();
         self.fetch_state.lock().expect("收件状态锁中毒").clone()
+    }
+
+    /// 看门狗：挂起轮（超出 FETCH_WATCHDOG_SECS 无进展）强制复位。
+    /// 由 fetch_snapshot（状态轮询链，进行中 2s 一次）驱动。复位即 epoch+1，
+    /// 挂起线程即便之后网络恢复，其 finish 也会因 epoch 失配被丢弃。
+    fn fetch_guard_hung(&self) {
+        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        if s.running && crate::mail::now_epoch() - s.started_at > FETCH_WATCHDOG_SECS {
+            eprintln!("[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，强制复位");
+            s.running = false;
+            s.epoch += 1;
+            s.last_error = format!(
+                "收件超时（{} 分钟无进展，可能网络中断），已复位，可重试",
+                FETCH_WATCHDOG_SECS / 60
+            );
+            s.just_finished = true;
+        }
     }
 
     /// 清除"刚完成"标记（状态片段消费后调用，避免重复触发列表刷新）
@@ -293,9 +321,9 @@ impl AppState {
     /// 参数快照与状态 CAS 在调用线程完成后，网络拉取与入库交由独立线程执行
     /// （独立连接，同发送 worker 模式；完成后更新游标/last_sync_at 并置 just_finished）。
     pub fn start_fetch(&self) {
-        if !self.fetch_cas_begin() {
+        let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
-        }
+        };
         let d = defaults();
         let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
         let host = g(keys::RECV_HOST);
@@ -304,7 +332,7 @@ impl AppState {
         let password = match self.retrieve_password(&account) {
             crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
             crate::secrets::GetResult::Missing => {
-                self.fetch_end(0, "凭据缺失，请先在设置中保存密码");
+                self.fetch_end(epoch, 0, "凭据缺失，请先在设置中保存密码");
                 return;
             }
         };
@@ -331,24 +359,33 @@ impl AppState {
                 password,
                 first_days,
                 last,
+                epoch,
             });
         });
     }
 
     /// 收件状态 CAS：空闲→进行中（成功 true；已在收件返回 false）
-    fn fetch_cas_begin(&self) -> bool {
+    /// 开始新轮（CAS）：成功返回该轮 epoch（finish 写状态的凭证）
+    fn fetch_cas_begin(&self) -> Option<u64> {
         let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
         if s.running {
-            return false;
+            return None;
         }
         s.running = true;
         s.just_finished = false;
-        true
+        s.epoch += 1;
+        s.started_at = crate::mail::now_epoch();
+        s.last_error.clear();
+        Some(s.epoch)
     }
 
     /// 收件结束（凭据缺失等同步失败路径；线程路径在闭包内直接更新 Arc）
-    fn fetch_end(&self, new_count: i64, error: &str) {
+    /// 同步失败收尾（start_fetch 线程前路径）。带 epoch 凭证校验
+    fn fetch_end(&self, epoch: u64, new_count: i64, error: &str) {
         let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        if s.epoch != epoch {
+            return; // 看门狗已复位或新一轮已开始：迟到结果丢弃
+        }
         s.running = false;
         s.new_count = new_count;
         s.last_error = error.into();
@@ -648,6 +685,8 @@ struct FetchJob {
     password: String,
     first_days: i64,
     last: crate::mail::LastCursor,
+    /// 本轮代际（fetch_cas_begin 发放；finish 时的凭证）
+    epoch: u64,
 }
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
@@ -663,9 +702,16 @@ fn fetch_round(job: FetchJob) {
         password,
         first_days,
         last,
+        epoch,
     } = job;
+    // finish 携带轮次凭证：epoch 失配（看门狗已复位/新一轮已开始）则仅记日志不写状态，
+    // 防止挂起轮迟到完成污染当前轮的展示
     let finish = |new_count: i64, error: String| {
         let mut s = fetch_state.lock().expect("收件状态锁中毒");
+        if s.epoch != epoch {
+            eprintln!("[fetch] 迟到结果（epoch {epoch} ≠ {}）丢弃", s.epoch);
+            return;
+        }
         s.running = false;
         s.new_count = new_count;
         s.last_error = error;
@@ -707,16 +753,30 @@ fn fetch_round(job: FetchJob) {
             // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
             // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
             // uidvalidity 变化时 UID 空间重置，必须无条件采纳新值。
-            let set = |k: &str, v: &str| {
-                let _ = crate::db::settings::set(&conn, k, v);
+            // 游标三键单事务写入：崩溃窗口内不得出现 uidvalidity 已变而 uid 滞留
+            // 旧空间的错配（会导致跨空间跳号漏信）
+            let mut push_cursor = || -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                crate::db::settings::set(
+                    &tx,
+                    keys::LAST_UIDVALIDITY,
+                    &outcome.uidvalidity.to_string(),
+                )?;
+                if outcome.max_uid > 0
+                    && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
+                {
+                    crate::db::settings::set(&tx, keys::LAST_UID, &outcome.max_uid.to_string())?;
+                }
+                crate::db::settings::set(
+                    &tx,
+                    keys::LAST_SYNC_AT,
+                    &crate::mail::now_epoch().to_string(),
+                )?;
+                tx.commit()
             };
-            set(keys::LAST_UIDVALIDITY, &outcome.uidvalidity.to_string());
-            if outcome.max_uid > 0
-                && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
-            {
-                set(keys::LAST_UID, &outcome.max_uid.to_string());
+            if let Err(err) = push_cursor() {
+                eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
             }
-            set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
             eprintln!(
                 "[fetch] 完成：命中游标 uid={}，解析 {} 封，入库 {added} 封",
                 outcome.max_uid,
@@ -734,6 +794,41 @@ fn fetch_round(job: FetchJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_watchdog_resets_hung_round() {
+        let dir = temp_dir("wd");
+        let state = AppState::open(&dir);
+        // 模拟挂起轮：running 且 started_at 拨回 6 分钟前（超出看门狗 300s）
+        {
+            let mut s = state.fetch_state.lock().unwrap();
+            s.running = true;
+            s.epoch = 7;
+            s.started_at = crate::mail::now_epoch() - (FETCH_WATCHDOG_SECS + 60);
+        }
+        let snap = state.fetch_snapshot();
+        assert!(!snap.running, "看门狗应复位挂起轮");
+        assert!(snap.last_error.contains("收件超时"), "应给出超时原因");
+        assert!(snap.just_finished, "复位应触发一次完成刷新");
+        assert_eq!(
+            snap.epoch, 8,
+            "复位应推进 epoch（挂起线程的迟到 finish 将被丢弃）"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_late_finish_discarded_by_epoch() {
+        let dir = temp_dir("wd-late");
+        let state = AppState::open(&dir);
+        // 看门狗已复位（epoch 3），挂起线程的 epoch=2 finish 不得写状态
+        state.fetch_end(2, 99, "迟到的失败");
+        let snap = state.fetch_snapshot();
+        assert_eq!(snap.new_count, 0, "迟到结果必须丢弃");
+        assert!(!snap.last_error.contains("迟到"), "迟到错误不得污染展示");
+        assert!(!snap.just_finished);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mbx-test-{tag}-{}", std::process::id()));

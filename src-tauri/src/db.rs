@@ -22,14 +22,44 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// 增量迁移表：v_n = 从 n-1 升到 n 的 DDL（只允许不可回退的加列/建索引/建表）
+const MIGRATIONS: &[&str] = &[
+    // v1 → v2：附件邮箱外键索引（级联删/详情附件查询免全表扫）
+    // + AU 触发器收窄为列限定（unread/status 等更新不再引发 FTS 重写 churn）
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_attach_email ON attachments(email_id);
+    DROP TRIGGER IF EXISTS emails_au;
+    CREATE TRIGGER emails_au AFTER UPDATE OF subject_tokens, body_tokens ON emails BEGIN
+      INSERT INTO email_fts(email_fts, rowid, subject, body_text)
+        VALUES('delete', old.id, old.subject_tokens, old.body_tokens);
+      INSERT INTO email_fts(rowid, subject, body_text) VALUES (new.id, new.subject_tokens, new.body_tokens);
+    END;
+    "#,
+];
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if v >= SCHEMA_VERSION {
         return Ok(());
     }
-    conn.execute_batch(SCHEMA_V1)?;
+    if v == 0 {
+        // 新库：v1 基线 + 全部增量一次性建到当前版本
+        conn.execute_batch(SCHEMA_V1)?;
+        for sql in MIGRATIONS {
+            conn.execute_batch(sql)?;
+        }
+    } else {
+        // 旧库：按序应用增量（v → v+1 → … → 当前）
+        for sql in MIGRATIONS
+            .iter()
+            .take((SCHEMA_VERSION - v) as usize)
+            .skip((v - 1) as usize)
+        {
+            conn.execute_batch(sql)?;
+        }
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
 }
 
@@ -97,7 +127,7 @@ CREATE TRIGGER emails_ad AFTER DELETE ON emails BEGIN
   INSERT INTO email_fts(email_fts, rowid, subject, body_text)
     VALUES('delete', old.id, old.subject_tokens, old.body_tokens);
 END;
-CREATE TRIGGER emails_au AFTER UPDATE ON emails BEGIN
+CREATE TRIGGER emails_au AFTER UPDATE OF subject_tokens, body_tokens ON emails BEGIN
   INSERT INTO email_fts(email_fts, rowid, subject, body_text)
     VALUES('delete', old.id, old.subject_tokens, old.body_tokens);
   INSERT INTO email_fts(rowid, subject, body_text) VALUES (new.id, new.subject_tokens, new.body_tokens);
@@ -258,6 +288,75 @@ mod tests {
             .query_row("SELECT count(*) FROM attachments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "外键级联应连带删除附件行");
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_adds_index_and_narrow_trigger() {
+        let conn = mem();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2, "新库应一步建到当前版本");
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_attach_email'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "附件外键索引应存在");
+        // 列限定 AU：仅更新 unread 不得触发 FTS 重写（性能：已读标记高频）
+        conn.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, unread, created_at)
+             VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', '清单',
+                     '清单', '月租 单', 1, 1)",
+            [],
+        )
+        .unwrap();
+        // 塞入两条 FTS 行后改 unread：行数应保持 1（未走 delete+insert，也无残留）
+        conn.execute("UPDATE emails SET unread = 0 WHERE id = 1", [])
+            .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM email_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "unread 更新不应触发 FTS churn");
+        // 影子列更新仍同步
+        conn.execute(
+            "UPDATE emails SET subject_tokens = '配案 清单' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let hit: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM email_fts WHERE email_fts MATCH '配案'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "影子列更新仍应同步 FTS");
+    }
+
+    #[test]
+    fn migrate_old_v1_db_upgrades_in_place() {
+        // 模拟旧库：建 v1（无索引、无条件 AU 触发器）后跑 migrate
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        migrate(&conn).unwrap();
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_attach_email'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "存量库升级应补附件索引");
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]

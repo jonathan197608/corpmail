@@ -103,10 +103,24 @@ impl MailFetcher for RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则按 SINCE 天数（§6.1）。
+        // 首拉范围：0 = 全部（UID SEARCH ALL，不限天数）；>0 = SINCE 天数。
+        // 首拉只发生在无游标/uidvalidity 变化时；巨箱建议先用 7/30 天再补全。
+        let first_pull: Vec<u32> = if first_days <= 0 {
+            sess.uid_search("ALL")
+                .map_err(|e| format!("检索全部邮件失败：{e}"))?
+                .into_iter()
+                .collect()
+        } else {
+            let since = imap_since(first_days);
+            sess.uid_search(format!("SINCE {since}"))
+                .map_err(|e| format!("检索新邮件失败：{e}"))?
+                .into_iter()
+                .collect()
+        };
+        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则用首拉范围（§6.1）。
         // 范围写法必须是 "N:*"（UID 范围）；曾误写 "N,*"（set 语义 = UID 恰为 N 或最大值），
         // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复。
-        // 增量命中 0 封时再以 SINCE 兜底重查（个别服务器对 UID 范围的返回仍有 quirk；
+        // 增量命中 0 封时再用首拉范围兜底重查（个别服务器对 UID 范围的返回仍有 quirk；
         // 入库按 remote_uid/message_id 幂等去重，重复拉取无害）
         let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
             let inc: Vec<u32> = sess
@@ -116,21 +130,16 @@ impl MailFetcher for RealFetcher {
                 .filter(|u| *u > last.uid)
                 .collect();
             if inc.is_empty() {
-                let since = imap_since(first_days);
-                eprintln!("[fetch] 增量命中 0 封，SINCE {since} 兜底重查");
-                sess.uid_search(format!("SINCE {since}"))
-                    .map_err(|e| format!("检索新邮件失败：{e}"))?
-                    .into_iter()
-                    .collect()
+                eprintln!(
+                    "[fetch] 增量命中 0 封，按首拉范围兜底重查（{} 封）",
+                    first_pull.len()
+                );
+                first_pull
             } else {
                 inc
             }
         } else {
-            let since = imap_since(first_days);
-            sess.uid_search(format!("SINCE {since}"))
-                .map_err(|e| format!("检索新邮件失败：{e}"))?
-                .into_iter()
-                .collect()
+            first_pull
         };
         eprintln!(
             "[fetch] INBOX uidvalidity={uidvalidity} 游标 uid={} 命中 {} 封",
