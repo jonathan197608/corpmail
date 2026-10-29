@@ -8,6 +8,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// 数据目录指针文件名（锚点目录下，与锚点库 data_dir_override 双保险）。
+/// 纯文本单行路径，迁移时与库指针同步写入：锚点 mailbox.db 被手动删除后
+/// （验收反馈：删除后启动误判首次启动）启动解析仍有兑底定位源。
+const DATA_DIR_POINTER: &str = "data-dir.txt";
+
 /// settings 键名（设计 §3；新增键须同步设计文档）
 pub mod keys {
     pub const ACCOUNT_PREFIX: &str = "account_prefix";
@@ -121,17 +126,28 @@ impl AppState {
         }
     }
 
-    /// 启动目录解析（lib.rs setup 调用）：开锚点库读 data_dir_override 指针，
-    /// 指针有效（目录存在）则用之，否则回退锚点目录（外置盘拔出等场景安全回退）
+    /// 启动目录解析（lib.rs setup 调用）：双源指针定位自定义数据目录，
+    /// 均无效/失效则回退锚点目录。
+    /// 1) 锚点库 data_dir_override（存在才打开，探测不副作用建库）；
+    /// 2) 锚点目录指针文件 data-dir.txt（锚点库被删除后的兑底，验收反馈）。
+    ///
+    /// 有效性 = 目录存在且含 mailbox.db（迁移快照必有；空壳目录不采纳，回退锚点
+    /// 可吃到"原目录保留为备份"的备份）；指针目录消失（外置盘拔出）同样安全回退
     pub fn resolve_start_dir(anchor: &Path) -> PathBuf {
-        let probe = anchor.join("mailbox.db");
-        let over = crate::db::open(&probe)
-            .ok()
-            .and_then(|c| crate::db::settings::get(&c, keys::DATA_DIR).ok().flatten());
-        match over {
-            Some(p) if Path::new(&p).is_dir() => PathBuf::from(p),
-            _ => anchor.to_path_buf(),
+        let usable = |p: &str| Path::new(p).join("mailbox.db").is_file();
+        let db_probe = anchor.join("mailbox.db");
+        if db_probe.is_file() {
+            let over = crate::db::open(&db_probe)
+                .ok()
+                .and_then(|c| crate::db::settings::get(&c, keys::DATA_DIR).ok().flatten());
+            if let Some(p) = over.filter(|p| usable(p)) {
+                return PathBuf::from(p);
+            }
         }
+        if let Some(p) = read_pointer_file(anchor).filter(|p| usable(p)) {
+            return PathBuf::from(p);
+        }
+        anchor.to_path_buf()
     }
 
     /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
@@ -179,9 +195,16 @@ impl AppState {
             crate::db::open(&anchor_db).map_err(|e| format!("锚点库打开失败：{e}"))?;
         crate::db::settings::set(&anchor_conn, keys::DATA_DIR, &dest_path.to_string_lossy())
             .map_err(|e| format!("指针写入失败：{e}"))?;
+        // 指针文件双保险：锚点 mailbox.db 被手动删除时（验收反馈）启动仍有定位源；
+        // 锚点库刚写入成功说明目录可写，此处失败应视为迁移不完整
+        std::fs::write(
+            self.anchor_dir.join(DATA_DIR_POINTER),
+            dest_path.to_string_lossy().as_bytes(),
+        )
+        .map_err(|e| format!("指针文件写入失败：{e}"))?;
 
         Ok(format!(
-            "数据已迁移到新目录，重启应用后生效；原目录保留为备份：{}",
+            "数据已迁移到新目录，重启应用后生效；原目录保留为备份（请勿删除其中的 mailbox.db 与 data-dir.txt）：{}",
             cur.display()
         ))
     }
@@ -510,6 +533,14 @@ impl AppState {
     }
 }
 
+/// 读锚点目录的指针文件（迁移时与库指针同步写入；文件缺失/空/读失败 → None，
+/// 读取失败按无指针处理、安全回退锚点目录）
+fn read_pointer_file(anchor: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(anchor.join(DATA_DIR_POINTER)).ok()?;
+    let p = text.trim();
+    (!p.is_empty()).then(|| p.to_string())
+}
+
 /// 递归复制目录（M5 迁移用：附件目录两级结构 {YYYY-MM}/{email_id}/ 文件）；
 /// 目标已存在的同名文件覆盖，缺失目录逐级创建
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
@@ -688,6 +719,79 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&empty);
         let _ = std::fs::remove_dir_all(&anchor);
+    }
+
+    #[test]
+    fn resolve_start_dir_survives_anchor_db_deletion() {
+        // 验收反馈场景：迁移后用户删除锚点目录 mailbox.db —— 若仅依赖库指针，
+        // 启动会在锚点目录新建空库并误判首次启动；指针文件双保险应继续定位自定义目录
+        let base = temp_dir("resolve-anchor-del");
+        let anchor = base.join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let state = AppState::open(&anchor);
+        // 造一封邮件：验证经指针文件定位后数据完整（非空壳）
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        crate::mail::save_draft(
+            &state,
+            &crate::mail::DraftInput {
+                id: None,
+                from_addr: "demo@chinatelecom.cn".into(),
+                from_name: "张伟".into(),
+                to_addrs: "peer@x.cn".into(),
+                cc_addrs: String::new(),
+                subject: "兜底定位用例".into(),
+                body_text: "正文".into(),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        let dest = base.join("moved");
+        state.move_data_dir(dest.to_str().unwrap()).unwrap();
+        drop(state);
+        // 双指针就位：锚点库 + data-dir.txt
+        assert!(anchor.join("mailbox.db").is_file(), "锚点库存在");
+        assert!(
+            anchor.join(DATA_DIR_POINTER).is_file(),
+            "指针文件已同步写入"
+        );
+        // 用户删除锚点库（保留指针文件的文件名无关性）
+        std::fs::remove_file(anchor.join("mailbox.db")).unwrap();
+        assert_eq!(
+            AppState::resolve_start_dir(&anchor),
+            dest,
+            "锚点库被删后应经指针文件继续定位自定义目录（不误判首次启动）"
+        );
+        // 定位到的库可正常打开且数据完整（非空壳）
+        let conn = crate::db::open(&dest.join("mailbox.db")).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "自定义目录数据完整");
+        // 指针文件也失效（指向已删目录）→ 回退锚点
+        std::fs::write(anchor.join(DATA_DIR_POINTER), "/nonexistent/usb-gone").unwrap();
+        assert_eq!(
+            AppState::resolve_start_dir(&anchor),
+            anchor,
+            "双指针均失效应回退锚点"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_start_dir_rejects_hollow_pointer_target() {
+        // 有效性加强：指针指向的目录存在但无 mailbox.db（空壳目录）→ 不采纳，回退锚点
+        let base = temp_dir("resolve-hollow");
+        let anchor = base.join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let hollow = base.join("hollow");
+        std::fs::create_dir_all(&hollow).unwrap();
+        std::fs::write(anchor.join(DATA_DIR_POINTER), hollow.to_str().unwrap()).unwrap();
+        assert_eq!(
+            AppState::resolve_start_dir(&anchor),
+            anchor,
+            "空壳目录不得被当作有效数据目录"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
