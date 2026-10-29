@@ -67,12 +67,6 @@
                                 onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.filename | js_str }})"
                                 title="解压另存到本机">另存为</button>
                         {% endif %}
-                        <span class="att-size">{{ a.size_orig }} 字节</span>
-                        {% if not a.detached %}
-                        <button type="button" class="btn small"
-                                onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.filename | js_str }})"
-                                title="解压另存到本机">另存为</button>
-                        {% endif %}
                     </li>
                     {% endfor %}
                 </ul>

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NanoMail（仓库项目名 Mailbox）· MSIX 清单（Microsoft Store 上架包）
+  配套：scripts/build-msix.sh —— 拷贝 NSIS 装好的产物目录 + 本 manifest + assets → MakeAppx
+  发布者/身份：Partner Center「应用标识详细信息」页为准；仅 Publisher 为占位（Name 已按保留名 nanomail 定稿）
+  签名：商店渠道由微软认证后代签，本地打包不签名
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6">
+
+  <!-- 版本四段制，末段固定 0（商店规则）；随应用 CARGO_PKG_VERSION 同步 -->
+  <Identity
+    Name="nanomail"
+    Version="0.2.4.0"
+    ProcessorArchitecture="x64"
+    Publisher="CN=PLACEHOLDER-Publisher"/>
+
+  <Properties>
+    <DisplayName>NanoMail 企业邮箱客户端</DisplayName>
+    <PublisherDisplayName>nanomail</PublisherDisplayName>
+    <Logo>assets\Square150x150Logo.png</Logo>
+    <!-- 禁用 AppData/注册表写虚拟化：不声明时 MSIX 会把 %APPDATA% 写重定向到包私有
+         路径，导致邮件库与 NSIS 渠道分裂（切渠道丢存档、卸载清空数据）。禁用后
+         两渠道共用 %APPDATA%\com.mailbox.desktop，数据互通可迁移 -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+    <!-- 允许在不重写包声明的情况下于 Properties 内使用 desktop6 扩展 -->
+    <uap10:PackageIntegrity>
+      <uap10:Content>
+        <uap10:Enforcement>on</uap10:Enforcement>
+      </uap10:Content>
+    </uap10:PackageIntegrity>
+  </Properties>
+
+  <Resources>
+    <Resource Language="zh-CN"/>
+    <Resource Language="en-US"/>
+  </Resources>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0"/>
+  </Dependencies>
+
+  <Capabilities>
+    <!-- win32 桌面应用完整信任（商店政策 10.2 允许桌面应用走此通道）；
+         无网络/文件/摄像头等额外能力声明，邮件收发由应用自身 SMTP/IMAP 直连实现 -->
+    <rescap:Capability Name="runFullTrust"/>
+  </Capabilities>
+
+  <Applications>
+    <Application Id="NanoMail" Executable="Mailbox.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="NanoMail 企业邮箱客户端"
+        Description="企业邮箱收发一体 · 本地存档 · 中文全文检索"
+        BackgroundColor="#3B6FD4"
+        Square150x150Logo="assets\Square150x150Logo.png"
+        Square44x44Logo="assets\Square44x44Logo.png"/>
+    </Application>
+  </Applications>
+</Package>

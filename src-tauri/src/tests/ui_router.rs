@@ -361,6 +361,18 @@ fn attachment_view_serves_bytes_with_safe_mime() {
         html.contains("attachments/3/view"),
         "zip 也应有预览按钮（点击提示不支持）：{html}"
     );
+    // 模板重复块回归防护（email.html 曾出现 size/另存为双渲染）：
+    // 详情页每个附件恰好一个"另存为"按钮与一个大小标签
+    assert_eq!(
+        html.matches("另存为").count(),
+        3,
+        "三个附件应恰有 3 个另存为按钮（不得重复渲染）：{html}"
+    );
+    assert_eq!(
+        html.matches("class=\"att-size\"").count(),
+        3,
+        "三个附件应恰有 3 个大小标签（不得重复渲染）：{html}"
+    );
     // GET 预览：原始字节 + 原 MIME + nosniff
     let resp = route(
         &state,
@@ -1951,19 +1963,112 @@ fn dump_smoke_html() {
         },
     )
     .unwrap();
-    state.with_conn(|c| {
-        c.execute(
-            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
-                                    subject, body_text, subject_tokens, body_tokens, unread,
-                                    created_at, received_at)
-                 VALUES ('in', 'inbox', 'received', 'boss@x.cn', '部门领导', 'demo@chinatelecom.cn',
-                         '激励清单已批复', '请按清单执行，月底前完成发放。', '激励 清单 已 批复',
-                         '请 按 清单 执行 月底 前 完成 发放', 1, 1, 1)",
-            [],
-        )
-        .unwrap();
-    });
-    let inbox_id = d2 + 1;
+    // 商店截图种子：近 3 天多封收件（真实感：未读点/附件夹/发件人多样/近期时间戳）。
+    // 时间基准 = 相对 now 的偏移（避免 1970-1-1 这类测试痕迹出现在截图里）
+    let now = mail::now_epoch();
+    /// 商店截图种子行（from, name, subject, subject_tokens, body, body_tokens, day_ago, unread, attach_cnt）
+    type Seed = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        bool,
+        i64,
+    );
+    let seeds: [Seed; 6] = [
+        // (from_addr, from_name, subject, subject_tokens, body, body_tokens, 天偏移, unread, 附件数提示列内嵌)
+        (
+            "boss@chinatelecom.cn",
+            "王副总经理",
+            "激励清单已批复，请按方案执行",
+            "激励 清单 已 批复 请 按 方案 执行",
+            "各位同事：本月激励清单已经批复，请各部门按既定方案推进，月底前完成发放。\n如有口径疑问随时找我核对。",
+            "各位 同事 本 月 激励 清单 已经 批复 请 各 部门 按 既定 方案 推进 月底 前 完成 发放 如 有 口径 疑问 随时 找 我 核对",
+            0,
+            true,
+            0,
+        ),
+        (
+            "finance@chinatelecom.cn",
+            "财务部-李静",
+            "十月专线佣金结算表（含分局明细）",
+            "十月 专线 佣金 结算 表 含 分局 明细",
+            "附件是十月的专线佣金结算表，含各分局明细与合计，请查收核对。\n差异项请于本周五前反馈至我邮箱。",
+            "附件 是 十 月 的 专线 佣金 结算 表 含 各 分局 明细 与 合计 请 查收 核对 差异 项 请 于 本 周五 前 反馈 至 我 邮箱",
+            0,
+            true,
+            1,
+        ),
+        (
+            "it-ops@chinatelecom.cn",
+            "IT运维组",
+            "邮件系统本周六凌晨例行维护通知",
+            "邮件 系统 本 周六 凌晨 例行 维护 通知",
+            "为提升服务稳定性，本周六 00:00-04:00 对邮件系统进行例行维护，期间收发可能短暂中断，请提前安排。",
+            "为 提升 服务 稳定性 本 周六 0000-0400 对 邮件 系统 进行 例行 维护 期间 收发 可能 短暂 中断 请 提前 安排",
+            1,
+            false,
+            0,
+        ),
+        (
+            "hr@chinatelecom.cn",
+            "人力资源部",
+            "关于开展四季度劳动竞赛的通知",
+            "关于 开展 四 季度 劳动 竞赛 的 通知",
+            "各部门：四季度劳动竞赛方案已印发，请组织学习并落实申报。\n申报截止 11 月 15 日。",
+            "各 部门 四 季度 劳动 竞赛 方案 已 印发 请 组织 学习 并 落实 申报 申报 截止 11 月 15 日",
+            1,
+            true,
+            0,
+        ),
+        (
+            "market@partner.cn",
+            "合作方-智慧园区项目组",
+            "智慧园区方案 v3 评审会议纪要",
+            "智慧 园区 方案 v3 评审 会议 纪要",
+            "纪要要点：\n1. 网络接入按双专线冗余设计；\n2. 安全设备清单请见附件核对；\n3. 下次评审 11 月 08 日 14:00。",
+            "纪要 要点 网络 接入 按 双 专线 冗余 设计 安全 设备 清单 请 见 附件 核对 下次 评审 11 月 08 日 1400",
+            2,
+            false,
+            2,
+        ),
+        (
+            "noreply-notice@chinatelecom.cn",
+            "系统通知",
+            "您的 VPN 证书将于 7 天后到期",
+            "您 的 vpn 证书 将 于 7 天 后 到期",
+            "检测到您正在使用的 VPN 客户端证书将于 7 天后到期，请及时在门户系统自助更新，避免影响内网访问。",
+            "检测 到 您 正在 使用 的 vpn 客户端 证书 将 于 7 天 后 到期 请 及时 在 门户 系统 自助 更新 避免 影响 内网 访问",
+            3,
+            false,
+            0,
+        ),
+    ];
+    let mut inbox_first_id = 0;
+    for (i, (faddr, fname, subj, stok, body, btok, day_ago, unread, att)) in
+        seeds.iter().enumerate()
+    {
+        let t = now - day_ago * 86_400 - (i as i64) * 3600;
+        state.with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, body_text, subject_tokens, body_tokens, attach_cnt,
+                                        unread, created_at, received_at)
+                     VALUES ('in', 'inbox', 'received', ?1, ?2, 'demo@chinatelecom.cn',
+                             ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                rusqlite::params![faddr, fname, subj, body, stok, btok, att, *unread as i64, t],
+            )
+            .unwrap();
+        });
+        let id = d2 + 1 + i as i64;
+        if i == 0 {
+            inbox_first_id = id;
+        }
+    }
+    let inbox_id = inbox_first_id;
 
     dump("main.html", get("/"));
     dump("main-inbox-unread.html", get_url("/?unread=1"));
