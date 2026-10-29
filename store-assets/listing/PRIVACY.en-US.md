@@ -1,8 +1,8 @@
-# NanoMail Privacy Statement
+# CorpMail Privacy Statement
 
 Effective date: 2026-10-29
 
-NanoMail ("this app") is a local-first business mail client. Our position on your privacy is the simplest one possible: **this app collects nothing, stores nothing off your device, and reports nothing about you.**
+CorpMail ("this app") is a local-first business mail client. Our position on your privacy is the simplest one possible: **this app collects nothing, stores nothing off your device, and reports nothing about you.**
 
 ## We run no servers
 

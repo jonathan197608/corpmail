@@ -1,4 +1,4 @@
-# NanoMail · Microsoft Store 上架文案（Partner Center 逐字段对照表）
+# CorpMail · Microsoft Store 上架文案（Partner Center 逐字段对照表）
 
 > 字段限制与提交位置均按 Partner Center「应用一览（Store listing）」页。
 > 中英双语各一份；除标注「两者通用」外，均分别填写。
@@ -7,15 +7,15 @@
 
 ## 1. 应用名称（App name）
 
-- **zh-CN**：`NanoMail 企业邮箱客户端`
-- **en-US**：`NanoMail Business Mail Client`
+- **zh-CN**：`CorpMail 企业邮箱客户端`
+- **en-US**：`CorpMail Business Mail Client`
 
-（保留名 nanomail 已占用；显示名可不同于保留名）
+（Partner Center 保留名：JonathanHuang.corpmail；商店显示名可不同于保留名）
 
 ## 2. 提交说明（Notes to certification，两者通用，英文提交）
 
 ```
-NanoMail is a native email client for business mailboxes (SMTP/IMAP).
+CorpMail is a native email client for business mailboxes (SMTP/IMAP).
 All data stays on the user's PC: mail is stored in a local SQLite database,
 account passwords are stored in Windows Credential Manager. The app connects
 directly to the user's own mail servers; we operate no servers and collect
@@ -34,9 +34,9 @@ the wizard page is the only reachable screen (by design).
 ### zh-CN（≤ 10000 字符）
 
 ```
-NanoMail 是一款为办公场景打造的本地优先邮箱客户端：收发一体、全部邮件本地存档、中文全文检索，数据不出本机。
+CorpMail 是一款为办公场景打造的本地优先邮箱客户端：收发一体、全部邮件本地存档、中文全文检索，数据不出本机。
 
-【为什么选择 NanoMail】
+【为什么选择 CorpMail】
 
 ■ 隐私优先，数据不出本机
 全部邮件保存在本机数据库，不经过任何第三方服务器；账号密码存入 Windows 凭据管理器，数据库不留明文。我们不运营任何服务器，也不收集任何数据。
@@ -73,7 +73,7 @@ NanoMail 是一款为办公场景打造的本地优先邮箱客户端：收发�
 
 【隐私与安全】
 
-NanoMail 不内置统计分析、不联网上报任何信息；唯一网络行为是与你配置的邮件服务器通信。密码仅存于 Windows 凭据管理器，数据库中不落明文。
+CorpMail 不内置统计分析、不联网上报任何信息；唯一网络行为是与你配置的邮件服务器通信。密码仅存于 Windows 凭据管理器，数据库中不落明文。
 
 【支持】
 
@@ -83,9 +83,9 @@ NanoMail 不内置统计分析、不联网上报任何信息；唯一网络行�
 ### en-US（≤ 10000 字符）
 
 ```
-NanoMail is a local-first email client for business mailboxes: send and receive in one app, full local archive of every message, and Chinese full-text search — your data never leaves your PC.
+CorpMail is a local-first email client for business mailboxes: send and receive in one app, full local archive of every message, and Chinese full-text search — your data never leaves your PC.
 
-【Why NanoMail】
+【Why CorpMail】
 
 ■ Privacy first — everything stays local
 All mail is stored in a local database and never passes through any third-party server. Account passwords live in Windows Credential Manager, never in plaintext. We run no servers and collect nothing.
@@ -122,7 +122,7 @@ A crisp blue-and-white pixel design language.
 
 【Privacy & security】
 
-NanoMail embeds no analytics and phones nothing home; its only network activity is talking to the mail servers you configure. Passwords are stored exclusively in Windows Credential Manager.
+CorpMail embeds no analytics and phones nothing home; its only network activity is talking to the mail servers you configure. Passwords are stored exclusively in Windows Credential Manager.
 
 【Support】
 

@@ -1,6 +1,6 @@
-# NanoMail（Mailbox）· Microsoft Store 上架方案
+# CorpMail（Mailbox）· Microsoft Store 上架方案
 
-> 版本：v1.0（2026-10-29）｜目标版本 0.2.4｜保留名 nanomail
+> 版本：v1.0（2026-10-29）｜目标版本 0.2.4｜保留名 JonathanHuang.corpmail
 > 本文档为执行总纲：阶段、步骤、责任分工、提交物与回退策略。
 
 ---
@@ -38,21 +38,21 @@ git clone https://github.com/jonathan197608/mailbox && cd mailbox
 
 # 2) 打 MSIX（脚本自动注入版本号 0.2.4.0）
 bash scripts/build-msix.sh "D:\Mailbox"
-# 产物：store-assets/msix/out/NanoMail_0.2.4.0_x64.msix（未签名）
+# 产物：store-assets/msix/out/CorpMail_0.2.4.0_x64.msix（未签名）
 
 # 3) 本地安装验证（自签名用一下，仅本机测试用）
-Add-AppxPackage -Path .\store-assets\msix\out\NanoMail_0.2.4.0_x64.msix -ForceApplicationShutdown
+Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.2.4.0_x64.msix -ForceApplicationShutdown
 # 验证点：① 首启向导正常 ② 数据目录 = %APPDATA%\com.mailbox.desktop
 #（若与 NSIS 版同装，确认无虚拟化重定向：安装后收几封信，再在 NSIS 版里能看到 = 数据互通）
 
 # 4) WACK 认证预检
 & "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe" reset
-& "...\appcert.exe" test -apptype desktop -appxpath "...\NanoMail_0.2.4.0_x64.msix"
+& "...\appcert.exe" test -apptype desktop -appxpath "...\CorpMail_0.2.4.0_x64.msix"
 # 要求：PASS，0 fail（FAIL 项按报告修后再提）
 ```
 
 ### 提交物
-- `NanoMail_0.2.4.0_x64.msix`（上传商店）
+- `CorpMail_0.2.4.0_x64.msix`（上传商店）
 - WACK 报告截图（留档）
 
 ## 三、阶段 2：Partner Center 逐字段提交（按 store-listing.md）

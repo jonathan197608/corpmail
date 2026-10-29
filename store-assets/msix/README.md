@@ -1,4 +1,4 @@
-# NanoMail · Microsoft Store 上架资产包
+# CorpMail · Microsoft Store 上架资产包
 
 本目录是商店上架的**配置、文案与截图**资产（MSIX 包体由 `scripts/build-msix.sh` 在 Windows 上构建）。
 
@@ -7,7 +7,7 @@
 ```
 store-assets/
 ├── msix/
-│   ├── AppxManifest.xml     # 商店包清单（Identity.Name=nanomail 已定稿；Publisher 为占位）
+│   ├── AppxManifest.xml     # 商店包清单（Identity.Name=corpmail 已定稿；Publisher 为占位）
 │   ├── assets/              # 全套商店图标（像素风，最近邻放大无损）
 │   └── （out/ 构建产物，不入库）
 ├── listing/

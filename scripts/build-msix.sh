@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================
-# NanoMail · MSIX 商店包构建（Microsoft Store 渠道）
+# CorpMail · MSIX 商店包构建（Microsoft Store 渠道）
 # 宿主：Windows（需 Windows SDK 的 makeappx；WACK 校验同机）
 # 前置：scripts/build-windows.sh 已产出 NSIS 安装器，且已在
 #       本机安装一次（取回完整安装目录）
-# 产物：store-assets/msix/out/NanoMail_x.y.z.0_x64.msix（未签名，
+# 产物：store-assets/msix/out/CorpMail_x.y.z.0_x64.msix（未签名，
 #       商店认证后由微软代签）
 # 用法：scripts/build-msix.sh [安装目录] （默认 D:\Mailbox）
 # ============================================================
@@ -38,12 +38,12 @@ if [ -z "${MAKEAPPX}" ]; then
     exit 1
 fi
 mkdir -p "${OUT_DIR}"
-"${MAKEAPPX}" pack /d "${STAGE}" /p "${OUT_DIR}\\NanoMail_${VERSION}.0_x64.msix" /o
+"${MAKEAPPX}" pack /d "${STAGE}" /p "${OUT_DIR}\\CorpMail_${VERSION}.0_x64.msix" /o
 
 # 4) WACK（Windows 应用认证工具包）提示
 echo
-echo "[msix] 产物：${OUT_DIR}/NanoMail_${VERSION}.0_x64.msix"
+echo "[msix] 产物：${OUT_DIR}/CorpMail_${VERSION}.0_x64.msix"
 echo "提交前请跑 WACK 校验（Partner Center 拒收清单错误）："
 echo "  \"C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe\" reset"
-echo "  appcert.exe test -apptype desktop -appxpath \"$(cygpath -w "${OUT_DIR}")\\\\NanoMail_${VERSION}.0_x64.msix\""
+echo "  appcert.exe test -apptype desktop -appxpath \"$(cygpath -w "${OUT_DIR}")\\\\CorpMail_${VERSION}.0_x64.msix\""
 echo "确认项：virtualization 禁用生效、Publisher 与 Partner Center 一致、WACK 零 fail"
