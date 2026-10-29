@@ -2,6 +2,9 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
+use crate::conf::{load, save};
+use crate::db::{open, settings};
+use crate::mail::{now_epoch, save_draft};
 
 #[test]
 fn fetch_watchdog_resets_hung_round() {
@@ -12,7 +15,7 @@ fn fetch_watchdog_resets_hung_round() {
         let mut s = state.fetch_state.lock().unwrap();
         s.running = true;
         s.epoch = 7;
-        s.started_at = crate::mail::now_epoch() - (FETCH_WATCHDOG_SECS + 60);
+        s.started_at = now_epoch() - (FETCH_WATCHDOG_SECS + 60);
     }
     let snap = state.fetch_snapshot();
     assert!(!snap.running, "看门狗应复位挂起轮");
@@ -86,7 +89,7 @@ fn move_data_dir_snapshots_and_writes_pointer() {
     let state = AppState::open(&anchor);
     // 造数据：配置 + 一封草稿 + 一个附件独立文件
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
-    let id = crate::mail::save_draft(
+    let id = save_draft(
         &state,
         &crate::mail::DraftInput {
             id: None,
@@ -109,19 +112,19 @@ fn move_data_dir_snapshots_and_writes_pointer() {
     assert!(msg.contains("重启"), "提示应含重启生效：{msg}");
     // 新库可打开且数据齐全
     let moved_db = dest.join("mailbox.db");
-    let conn = crate::db::open(&moved_db).unwrap();
+    let conn = open(&moved_db).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1, "快照应含全部邮件");
     // 配置不落库（验收拍板）：库无可配置键，配置随 mailbox.toml 常驻锚点
     assert!(
-        crate::db::settings::get(&conn, keys::ACCOUNT_PREFIX)
+        settings::get(&conn, keys::ACCOUNT_PREFIX)
             .unwrap()
             .is_none(),
         "配置键不得入库（迁移库当然也没有）"
     );
-    let cfg_after = crate::conf::load(&anchor);
+    let cfg_after = load(&anchor);
     assert_eq!(
         cfg_after.get(keys::ACCOUNT_PREFIX).map(String::as_str),
         Some("demo"),
@@ -133,14 +136,14 @@ fn move_data_dir_snapshots_and_writes_pointer() {
         "附件文件应复制"
     );
     // 指针仅写独立配置文件（不落库，验收拍板简化）；启动解析定位新目录
-    let anchor_conn = crate::db::open(&anchor.join("mailbox.db")).unwrap();
+    let anchor_conn = open(&anchor.join("mailbox.db")).unwrap();
     assert!(
-        crate::db::settings::get(&anchor_conn, keys::DATA_DIR)
+        settings::get(&anchor_conn, keys::DATA_DIR)
             .unwrap()
             .is_none(),
         "迁移指针不得写库（mailbox.toml 为唯一持久源）"
     );
-    let cfg = crate::conf::load(&anchor);
+    let cfg = load(&anchor);
     assert_eq!(
         cfg.get(keys::DATA_DIR).map(String::as_str),
         Some(dest.to_str().unwrap()),
@@ -181,16 +184,14 @@ fn move_data_dir_rejects_invalid_targets() {
     // 相对路径拒绝
     assert!(state.move_data_dir("relative/dir").is_err());
     // 失败不应留下指针（配置文件与库镜像均不得写入）
-    let conn = crate::db::open(&cur.join("mailbox.db")).unwrap();
+    let conn = open(&cur.join("mailbox.db")).unwrap();
     assert!(
-        crate::db::settings::get(&conn, keys::DATA_DIR)
-            .unwrap()
-            .is_none(),
+        settings::get(&conn, keys::DATA_DIR).unwrap().is_none(),
         "失败不得写库指针"
     );
     drop(conn);
     assert!(
-        !crate::conf::load(&cur).contains_key(keys::DATA_DIR),
+        !load(&cur).contains_key(keys::DATA_DIR),
         "失败不得写配置文件指针"
     );
     let _ = std::fs::remove_dir_all(&base);
@@ -231,7 +232,7 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
     let state = AppState::open(&anchor);
     // 造一封邮件：验证定位后数据完整（非空壳）
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
-    crate::mail::save_draft(
+    save_draft(
         &state,
         &crate::mail::DraftInput {
             id: None,
@@ -262,7 +263,7 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
         "锚点库被删后应经配置文件继续定位自定义目录（不误判首次启动）"
     );
     // 定位到的库可正常打开且数据完整（非空壳）
-    let conn = crate::db::open(&dest.join("mailbox.db")).unwrap();
+    let conn = open(&dest.join("mailbox.db")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
         .unwrap();
@@ -279,9 +280,9 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
         "指针已生效（==当前目录）应无待生效提示"
     );
     // 配置指针也失效（指向已删目录）→ 回退锚点
-    let mut cfg = crate::conf::load(&anchor);
+    let mut cfg = load(&anchor);
     cfg.insert(keys::DATA_DIR.to_string(), "/nonexistent/usb-gone".into());
-    crate::conf::save(&anchor, &cfg).unwrap();
+    save(&anchor, &cfg).unwrap();
     assert_eq!(
         AppState::resolve_start_dir(&anchor),
         anchor,
@@ -324,7 +325,7 @@ fn resolve_start_dir_rejects_hollow_pointer_target() {
         keys::DATA_DIR.to_string(),
         hollow.to_string_lossy().into_owned(),
     );
-    crate::conf::save(&anchor, &cfg).unwrap();
+    save(&anchor, &cfg).unwrap();
     assert_eq!(
         AppState::resolve_start_dir(&anchor),
         anchor,
@@ -353,7 +354,7 @@ fn config_keys_stored_in_toml_only() {
         state.get(keys::SMTP_HOST).unwrap().as_deref(),
         Some("smtp.test.cn")
     );
-    let cfg = crate::conf::load(&dir);
+    let cfg = load(&dir);
     assert_eq!(
         cfg.get(keys::SMTP_HOST).map(String::as_str),
         Some("smtp.test.cn"),
@@ -370,15 +371,13 @@ fn config_keys_stored_in_toml_only() {
     );
     // 库中无配置键（验收拍板：DB 不保存 mailbox.toml 已有配置）
     {
-        let conn = crate::db::open(&dir.join("mailbox.db")).unwrap();
+        let conn = open(&dir.join("mailbox.db")).unwrap();
         assert!(
-            crate::db::settings::get(&conn, keys::SMTP_HOST)
-                .unwrap()
-                .is_none(),
+            settings::get(&conn, keys::SMTP_HOST).unwrap().is_none(),
             "配置键不得写库"
         );
         assert_eq!(
-            crate::db::settings::get(&conn, keys::KEEP_INBOX_DAYS)
+            settings::get(&conn, keys::KEEP_INBOX_DAYS)
                 .unwrap()
                 .as_deref(),
             Some("60"),

@@ -2,6 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
+use crate::mail::{get, save_draft};
 use crate::state::AppState;
 use std::path::PathBuf;
 
@@ -61,7 +62,7 @@ fn temp_state(tag: &str) -> (AppState, PathBuf) {
     (AppState::open(&dir), dir)
 }
 
-fn cleanup(dir: &std::path::Path) {
+fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -128,7 +129,7 @@ fn store_incoming_dedupes_and_sets_unread() {
     };
     let added = store_incoming(&state, &[with_attach]).unwrap();
     assert_eq!(added, 1);
-    let d = crate::mail::get(&state, 3).unwrap();
+    let d = get(&state, 3).unwrap();
     assert_eq!(d.attach_cnt, 1);
     assert_eq!(d.attachments[0].filename, "清单.xlsx");
     cleanup(&dir);
@@ -191,7 +192,7 @@ fn mark_seen_local_and_delegates_to_fetcher() {
         body_text: "体".into(),
         in_reply_to: None,
     };
-    let draft_id = crate::mail::save_draft(&state, &input).unwrap();
+    let draft_id = save_draft(&state, &input).unwrap();
     let fetcher3 = FakeFetcher::new();
     mark_seen(&state, &fetcher3, draft_id).unwrap();
     assert_eq!(

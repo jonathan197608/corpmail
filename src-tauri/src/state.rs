@@ -448,7 +448,7 @@ impl AppState {
     }
 
     /// 借出连接执行闭包（邮件存储层 mail 模块使用；锁随闭包返回释放）
-    pub fn with_conn<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+    pub fn with_conn<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
         let mut conn = self.db.lock().expect("数据库锁中毒");
         f(&mut conn)
     }
@@ -677,8 +677,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 /// 收件轮次任务参数（start_fetch 快照 → fetch_round 线程体）
 struct FetchJob {
     fetch_state: std::sync::Arc<Mutex<FetchState>>,
-    db_path: std::path::PathBuf,
-    data_dir: std::path::PathBuf,
+    db_path: PathBuf,
+    data_dir: PathBuf,
     host: String,
     port: u16,
     account: String,

@@ -39,6 +39,10 @@ tauri-plugin-dialog = "2"                                  # 系统文件/保存
 # NSIS 安装到 $INSTDIR 与主程序同级；Runtime 由安装器 embedBootstrapper 内嵌安装。
 # 主程序不再内嵌 Bootstrapper（原 ensure_runtime 已移除），无 runas/windows 依赖。
 
+[lints.rust]
+# 路径限定不必要（item 已在作用域仍写全路径）：cargo fix 可自动修复
+unused_qualifications = "warn"
+
 [profile.release]
 lto = "thin"
 strip = true

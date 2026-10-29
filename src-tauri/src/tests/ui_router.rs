@@ -2,6 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
+use crate::secrets::GetResult;
 use std::collections::HashMap;
 
 /// 假资源表（路径 → (MIME, 内容)）
@@ -153,7 +154,7 @@ fn list_page_shows_drafts_with_sidebar_counts() {
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let draft = |s: &str| crate::mail::DraftInput {
+    let draft = |s: &str| mail::DraftInput {
         id: None,
         from_addr: "demo@chinatelecom.cn".into(),
         from_name: "张伟".into(),
@@ -163,8 +164,8 @@ fn list_page_shows_drafts_with_sidebar_counts() {
         body_text: "配案正文预览".into(),
         in_reply_to: None,
     };
-    crate::mail::save_draft(&state, &draft("第一封草稿主题")).unwrap();
-    crate::mail::save_draft(&state, &draft("第二封草稿主题")).unwrap();
+    mail::save_draft(&state, &draft("第一封草稿主题")).unwrap();
+    mail::save_draft(&state, &draft("第二封草稿主题")).unwrap();
     let resp = route(
         &state,
         &assets(),
@@ -189,7 +190,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let draft = |s: &str| crate::mail::DraftInput {
+    let draft = |s: &str| mail::DraftInput {
         id: None,
         from_addr: "demo@chinatelecom.cn".into(),
         from_name: "张伟".into(),
@@ -199,8 +200,8 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
         body_text: "配案正文预览".into(),
         in_reply_to: None,
     };
-    crate::mail::save_draft(&state, &draft("激励配案通知")).unwrap();
-    crate::mail::save_draft(&state, &draft("无关主题邮件")).unwrap();
+    mail::save_draft(&state, &draft("激励配案通知")).unwrap();
+    mail::save_draft(&state, &draft("无关主题邮件")).unwrap();
     let tester = FakeTester {
         smtp_ok: true,
         imap_ok: true,
@@ -307,9 +308,9 @@ fn attachment_view_serves_bytes_with_safe_mime() {
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let id = crate::mail::save_draft(
+    let id = mail::save_draft(
         &state,
-        &crate::mail::DraftInput {
+        &mail::DraftInput {
             id: None,
             from_addr: "demo@chinatelecom.cn".into(),
             from_name: "张伟".into(),
@@ -327,7 +328,7 @@ fn attachment_view_serves_bytes_with_safe_mime() {
     std::fs::write(&txt, "纯文本内容").unwrap();
     let zip = dir.join("打包.zip");
     std::fs::write(&zip, b"zip-bytes").unwrap();
-    crate::mail::add_attachments(
+    mail::add_attachments(
         &state,
         id,
         &[
@@ -420,7 +421,7 @@ fn storage_pane_shows_estimate_and_clean_runs() {
     let (state, dir) = temp_state("m5-clean");
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
     // 过期 inbox 邮件（30 天策略，40 天前收到）
-    let now = crate::mail::now_epoch();
+    let now = mail::now_epoch();
     state.with_conn(|c| {
         c.execute(
             "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
@@ -500,7 +501,7 @@ fn storage_move_returns_pane_with_pending_dir() {
     assert!(html.contains("重启应用后启用"), "应提示重启生效：{html}");
     // 指针已写锚点库，启动解析定位新目录
     assert_eq!(
-        crate::state::AppState::resolve_start_dir(&dir),
+        AppState::resolve_start_dir(&dir),
         dest,
         "重启后应定位新目录"
     );
@@ -727,9 +728,9 @@ fn attachment_save_via_post_writes_file() {
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let id = crate::mail::save_draft(
+    let id = mail::save_draft(
         &state,
-        &crate::mail::DraftInput {
+        &mail::DraftInput {
             id: None,
             from_addr: "demo@chinatelecom.cn".into(),
             from_name: "张伟".into(),
@@ -743,7 +744,7 @@ fn attachment_save_via_post_writes_file() {
     .unwrap();
     let src = dir.join("源数据.txt");
     std::fs::write(&src, "attachment-content-123").unwrap();
-    crate::mail::add_attachments(&state, id, &[src.to_str().unwrap().into()]).unwrap();
+    mail::add_attachments(&state, id, &[src.to_str().unwrap().into()]).unwrap();
     // 详情页渲染附件行
     let html = body(&route(
         &state,
@@ -818,7 +819,7 @@ fn compose_draft_with_attachments_and_keep_ids() {
             .any(|(k, v)| k == "HX-Redirect" && v == "/compose?draft_id=1&saved=1"),
         "附件随草稿保存成功"
     );
-    let detail = crate::mail::get(&state, 1).unwrap();
+    let detail = mail::get(&state, 1).unwrap();
     assert_eq!(detail.attach_cnt, 1, "附件应入库");
     assert_eq!(detail.attachments[0].filename, "甲.txt");
     // 再次保存：keep_ids 空 → 裁剪既有附件
@@ -842,7 +843,7 @@ fn compose_draft_with_attachments_and_keep_ids() {
             imap_ok: true,
         },
     );
-    let detail = crate::mail::get(&state, 1).unwrap();
+    let detail = mail::get(&state, 1).unwrap();
     assert_eq!(detail.attach_cnt, 0, "keep_ids 空应裁剪全部既有附件");
     cleanup(&dir);
 }
@@ -1283,7 +1284,7 @@ fn wizard_save_success_redirects_and_persists() {
     // 凭据走 keychain/keyfile，不落 settings 明文
     assert!(matches!(
         state.retrieve_password("unit.router@chinatelecom.cn"),
-        crate::secrets::GetResult::Keychain(_) | crate::secrets::GetResult::Keyfile(_)
+        GetResult::Keychain(_) | GetResult::Keyfile(_)
     ));
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
@@ -1615,7 +1616,7 @@ fn settings_account_save_keeps_credential_when_blank() {
     assert!(
         matches!(
             state.retrieve_password("unit.router@chinatelecom.cn"),
-            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p)
+            GetResult::Keychain(p) | GetResult::Keyfile(p)
                 if p == "pw-test"
         ),
         "密码留空不应改动凭据"
@@ -1662,7 +1663,7 @@ fn wizard_save_with_custom_domain() {
     assert!(
         matches!(
             state.retrieve_password("unit.router@custom.cn"),
-            crate::secrets::GetResult::Keychain(_) | crate::secrets::GetResult::Keyfile(_)
+            GetResult::Keychain(_) | GetResult::Keyfile(_)
         ),
         "凭据应存到自定义域名账号下"
     );
@@ -1723,7 +1724,7 @@ fn settings_domain_change_migrates_credential() {
     assert!(
         matches!(
             state.retrieve_password("unit.router@custom.cn"),
-            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p)
+            GetResult::Keychain(p) | GetResult::Keyfile(p)
                 if p == "pw-test"
         ),
         "旧凭据应迁移到新域名账号"
@@ -1731,7 +1732,7 @@ fn settings_domain_change_migrates_credential() {
     assert!(
         matches!(
             state.retrieve_password("unit.router@chinatelecom.cn"),
-            crate::secrets::GetResult::Missing
+            GetResult::Missing
         ),
         "旧账号凭据应清除"
     );
@@ -1922,9 +1923,9 @@ fn dump_smoke_html() {
     dump("done.html", get("/welcome/done"));
 
     // M2 种子数据：草稿 ×2 + 收件 ×1（列表/详情/撰写冒烟用）
-    let d1 = crate::mail::save_draft(
+    let d1 = mail::save_draft(
         &state,
-        &crate::mail::DraftInput {
+        &mail::DraftInput {
             id: None,
             from_addr: "demo@chinatelecom.cn".into(),
             from_name: "张伟".into(),
@@ -1936,9 +1937,9 @@ fn dump_smoke_html() {
         },
     )
     .unwrap();
-    let d2 = crate::mail::save_draft(
+    let d2 = mail::save_draft(
         &state,
-        &crate::mail::DraftInput {
+        &mail::DraftInput {
             id: None,
             from_addr: "demo@chinatelecom.cn".into(),
             from_name: "张伟".into(),
@@ -2028,7 +2029,7 @@ fn dump_smoke_html() {
         std::fs::write(&src_txt, "附件文本内容样例".as_bytes()).unwrap();
         let src_zip = root.join("打包.zip");
         std::fs::write(&src_zip, b"zip-bytes").unwrap();
-        crate::mail::add_attachments(
+        mail::add_attachments(
             &state,
             d1,
             &[
@@ -2059,7 +2060,7 @@ fn dump_smoke_html() {
                  VALUES ('in', 'inbox', 'received', 'old@x.cn', '历史归档', 'demo@chinatelecom.cn',
                          '40天前的存量通知', '已超期的旧内容。', '40 天 前 的 存量 通知',
                          '已 超期 的 旧 内容', 0, ?1, ?1)",
-            [crate::mail::now_epoch() - 40 * 86_400],
+            [mail::now_epoch() - 40 * 86_400],
         )
         .unwrap();
     });
@@ -2075,7 +2076,7 @@ fn dump_smoke_html() {
 
     // M5 迁移后重启态：数据目录已在新位置、锚点（原目录）保留备份 → "删除备份"行
     {
-        let state2 = crate::state::AppState::open_with_anchor(&pending_target, &db_dir);
+        let state2 = AppState::open_with_anchor(&pending_target, &db_dir);
         let get2 = |path: &str| body(&route(&state2, &a, &req("GET", path, b""), &t));
         dump("settings-storage-backup.html", get2("/settings/storage"));
     }

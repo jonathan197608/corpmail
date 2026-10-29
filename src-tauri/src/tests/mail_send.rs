@@ -2,6 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
+use crate::mail::{DraftInput, save_draft};
 use crate::state::AppState;
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ fn cleanup(dir: &std::path::Path) {
 
 /// 排队态邮件（发件人固定单测账号，可带收件人覆盖）
 fn queued_email(state: &AppState, to: &str) -> i64 {
-    let input = crate::mail::DraftInput {
+    let input = DraftInput {
         id: None,
         from_addr: "demo@chinatelecom.cn".into(),
         from_name: "张伟".into(),
@@ -28,13 +29,13 @@ fn queued_email(state: &AppState, to: &str) -> i64 {
         body_text: "请查收汇总表。".into(),
         in_reply_to: None,
     };
-    let id = crate::mail::save_draft(state, &input).unwrap();
-    assert!(crate::mail::enqueue_draft(state, id));
+    let id = save_draft(state, &input).unwrap();
+    assert!(enqueue_draft(state, id));
     id
 }
 
-fn draft(subject: &str, body: &str) -> crate::mail::DraftInput {
-    crate::mail::DraftInput {
+fn draft(subject: &str, body: &str) -> DraftInput {
+    DraftInput {
         id: None,
         from_addr: "demo@chinatelecom.cn".into(),
         from_name: "单测用户".into(),
@@ -187,7 +188,7 @@ fn dispatch_rejects_non_queued_and_blank_recipients() {
     let sender = FakeSender::ok();
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     // draft 态直接派发：CAS 抢占失败
-    let id = crate::mail::save_draft(&state, &draft("未排队", "体")).unwrap();
+    let id = save_draft(&state, &draft("未排队", "体")).unwrap();
     assert!(
         state
             .with_conn(|c| dispatch_one(c, &sender, id, &smtp))
@@ -284,7 +285,7 @@ fn reopen_failed_returns_to_draft() {
 #[test]
 fn enqueue_is_cas_idempotent() {
     let (state, dir) = temp_state("m3-cas");
-    let id = crate::mail::save_draft(&state, &draft("入队", "体")).unwrap();
+    let id = save_draft(&state, &draft("入队", "体")).unwrap();
     assert!(enqueue_draft(&state, id), "首次入队成功");
     assert!(!enqueue_draft(&state, id), "重复入队应被拒（幂等）");
     let status: String = state.with_conn(|c| {

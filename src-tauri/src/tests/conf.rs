@@ -2,6 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
+use crate::state::keys;
 
 #[test]
 fn save_load_roundtrip_and_corrupt_tolerated() {
@@ -9,23 +10,17 @@ fn save_load_roundtrip_and_corrupt_tolerated() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut cfg = BTreeMap::new();
+    cfg.insert(keys::DATA_DIR.to_string(), "/Volumes/data/mail".to_string());
     cfg.insert(
-        crate::state::keys::DATA_DIR.to_string(),
-        "/Volumes/data/mail".to_string(),
-    );
-    cfg.insert(
-        crate::state::keys::DISPLAY_NAME.to_string(),
+        keys::DISPLAY_NAME.to_string(),
         "张三 \"引号\" = 等号".to_string(),
     );
     save(&dir, &cfg).unwrap();
     let back = load(&dir);
-    assert_eq!(
-        back.get(crate::state::keys::DATA_DIR).unwrap(),
-        "/Volumes/data/mail"
-    );
+    assert_eq!(back.get(keys::DATA_DIR).unwrap(), "/Volumes/data/mail");
     // 特殊字符 roundtrip 无损
     assert_eq!(
-        back.get(crate::state::keys::DISPLAY_NAME).unwrap(),
+        back.get(keys::DISPLAY_NAME).unwrap(),
         "张三 \"引号\" = 等号"
     );
     // 损坏文件 → 空 map（不 panic，自愈路径）
@@ -34,10 +29,7 @@ fn save_load_roundtrip_and_corrupt_tolerated() {
     // 未知键被忽略（只承载 CONFIG_KEYS）
     std::fs::write(
         dir.join(CONFIG_FILE),
-        format!(
-            "{} = \"x\"\nunknown_key = \"y\"\n",
-            crate::state::keys::SMTP_HOST
-        ),
+        format!("{} = \"x\"\nunknown_key = \"y\"\n", keys::SMTP_HOST),
     )
     .unwrap();
     let back2 = load(&dir);

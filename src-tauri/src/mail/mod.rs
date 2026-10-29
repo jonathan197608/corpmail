@@ -876,7 +876,7 @@ pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Res
             if orig.is_empty() {
                 return Err("附件为空文件".into());
             }
-            let filename = std::path::Path::new(p)
+            let filename = Path::new(p)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(safe_filename)
