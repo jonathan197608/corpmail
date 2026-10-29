@@ -1,6 +1,11 @@
-# ============================================================
+﻿# ============================================================
 # CorpMail · MSIX 商店包构建（Microsoft Store 渠道）· PowerShell 原生版
 # 宿主：Windows（需 Windows SDK：makeappx 打包 + WACK 校验）
+#
+# 【编码】本文件必须为 UTF-8 with BOM（当前已是）。Windows PowerShell 5.1
+#   对无 BOM 脚本按系统 ANSI（中文系统 = GBK）解码，中文注释与
+#   Write-Host 输出会乱码，甚至引发语法错误。
+#   编辑后请保留 BOM，勿转存为无 BOM UTF-8。
 #
 # 前置链路（部署方案确认）：
 #   1) macOS 交叉编译出 NSIS：scripts/build-windows.sh
@@ -25,7 +30,9 @@ $AssetsDir = Join-Path $ManifestDir "assets"
 $OutDir = Join-Path $ManifestDir "out"
 
 # ---- 版本：读 src-tauri/Cargo.toml（与商店 manifest 注入同源）----
-$CargoToml = Get-Content (Join-Path $Root "src-tauri\Cargo.toml") -Raw
+# 【中文兼容】Cargo.toml 含中文注释，无 BOM；PS5.1 的 -Raw 默认按 ANSI
+#   （GBK）解码会乱码，必须显式 -Encoding UTF8。下同（AppxManifest）。
+$CargoToml = Get-Content (Join-Path $Root "src-tauri\Cargo.toml") -Raw -Encoding UTF8
 if ($CargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
     Write-Error "[msix] 无法从 src-tauri/Cargo.toml 解析版本号"
 }
@@ -55,7 +62,9 @@ if (-not (Test-Path $sdkRoot)) {
     Write-Error "[msix] 未找到 Windows SDK（$sdkRoot）。请安装 Windows SDK（任意近版，勾选 SDK 桌版工具）。"
 }
 $makeappx = Get-ChildItem $sdkRoot -Directory |
-    Sort-Object Name -Descending |
+    # SDK 目录名为版本号（10.0.26100.0 等）：[version] 数值排序取最新；
+    # 字符串排序会把 10.0.9xxx 误排在 10.0.26xxx 前
+    Sort-Object { if ($_.Name -match '^\d+(\.\d+)+$') { [version]$_.Name } else { [version]'0.0' } } -Descending |
     ForEach-Object { Join-Path $_.FullName "x64\makeappx.exe" } |
     Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $makeappx) {
@@ -79,8 +88,10 @@ try {
     }
 
     # ---- 2) 版本号注入 manifest（四段制，末段 0）----
+    # 读显式 -Encoding UTF8（manifest 无 BOM 且含中文注释/名称，防 GBK 乱码）；
+    # 写回 -Encoding UTF8（PS5.1 = UTF-8 with BOM，XML 规范允许，makeappx 接受）
     $manifestPath = Join-Path $Stage "AppxManifest.xml"
-    (Get-Content $manifestPath -Raw) -replace 'Version="[0-9.]+"', "Version=""$Version.0""" |
+    (Get-Content $manifestPath -Raw -Encoding UTF8) -replace 'Version="[0-9.]+"', "Version="$Version.0"" |
         Set-Content $manifestPath -Encoding UTF8 -NoNewline
 
     # ---- 3) MakeAppx 打包 ----
