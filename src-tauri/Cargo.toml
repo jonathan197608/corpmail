@@ -1,6 +1,6 @@
 [package]
 name = "mailbox"
-version = "0.2.2"
+version = "0.2.3"
 description = "Mailbox - Tauri + htmx 桌面应用（Rust 端渲染，无 Node 构建链）"
 edition = "2024"
 
