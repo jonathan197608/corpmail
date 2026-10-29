@@ -32,6 +32,7 @@ jieba-rs = "0.11"                                          # 中文预分词（�
 flate2 = "1"                                               # 附件 gzip（§5.1 两级存储）
 sha2 = "0.10"                                              # 附件指纹（§5.1 sha256 列）
 tauri-plugin-dialog = "2"                                  # 系统文件/保存对话框（M2：附件选择与另存）
+tauri-plugin-single-instance = "2.5.5"
 
 # --- Windows 交付（设计 §11.2/11.3 v3.4：官方 NSIS 安装器）---
 # 零 vendor：上游 webview2-com-sys 0.39.1 gnu 目标动态链接 WebView2Loader.dll，

@@ -39,6 +39,16 @@ const APP_URL: &str = "ui://localhost/";
 /// 应用主入口
 pub fn run() {
     tauri::Builder::default()
+        // 单实例（首个注册，确保在其他插件初始化前拦截第二实例；
+        // 重复启动时聚焦已有主窗口而非新开，避免双实例并发写同一 SQLite/
+        // 附件目录（WAL 容许多连接，但收件/清理双线程互踩会互相平白发工作）。
+        // 第二实例不进入 run，交出 argv 后立即退出
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol("ui", |ctx, request| {
             let app = ctx.app_handle();
