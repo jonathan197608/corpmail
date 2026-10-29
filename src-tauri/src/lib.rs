@@ -64,50 +64,9 @@ pub fn run() {
             state.start_send_worker();
             app.manage(state);
 
-            // M4 收件调度（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。
-            // 调度线程持 AppHandle 取 State（设置每轮重读，改参数即时生效；0=仅手动）
-            let handle = app.app_handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let state = handle.state::<state::AppState>();
-                let on_start = state
-                    .get(state::keys::SYNC_ON_START)
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-                if on_start {
-                    state.start_fetch();
-                }
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                    let state = handle.state::<state::AppState>();
-                    let only_manual = state
-                        .get(state::keys::SYNC_INTERVAL_MIN)
-                        .flatten()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(30);
-                    if only_manual > 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            only_manual.saturating_sub(1).saturating_mul(60),
-                        ));
-                        state.start_fetch();
-                    }
-                }
-            });
-
-            // M5 存储清理器（§5.2）：启动 30s 首清（避开启动高峰）+ 每 24h 循环；
-            // 策略每轮重读（设置页改保留天数即时生效）；失败仅记日志，下轮再试
-            let clean_handle = app.app_handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                loop {
-                    let state = clean_handle.state::<state::AppState>();
-                    if let Err(err) = clean::run(&state) {
-                        eprintln!("[clean] 清理器执行失败：{err}");
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
-                }
-            });
+            // M4 收件调度 + M5 清理器：常驻线程（每轮重读设置，改参数即时生效）
+            spawn_fetch_scheduler(app.app_handle().clone());
+            spawn_clean_scheduler(app.app_handle().clone());
 
             let url: tauri::Url = APP_URL.parse().expect("入口 URL 为常量，恒合法");
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
@@ -127,4 +86,51 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("Mailbox 运行失败");
+}
+
+/// 收件调度线程（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。
+/// 每轮重读设置（改参数即时生效；间隔 0 = 仅手动）。
+fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let state = handle.state::<state::AppState>();
+        let on_start = state
+            .get(state::keys::SYNC_ON_START)
+            .flatten()
+            .map(|v| v != "false")
+            .unwrap_or(true);
+        if on_start {
+            state.start_fetch();
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let state = handle.state::<state::AppState>();
+            let interval = state
+                .get(state::keys::SYNC_INTERVAL_MIN)
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30);
+            if interval > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(
+                    interval.saturating_sub(1).saturating_mul(60),
+                ));
+                state.start_fetch();
+            }
+        }
+    });
+}
+
+/// 存储清理器线程（§5.2）：启动 30s 首清（避开启动高峰）+ 每 24h 循环；
+/// 策略每轮重读；失败仅记日志，下轮再试。
+fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        loop {
+            let state = handle.state::<state::AppState>();
+            if let Err(err) = clean::run(&state) {
+                eprintln!("[clean] 清理器执行失败：{err}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        }
+    });
 }

@@ -321,72 +321,17 @@ impl AppState {
         let db_path = self.data_dir.join("mailbox.db");
         let data_dir = self.data_dir.clone();
         std::thread::spawn(move || {
-            let finish = |new_count: i64, error: String| {
-                let mut s = fetch_state.lock().expect("收件状态锁中毒");
-                s.running = false;
-                s.new_count = new_count;
-                s.last_error = error;
-                s.just_finished = true;
-            };
-            let Ok(mut conn) = crate::db::open(&db_path) else {
-                finish(0, "本地数据库打开失败".into());
-                return;
-            };
-            // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
-            // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
-            // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
-            let last_uid = last.uid;
-            let last_uidvalidity = last.uidvalidity;
-            let outcome: Result<(crate::mail::FetchOutcome, usize), String> =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let outcome = crate::mail::MailFetcher::fetch(
-                        &crate::mail::RealFetcher,
-                        &host,
-                        port,
-                        &account,
-                        &password,
-                        first_days,
-                        last,
-                    )?;
-                    // 入库与网络拉取同属关键路径：两者任一 panic 都必须复位状态
-                    let added =
-                        crate::mail::store_incoming_conn(&mut conn, &data_dir, &outcome.mails)?;
-                    Ok((outcome, added))
-                })) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
-                        Err("收件内部异常终止，请重试收取".into())
-                    }
-                };
-            match outcome {
-                Ok((outcome, added)) => {
-                    // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
-                    // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
-                    // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
-                    // uidvalidity 变化时 UID 空间重置，必须无条件采纳新值。
-                    let set = |k: &str, v: &str| {
-                        let _ = crate::db::settings::set(&conn, k, v);
-                    };
-                    set(keys::LAST_UIDVALIDITY, &outcome.uidvalidity.to_string());
-                    if outcome.max_uid > 0
-                        && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
-                    {
-                        set(keys::LAST_UID, &outcome.max_uid.to_string());
-                    }
-                    set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
-                    eprintln!(
-                        "[fetch] 完成：命中游标 uid={}，解析 {} 封，入库 {added} 封",
-                        outcome.max_uid,
-                        outcome.mails.len()
-                    );
-                    finish(added as i64, String::new());
-                }
-                Err(e) => {
-                    eprintln!("[fetch] 失败：{e}");
-                    finish(0, e);
-                }
-            }
+            fetch_round(FetchJob {
+                fetch_state,
+                db_path,
+                data_dir,
+                host,
+                port,
+                account,
+                password,
+                first_days,
+                last,
+            });
         });
     }
 
@@ -690,6 +635,100 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 收件轮次任务参数（start_fetch 快照 → fetch_round 线程体）
+struct FetchJob {
+    fetch_state: std::sync::Arc<Mutex<FetchState>>,
+    db_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    host: String,
+    port: u16,
+    account: String,
+    password: String,
+    first_days: i64,
+    last: crate::mail::LastCursor,
+}
+
+/// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
+/// 独立连接访问数据库（与主连接、发送 worker 并行，WAL 读写不互阻）。
+fn fetch_round(job: FetchJob) {
+    let FetchJob {
+        fetch_state,
+        db_path,
+        data_dir,
+        host,
+        port,
+        account,
+        password,
+        first_days,
+        last,
+    } = job;
+    let finish = |new_count: i64, error: String| {
+        let mut s = fetch_state.lock().expect("收件状态锁中毒");
+        s.running = false;
+        s.new_count = new_count;
+        s.last_error = error;
+        s.just_finished = true;
+    };
+    let Ok(mut conn) = crate::db::open(&db_path) else {
+        finish(0, "本地数据库打开失败".into());
+        return;
+    };
+    // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
+    // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
+    // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
+    let last_uid = last.uid;
+    let last_uidvalidity = last.uidvalidity;
+    let outcome: Result<(crate::mail::FetchOutcome, usize), String> =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome = crate::mail::MailFetcher::fetch(
+                &crate::mail::RealFetcher,
+                &host,
+                port,
+                &account,
+                &password,
+                first_days,
+                last,
+            )?;
+            // 入库与网络拉取同属关键路径：两者任一 panic 都必须复位状态
+            let added = crate::mail::store_incoming_conn(&mut conn, &data_dir, &outcome.mails)?;
+            Ok((outcome, added))
+        })) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
+                Err("收件内部异常终止，请重试收取".into())
+            }
+        };
+    match outcome {
+        Ok((outcome, added)) => {
+            // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
+            // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
+            // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
+            // uidvalidity 变化时 UID 空间重置，必须无条件采纳新值。
+            let set = |k: &str, v: &str| {
+                let _ = crate::db::settings::set(&conn, k, v);
+            };
+            set(keys::LAST_UIDVALIDITY, &outcome.uidvalidity.to_string());
+            if outcome.max_uid > 0
+                && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
+            {
+                set(keys::LAST_UID, &outcome.max_uid.to_string());
+            }
+            set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
+            eprintln!(
+                "[fetch] 完成：命中游标 uid={}，解析 {} 封，入库 {added} 封",
+                outcome.max_uid,
+                outcome.mails.len()
+            );
+            finish(added as i64, String::new());
+        }
+        Err(e) => {
+            eprintln!("[fetch] 失败：{e}");
+            finish(0, e);
+        }
+    }
 }
 
 #[cfg(test)]

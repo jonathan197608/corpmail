@@ -165,7 +165,10 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
         return out;
     };
     let grace = std::time::Duration::from_secs(ORPHAN_GRACE_SECS);
-    let stale_before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64) - grace;
+    // 时钟早于 1970+1h（极端测试/系统时钟错拨）时判不出孤儿：全部跳过，防 Duration 下溢 panic
+    let stale_before = std::time::Duration::from_secs(now.max(0) as u64)
+        .checked_sub(grace)
+        .map(|d| std::time::UNIX_EPOCH + d);
     for month in months.flatten() {
         if !month.path().is_dir() {
             continue;
@@ -192,10 +195,14 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
                     continue;
                 }
                 // mtime 宽限：刚落盘的文件（可能是收件竞态窗口）本轮跳过
-                let stale = std::fs::metadata(&path)
-                    .and_then(|md| md.modified())
-                    .map(|t| t < stale_before)
-                    .unwrap_or(false);
+                // mtime 宽限：刚落盘的文件（可能是收件竞态窗口）本轮跳过；
+                // stale_before 为 None（系统时钟异常）时按不超期处理
+                let stale = stale_before.is_some_and(|cut| {
+                    std::fs::metadata(&path)
+                        .and_then(|md| md.modified())
+                        .map(|t| t < cut)
+                        .unwrap_or(false)
+                });
                 if !stale {
                     continue;
                 }

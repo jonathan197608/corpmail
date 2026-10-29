@@ -5,6 +5,7 @@
 
 mod assets;
 mod router;
+mod settings;
 
 use std::borrow::Cow;
 use tauri::http::{Response, StatusCode, header};

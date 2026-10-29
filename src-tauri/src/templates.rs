@@ -45,9 +45,16 @@ const TEMPLATES: &[(&str, &str)] = &[
     ),
 ];
 
+/// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义，
+/// 任何字符（含单引号/换行/反斜杠/代理对）都不会破坏外层单引号属性
+fn js_str(s: String) -> String {
+    serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 fn build_env() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_auto_escape_callback(minijinja::default_auto_escape_callback);
+    env.add_filter("js_str", js_str);
     for (name, src) in TEMPLATES {
         // include_str 内嵌的模板编译失败属于程序 bug（模板语法错误），直接 panic 暴露
         env.add_template(name, src).expect("模板语法有误");
