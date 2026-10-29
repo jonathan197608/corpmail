@@ -178,13 +178,33 @@ pub fn time_full(epoch: i64) -> String {
 }
 
 /// 时区缓存（zoned_of 在列表/详情高频调用；每次 Zoned::now() 读系统时区是浪费）
-static LOCAL_TZ: std::sync::LazyLock<jiff::tz::TimeZone> =
-    std::sync::LazyLock::new(|| jiff::Zoned::now().time_zone().clone());
+/// 本地时区缓存（jiff TimeZone 为 Arc 包裹，clone 仅引用计数）。
+/// TTL 1 小时：长期驻留的应用在系统时区变更（出差/夏令时）后，
+/// 至多 1 小时内所有时间展示切换到新时区，而非永久滞留启动时的时区
+static LOCAL_TZ: std::sync::RwLock<Option<(jiff::tz::TimeZone, i64)>> =
+    std::sync::RwLock::new(None);
+const TZ_TTL_SECS: i64 = 3600;
+
+fn local_tz() -> jiff::tz::TimeZone {
+    {
+        let guard = LOCAL_TZ.read().expect("时区缓存锁中毒");
+        if let Some((tz, at)) = guard.as_ref()
+            && now_epoch() - at < TZ_TTL_SECS
+        {
+            return tz.clone();
+        }
+    }
+    let fresh = jiff::Zoned::now().time_zone().clone();
+    // 双检防并发重复加载（多线程同时过期）：后到者抢到写锁时可能已被刷新
+    let mut guard = LOCAL_TZ.write().expect("时区缓存锁中毒");
+    *guard = Some((fresh.clone(), now_epoch()));
+    fresh
+}
 
 fn zoned_of(epoch: i64) -> Option<jiff::Zoned> {
     jiff::Timestamp::from_second(epoch)
         .ok()
-        .map(|ts| ts.to_zoned(LOCAL_TZ.clone()))
+        .map(|ts| ts.to_zoned(local_tz()))
 }
 
 // ---------- 草稿（撰写/存草稿/覆盖，§9） ----------

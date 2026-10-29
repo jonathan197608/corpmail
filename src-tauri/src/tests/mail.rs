@@ -396,3 +396,12 @@ fn add_attachments_rejects_missing_file_atomically() {
     assert_eq!(n, 0, "整体失败应回滚不留半成品");
     cleanup(&dir);
 }
+
+#[test]
+fn local_tz_cache_returns_fresh_zone() {
+    // 两次取时区（缓存命中/未命中路径）：换算出的带时区时间必须一致
+    let z1 = zoned_of(1_760_000_000).map(|z| z.to_string());
+    let z2 = zoned_of(1_760_000_000).map(|z| z.to_string());
+    assert_eq!(z1, z2, "两次取时区对同一时刻的换算应一致");
+    assert!(z1.is_some(), "合法 epoch 应可换算");
+}

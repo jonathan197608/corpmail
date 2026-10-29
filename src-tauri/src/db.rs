@@ -17,6 +17,10 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // WAL 自动 checkpoint 阈值（页）：默认 1000（≈4MB）即可，行此 pragma
+    // 是显式固化该行为——防将来依赖环境差异。本应用无长读事务
+    // （所有 with_conn 闭包均为短查询），autocheckpoint 不会被持续推迟
+    conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
     migrate(&conn)?;
     Ok(conn)
 }
