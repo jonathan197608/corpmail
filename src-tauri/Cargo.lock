@@ -2568,6 +2568,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "toml 0.8.2",
  "url",
 ]
 

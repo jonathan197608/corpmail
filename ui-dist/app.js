@@ -62,34 +62,47 @@ function mbxRemoveKept(aid, btn) {
 }
 
 // ---------- 详情页：附件另存为（dialog 选保存路径 → htmx POST） ----------
+// 请求护栏（M5 防抖审计）：在途期间重复点击忽略
+let mbxSaveBusy = false;
 
 async function mbxSaveAttachment(emailId, attachId, filename) {
+    if (mbxSaveBusy) return;
+    mbxSaveBusy = true;
     try {
         const dest = await window.__TAURI__.dialog.save({ defaultPath: filename });
         if (!dest) return;
-        htmx.ajax('POST', `/emails/${emailId}/attachments/${attachId}`, {
+        await htmx.ajax('POST', `/emails/${emailId}/attachments/${attachId}`, {
             target: '#toast',
             swap: 'innerHTML',
             values: { dest }
         });
     } catch (e) {
         console.error('[mbx] 保存对话框失败', e);
+    } finally {
+        mbxSaveBusy = false;
     }
 }
 
 // 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
-// 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区
+// 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区。
+// 请求护栏（M5 防抖审计）：弹窗+请求全程只允许一次在途
+let mbxMoveBusy = false;
+
 async function mbxMoveDataDir() {
+    if (mbxMoveBusy) return;
+    mbxMoveBusy = true;
     try {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
-        htmx.ajax('POST', '/settings/storage/move', {
+        await htmx.ajax('POST', '/settings/storage/move', {
             target: '#settings-pane',
             swap: 'outerHTML',
             values: { dest: dir }
         });
     } catch (e) {
         console.error('[mbx] 打开目录对话框失败', e);
+    } finally {
+        mbxMoveBusy = false;
     }
 }
 

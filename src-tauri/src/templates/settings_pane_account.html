@@ -1,6 +1,6 @@
 {# 设置·账号 pane（上下文：SettingsCtx）#}
 <div class="settings-pane on" id="settings-pane">
-    <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML">
+    <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
         <div class="card settings-card">
             <h3>发信（SMTP）</h3>
             <p class="desc">修改后请重新测试连接。凭据保存在操作系统凭据保管中。</p>

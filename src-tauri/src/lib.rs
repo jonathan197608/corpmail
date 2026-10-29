@@ -10,6 +10,7 @@
 //! macOS/Linux 直接使用原生 scheme，二者对页面同源、无 CORS 差异。
 
 mod clean;
+mod conf;
 mod conncheck;
 mod db;
 mod mail;

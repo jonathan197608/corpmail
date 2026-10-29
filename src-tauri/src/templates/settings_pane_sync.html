@@ -1,6 +1,6 @@
 {# 设置·收件同步 pane（上下文：SettingsCtx）#}
 <div class="settings-pane on" id="settings-pane">
-    <form hx-post="/settings/sync/save" hx-target="#settings-pane" hx-swap="outerHTML">
+    <form hx-post="/settings/sync/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
         <div class="card settings-card">
             <h3>收件同步</h3>
             <p class="desc">收件为手动 + 定时模式，均带防抖，避免频繁连接服务器。</p>

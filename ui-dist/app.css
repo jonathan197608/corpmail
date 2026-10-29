@@ -1156,6 +1156,11 @@ body {
     vertical-align: middle;
 }
 
+.backup-size {
+    white-space: nowrap;
+    flex: none;
+}
+
 .kv .k small {
     display: block;
     color: var(--muted);

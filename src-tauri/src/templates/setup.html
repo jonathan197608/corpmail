@@ -11,7 +11,7 @@
                 <span class="step"><span class="n">3</span> 完成</span>
             </div>
 
-            <form class="setup-card" hx-post="/welcome/setup/save" hx-target="#test-results" hx-swap="innerHTML">
+            <form class="setup-card" hx-post="/welcome/setup/save" hx-target="#test-results" hx-swap="innerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
                 <h3>配置邮箱账号</h3>
                 <p class="desc">填写后会自动测试发信与收信通道，全部通过才会保存。</p>
 

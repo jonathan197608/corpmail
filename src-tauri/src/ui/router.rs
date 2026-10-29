@@ -246,6 +246,11 @@ struct SettingsCtx {
     clean_view: Option<CleanView>,
     // 待生效的数据目录（M5 迁移成功后展示，重启后消失）
     pending_dir: String,
+    // 旧目录迁移备份（M5：锚点中的库/附件副本；仅存储 tab 且已迁移时展示）
+    has_backup: bool,
+    backup_size: String,
+    backup_files: u64,
+    backup_view: Option<BackupDeleteView>,
     // 关于 tab
     app_version: String,
     sqlite_version: String,
@@ -260,6 +265,13 @@ struct CleanView {
     removed: u64,
     orphans: u64,
     error: String,
+}
+
+/// 删除迁移备份结果展示（存储页；ok=false 时展示失败原因）
+#[derive(Serialize)]
+struct BackupDeleteView {
+    ok: bool,
+    msg: String,
 }
 
 /// 连接测试结果片段
@@ -360,6 +372,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", "/settings/storage/save") => Some(settings_storage_save(state, req)),
         ("POST", "/settings/storage/clean") => Some(settings_storage_clean(state)),
         ("POST", "/settings/storage/move") => Some(settings_storage_move(state, req)),
+        ("POST", "/settings/storage/backup/delete") => Some(settings_backup_delete(state)),
         _ => None,
     }
 }
@@ -836,13 +849,16 @@ fn wizard_done(state: &AppState) -> Resp {
 }
 
 fn settings_page(state: &AppState, tab: &str) -> Resp {
-    render_html("settings.html", &settings_ctx(state, tab, false, "", None))
+    render_html(
+        "settings.html",
+        &settings_ctx(state, tab, false, "", None, None),
+    )
 }
 
 fn settings_pane_fragment(state: &AppState, tab: &str) -> Resp {
     render_html(
         &pane_template(tab),
-        &settings_ctx(state, tab, false, "", None),
+        &settings_ctx(state, tab, false, "", None, None),
     )
 }
 
@@ -1082,7 +1098,7 @@ fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
     };
     render_html(
         &pane_template("storage"),
-        &settings_ctx(state, "storage", false, &error, None),
+        &settings_ctx(state, "storage", false, &error, None, None),
     )
 }
 
@@ -1128,7 +1144,17 @@ fn settings_ctx(
     saved: bool,
     error: &str,
     clean: Option<CleanView>,
+    backup: Option<BackupDeleteView>,
 ) -> SettingsCtx {
+    // M5 旧目录迁移备份：仅存储 tab 计算（递归扫描锚点附件）
+    let (has_backup, backup_size, backup_files) = if tab == "storage" {
+        match state.old_backup_stats() {
+            Some((b, n)) => (true, human_bytes(b), n),
+            None => (false, String::new(), 0),
+        }
+    } else {
+        (false, String::new(), 0)
+    };
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let counts = state.folder_counts();
@@ -1225,6 +1251,10 @@ fn settings_ctx(
         } else {
             String::new()
         },
+        has_backup,
+        backup_size,
+        backup_files,
+        backup_view: backup,
         app_version: env!("CARGO_PKG_VERSION").into(),
         sqlite_version: state.sqlite_version(),
     }
@@ -1233,21 +1263,21 @@ fn settings_ctx(
 fn account_pane(state: &AppState, saved: bool, error: &str) -> Resp {
     render_html(
         &pane_template("account"),
-        &settings_ctx(state, "account", saved, error, None),
+        &settings_ctx(state, "account", saved, error, None, None),
     )
 }
 
 fn sync_pane(state: &AppState, saved: bool) -> Resp {
     render_html(
         &pane_template("sync"),
-        &settings_ctx(state, "sync", saved, "", None),
+        &settings_ctx(state, "sync", saved, "", None, None),
     )
 }
 
 fn storage_pane(state: &AppState, saved: bool) -> Resp {
     render_html(
         &pane_template("storage"),
-        &settings_ctx(state, "storage", saved, "", None),
+        &settings_ctx(state, "storage", saved, "", None, None),
     )
 }
 
@@ -1273,7 +1303,30 @@ fn settings_storage_clean(state: &AppState) -> Resp {
     };
     render_html(
         &pane_template("storage"),
-        &settings_ctx(state, "storage", false, "", Some(view)),
+        &settings_ctx(state, "storage", false, "", Some(view), None),
+    )
+}
+
+/// 设置·存储管理：删除旧目录迁移备份（M5 验收功能；清锚点 mailbox.db[-wal/-shm]
+/// 与 attachments/，配置文件 mailbox.conf 与当前数据不受影响；回 pane 带结果）
+fn settings_backup_delete(state: &AppState) -> Resp {
+    let view = match state.delete_old_backup() {
+        Ok((freed, files)) => BackupDeleteView {
+            ok: true,
+            msg: format!(
+                "已删除迁移备份，释放 {}（{} 个文件）",
+                human_bytes(freed),
+                files
+            ),
+        },
+        Err(err) => BackupDeleteView {
+            ok: false,
+            msg: err,
+        },
+    };
+    render_html(
+        &pane_template("storage"),
+        &settings_ctx(state, "storage", false, "", None, Some(view)),
     )
 }
 
@@ -3418,13 +3471,19 @@ mod tests {
         state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
         dump("settings-storage-pending.html", get("/settings/storage"));
 
-        // M5 迁移待生效素材：锚点库写指针（temp_state 的锚点=数据目录）→ pane 显示"待生效目录"行
+        // M5 迁移素材：真迁移（快照 + 附件复制 + mailbox.conf 指针）→ pane 显示"待生效目录"行
         let pending_target = root.join("pending-target");
-        std::fs::create_dir_all(&pending_target).unwrap();
         state
-            .set_batch(&[(keys::DATA_DIR, pending_target.to_str().unwrap())])
+            .move_data_dir(pending_target.to_str().unwrap())
             .unwrap();
         dump("settings-storage-moved.html", get("/settings/storage"));
+
+        // M5 迁移后重启态：数据目录已在新位置、锚点（原目录）保留备份 → "删除备份"行
+        {
+            let state2 = crate::state::AppState::open_with_anchor(&pending_target, &db_dir);
+            let get2 = |path: &str| body(&route(&state2, &a, &req("GET", path, b""), &t));
+            dump("settings-storage-backup.html", get2("/settings/storage"));
+        }
 
         // 测试连接片段演示页（成功 + 失败双态 + 未保存提示）
         let frag = test_fragment(
