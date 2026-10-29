@@ -2226,3 +2226,62 @@ fn dump_smoke_html() {
     }
     let _ = std::fs::remove_dir_all(&db_dir);
 }
+
+#[test]
+fn router_tolerates_malformed_requests() {
+    // 协议层契约探针：畸形方法/路径/大小写/查询串不 panic，行为有界
+    let (state, dir) = temp_state("fuzz-req");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let a = assets();
+    // 1) 大小写方法名（非标准形式应 404/落空，不得 panic）
+    for m in ["get", "GET ", "PATCH", "CONNECT"] {
+        let resp = route(&state, &a, &req(m, "/", b""), &t);
+        assert!(resp.status == 200 || resp.status == 404, "{m} 应有界响应");
+    }
+    // 2) 路径边界：编码点、空段、超长
+    for p in [
+        "/%2e%2e/etc",
+        "//",
+        "/emails/",
+        "/emails/-1",
+        "/emails/99999999999999999999",
+        "/settings/panes/",
+        "/settings/panes/unknown",
+        &format!("/emails/{}", "9".repeat(40)),
+    ] {
+        let resp = route(&state, &a, &req("GET", p, b""), &t);
+        assert!(resp.status == 200 || resp.status == 404, "{p} 应有界响应");
+    }
+    // 3) 未配置状态下的全部动态路由 → 欢迎页（强制入口），不 panic
+    let (fresh, fdir) = temp_state("fuzz-req-fresh");
+    for p in [
+        "/",
+        "/compose",
+        "/emails/1",
+        "/settings",
+        "/welcome/done",
+        "/emails/fetch",
+    ] {
+        let resp = route(&fresh, &a, &req("GET", p, b""), &t);
+        assert_eq!(resp.status, 200, "{p} 未配置应渲染欢迎页");
+    }
+    // 4) 畸形表单体：非 UTF-8 字节 / 断半 percent 编码 / 巨参
+    for body in [
+        &b"subject=\xff\xfe"[..],
+        b"a=%E4%B8",
+        b"a=%zz&b=1",
+        &vec![b'x'; 1_000_000][..],
+    ] {
+        let resp = route(&state, &a, &req("POST", "/settings/sync/save", body), &t);
+        assert!(
+            resp.status == 200 || resp.status == 404,
+            "畸形表单应有界响应"
+        );
+    }
+    std::fs::remove_dir_all(&fdir).unwrap();
+    cleanup(&dir);
+}

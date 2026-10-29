@@ -350,3 +350,41 @@ fn parse_incoming_extracts_headers_and_body() {
     assert!(!mail.seen);
     assert_eq!(mail.uid, 99);
 }
+
+#[test]
+fn parse_incoming_tolerates_malformed_mime() {
+    // 模糊面探针：畸形输入不 panic、有界返回（真实邮件网关产物千奇百怪）
+    let cases: Vec<Vec<u8>> = vec![
+        b"".to_vec(),                                                           // 空报文
+        b"\r\n".to_vec(),                                                       // 纯换行
+        b"From:".to_vec(),                                                      // 无值头
+        b"From: \x80\x81\xff".to_vec(),                                         // 非法 UTF-8 字节
+        b"Subject: =?utf-8?B?????=".to_vec(),                                   // 损坏 RFC2047
+        b"Subject: =?bogus-charset?Q?x?=".to_vec(),                             // 未知 charset
+        b"Content-Type: multipart/mixed; boundary=".to_vec(),                   // 空 boundary
+        b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n".to_vec(),   // 不闭合 multipart
+        b"Content-Type: multipart/mixed\r\n\r\n[no parts]".to_vec(), // 无 boundary 的 multipart
+        b"Subject: a\r\n\r\nb\xc3(b\xd1\xff".to_vec(),               // 正文非法 UTF-8
+        format!("Subject: {}\r\n\r\nx", "\u{4e00}".repeat(50000)).into_bytes(), // 超长主题
+    ];
+    for (i, raw) in cases.iter().enumerate() {
+        let out = parse_incoming(1, 1, false, Some(1), raw);
+        // 允许 None（解析失败跳过）或 Some；断言主题有界
+        if let Some(m) = out {
+            assert!(m.subject.chars().count() < 100_000, "case {i} 主题超界");
+        }
+    }
+}
+
+#[test]
+fn walk_attachments_tolerates_deep_nesting() {
+    // 深嵌套 multipart：100 层（真实炸弹邮件结构）。递归 walk_attachments
+    // 必须不栈溢出（100 层远低于触发线则通过；真正防线是 IMAP 拉取大小本身）
+    let mut raw = String::from("Content-Type: multipart/mixed; boundary=B\r\n\r\n");
+    for _ in 0..100 {
+        raw.push_str("--B\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n");
+    }
+    raw.push_str("--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B--\r\n");
+    let parsed = mailparse::parse_mail(raw.as_bytes()).unwrap();
+    let _ = collect_attachments(&parsed); // 不 panic 即过
+}
