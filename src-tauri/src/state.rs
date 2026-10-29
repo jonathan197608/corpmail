@@ -151,7 +151,8 @@ impl AppState {
     }
 
     /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
-    /// 成功后返回用户提示文案；原目录保留为备份（用户确认无误后可手动删除）。
+    /// 成功后返回用户提示文案；mailbox.db/attachments 为备份可删，
+    /// data-dir.txt 为定位文件不可删（验收拍板）。
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
     /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
     pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
@@ -204,7 +205,7 @@ impl AppState {
         .map_err(|e| format!("指针文件写入失败：{e}"))?;
 
         Ok(format!(
-            "数据已迁移到新目录，重启应用后生效；原目录保留为备份（请勿删除其中的 mailbox.db 与 data-dir.txt）：{}",
+            "数据已迁移到新目录，重启应用后生效。注意：原目录中 data-dir.txt 是定位文件不可删除；mailbox.db 与 attachments 仅为备份，确认迁移成功后可自行删除。原目录：{}",
             cur.display()
         ))
     }
@@ -494,16 +495,31 @@ impl AppState {
     /// 待生效的数据目录（M5 迁移）：读锚点库的 data_dir_override 指针；
     /// 重启后 resolve_start_dir 应用指针、其值 == 当前目录，提示自然消失
     pub fn pending_data_dir(&self) -> Option<String> {
-        let conn = crate::db::open(&self.anchor_dir.join("mailbox.db")).ok()?;
-        let over = crate::db::settings::get(&conn, keys::DATA_DIR)
-            .ok()
-            .flatten()?;
+        // 双源读取（与 resolve_start_dir 一致）：锚点库存在才打开（不复活被删的库），
+        // 否则读指针文件；语义同为"指针指向另一可用目录且尚未生效"
+        let over = self.read_anchor_pointer()?;
         let pending = PathBuf::from(&over);
-        if pending != self.data_dir && pending.is_dir() {
+        if pending != self.data_dir && pending.join("mailbox.db").is_file() {
             Some(over)
         } else {
             None
         }
+    }
+
+    /// 锚点指针双源读取：锚点库（存在才打开，探测无副作用）优先，data-dir.txt 兑底
+    fn read_anchor_pointer(&self) -> Option<String> {
+        let anchor_db = self.anchor_dir.join("mailbox.db");
+        if anchor_db.is_file() {
+            let conn = crate::db::open(&anchor_db).ok()?;
+            if let Some(p) = crate::db::settings::get(&conn, keys::DATA_DIR)
+                .ok()
+                .flatten()
+                && !p.is_empty()
+            {
+                return Some(p);
+            }
+        }
+        read_pointer_file(&self.anchor_dir)
     }
 
     /// 数据目录下的独立附件占用（M1 尚无附件；目录不存在 → 0）：(字节, 文件数)
@@ -767,12 +783,45 @@ mod tests {
             .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "自定义目录数据完整");
+        // 邮箱验收拍板：mailbox.db 可删（备份）；删后 pending 双源读文件指针，
+        // 且不得在锚点目录"复活"新的空库文件（模拟重启后状态：数据目录已在新位置）
+        let state2 = AppState::open_with_anchor(&dest, &anchor);
+        assert!(
+            !anchor.join("mailbox.db").exists(),
+            "open+pending 读取不得复活锚点库文件"
+        );
+        assert_eq!(
+            state2.pending_data_dir(),
+            None,
+            "指针已生效（==当前目录）应无待生效提示"
+        );
         // 指针文件也失效（指向已删目录）→ 回退锚点
         std::fs::write(anchor.join(DATA_DIR_POINTER), "/nonexistent/usb-gone").unwrap();
         assert_eq!(
             AppState::resolve_start_dir(&anchor),
             anchor,
             "双指针均失效应回退锚点"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pending_data_dir_reads_file_pointer_after_db_delete() {
+        // 未重启状态下删锚点库：待生效目录应从 data-dir.txt 读出（迁移待生效仍可见）
+        let base = temp_dir("pending-fptr");
+        let anchor = base.join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let state = AppState::open(&anchor);
+        let dest = base.join("moved");
+        state.move_data_dir(dest.to_str().unwrap()).unwrap();
+        let _ = state;
+        std::fs::remove_file(anchor.join("mailbox.db")).unwrap();
+        // 重新打开（锚点=默认目录，数据目录也还是它——模拟未重启进程）
+        let state2 = AppState::open_with_anchor(&anchor, &anchor);
+        assert_eq!(
+            state2.pending_data_dir().as_deref(),
+            Some(dest.to_str().unwrap()),
+            "迁移待生效应能从指针文件读出"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

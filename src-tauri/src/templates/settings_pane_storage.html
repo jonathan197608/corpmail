@@ -4,7 +4,7 @@
     <div class="card compose-note err">✕ {{ error }}</div>
     {% endif %}
     {% if pending_dir %}
-    <div class="card compose-note ok">✓ 数据已迁移，重启应用后启用新目录（原目录保留为备份）</div>
+    <div class="card compose-note ok">✓ 数据已迁移，重启应用后启用新目录（原目录中 data-dir.txt 为定位文件请勿删除；mailbox.db 为备份可删）</div>
     {% endif %}
     <form hx-post="/settings/storage/save" hx-target="#settings-pane" hx-swap="outerHTML">
         <div class="card settings-card">
@@ -12,7 +12,7 @@
             <p class="desc">附件压缩后超过内联上限的不入库，单独存文件。</p>
 
             <div class="kv">
-                <span class="k">数据目录<small>数据库与附件文件所在位置；迁移后重启生效，原目录保留为备份</small></span>
+                <span class="k">数据目录<small>数据库与附件文件所在位置；迁移后重启生效，原目录仅 data-dir.txt 为必需文件</small></span>
                 <span class="kv-val">
                     <span class="mono dir-path" title="{{ data_dir }}">{{ data_dir }}</span>
                     <button type="button" class="btn small" onclick="mbxMoveDataDir()"
