@@ -13,6 +13,7 @@
 //! 文件删除失败或崩溃残留由步骤 3 孤儿回收兜底（detached 行不再计入引用集合）。
 //! 孤儿回收带 1 小时 mtime 宽限期，防与并发收件线程的"文件已落盘、行未提交"窗口竞态。
 
+use crate::err as e;
 use crate::mail::now_epoch;
 use crate::state::{AppState, keys};
 use serde::Serialize;
@@ -49,10 +50,6 @@ pub struct Estimate {
 /// 孤儿文件 mtime 宽限（秒）：新落盘附件不立即判孤儿，防与收件线程竞态
 const ORPHAN_GRACE_SECS: u64 = 3600;
 
-fn e<E: std::fmt::Display>(err: E) -> String {
-    err.to_string()
-}
-
 /// 清理策略快照（锁外读取；None = 永久保留）
 struct Policy {
     clean_sent_bulk_days: Option<i64>,
@@ -86,27 +83,17 @@ fn detach_targets(
     let Some(cutoff) = cutoff else {
         return Ok(Vec::new());
     };
-    let mut stmt = conn
-        .prepare(
-            "SELECT a.id, COALESCE(a.file_path, ''), a.size_gz
-             FROM attachments a JOIN emails e ON e.id = a.email_id
-             WHERE a.storage = 'file' AND a.detached = 0
-               AND e.direction = 'out' AND e.status = 'sent'
-               AND e.sent_at IS NOT NULL AND e.sent_at < ?1",
-        )
-        .map_err(e)?;
-    let rows = stmt
-        .query_map([cutoff], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(e)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(e)?;
-    Ok(rows)
+    crate::db::collect_rows(
+        conn,
+        "SELECT a.id, COALESCE(a.file_path, ''), a.size_gz
+         FROM attachments a JOIN emails e ON e.id = a.email_id
+         WHERE a.storage = 'file' AND a.detached = 0
+           AND e.direction = 'out' AND e.status = 'sent'
+           AND e.sent_at IS NOT NULL AND e.sent_at < ?1",
+        &[&cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .map_err(e)
 }
 
 /// 步骤 2 目标：过期邮件 id（inbox 按 created_at、sent 按 sent_at）
@@ -116,29 +103,27 @@ fn expire_targets(
 ) -> Result<Vec<i64>, String> {
     let mut ids: Vec<i64> = Vec::new();
     if let Some(cut) = inbox_cut {
-        let mut stmt = conn
-            .prepare("SELECT id FROM emails WHERE folder = 'inbox' AND created_at < ?1")
-            .map_err(e)?;
-        let rows = stmt
-            .query_map([cut], |r| r.get::<_, i64>(0))
-            .map_err(e)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(e)?;
-        ids.extend(rows);
+        ids.extend(
+            crate::db::collect_rows(
+                conn,
+                "SELECT id FROM emails WHERE folder = 'inbox' AND created_at < ?1",
+                &[&cut],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(e)?,
+        );
     }
     if let Some(cut) = sent_cut {
-        let mut stmt = conn
-            .prepare(
+        ids.extend(
+            crate::db::collect_rows(
+                conn,
                 "SELECT id FROM emails
                  WHERE folder = 'sent' AND sent_at IS NOT NULL AND sent_at < ?1",
+                &[&cut],
+                |r| r.get::<_, i64>(0),
             )
-            .map_err(e)?;
-        let rows = stmt
-            .query_map([cut], |r| r.get::<_, i64>(0))
-            .map_err(e)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(e)?;
-        ids.extend(rows);
+            .map_err(e)?,
+        );
     }
     ids.sort_unstable();
     ids.dedup();
@@ -147,30 +132,30 @@ fn expire_targets(
 
 /// 邮件的独立附件相对路径（删行前收集；文件删除在提交后）
 fn file_paths_of(conn: &rusqlite::Connection, email_id: i64) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT file_path FROM attachments WHERE email_id = ?1 AND storage = 'file'")
-        .map_err(e)?;
-    let rows = stmt
-        .query_map([email_id], |r| r.get::<_, String>(0))
-        .map_err(e)?
-        .filter_map(|x| x.ok())
-        .filter(|p| !p.is_empty())
-        .collect();
-    Ok(rows)
+    Ok(crate::db::collect_rows(
+        conn,
+        "SELECT file_path FROM attachments WHERE email_id = ?1 AND storage = 'file'",
+        &[&email_id],
+        |r| r.get::<_, String>(0),
+    )
+    .map_err(e)?
+    .into_iter()
+    .filter(|p| !p.is_empty())
+    .collect())
 }
 
 /// 引用集合（storage='file' 且未 detached；detached 行的残留文件由孤儿回收清）
 fn referenced_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT file_path FROM attachments WHERE storage = 'file' AND detached = 0")
-        .map_err(e)?;
-    let set = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(e)?
-        .filter_map(|x| x.ok())
-        .filter(|p| !p.is_empty())
-        .collect();
-    Ok(set)
+    Ok(crate::db::collect_rows(
+        conn,
+        "SELECT file_path FROM attachments WHERE storage = 'file' AND detached = 0",
+        &[],
+        |r| r.get::<_, String>(0),
+    )
+    .map_err(e)?
+    .into_iter()
+    .filter(|p| !p.is_empty())
+    .collect())
 }
 
 /// 孤儿文件（未引用 + mtime 超宽限期）绝对路径列表（只收集不删除，estimate/run 共用）

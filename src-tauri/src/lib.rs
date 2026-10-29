@@ -19,6 +19,11 @@ mod state;
 mod templates;
 mod ui;
 
+/// 错误转字符串（各模块 `map_err` 适配器共用；避免每个模块各写一份 `fn e`）
+pub(crate) fn err<E: std::fmt::Display>(err: E) -> String {
+    err.to_string()
+}
+
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 主窗口入口 URL：自定义协议 `ui` 的根路径。

@@ -470,10 +470,8 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     mark_read_and_sync_seen(state, id);
     let email = mail::get(state, id)?;
     let folder = email.folder.clone();
-    let notice = req
-        .query_param("error")
-        .map(|v| urldecode(&v))
-        .unwrap_or_default();
+    // query_param 已做百分号解码，勿再 urldecode（二次解码会破坏含 %/+ 的错误文案）
+    let notice = req.query_param("error").unwrap_or_default();
     Some(render_html(
         "email.html",
         &EmailCtx {
@@ -575,10 +573,8 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         return render_html("welcome.html", &());
     }
     let saved = req.query_param("saved").map(|v| v == "1").unwrap_or(false);
-    let error = req
-        .query_param("error")
-        .map(|v| urldecode(&v))
-        .unwrap_or_default();
+    // query_param 已解码，勿再 urldecode（二次解码会破坏含 %/+ 的错误文案）
+    let error = req.query_param("error").unwrap_or_default();
     let mut ctx = ComposeCtx {
         frame: frame_ctx(state, "draft"),
         draft_id: 0,
@@ -709,19 +705,30 @@ fn redirect_compose(draft_id: i64, error: &str) -> Resp {
     ))
 }
 
-/// 附件另存（POST /emails/{id}/attachments/{aid}；前端 __TAURI__.dialog 选好 dest）
 /// 附件预览（GET /emails/{id}/attachments/{aid}/view，M5）：解压后按原始 MIME 内联返回。
-/// 文本类强制 text/plain（防 text/html 内嵌脚本执行）+ nosniff（防嗅探错渲染）
+/// 安全约束：邮件头 MIME 不可信（可含控制字符/伪造类型）→ 白名单校验后回退 octet-stream；
+/// text 类强制 text/plain（防 HTML 脚本执行）；SVG 不在图片白名单（顶层渲染可执行脚本）；
+/// 非内联类型附 Content-Disposition: attachment（强制下载）。
 fn attachment_view(state: &AppState, req: &Req) -> Resp {
     let Some((_, aid)) = path_attach(&req.path) else {
         return Resp::not_found();
     };
     match mail::attachment_bytes(state, aid) {
         Some((view, bytes)) => {
-            let content_type = if view.preview_kind == "text" {
-                "text/plain; charset=utf-8".to_string()
+            let mime = view.mime.trim().to_ascii_lowercase();
+            let (content_type, inline) = if view.preview_kind == "text" {
+                ("text/plain; charset=utf-8".to_string(), true)
+            } else if view.preview_kind == "img"
+                && matches!(
+                    mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+                )
+            {
+                (mime, true)
+            } else if view.preview_kind == "pdf" {
+                ("application/pdf".to_string(), true)
             } else {
-                view.mime.clone()
+                ("application/octet-stream".to_string(), false)
             };
             let mut resp = Resp {
                 status: 200,
@@ -732,6 +739,10 @@ fn attachment_view(state: &AppState, req: &Req) -> Resp {
             };
             resp.extra_headers
                 .push(("X-Content-Type-Options".into(), "nosniff".into()));
+            if !inline {
+                resp.extra_headers
+                    .push(("Content-Disposition".into(), "attachment".into()));
+            }
             resp
         }
         None => Resp::not_found(),
@@ -806,13 +817,6 @@ fn form_json_strings(form: &HashMap<String, String>, name: &str) -> Vec<String> 
 
 fn urlencode(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-fn urldecode(s: &str) -> String {
-    form_urlencoded::parse(s.as_bytes())
-        .map(|(k, _)| k.to_string())
-        .next()
-        .unwrap_or_default()
 }
 
 fn wizard_setup_page(state: &AppState) -> Resp {
@@ -967,34 +971,23 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
     let new_account = full_address(&prefix, &domain);
     let new_password = trimmed_field(&form, "password");
+    let old_account = full_address(&old_prefix, &old_domain);
+    let account_changed = prefix != old_prefix || domain != old_domain;
 
-    if prefix != old_prefix || domain != old_domain {
-        // 账号变更：迁移凭据（密码框有值则直接写新账号；无值则搬旧凭据）
-        match new_password {
-            Some(p) => {
-                if let Err(e) = state.store_password(&new_account, &p) {
-                    return account_pane(state, false, &format!("密码保存失败：{e}"));
-                }
+    // 1) 凭据预检：账号变更且密码框留空时，旧账号必须存在可迁移凭据。
+    //    先预检再落配置——预检失败不得留下"配置已改、密码未迁"的半状态。
+    let migrate_from = if account_changed && new_password.is_none() {
+        match state.retrieve_password(&old_account) {
+            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => {
+                Some(p)
             }
-            None => match state.retrieve_password(&full_address(&old_prefix, &old_domain)) {
-                crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => {
-                    if let Err(e) = state.store_password(&new_account, &p) {
-                        return account_pane(state, false, &format!("密码迁移失败：{e}"));
-                    }
-                }
-                crate::secrets::GetResult::Missing => {
-                    return account_pane(state, false, "账号已修改，请输入密码后保存");
-                }
-            },
+            crate::secrets::GetResult::Missing => {
+                return account_pane(state, false, "账号已修改，请输入密码后保存");
+            }
         }
-        if !old_prefix.is_empty() {
-            state.clear_password(&full_address(&old_prefix, &old_domain));
-        }
-    } else if let Some(p) = &new_password
-        && let Err(e) = state.store_password(&new_account, p)
-    {
-        return account_pane(state, false, &format!("密码保存失败：{e}"));
-    }
+    } else {
+        None
+    };
 
     let smtp_host = host_state_or(&form, state, keys::SMTP_HOST, state::SMTP_HOST_DEFAULT);
     let recv_host = host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT);
@@ -1010,8 +1003,26 @@ fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         (keys::RECV_HOST, recv_host.as_str()),
         (keys::RECV_PORT, recv_port_s.as_str()),
     ];
+    // 2) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
         return account_pane(state, false, &format!("保存失败：{e}"));
+    }
+
+    // 3) 配置已生效，再写/迁移凭据（失败时配置不回滚，但已存密码不会被清掉）
+    if account_changed {
+        let target = new_password.clone().or(migrate_from);
+        if let Some(p) = target
+            && let Err(e) = state.store_password(&new_account, &p)
+        {
+            return account_pane(state, false, &format!("密码保存失败：{e}"));
+        }
+        if !old_prefix.is_empty() {
+            state.clear_password(&old_account);
+        }
+    } else if let Some(p) = &new_password
+        && let Err(e) = state.store_password(&new_account, p)
+    {
+        return account_pane(state, false, &format!("密码保存失败：{e}"));
     }
     account_pane(state, true, "")
 }
@@ -1027,8 +1038,9 @@ fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         None => cur(keys::SYNC_ON_START) == "true",
     };
     let interval = match form.get("sync_interval_min") {
+        // 上限 7 天：调度线程按间隔 sleep，巨值会让定时收件永久失效（重启才恢复）
         Some(v) => match v.trim().parse::<u32>() {
-            Ok(n) => n.to_string(),
+            Ok(n) => n.min(10_080).to_string(),
             Err(_) => cur(keys::SYNC_INTERVAL_MIN),
         },
         None => cur(keys::SYNC_INTERVAL_MIN),
@@ -1104,38 +1116,47 @@ fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
 
 // ---------- 上下文装配 ----------
 
+/// 侧栏上下文构造（frame_ctx 与设置页共用；账号三要素由调用方预取，避免重复读配置）
+fn frame_of(
+    prefix: &str,
+    domain: &str,
+    display: &str,
+    folder: &str,
+    counts: &HashMap<&'static str, i64>,
+) -> FrameCtx {
+    FrameCtx {
+        display_name: if display.is_empty() {
+            "未配置".into()
+        } else {
+            display.to_string()
+        },
+        full_addr: if prefix.is_empty() {
+            "未配置账号".into()
+        } else {
+            full_address(prefix, domain)
+        },
+        avatar: display
+            .chars()
+            .next()
+            .or(prefix.chars().next())
+            .unwrap_or('✉')
+            .to_string(),
+        inbox: counts["inbox"],
+        inbox_unread: counts["inbox_unread"],
+        all_mail: counts["all"],
+        sent: counts["sent"],
+        draft: counts["draft"],
+        folder: folder.into(),
+    }
+}
+
 fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {
     let d = defaults();
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let display = state.get_or(keys::DISPLAY_NAME, &d).unwrap_or_default();
-    let full = if prefix.is_empty() {
-        "未配置账号".to_string()
-    } else {
-        full_address(&prefix, &domain)
-    };
-    let avatar = display
-        .chars()
-        .next()
-        .or(prefix.chars().next())
-        .unwrap_or('✉')
-        .to_string();
-    let c = state.folder_counts();
-    FrameCtx {
-        display_name: if display.is_empty() {
-            "未配置".into()
-        } else {
-            display
-        },
-        full_addr: full,
-        avatar,
-        inbox: c["inbox"],
-        inbox_unread: c["inbox_unread"],
-        all_mail: c["all"],
-        sent: c["sent"],
-        draft: c["draft"],
-        folder: folder.into(),
-    }
+    let counts = state.folder_counts();
+    frame_of(&prefix, &domain, &display, folder, &counts)
 }
 
 fn settings_ctx(
@@ -1178,47 +1199,31 @@ fn settings_ctx(
     let (attach_bytes, attach_files) = state.attachments_stats();
     let db_bytes = state.db_size_bytes();
     let total = db_bytes + attach_bytes;
-    let db_pct = (db_bytes * 100)
-        .checked_div(total)
-        .map(|v| (v as u32).min(100))
-        .unwrap_or(0);
+    // 空库时两段占比均为 0（不能把 100% 错记到附件段）
+    let (db_pct, attach_pct) = match db_bytes.saturating_mul(100).checked_div(total) {
+        Some(p) => {
+            let p = p.min(100) as u32;
+            (p, 100 - p)
+        }
+        None => (0, 0),
+    };
+    // 账号三要素一次读取：frame 与各 tab 字段复用（避免重复读配置/库锁）
+    let display = g(keys::DISPLAY_NAME);
+    let prefix = g(keys::ACCOUNT_PREFIX);
+    let domain = g(keys::ACCOUNT_DOMAIN);
+    // 凭据降级态需在 prefix/domain 被 move 进字段前算（借用先于所有权转移）
+    let degraded = state.secrets_degraded(&full_address(&prefix, &domain));
     SettingsCtx {
-        frame: FrameCtx {
-            display_name: if g(keys::DISPLAY_NAME).is_empty() {
-                "未配置".into()
-            } else {
-                g(keys::DISPLAY_NAME)
-            },
-            full_addr: if g(keys::ACCOUNT_PREFIX).is_empty() {
-                "未配置账号".into()
-            } else {
-                full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN))
-            },
-            avatar: g(keys::DISPLAY_NAME)
-                .chars()
-                .next()
-                .or(g(keys::ACCOUNT_PREFIX).chars().next())
-                .unwrap_or('✉')
-                .to_string(),
-            inbox: counts["inbox"],
-            inbox_unread: counts["inbox_unread"],
-            all_mail: counts["all"],
-            sent: counts["sent"],
-            draft: counts["draft"],
-            folder: String::new(),
-        },
+        frame: frame_of(&prefix, &domain, &display, "", &counts),
         tab: tab.into(),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
-        account_prefix: g(keys::ACCOUNT_PREFIX),
-        account_domain: g(keys::ACCOUNT_DOMAIN),
-        display_name: g(keys::DISPLAY_NAME),
+        account_prefix: prefix,
+        account_domain: domain,
+        display_name: display,
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
-        degraded: state.secrets_degraded(&full_address(
-            &g(keys::ACCOUNT_PREFIX),
-            &g(keys::ACCOUNT_DOMAIN),
-        )),
+        degraded,
         saved,
         error: error.into(),
         sync_on_start: g(keys::SYNC_ON_START) == "true",
@@ -1238,7 +1243,7 @@ fn settings_ctx(
         db_pct,
         attach_size: human_bytes(attach_bytes),
         attach_files,
-        attach_pct: 100 - db_pct,
+        attach_pct,
         clean_days: g(keys::CLEAN_SENT_BULK_DAYS),
         keep_inbox: g(keys::KEEP_INBOX_DAYS),
         keep_sent: g(keys::KEEP_SENT_DAYS),
@@ -1363,6 +1368,9 @@ fn serve_asset<A: Assets>(assets: &A, req: &Req) -> Option<Resp> {
 }
 
 fn error_page(title: &str, message: &str) -> String {
+    // 转义防注入：错误文案可能内嵌外部数据（如库错误串）
+    let title = html_escape(title);
+    let message = html_escape(message);
     format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
 <title>{title}</title></head><body style=\"font-family:system-ui,sans-serif;\
@@ -1859,6 +1867,21 @@ mod tests {
         );
         assert_eq!(resp2.content_type, "text/plain; charset=utf-8");
         assert_eq!(resp2.body, "纯文本内容".as_bytes());
+        // 不支持内嵌的类型（zip）→ octet-stream + 强制下载，防伪造 MIME 内嵌渲染
+        let resp_zip = route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/emails/{id}/attachments/3/view"), b""),
+            &tester,
+        );
+        assert_eq!(resp_zip.content_type, "application/octet-stream");
+        assert!(
+            resp_zip
+                .extra_headers
+                .iter()
+                .any(|(k, v)| k == "Content-Disposition" && v == "attachment"),
+            "非白名单类型应强制下载"
+        );
         // 不存在的附件 → 404
         let resp3 = route(
             &state,
@@ -2871,6 +2894,53 @@ mod tests {
     }
 
     #[test]
+    fn sync_interval_clamped_to_7_days() {
+        let (state, dir) = temp_state("sync-clamp");
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        let _ = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/sync/save",
+                &form(&[
+                    ("sync_on_start", "true"),
+                    ("sync_interval_min", "100000"),
+                    ("first_fetch_days", "30"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        let d = defaults();
+        assert_eq!(
+            state.get_or(keys::SYNC_INTERVAL_MIN, &d).as_deref(),
+            Some("10080"),
+            "巨型间隔应被钳到 7 天，防调度线程沉睡"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn huge_page_number_does_not_panic() {
+        let (state, dir) = temp_state("huge-page");
+        state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+        let resp = route(
+            &state,
+            &assets(),
+            &req_q("GET", "/", "page=9223372036854775807", b""),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+        assert_eq!(resp.status, 200);
+        cleanup(&dir);
+    }
+
+    #[test]
     fn settings_sync_save_roundtrip() {
         let (state, dir) = temp_state("sync-save");
         let resp = route(
@@ -3251,6 +3321,13 @@ mod tests {
         );
         assert_eq!(resp.status, 404);
         cleanup(&dir);
+    }
+
+    #[test]
+    fn error_page_escapes_dynamic_text() {
+        let html = error_page("404", "<script>alert(1)</script>");
+        assert!(!html.contains("<script"), "动态文案必须转义：{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     #[test]

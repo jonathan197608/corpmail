@@ -7,8 +7,10 @@
 //! - 密码仅运行时读入内存；UI 永不回显明文（输入框留空 = 不修改）
 
 use crate::db;
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine;
 use rusqlite::Connection;
 
 /// keyring 的 service 名（Windows Credential Manager / macOS Keychain 通用）
@@ -61,21 +63,18 @@ pub fn clear(conn: &Connection, account: &str) {
     let _ = conn.execute("DELETE FROM settings WHERE k = ?1", [key]);
 }
 
-/// 当前是否处于 keyfile 降级态（设置页"关于/账号"提示用）
+/// 当前是否处于 keyfile 降级态（设置页"关于/账号"提示用）。
+/// 与 retrieve 同语义：keychain 无可用密码时，只要 keyfile 行存在即视为降级
 pub fn degraded(conn: &Connection, account: &str) -> bool {
-    match keyring::Entry::new(KEYRING_SERVICE, account) {
-        Ok(entry) => {
-            matches!(entry.get_password(), Err(keyring::Error::NoEntry))
-                && db::settings::get(conn, &format!("enc:{account}"))
-                    .ok()
-                    .flatten()
-                    .is_some()
-        }
-        Err(_) => db::settings::get(conn, &format!("enc:{account}"))
+    let keychain_ok = matches!(
+        keyring::Entry::new(KEYRING_SERVICE, account),
+        Ok(entry) if entry.get_password().is_ok()
+    );
+    !keychain_ok
+        && db::settings::get(conn, &format!("enc:{account}"))
             .ok()
             .flatten()
-            .is_some(),
-    }
+            .is_some()
 }
 
 // ---------- keyfile 回退实现（AES-256-GCM） ----------
@@ -85,9 +84,6 @@ pub fn degraded(conn: &Connection, account: &str) -> bool {
 /// 说明：设计称"128-bit 随机 key 文件 + AES-256-GCM"——keyfile 语义落在库内一行
 /// （桌面单用户场景与独立文件等效，且随库备份），AES 密钥本身 256-bit。
 fn keyfile_key(conn: &Connection) -> Result<[u8; 32], String> {
-    use aes_gcm::aead::rand_core::RngCore;
-    use base64::Engine;
-
     if let Some(b64) = db::settings::get(conn, "enc:keyfile").map_err(|e| e.to_string())? {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -112,7 +108,6 @@ fn keyfile_store(conn: &Connection, account: &str, password: &str) -> Result<(),
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     // nonce 96-bit（NIST 建议；同 key 下唯一即可）
     let mut nonce_bytes = [0u8; 12];
-    use aes_gcm::aead::rand_core::RngCore;
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
@@ -121,7 +116,6 @@ fn keyfile_store(conn: &Connection, account: &str, password: &str) -> Result<(),
     // 存储格式：nonce(12) || ciphertext+tag，base64
     let mut blob = nonce_bytes.to_vec();
     blob.extend_from_slice(&ct);
-    use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
     db::settings::set(conn, &format!("enc:{account}"), &b64).map_err(|e| e.to_string())
 }
@@ -135,7 +129,6 @@ fn keyfile_retrieve(conn: &Connection, account: &str) -> GetResult {
         Ok(Some(v)) => v,
         _ => return GetResult::Missing,
     };
-    use base64::Engine;
     let blob = match base64::engine::general_purpose::STANDARD.decode(&b64) {
         Ok(b) => b,
         Err(_) => return GetResult::Missing,
@@ -175,7 +168,6 @@ mod tests {
         let c = conn();
         // 预置有效 keyfile key（避免单测触发 OS 随机写库分支的键冲突路径）
         let key: [u8; 32] = [7u8; 32];
-        use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(key);
         c.execute("UPDATE settings SET v = ?1 WHERE k = 'enc:keyfile'", [b64])
             .unwrap();

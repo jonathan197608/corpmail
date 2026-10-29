@@ -106,6 +106,18 @@ END;
 CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 "#;
 
+/// 多行查询（prepare → query_map → collect 的共用封装；mail/clean 复用，消除散落的样板）
+pub fn collect_rows<T>(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<Vec<T>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, map)?;
+    rows.collect()
+}
+
 /// settings 读写（TEXT 键值，业务层负责类型转换与默认值）
 pub mod settings {
     use rusqlite::{Connection, OptionalExtension};

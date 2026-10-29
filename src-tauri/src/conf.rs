@@ -33,14 +33,13 @@ pub fn is_config_key(key: &str) -> bool {
     CONFIG_KEYS.contains(&key)
 }
 
-/// 读取全部配置（文件缺失/损坏 → 空 map，由 DB 镜像自愈；未知键过滤——
+/// 读取全部配置（文件缺失/损坏 → 空 map，即未配置状态；未知键过滤——
 /// 配置文件内仅承载 CONFIG_KEYS）
 pub fn load(anchor: &Path) -> BTreeMap<String, String> {
-    let parsed: BTreeMap<String, String> = std::fs::read_to_string(anchor.join(CONFIG_FILE))
+    std::fs::read_to_string(anchor.join(CONFIG_FILE))
         .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default();
-    parsed
+        .and_then(|t| toml::from_str::<BTreeMap<String, String>>(&t).ok())
+        .unwrap_or_default()
         .into_iter()
         .filter(|(k, _)| is_config_key(k))
         .collect()
@@ -59,7 +58,11 @@ pub fn save(anchor: &Path, cfg: &BTreeMap<String, String>) -> Result<(), String>
     let path = anchor.join(CONFIG_FILE);
     let tmp = anchor.join(format!("{CONFIG_FILE}.tmp"));
     std::fs::write(&tmp, text).map_err(|e| format!("配置写入失败：{e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("配置落盘失败：{e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // rename 失败（目标被占用等）：清掉临时残片，下次重试从干净状态开始
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("配置落盘失败：{e}"));
+    }
     Ok(())
 }
 

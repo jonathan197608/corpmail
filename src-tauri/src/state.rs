@@ -145,12 +145,22 @@ impl AppState {
 
     /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
     /// 指针写入独立配置文件 mailbox.toml（随锚点目录常驻，不随数据迁移、
-    /// 不被备份删除影响）；锚点库同步兼容镜像。原目录残留备份可由用户在
+    /// 不被备份删除影响）；原目录保留迁移前的库/附件备份，可由用户在
     /// 存储页手动删除（delete_old_backup）。
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
     /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
     pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
-        let dest_path = PathBuf::from(dest.trim_end_matches(['/', '\\']));
+        // 去尾部斜杠保留根目录："/" 与 Windows "C:\\" 不得被清成非绝对路径
+        let raw = dest.trim();
+        let trimmed = raw.trim_end_matches(['/', '\\']);
+        let dest_str = if trimmed.is_empty() {
+            raw.to_string()
+        } else if trimmed.len() == 2 && trimmed.ends_with(':') {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_string()
+        };
+        let dest_path = PathBuf::from(dest_str);
         if !dest_path.is_absolute() {
             return Err("请选择绝对路径目录".into());
         }
@@ -322,12 +332,14 @@ impl AppState {
                 finish(0, "本地数据库打开失败".into());
                 return;
             };
-            // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析等任何 panic
+            // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
             // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
             // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
-            let outcome: Result<crate::mail::FetchOutcome, String> =
+            let last_uid = last.uid;
+            let last_uidvalidity = last.uidvalidity;
+            let outcome: Result<(crate::mail::FetchOutcome, usize), String> =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::mail::MailFetcher::fetch(
+                    let outcome = crate::mail::MailFetcher::fetch(
                         &crate::mail::RealFetcher,
                         &host,
                         port,
@@ -335,7 +347,11 @@ impl AppState {
                         &password,
                         first_days,
                         last,
-                    )
+                    )?;
+                    // 入库与网络拉取同属关键路径：两者任一 panic 都必须复位状态
+                    let added =
+                        crate::mail::store_incoming_conn(&mut conn, &data_dir, &outcome.mails)?;
+                    Ok((outcome, added))
                 })) {
                     Ok(r) => r,
                     Err(_) => {
@@ -344,25 +360,18 @@ impl AppState {
                     }
                 };
             match outcome {
-                Ok(outcome) => {
-                    let added = match crate::mail::store_incoming_conn(
-                        &mut conn,
-                        &data_dir,
-                        &outcome.mails,
-                    ) {
-                        Ok(n) => n,
-                        Err(err) => {
-                            eprintln!("[fetch] 入库失败：{err}");
-                            0
-                        }
-                    };
+                Ok((outcome, added)) => {
                     // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
-                    // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）
+                    // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
+                    // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
+                    // uidvalidity 变化时 UID 空间重置，必须无条件采纳新值。
                     let set = |k: &str, v: &str| {
                         let _ = crate::db::settings::set(&conn, k, v);
                     };
                     set(keys::LAST_UIDVALIDITY, &outcome.uidvalidity.to_string());
-                    if outcome.max_uid > 0 {
+                    if outcome.max_uid > 0
+                        && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
+                    {
                         set(keys::LAST_UID, &outcome.max_uid.to_string());
                     }
                     set(keys::LAST_SYNC_AT, &crate::mail::now_epoch().to_string());
@@ -462,10 +471,7 @@ impl AppState {
         f(&mut conn)
     }
 
-    /// 读 settings 键（None = 未设置；库错误按未设置处理，页面回退默认值）
-    /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）路由到
-    /// mailbox.toml 内存镜像（缺失时兜底库镜像——启动并集同步后罕见）；其余读库
-    /// 配置快照（外部线程/测试读 mailbox.toml 镜像用；worker 线程直接持 Arc）
+    /// 配置镜像快照（外部线程/测试读 mailbox.toml 内存镜像用；worker 线程直接持 Arc）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn config_snapshot(&self) -> crate::conf::ConfigMap {
         self.config.lock().expect("配置锁中毒").clone()
@@ -507,19 +513,35 @@ impl AppState {
             .filter(|(k, _)| !crate::conf::is_config_key(k))
             .collect();
         if !cfg_pairs.is_empty() {
+            // 写前快照旧值：文件写失败时恢复原镜像（覆盖写失败不得丢掉旧值）
+            let prev: Vec<(String, Option<String>)> = {
+                let cfg = self.config.lock().expect("配置锁中毒");
+                cfg_pairs
+                    .iter()
+                    .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
+                    .collect()
+            };
             {
                 let mut cfg = self.config.lock().expect("配置锁中毒");
                 for (k, v) in &cfg_pairs {
                     cfg.insert((*k).to_string(), (*v).to_string());
                 }
             }
-            let cfg = self.config.lock().expect("配置锁中毒");
-            if let Err(e) = crate::conf::save(&self.anchor_dir, &cfg) {
-                // 文件写失败：回滚内存镜像，调用方报错（下次保存重试）
-                drop(cfg);
+            let save_res = {
+                let cfg = self.config.lock().expect("配置锁中毒");
+                crate::conf::save(&self.anchor_dir, &cfg)
+            };
+            if let Err(e) = save_res {
                 let mut cfg = self.config.lock().expect("配置锁中毒");
-                for (k, _) in &cfg_pairs {
-                    cfg.remove(*k);
+                for (k, old) in prev {
+                    match old {
+                        Some(v) => {
+                            cfg.insert(k, v);
+                        }
+                        None => {
+                            cfg.remove(&k);
+                        }
+                    }
                 }
                 return Err(format!("配置文件写入失败：{e}"));
             }
@@ -540,11 +562,13 @@ impl AppState {
         Ok(())
     }
 
-    /// 数据库文件大小（字节；设置·存储页"邮箱数据库大小"）
+    /// 数据库文件大小（字节；设置·存储页"邮箱数据库大小"；含 WAL 与索引开销）
     pub fn db_size_bytes(&self) -> u64 {
-        std::fs::metadata(self.data_dir.join("mailbox.db"))
+        ["mailbox.db", "mailbox.db-wal"]
+            .iter()
+            .filter_map(|f| std::fs::metadata(self.data_dir.join(f)).ok())
             .map(|m| m.len())
-            .unwrap_or(0)
+            .sum()
     }
 
     /// SQLite 版本串（关于页展示）
@@ -554,29 +578,35 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// 侧栏文件夹计数（列表屏冗余展示；M1 无邮件恒为 0，查询面向 M2 复用）
+    /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（5 个计数）
     pub fn folder_counts(&self) -> HashMap<&'static str, i64> {
         let conn = self.db.lock().expect("数据库锁中毒");
-        let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
-        let mut m = HashMap::new();
-        m.insert(
-            "inbox",
-            one("SELECT count(*) FROM emails WHERE folder = 'inbox'"),
+        let row = conn.query_row(
+            "SELECT COALESCE(SUM(folder = 'inbox'), 0),
+                    COALESCE(SUM(folder = 'inbox' AND unread = 1), 0),
+                    count(*),
+                    COALESCE(SUM(folder = 'sent'), 0),
+                    COALESCE(SUM(folder = 'draft'), 0)
+             FROM emails",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
         );
-        m.insert(
-            "inbox_unread",
-            one("SELECT count(*) FROM emails WHERE folder = 'inbox' AND unread = 1"),
-        );
-        m.insert("all", one("SELECT count(*) FROM emails"));
-        m.insert(
-            "sent",
-            one("SELECT count(*) FROM emails WHERE folder = 'sent'"),
-        );
-        m.insert(
-            "draft",
-            one("SELECT count(*) FROM emails WHERE folder = 'draft'"),
-        );
-        m
+        let (inbox, inbox_unread, all, sent, draft) = row.unwrap_or((0, 0, 0, 0, 0));
+        HashMap::from([
+            ("inbox", inbox),
+            ("inbox_unread", inbox_unread),
+            ("all", all),
+            ("sent", sent),
+            ("draft", draft),
+        ])
     }
 
     /// 存密码（secrets 封装；返回是否发生 keyfile 降级）
@@ -603,7 +633,7 @@ impl AppState {
         crate::secrets::degraded(&conn, account)
     }
 
-    /// 待生效的数据目录（M5 迁移）：读配置指针（get 路由 mailbox.toml/库镜像）；
+    /// 待生效的数据目录（M5 迁移）：读 mailbox.toml 指针；
     /// 重启后 resolve_start_dir 应用指针、其值 == 当前目录，提示自然消失
     pub fn pending_data_dir(&self) -> Option<String> {
         let over = match self.get(keys::DATA_DIR) {
@@ -614,7 +644,6 @@ impl AppState {
         (pending != self.data_dir && pending.join("mailbox.db").is_file()).then_some(over)
     }
 
-    /// 数据目录下的独立附件占用（M1 尚无附件；目录不存在 → 0）：(字节, 文件数)
     /// 数据目录下的独立附件占用（目录不存在 → 0）：(字节, 文件数)
     pub fn attachments_stats(&self) -> (u64, u64) {
         dir_stats(&self.data_dir.join("attachments"))

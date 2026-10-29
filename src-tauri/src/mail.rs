@@ -8,6 +8,7 @@
 //!   + 独立附件文件（应用层清理，空目录一并回收）
 //! - 列表分页 50/页（§8.3）；时间展示 label：今天 HH:MM / 同年 M月D日 / 跨年 YYYY-M-D
 
+use crate::err as e;
 use crate::state::{AppState, defaults, full_address, keys};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -112,10 +113,6 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-fn e<E: std::fmt::Display>(err: E) -> String {
-    err.to_string()
-}
-
 /// HTML 转义（展示层通用；router.rs 复用本实现，避免双份漂移）
 pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -170,11 +167,14 @@ pub fn time_full(epoch: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 时区缓存（zoned_of 在列表/详情高频调用；每次 Zoned::now() 读系统时区是浪费）
+static LOCAL_TZ: std::sync::LazyLock<jiff::tz::TimeZone> =
+    std::sync::LazyLock::new(|| jiff::Zoned::now().time_zone().clone());
+
 fn zoned_of(epoch: i64) -> Option<jiff::Zoned> {
-    let tz = jiff::Zoned::now().time_zone().clone();
     jiff::Timestamp::from_second(epoch)
         .ok()
-        .map(|ts| ts.to_zoned(tz))
+        .map(|ts| ts.to_zoned(LOCAL_TZ.clone()))
 }
 
 // ---------- 草稿（撰写/存草稿/覆盖，§9） ----------
@@ -310,7 +310,8 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
     let unread_sql = if q.unread_only { " AND unread = 1" } else { "" };
     let where_sql = format!("WHERE 1=1{folder_sql}{unread_sql}");
     let page = q.page.max(1);
-    let offset = (page - 1) * PAGE_SIZE;
+    // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
+    let offset = (page - 1).saturating_mul(PAGE_SIZE);
     state.with_conn(|conn| {
         let total: i64 = conn
             .query_row(
@@ -454,7 +455,7 @@ pub fn search(
         ""
     };
     let page = q.page.max(1);
-    let offset = (page - 1) * PAGE_SIZE;
+    let offset = (page - 1).saturating_mul(PAGE_SIZE);
     let words = tokenize_words(input);
     state.with_conn(|conn| {
         let total: i64 = conn
@@ -491,18 +492,22 @@ pub fn search(
 
 /// 正文摘要：压缩空白后取前 100 字符（chars 截断防中文 panic）
 fn preview(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    flat.chars().take(100).collect()
+    flatten_ws(text).chars().take(100).collect()
 }
 
 /// 悬停预览正文：压缩空白 + 300 字符截断 + 超长补省略号（M5 列表 tooltip）
 fn preview_tip(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten_ws(text);
     let mut tip: String = flat.chars().take(300).collect();
     if flat.chars().count() > 300 {
         tip.push('…');
     }
     tip
+}
+
+/// 空白折叠（连续空白/换行折叠为单空格；preview 与 preview_tip 共用）
+fn flatten_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 附件行（详情页/预览/另存；不携带 BLOB 本体）
@@ -519,38 +524,35 @@ pub struct AttachView {
 }
 
 /// 附件预览方式判定（M5）：MIME 优先；MIME 缺失或为 octet-stream 时按文件扩展名兜底
-/// （真实邮件附件头常不规范）；text/html 归入不可预览（内嵌渲染会执行脚本）
+/// （真实邮件附件头常不规范）；text/html 与 image/svg+xml 归入不可预览
+/// （内嵌渲染会执行脚本）
 fn preview_kind_of(mime: &str, filename: &str) -> &'static str {
-    let m = mime.to_ascii_lowercase();
-    let by_mime = if m.starts_with("image/") {
-        Some("img")
-    } else if m == "application/pdf" {
-        Some("pdf")
-    } else if m.starts_with("text/") && m != "text/html" {
-        Some("text")
-    } else if m.is_empty() || m == "application/octet-stream" {
-        None // 头部不可信，走扩展名兜底
-    } else {
-        Some("") // 明确不支持的类型，不再兜底
-    };
-    if let Some(kind) = by_mime {
-        if !kind.is_empty() {
-            return kind;
-        }
-        return "";
+    let m = mime.trim().to_ascii_lowercase();
+    if m.is_empty() || m == "application/octet-stream" {
+        let ext = filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" => "img",
+            "pdf" => "pdf",
+            "txt" | "csv" | "log" | "json" | "xml" | "md" | "yml" | "yaml" | "ini" | "conf"
+            | "sql" | "toml" | "ts" | "js" | "css" => "text",
+            _ => "",
+        };
     }
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" => "img",
-        "pdf" => "pdf",
-        "txt" | "csv" | "log" | "json" | "xml" | "md" | "yml" | "yaml" | "ini" | "conf" | "sql"
-        | "toml" | "ts" | "js" | "css" => "text",
-        _ => "",
+    if m == "application/pdf" {
+        return "pdf";
     }
+    if m.starts_with("text/") && m != "text/html" {
+        return "text";
+    }
+    // SVG 可携带脚本：顶层渲染会执行，不按图片内嵌预览
+    if m.starts_with("image/") && m != "image/svg+xml" {
+        return "img";
+    }
+    "" // 明确不支持的类型，不再兜底
 }
 
 /// 邮件详情（全部展示字段 + 附件列表）
@@ -643,13 +645,17 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
 /// 本地标记已读（IMAP 服务器回写为 M4；§6.1）。返回是否生效
 pub fn mark_read(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
-        conn.execute(
+        exec_one(
+            conn,
             "UPDATE emails SET unread = 0 WHERE id = ?1 AND unread = 1",
-            [id],
+            id,
         )
-        .map(|n| n == 1)
-        .unwrap_or(false)
     })
+}
+
+/// 单行 CAS 更新：仅当恰好影响 1 行返回 true（0 行 = 条件不满足/重复提交，幂等）
+fn exec_one(conn: &rusqlite::Connection, sql: &str, id: i64) -> bool {
+    conn.execute(sql, [id]).map(|n| n == 1).unwrap_or(false)
 }
 
 // ---------- SMTP 发送（M3，设计 §2 发送队列 / §7 幂等 / §9 compose/send） ----------
@@ -739,25 +745,23 @@ fn split_addrs(raw: &str) -> Vec<String> {
 /// 草稿 → 排队（原子 CAS：仅 status='draft' 可入队；重复提交 0 行返回 false，幂等 §7）
 pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
-        conn.execute(
+        exec_one(
+            conn,
             "UPDATE emails SET status = 'queued', error = NULL WHERE id = ?1 AND status = 'draft'",
-            [id],
+            id,
         )
-        .map(|n| n == 1)
-        .unwrap_or(false)
     })
 }
 
 /// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）
 pub fn reopen_failed(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
-        conn.execute(
+        exec_one(
+            conn,
             "UPDATE emails SET status = 'draft', folder = 'draft', error = NULL
              WHERE id = ?1 AND status = 'failed'",
-            [id],
+            id,
         )
-        .map(|n| n == 1)
-        .unwrap_or(false)
     })
 }
 
@@ -824,25 +828,32 @@ pub fn dispatch_one(
         .map(|_| ())
         .map_err(e)
     };
-    let row = conn
-        .query_row(
-            "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''),
-                    subject, body_text
-             FROM emails WHERE id = ?1",
-            [id],
-            |r| {
-                Ok(OutgoingMessage {
-                    from_addr: r.get(0)?,
-                    from_name: r.get(1)?,
-                    to_addrs: split_addrs(&r.get::<_, String>(2)?),
-                    cc_addrs: split_addrs(&r.get::<_, String>(3)?),
-                    subject: r.get(4)?,
-                    body_text: r.get(5)?,
-                })
-            },
-        )
-        .map_err(|err| format!("读取待发邮件失败：{err}"))?;
-    let msg = row;
+    let row = conn.query_row(
+        "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''),
+                subject, body_text
+         FROM emails WHERE id = ?1",
+        [id],
+        |r| {
+            Ok(OutgoingMessage {
+                from_addr: r.get(0)?,
+                from_name: r.get(1)?,
+                to_addrs: split_addrs(&r.get::<_, String>(2)?),
+                cc_addrs: split_addrs(&r.get::<_, String>(3)?),
+                subject: r.get(4)?,
+                body_text: r.get(5)?,
+            })
+        },
+    );
+    // 读取失败（行被删/库异常）也必须把已抢占的 sending 落定：
+    // worker 侧吞错，若状态滞留 sending 则永不重试（启动补发只查 queued）
+    let msg = match row {
+        Ok(m) => m,
+        Err(err) => {
+            let reason = format!("读取待发邮件失败：{err}");
+            mark("failed", Some(&reason))?;
+            return Ok("failed");
+        }
+    };
     if msg.to_addrs.is_empty() {
         mark("failed", Some("收件人为空"))?;
         return Ok("failed");
@@ -1272,47 +1283,47 @@ fn find_inline_part<'a>(
     None
 }
 
-/// HTML 剥标签（无 regex 依赖的手工实现）+ 基础实体解码
+/// HTML 剥标签（无 regex 依赖的手工实现）+ 基础实体解码。
+/// 索引扫描而非吞并式迭代：未闭合 `<` 不应吞掉后文（畸形 HTML 常见）
 fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
-    let mut chars = html.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '<' => {
-                for t in chars.by_ref() {
-                    if t == '>' {
-                        break;
+    let mut i = 0;
+    while i < html.len() {
+        match html.as_bytes()[i] {
+            b'<' => match html[i..].find('>') {
+                Some(rel) => i += rel + 1, // 整段标签丢弃
+                None => {
+                    // 未闭合：保留 '<' 与后文（不解析）
+                    out.push_str(&html[i..]);
+                    break;
+                }
+            },
+            b'&' => {
+                // 实体：扫描到 ';'（最多 8 字符）；未闭合则原样输出
+                let rest = &html[i + 1..];
+                match rest.find(';').filter(|pos| *pos <= 8) {
+                    Some(pos) => {
+                        match &rest[..pos] {
+                            "nbsp" => out.push(' '),
+                            "lt" => out.push('<'),
+                            "gt" => out.push('>'),
+                            "amp" => out.push('&'),
+                            "quot" => out.push('"'),
+                            other => out.push_str(other),
+                        }
+                        i += 1 + pos + 1;
+                    }
+                    None => {
+                        out.push('&');
+                        i += 1;
                     }
                 }
             }
-            '&' => {
-                let mut entity = String::new();
-                let mut terminated = false;
-                for t in chars.by_ref() {
-                    if t == ';' {
-                        terminated = true;
-                        break;
-                    }
-                    entity.push(t);
-                    if entity.len() > 8 {
-                        break;
-                    }
-                }
-                if terminated {
-                    match entity.as_str() {
-                        "nbsp" => out.push(' '),
-                        "lt" => out.push('<'),
-                        "gt" => out.push('>'),
-                        "amp" => out.push('&'),
-                        "quot" => out.push('"'),
-                        _ => out.push_str(&entity),
-                    }
-                } else {
-                    out.push('&');
-                    out.push_str(&entity);
-                }
+            _ => {
+                let ch = html[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8();
             }
-            _ => out.push(c),
         }
     }
     out
@@ -1359,45 +1370,38 @@ pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize,
 }
 
 /// 收件入库核心（独立连接版：收件线程使用，不依赖 AppState）。
-/// 单封失败中止整批（调用方以整体事务语义报告）；逐封独立提交更稳的取舍见 §6.1。
+/// 每封邮件一个事务：正文行 + 附件行原子提交（避免"正文已入库、附件缺失"的半状态）；
+/// 单封失败回滚该封并中止整批（已提交的前序邮件保留，与 §6.1 取舍一致）。
 pub fn store_incoming_conn(
     conn: &mut rusqlite::Connection,
     data_dir: &Path,
     mails: &[IncomingMail],
 ) -> Result<usize, String> {
+    let root = attach_root_of(data_dir);
+    let limit = inline_limit_conn(conn);
     let mut added = 0usize;
     for m in mails {
         let remote = format!("{}:{}", m.uidvalidity, m.uid);
+        // 去重：remote_uid 唯一索引 + message_id 双保险（为空串时不按 message_id 去重）
+        let dup: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM emails WHERE remote_uid = ?1)
+                     OR (?2 <> '' AND EXISTS(SELECT 1 FROM emails WHERE message_id = ?2))",
+                rusqlite::params![remote, m.message_id],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
+        if dup {
+            continue;
+        }
         let st = tokenize(&m.subject);
         let bt = tokenize(&m.body_text);
         let now = now_epoch();
         let attach_bytes: i64 = m.attachments.iter().map(|a| a.data.len() as i64).sum();
-        let dup_remote: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM emails WHERE remote_uid = ?1",
-                [&remote],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(e)?;
-        if dup_remote.is_some() {
-            continue;
-        }
-        if !m.message_id.is_empty() {
-            let dup_mid: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM emails WHERE message_id = ?1",
-                    [&m.message_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(e)?;
-            if dup_mid.is_some() {
-                continue;
-            }
-        }
         let unread = !m.seen;
-        conn.execute(
+
+        let tx = conn.transaction().map_err(e)?;
+        tx.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                 subject, body_text, body_kind, subject_tokens, body_tokens,
                                 attach_cnt, attach_bytes, unread, remote_uid, message_id,
@@ -1423,10 +1427,40 @@ pub fn store_incoming_conn(
             ],
         )
         .map_err(e)?;
-        let id = conn.last_insert_rowid();
-        added += 1;
-        for a in &m.attachments {
-            store_attachment_bytes_conn(conn, data_dir, id, &a.filename, &a.mime, &a.data)?;
+        let id = tx.last_insert_rowid();
+        let month = month_dir_conn(&tx, id);
+        let mut written: Vec<PathBuf> = Vec::new();
+        let stored = (|| -> Result<(), String> {
+            for a in &m.attachments {
+                insert_attachment(
+                    &AttachCtx {
+                        tx: &tx,
+                        root: &root,
+                        month: &month,
+                        email_id: id,
+                        limit,
+                    },
+                    &safe_filename(&a.filename),
+                    &a.mime,
+                    &a.data,
+                    &mut written,
+                )?;
+            }
+            sync_attach_stats(&tx, id)
+        })();
+        match stored {
+            Ok(()) => {
+                tx.commit().map_err(e)?;
+                added += 1;
+            }
+            Err(err) => {
+                // 事务 drop 即回滚；清理本封已写盘的独立附件文件
+                drop(tx);
+                for f in &written {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(err);
+            }
         }
     }
     Ok(added)
@@ -1570,7 +1604,7 @@ fn attach_root_of(data_dir: &Path) -> PathBuf {
     data_dir.join("attachments")
 }
 
-/// 附件入库上限（字节）：settings inline_attach_max_mb（默认 20MB；独立连接版）
+/// 附件入库上限（字节）：settings inline_attach_max_mb（默认 20MB）
 fn inline_limit_conn(conn: &rusqlite::Connection) -> u64 {
     conn.query_row(
         "SELECT v FROM settings WHERE k = 'inline_attach_max_mb'",
@@ -1587,14 +1621,9 @@ fn inline_limit_conn(conn: &rusqlite::Connection) -> u64 {
 
 // ---------- 附件两级存储（§5.1） ----------
 
-/// 附件入库上限（字节）：settings inline_attach_max_mb（默认 20MB）
+/// 附件入库上限（字节；AppState 薄封装，唯一实现在 inline_limit_conn）
 fn inline_limit(state: &AppState) -> u64 {
-    let d = defaults();
-    state
-        .get_or(keys::INLINE_ATTACH_MAX_MB, &d)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(20)
-        .saturating_mul(1024 * 1024)
+    state.with_conn(|conn| inline_limit_conn(conn))
 }
 
 /// 文件名净化：Windows/Unix 保留字符替换为 `_`
@@ -1616,7 +1645,7 @@ struct AttachCtx<'a> {
     limit: u64,
 }
 
-/// 单附件入库核心（事务内调用，add_attachments 与收件 store_attachment_bytes_conn 共用）：
+/// 单附件入库核心（事务内调用，add_attachments 与收件入库共用）：
 /// gzip → 按上限分级（inline BLOB / 独立文件）→ 行插入。written 记录已写盘路径供回滚清理。
 fn insert_attachment(
     ctx: &AttachCtx,
@@ -1749,48 +1778,6 @@ pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Res
     result
 }
 
-/// 收件附件入库核心（独立连接版，M4 §6.1，不落临时文件）
-pub fn store_attachment_bytes_conn(
-    conn: &mut rusqlite::Connection,
-    data_dir: &Path,
-    email_id: i64,
-    filename: &str,
-    mime: &str,
-    orig: &[u8],
-) -> Result<(), String> {
-    let limit = inline_limit_conn(conn);
-    let root = attach_root_of(data_dir);
-    let month = month_dir_conn(conn, email_id);
-    let mut written_files: Vec<PathBuf> = Vec::new();
-    let tx = conn.transaction().map_err(e)?;
-    let result = (|| {
-        insert_attachment(
-            &AttachCtx {
-                tx: &tx,
-                root: &root,
-                month: &month,
-                email_id,
-                limit,
-            },
-            &safe_filename(filename),
-            mime,
-            orig,
-            &mut written_files,
-        )?;
-        sync_attach_stats(&tx, email_id)?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => tx.commit().map_err(e),
-        Err(err) => {
-            for f in &written_files {
-                let _ = std::fs::remove_file(f);
-            }
-            Err(err)
-        }
-    }
-}
-
 /// 草稿重存时按 keep 列表裁剪附件（删除行 + 独立文件；attach_cnt/bytes 回写）
 pub fn remove_attachments_except(
     state: &AppState,
@@ -1798,36 +1785,33 @@ pub fn remove_attachments_except(
     keep: &[i64],
 ) -> Result<(), String> {
     let root = attach_root(state);
-    state.with_conn(|conn| {
+    // 事务内只删行，独立文件在提交成功后删除（commit 失败则文件仍有效，不留半删除状态）
+    let victims: Vec<String> = state.with_conn(|conn| -> Result<Vec<String>, String> {
         let tx = conn.transaction().map_err(e)?;
-        let mut stmt = tx
-            .prepare("SELECT id, file_path FROM attachments WHERE email_id = ?1")
-            .map_err(e)?;
-        let victims: Vec<(i64, Option<String>)> = stmt
-            .query_map([email_id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(e)?
-            .filter_map(Result::ok)
-            .filter(|(id, _)| !keep.contains(id))
-            .collect();
-        drop(stmt);
-        for (aid, rel) in &victims {
-            tx.execute("DELETE FROM attachments WHERE id = ?1", [aid])
-                .map_err(e)?;
-            if let Some(rel) = rel {
-                let _ = std::fs::remove_file(root.join(rel));
-            }
-        }
-        tx.execute(
-            "UPDATE emails SET
-                 attach_cnt  = (SELECT count(*) FROM attachments WHERE email_id = ?1),
-                 attach_bytes = (SELECT COALESCE(sum(size_orig), 0) FROM attachments WHERE email_id = ?1)
-             WHERE id = ?1",
-            [email_id],
+        let rows: Vec<(i64, Option<String>)> = crate::db::collect_rows(
+            &tx,
+            "SELECT id, file_path FROM attachments WHERE email_id = ?1",
+            &[&email_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(e)?;
+        let victims: Vec<(i64, Option<String>)> = rows
+            .into_iter()
+            .filter(|(aid, _)| !keep.contains(aid))
+            .collect();
+        for (aid, _) in &victims {
+            tx.execute("DELETE FROM attachments WHERE id = ?1", [aid])
+                .map_err(e)?;
+        }
+        sync_attach_stats(&tx, email_id)?;
         tx.commit().map_err(e)?;
-        Ok(())
-    })
+        Ok(victims.into_iter().filter_map(|(_, rel)| rel).collect())
+    })?;
+    for rel in victims {
+        let _ = std::fs::remove_file(root.join(rel));
+    }
+    prune_empty_dirs(&root);
+    Ok(())
 }
 
 /// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）
@@ -1884,7 +1868,7 @@ pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Resul
 
 // ---------- 内部辅助 ----------
 
-/// 附件独立文件的月份目录（§5.1：邮件时间所在月；独立连接版）
+/// 附件独立文件的月份目录（§5.1：邮件时间所在月）
 fn month_dir_conn(conn: &rusqlite::Connection, email_id: i64) -> String {
     let epoch: i64 = conn
         .query_row(
@@ -1898,19 +1882,9 @@ fn month_dir_conn(conn: &rusqlite::Connection, email_id: i64) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// 附件独立文件的月份目录（§5.1：邮件时间所在月；在 with_conn 外调用）
+/// 附件独立文件的月份目录（§5.1：邮件时间所在月；AppState 薄封装）
 fn month_dir_of(state: &AppState, email_id: i64) -> String {
-    let epoch: i64 = state.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(received_at, sent_at, created_at) FROM emails WHERE id = ?1",
-            [email_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
-    });
-    zoned_of(epoch)
-        .map(|z| format!("{:04}-{:02}", z.year(), z.month() as u32))
-        .unwrap_or_else(|| "unknown".into())
+    state.with_conn(|conn| month_dir_conn(conn, email_id))
 }
 
 fn mime_of(filename: &str) -> &'static str {
@@ -2042,6 +2016,10 @@ mod tests {
         assert_eq!(preview_kind_of("image/jpeg", "无扩展名"), "img");
         // text/html 拒绝内嵌（脚本执行风险）
         assert_eq!(preview_kind_of("text/html", "x.html"), "");
+        // SVG 拒绝内嵌（顶层渲染可执行脚本；MIME 与扩展名两条路径都不得归入 img）
+        assert_eq!(preview_kind_of("image/svg+xml", "图.svg"), "");
+        assert_eq!(preview_kind_of("", "图.svg"), "");
+        assert_eq!(preview_kind_of("application/octet-stream", "图.svg"), "");
     }
 
     #[test]
