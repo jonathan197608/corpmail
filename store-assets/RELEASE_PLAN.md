@@ -69,13 +69,26 @@ AppData 虚拟化已禁用，两渠道数据互通；单实例互斥不跨渠道
 2. 该机已用 `CorpMail_0.3.0_x64-setup.exe` 安装应用（记下安装目录，默认
    `C:\Program Files\Mailbox`，下文以 `D:\Mailbox` 为例）
 
+### 部署链路（已确认：macOS 编译，Windows 打商店包）
+
+```
+[macOS]   scripts/build-windows.sh
+   └→ 产物 CorpMail_0.3.0_x64-setup.exe（NSIS）→ 拷贝到 Windows 机
+[Windows] 运行安装器，安装 CorpMail（默认 C:\Program Files\CorpMail）
+[Windows] 装 Windows SDK（含桌面工具）
+[Windows] git clone 本仓库最新 main
+   └→ powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
+        （自动探测安装目录与版本；可 -InstallDir "D:\CorpMail" 覆盖）
+   └→ 产物 store-assets\msix\out\CorpMail_0.3.0.0_x64.msix（未签名，商店代签）
+```
+
 ### 步骤
 ```powershell
 # 1) 从 GitHub 拉取本仓库最新 main（含 store-assets/）
 git clone https://github.com/jonathan197608/mailbox && cd mailbox
 
-# 2) 打 MSIX（脚本自动注入版本号 0.3.0.0）
-bash scripts/build-msix.sh "D:\Mailbox"
+# 2) 打 MSIX（PowerShell 原生脚本：自动探测安装目录与版本，无需参数）
+powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
 # 产物：store-assets/msix/out/CorpMail_0.3.0.0_x64.msix（未签名）
 
 # 3) 本地安装验证（自签名用一下，仅本机测试用）
@@ -143,13 +156,13 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 | listing 中英双语 + 认证备注英文 | ✅ |
 | 隐私声明（zh-CN 主用 + en-US 备用） | ✅ 本次推根目录公开路径 |
 | 截图 5 张 1920×1080 | ✅ |
-| build-msix.sh + WACK 校验提示 | ✅ |
+| build-msix.ps1（PowerShell 原生）+ WACK 校验提示 | ✅ |
 | 版本 0.3.0 全链统一 | ✅ |
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
 | 本体品牌 CorpMail（productName/窗口标题/页面/启动动画） | ✅ 本版统一 |
 | 公开隐私文档路径（仓库根） | ✅ 本次修复（原 docs/ 整体在 .gitignore，链接会 404） |
 
-bash scripts/build-msix.sh "D:\Mailbox"
+powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
 # 产物：store-assets/msix/out/CorpMail_0.3.0.0_x64.msix（未签名）
 
 # 3) 本地安装验证（自签名用一下，仅本机测试用）
@@ -217,7 +230,7 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 | listing 中英双语 + 认证备注英文 | ✅ |
 | 隐私声明（zh-CN 主用 + en-US 备用） | ✅ 本次推根目录公开路径 |
 | 截图 5 张 1920×1080 | ✅ |
-| build-msix.sh + WACK 校验提示 | ✅ |
+| build-msix.ps1（PowerShell 原生）+ WACK 校验提示 | ✅ |
 | 版本 0.3.0 全链统一 | ✅ |
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
 | 本体品牌 CorpMail（productName/窗口标题/页面/启动动画） | ✅ 本版统一 |

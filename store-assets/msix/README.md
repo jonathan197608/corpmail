@@ -1,6 +1,6 @@
 # CorpMail · Microsoft Store 上架资产包
 
-本目录是商店上架的**配置、文案与截图**资产（MSIX 包体由 `scripts/build-msix.sh` 在 Windows 上构建）。
+本目录是商店上架的**配置、文案与截图**资产（MSIX 包体由 `scripts/build-msix.ps1`（PowerShell）在 Windows 上构建）。
 
 ## 目录结构
 
@@ -51,9 +51,10 @@ store-assets/
 ## 构建流程（Windows 机上）
 
 ```powershell
-# 1) 先出 NSIS 安装器（macOS 交叉编译）并安装到本机
-# 2) MSIX 重打包（推荐改装目录 D:\Mailbox）
-scripts/build-msix.sh
+# 1) [macOS] scripts/build-windows.sh 出 NSIS → 拷到 Windows 机安装
+# 2) [Windows] 装 Windows SDK 后：
+powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
+#    （自动探测安装目录/版本；可 -InstallDir "D:\CorpMail" 覆盖）
 # 3) WACK 校验 → Partner Center 提交（.msix 上传，商店代签）
 ```
 
