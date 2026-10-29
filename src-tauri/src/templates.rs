@@ -73,13 +73,5 @@ pub fn render(name: &str, ctx: &impl serde::Serialize) -> Result<String, minijin
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_registers_all_templates() {
-        for (name, _) in TEMPLATES {
-            assert!(ENV.get_template(name).is_ok(), "模板 {name} 未注册");
-        }
-    }
-}
+#[path = "tests/templates.rs"]
+mod tests;
