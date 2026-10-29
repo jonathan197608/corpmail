@@ -13,7 +13,7 @@ CorpMail 是一款面向中国电信企业邮箱的桌面客户端（Tauri 2 + h
 
 ### Windows 安装
 
-1. 从 [Releases](https://github.com/jonathan197608/mailbox/releases) 下载 `CorpMail_x64-setup.exe`
+1. 从 [Releases](https://github.com/jonathan197608/corpmail/releases) 下载 `CorpMail_x64-setup.exe`
 2. 运行安装（默认安装到 `C:\Program Files\CorpMail`）
 3. 首次启动按向导填写邮箱账号（默认服务器已按中国电信企业邮箱预填：IMAP `imap.chinatelecom.cn:993` / SMTP `smtp.chinatelecom.cn:465`）
 

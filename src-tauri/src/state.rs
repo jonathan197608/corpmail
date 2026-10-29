@@ -29,7 +29,7 @@ pub mod keys {
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
     pub const LAST_UID: &str = "last_uid";
 
-    /// 自定义数据目录指针（存独立配置文件 mailbox.toml，随锚点目录常驻）
+    /// 自定义数据目录指针（存独立配置文件 corpmail.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
 }
 
@@ -65,10 +65,10 @@ pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）
     pub data_dir: PathBuf,
-    /// 锚点目录（系统默认应用数据目录）：独立配置文件 mailbox.toml 在此，
+    /// 锚点目录（系统默认应用数据目录）：独立配置文件 corpmail.toml 在此，
     /// 不随数据目录迁移、不被备份删除影响（resolve_start_dir 亦从此定位）
     anchor_dir: PathBuf,
-    /// 应用配置内存镜像（mailbox.toml；Arc 供发送 worker 每封取快照——
+    /// 应用配置内存镜像（corpmail.toml；Arc 供发送 worker 每封取快照——
     /// 配置不落库后 dispatch 不能再从 conn 读 SMTP 参数）
     config: std::sync::Arc<Mutex<crate::conf::ConfigMap>>,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
@@ -114,11 +114,11 @@ impl AppState {
         Self::open_with_anchor(data_dir, data_dir)
     }
 
-    /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 mailbox.toml）。
+    /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 corpmail.toml）。
     /// 配置直接从文件加载（唯一持久源，不做任何旧库回填）；文件为空即未配置
     pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
         std::fs::create_dir_all(data_dir).expect("数据目录应可创建");
-        let conn = crate::db::open(&data_dir.join("mailbox.db")).expect("数据库应可打开");
+        let conn = crate::db::open(&data_dir.join("corpmail.db")).expect("数据库应可打开");
         Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
@@ -136,13 +136,13 @@ impl AppState {
         }
     }
 
-    /// 启动目录解析（lib.rs setup 调用）：独立配置文件 mailbox.toml 的 data_dir_override
+    /// 启动目录解析（lib.rs setup 调用）：独立配置文件 corpmail.toml 的 data_dir_override
     /// 指针定位自定义数据目录；文件缺失/指针失效（目录被删、外置盘拔出）回退锚点目录。
     ///
-    /// 有效性 = 目录存在且含 mailbox.db（迁移快照必有；空壳/失效目录不采纳，
+    /// 有效性 = 目录存在且含 corpmail.db（迁移快照必有；空壳/失效目录不采纳，
     /// 安全回退锚点目录——迁移前的原数据就留在那里）
     pub fn resolve_start_dir(anchor: &Path) -> PathBuf {
-        let usable = |p: &str| Path::new(p).join("mailbox.db").is_file();
+        let usable = |p: &str| Path::new(p).join("corpmail.db").is_file();
         if let Some(p) = crate::conf::load(anchor)
             .get(keys::DATA_DIR)
             .cloned()
@@ -154,7 +154,7 @@ impl AppState {
     }
 
     /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
-    /// 指针写入独立配置文件 mailbox.toml（随锚点目录常驻，不随数据迁移、
+    /// 指针写入独立配置文件 corpmail.toml（随锚点目录常驻，不随数据迁移、
     /// 不被备份删除影响）；原目录保留迁移前的库/附件备份，可由用户在
     /// 存储页手动删除（delete_old_backup）。
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
@@ -181,30 +181,30 @@ impl AppState {
         if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
             return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
         }
-        if dest_path.join("mailbox.db").exists() {
-            return Err("目标目录已存在 mailbox.db，请选择空目录".into());
+        if dest_path.join("corpmail.db").exists() {
+            return Err("目标目录已存在 corpmail.db，请选择空目录".into());
         }
         std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
         // 写入探针：目标可写
-        let probe = dest_path.join(".mailbox-write-probe");
+        let probe = dest_path.join(".corpmail-write-probe");
         std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
         let _ = std::fs::remove_file(&probe);
 
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
-        let new_db = dest_path.join("mailbox.db");
+        let new_db = dest_path.join("corpmail.db");
         self.with_conn(|conn| {
             conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
                 .map_err(|e| format!("数据库快照失败：{e}"))
         })?;
 
-        // 2) 附件目录复制（大附件独立文件；崩溃中断则目标残留，下次迁移前有 mailbox.db 检查拦住）
+        // 2) 附件目录复制（大附件独立文件；崩溃中断则目标残留，下次迁移前有 corpmail.db 检查拦住）
         let src_att = cur.join("attachments");
         if src_att.is_dir() {
             copy_dir_recursive(&src_att, &dest_path.join("attachments"))
                 .map_err(|e| format!("附件目录复制失败：{e}"))?;
         }
 
-        // 3) 指针写入独立配置文件（mailbox.toml，唯一持久源；不落库）。
+        // 3) 指针写入独立配置文件（corpmail.toml，唯一持久源；不落库）。
         //    配置写失败 → 清理已产出的目标快照与附件目录（保证重试不被"已存在库"拦截）
         {
             let mut cfg = self.config.lock().expect("配置锁中毒");
@@ -229,7 +229,7 @@ impl AppState {
         ))
     }
 
-    /// 迁移备份统计：锚点（默认安装目录）中的 mailbox.db[-wal/-shm] + attachments/。
+    /// 迁移备份统计：锚点（默认安装目录）中的 corpmail.db[-wal/-shm] + attachments/。
     /// 仅当已迁移（data_dir != anchor）且锚点存在备份文件时为 Some
     pub fn old_backup_stats(&self) -> Option<(u64, u64)> {
         if self.data_dir == self.anchor_dir {
@@ -237,7 +237,7 @@ impl AppState {
         }
         let mut bytes = 0u64;
         let mut files = 0u64;
-        for f in ["mailbox.db", "mailbox.db-wal", "mailbox.db-shm"] {
+        for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
             if let Ok(md) = std::fs::metadata(self.anchor_dir.join(f))
                 && md.is_file()
             {
@@ -251,14 +251,14 @@ impl AppState {
         (files > 0).then_some((bytes, files))
     }
 
-    /// 删除迁移备份（存储页按钮，验收功能）：清锚点目录中的 mailbox.db[-wal/-shm]
-    /// 与 attachments/；配置文件 mailbox.toml 与当前数据不受影响。
+    /// 删除迁移备份（存储页按钮，验收功能）：清锚点目录中的 corpmail.db[-wal/-shm]
+    /// 与 attachments/；配置文件 corpmail.toml 与当前数据不受影响。
     /// 返回 (释放字节, 删除文件数)
     pub fn delete_old_backup(&self) -> Result<(u64, u64), String> {
         if self.data_dir == self.anchor_dir {
             return Err("当前使用默认数据目录，无迁移备份".into());
         }
-        if !self.data_dir.join("mailbox.db").is_file() {
+        if !self.data_dir.join("corpmail.db").is_file() {
             return Err("当前数据目录缺少数据库文件，拒绝删除备份".into());
         }
         if self.old_backup_stats().is_none() {
@@ -266,7 +266,7 @@ impl AppState {
         }
         let mut freed = 0u64;
         let mut files = 0u64;
-        for f in ["mailbox.db", "mailbox.db-wal", "mailbox.db-shm"] {
+        for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
             let p = self.anchor_dir.join(f);
             if p.is_file() {
                 let sz = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
@@ -346,7 +346,7 @@ impl AppState {
             uid: g(keys::LAST_UID).parse().unwrap_or(0),
         };
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
-        let db_path = self.data_dir.join("mailbox.db");
+        let db_path = self.data_dir.join("corpmail.db");
         let data_dir = self.data_dir.clone();
         std::thread::spawn(move || {
             fetch_round(FetchJob {
@@ -397,13 +397,13 @@ impl AppState {
     /// 独立连接 + MPSC 队列逐封派发（企业 SMTP 串行更稳）；
     /// 启动时扫描残留 queued 一并补发（崩溃恢复）。
     /// 发送队列装配：启动残留 queued 补发 + 后续入队即时派发。
-    /// worker 持独立连接与配置镜像 Arc（配置源 mailbox.toml，不占库锁）
+    /// worker 持独立连接与配置镜像 Arc（配置源 corpmail.toml，不占库锁）
     pub fn start_send_worker(&self) {
         let mut guard = self.send_tx.lock().expect("发送队列锁中毒");
         if guard.is_some() {
             return;
         }
-        let Ok(conn) = crate::db::open(&self.data_dir.join("mailbox.db")) else {
+        let Ok(conn) = crate::db::open(&self.data_dir.join("corpmail.db")) else {
             return;
         };
         let config_arc = std::sync::Arc::clone(&self.config);
@@ -418,7 +418,7 @@ impl AppState {
             .unwrap_or_default();
         std::thread::spawn(move || {
             for id in rx {
-                // 发送参数快照：每封派发前重读配置（mailbox.toml；改动即时生效，
+                // 发送参数快照：每封派发前重读配置（corpmail.toml；改动即时生效，
                 // 不落库——验收拍板简化）
                 let smtp = {
                     let cfg = config_arc.lock().expect("配置锁中毒");
@@ -459,13 +459,13 @@ impl AppState {
         f(&mut conn)
     }
 
-    /// 配置镜像快照（外部线程/测试读 mailbox.toml 内存镜像用；worker 线程直接持 Arc）
+    /// 配置镜像快照（外部线程/测试读 corpmail.toml 内存镜像用；worker 线程直接持 Arc）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn config_snapshot(&self) -> crate::conf::ConfigMap {
         self.config.lock().expect("配置锁中毒").clone()
     }
 
-    /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）仅从 mailbox.toml
+    /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）仅从 corpmail.toml
     /// 内存镜像读（文件为唯一持久源，不落库）；其余读库
     pub fn get(&self, key: &str) -> Option<Option<String>> {
         if crate::conf::is_config_key(key) {
@@ -487,7 +487,7 @@ impl AppState {
             .map(|(_, v)| (*v).to_string())
     }
 
-    /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 mailbox.toml
+    /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 corpmail.toml
     /// （先写文件，成功后才处理库键）；非配置键走库单事务（全库单一写入口不变）
     pub fn set_batch(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
         let cfg_pairs: Vec<(&str, &str)> = pairs
@@ -552,7 +552,7 @@ impl AppState {
 
     /// 数据库文件大小（字节；设置·存储页"邮箱数据库大小"；含 WAL 与索引开销）
     pub fn db_size_bytes(&self) -> u64 {
-        ["mailbox.db", "mailbox.db-wal"]
+        ["corpmail.db", "corpmail.db-wal"]
             .iter()
             .filter_map(|f| std::fs::metadata(self.data_dir.join(f)).ok())
             .map(|m| m.len())
@@ -621,7 +621,7 @@ impl AppState {
         crate::secrets::degraded(&conn, account)
     }
 
-    /// 待生效的数据目录（M5 迁移）：读 mailbox.toml 指针；
+    /// 待生效的数据目录（M5 迁移）：读 corpmail.toml 指针；
     /// 重启后 resolve_start_dir 应用指针、其值 == 当前目录，提示自然消失
     pub fn pending_data_dir(&self) -> Option<String> {
         let over = match self.get(keys::DATA_DIR) {
@@ -629,7 +629,7 @@ impl AppState {
             _ => return None,
         };
         let pending = PathBuf::from(&over);
-        (pending != self.data_dir && pending.join("mailbox.db").is_file()).then_some(over)
+        (pending != self.data_dir && pending.join("corpmail.db").is_file()).then_some(over)
     }
 
     /// 数据目录下的独立附件占用（目录不存在 → 0）：(字节, 文件数)

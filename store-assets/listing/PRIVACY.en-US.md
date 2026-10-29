@@ -38,8 +38,8 @@ Both use only the server addresses and credentials you explicitly configure.
 ## Open source and verifiable
 
 This app is open source under the MIT license:
-https://github.com/jonathan197608/mailbox
+https://github.com/jonathan197608/corpmail
 
 ## Contact
 
-Issue tracker: https://github.com/jonathan197608/mailbox/issues
+Issue tracker: https://github.com/jonathan197608/corpmail/issues

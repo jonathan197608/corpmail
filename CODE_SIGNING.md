@@ -1,6 +1,6 @@
 # 代码签名政策（Code Signing Policy）
 
-本文档描述 Mailbox 的 Windows 发布物签名方式与团队职责，适用于本项目的发布/下载页面。
+本文档描述 CorpMail 的 Windows 发布物签名方式与团队职责，适用于本项目的发布/下载页面。
 
 **Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)**
 
@@ -15,14 +15,14 @@
 
 本项目由个人维护（当前无组织团队）。
 
-- **作者（Authors）**：可以直接修改源码的成员——当前为 [@jonathan197608](https://github.com/jonathan197608)（仓库管理员）；后续协作者以仓库 [Collaborators](https://github.com/jonathan197608/mailbox/settings/access) 为准
+- **作者（Authors）**：可以直接修改源码的成员——当前为 [@jonathan197608](https://github.com/jonathan197608)（仓库管理员）；后续协作者以仓库 [Collaborators](https://github.com/jonathan197608/corpmail/settings/access) 为准
 - **评审（Reviewers）**：非作者提交的变更（Pull Request）须由作者评审通过后合并
 - **批准人（Approvers）**：每次发布签名须由下列成员批准：
   - `@jonathan197608`（仓库管理员）
 
 ## 签名产物
 
-- Windows NSIS 安装器（`Mailbox_x.y.z_x64-setup.exe`）：主程序、WebView2Loader.dll、NSIS 插件与内嵌卸载器均被签名
+- Windows NSIS 安装器（`CorpMail_x.y.z_x64-setup.exe`）：主程序、WebView2Loader.dll、NSIS 插件与内嵌卸载器均被签名
 - 核验：Windows 上 `signtool verify /pa` 或文件属性 → 数字签名
 
 ## 隐私

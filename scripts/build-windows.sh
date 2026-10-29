@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Mailbox · Windows 交叉打包（官方 NSIS，设计 §11.2/§11.3 v3.4）
+# CorpMail · Windows 交叉打包（官方 NSIS，设计 §11.2/§11.3 v3.4）
 # 宿主：macOS（mingw-w64 交叉编译 + tauri-bundler NSIS）
 # 产物：target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe
 # 用法：scripts/build-windows.sh [--debug]

@@ -4,7 +4,7 @@
 //! - 全部 HTML 由 Rust 端 minijinja 渲染，前端只用 htmx 表达交互
 //! - 静态资源（htmx.min.js / app.css）与模板均在编译期内嵌进二进制，离线可用
 //! - 不监听任何本地端口，无防火墙弹窗
-//! - SQLite（mailbox.db）存于 app_data_dir；账号密码走 OS 凭据保管（设计 §5.4）
+//! - SQLite（corpmail.db）存于 app_data_dir；账号密码走 OS 凭据保管（设计 §5.4）
 //!
 //! Windows 平台上，wry/WebView2 将自定义协议映射为 `http://<scheme>.localhost`，
 //! macOS/Linux 直接使用原生 scheme，二者对页面同源、无 CORS 差异。

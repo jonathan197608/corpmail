@@ -1,4 +1,4 @@
-# CorpMail（Mailbox）· Microsoft Store 上架方案
+# CorpMail · Microsoft Store 上架方案
 
 > 版本：v1.1（2026-10-29）｜目标版本 0.3.0｜保留名 JonathanHuang.corpmail
 > 本文档为执行总纲：阶段、步骤、责任分工、提交物与回退策略。
@@ -49,7 +49,7 @@ AppData 虚拟化已禁用，两渠道数据互通；单实例互斥不跨渠道
 ### 步骤
 ```powershell
 # 1) 从 GitHub 拉取本仓库最新 main（含 store-assets/）
-git clone https://github.com/jonathan197608/mailbox && cd mailbox
+git clone https://github.com/jonathan197608/corpmail && cd corpmail
 
 # 2) 打 MSIX（PowerShell 原生脚本：自动探测安装目录与版本，无需参数）
 powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
@@ -83,7 +83,7 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 | # | 页面 | 关键动作 | 易错点 |
 |---|---|---|---|
 | 1 | 定价和可用性 | 市场=全部默认；受众=公共；基价=免费 | 无 |
-| 2 | 属性 | 类别=Productivity（子类别 Email 如有）；**隐私策略 URL 填** `https://github.com/jonathan197608/mailbox/blob/main/PRIVACY.zh-CN.md`；网站 `https://github.com/jonathan197608/mailbox`；支持联系方式=邮箱 | 隐私 URL 必须先推 GitHub 生效再提交 |
+| 2 | 属性 | 类别=Productivity（子类别 Email 如有）；**隐私策略 URL 填** `https://github.com/jonathan197608/corpmail/blob/main/PRIVACY.zh-CN.md`；网站 `https://github.com/jonathan197608/corpmail`；支持联系方式=邮箱 | 隐私 URL 必须先推 GitHub 生效再提交 |
 | 3 | 年龄分级 | 问卷全"否" → 3+ | 无 |
 | 4 | 包 | 上传 `.msix`（未签名，商店代签） | 拒收时先查 Publisher 逐字符 |
 | 5 | 商店一览 | 按 store-listing.md 粘贴 zh-CN/en-US 两份；5 张截图按清单上传 | 截图 ≥1366×768（我们 1920×1080） |
@@ -130,4 +130,4 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
 | 本体品牌 CorpMail（productName/窗口标题/页面/启动动画） | ✅ 本版统一 |
 | 公开隐私文档路径（仓库根） | ✅ 本次修复（原 docs/ 整体在 .gitignore，链接会 404） |
-| GitHub 仓库名保持 mailbox | ✅ 已确认不改（商店隐私链接指向该路径） |
+| GitHub 仓库迁移至 corpmail（原 mailbox 仓库停用为历史归档） | ✅ 已迁移（商店隐私链接等全链指向新仓库） |

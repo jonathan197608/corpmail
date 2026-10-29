@@ -5,7 +5,7 @@ use super::*;
 use crate::state::AppState;
 
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailbox-m2-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("corpmail-m2-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     (AppState::open(&dir), dir)

@@ -20,7 +20,7 @@ store-assets/
 ## 上架身份（已定稿）
 
 - **Publisher**：`CN=3DAC9C91-AE75-4F8D-A413-16DBAF29757A`（已写入 manifest）
-- **隐私政策 URL**：`https://github.com/jonathan197608/mailbox/blob/main/PRIVACY.zh-CN.md`
+- **隐私政策 URL**：`https://github.com/jonathan197608/corpmail/blob/main/PRIVACY.zh-CN.md`
  （隐私文档已随仓库根目录公开）
 - 内部文档（设计稿等）位于 `docs-private/`，不公开（.gitignore 拦截）
 

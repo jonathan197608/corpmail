@@ -1,6 +1,6 @@
 //! SQLite 存储层（设计 §3/§4.2）
 //!
-//! - 单文件 `mailbox.db` 于 app_data_dir；`Mutex<Connection>` 全局单写者（§13-R6）
+//! - 单文件 `corpmail.db` 于 app_data_dir；`Mutex<Connection>` 全局单写者（§13-R6）
 //! - WAL + NORMAL：读写不互阻（spike 实测写入吞吐足够）
 //! - schema 含 emails / attachments / email_fts（FTS5 外部内容表）/ settings
 //! - FTS5 行与 emails 行的一致性由 AI/AD/AU 触发器保证（事务内同步）

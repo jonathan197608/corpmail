@@ -1,4 +1,4 @@
-//! 独立应用配置文件（`mailbox.toml`，M5 验收架构）
+//! 独立应用配置文件（`corpmail.toml`，M5 验收架构）
 //!
 //! 内容：数据目录指针 + 邮件服务器 + 账号配置（**不含密码**：密码仅 OS keychain /
 //! keyfile，设计 §5.4）。位置：锚点目录（系统默认应用数据目录），与数据目录解耦——
@@ -14,7 +14,7 @@ use std::path::Path;
 pub type ConfigMap = BTreeMap<String, String>;
 
 /// 配置文件名（锚点目录下）
-pub const CONFIG_FILE: &str = "mailbox.toml";
+pub const CONFIG_FILE: &str = "corpmail.toml";
 
 /// 配置文件承载键（与 DB settings 同名，读写路由见 AppState::get/set_batch）
 pub const CONFIG_KEYS: &[&str] = &[
@@ -49,7 +49,7 @@ pub fn load(anchor: &Path) -> BTreeMap<String, String> {
 /// BTreeMap 序列化为排序平铺键值；文件头附说明注释。
 pub fn save(anchor: &Path, cfg: &BTreeMap<String, String>) -> Result<(), String> {
     let mut text = String::from(
-        "# Mailbox 应用配置（独立于数据目录：迁移数据、删除旧库备份均不影响本文件）\n\
+        "# CorpMail 应用配置（独立于数据目录：迁移数据、删除旧库备份均不影响本文件）\n\
          # data_dir_override 为数据目录指针，留空表示使用默认目录；请勿删除本文件\n",
     );
     let body = toml::to_string(cfg).map_err(|e| format!("配置序列化失败：{e}"))?;

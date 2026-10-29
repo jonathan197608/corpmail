@@ -517,7 +517,7 @@ fn storage_move_returns_pane_with_pending_dir() {
         dest,
         "重启后应定位新目录"
     );
-    // 失败路径：目标已占用（已有 mailbox.db）→ pane 顶部错误区
+    // 失败路径：目标已占用（已有 corpmail.db）→ pane 顶部错误区
     let html2 = body(&route(
         &state,
         &assets(),
@@ -529,7 +529,7 @@ fn storage_move_returns_pane_with_pending_dir() {
         &tester,
     ));
     assert!(
-        html2.contains("mailbox.db") && html2.contains("compose-note err"),
+        html2.contains("corpmail.db") && html2.contains("compose-note err"),
         "失败应显示错误原因：{html2}"
     );
     let _ = std::fs::remove_dir_all(&dest);
@@ -2172,7 +2172,7 @@ fn dump_smoke_html() {
     state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
     dump("settings-storage-pending.html", get("/settings/storage"));
 
-    // M5 迁移素材：真迁移（快照 + 附件复制 + mailbox.toml 指针）→ pane 显示"待生效目录"行
+    // M5 迁移素材：真迁移（快照 + 附件复制 + corpmail.toml 指针）→ pane 显示"待生效目录"行
     let pending_target = root.join("pending-target");
     state
         .move_data_dir(pending_target.to_str().unwrap())

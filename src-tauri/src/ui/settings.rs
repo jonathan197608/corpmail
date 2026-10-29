@@ -471,8 +471,8 @@ pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
     )
 }
 
-/// 设置·存储管理：删除旧目录迁移备份（M5 验收功能；清锚点 mailbox.db[-wal/-shm]
-/// 与 attachments/，配置文件 mailbox.toml 与当前数据不受影响；回 pane 带结果）
+/// 设置·存储管理：删除旧目录迁移备份（M5 验收功能；清锚点 corpmail.db[-wal/-shm]
+/// 与 attachments/，配置文件 corpmail.toml 与当前数据不受影响；回 pane 带结果）
 pub(super) fn settings_backup_delete(state: &AppState) -> Resp {
     let view = match state.delete_old_backup() {
         Ok((freed, files)) => BackupDeleteView {

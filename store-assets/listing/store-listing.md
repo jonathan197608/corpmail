@@ -77,7 +77,7 @@ CorpMail 不内置统计分析、不联网上报任何信息；唯一网络行�
 
 【支持】
 
-问题反馈与源代码（MIT 开源）：https://github.com/jonathan197608/mailbox
+问题反馈与源代码（MIT 开源）：https://github.com/jonathan197608/corpmail
 ```
 
 ### en-US（≤ 10000 字符）
@@ -126,7 +126,7 @@ CorpMail embeds no analytics and phones nothing home; its only network activity 
 
 【Support】
 
-Issues & source code (MIT): https://github.com/jonathan197608/mailbox
+Issues & source code (MIT): https://github.com/jonathan197608/corpmail
 ```
 
 ## 4. 搜索关键词（Search terms，7 词上限，≤ 30 字符/词，两者各自填写）
@@ -162,13 +162,13 @@ v0.3.0
 
 ## 10. 隐私政策 URL（Privacy policy URL）
 
-- URL：`https://github.com/jonathan197608/mailbox/blob/main/PRIVACY.zh-CN.md`
+- URL：`https://github.com/jonathan197608/corpmail/blob/main/PRIVACY.zh-CN.md`
 - **注意**：隐私文档已随仓库根目录公开（`PRIVACY.zh-CN.md`/`PRIVACY.en-US.md`），链接推送即生效。
 
 ## 11. 支持联系方式（Support contact info）
 
 - 电子邮件：`18988991633@189.cn`
-- 网站：`https://github.com/jonathan197608/mailbox/issues`
+- 网站：`https://github.com/jonathan197608/corpmail/issues`
 
 ## 12. 商店徽标（Store logos）
 

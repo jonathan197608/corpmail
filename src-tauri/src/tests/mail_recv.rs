@@ -56,7 +56,7 @@ impl MailFetcher for FakeFetcher {
 }
 
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailbox-recv-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("corpmail-recv-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     (AppState::open(&dir), dir)

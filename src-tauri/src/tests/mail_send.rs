@@ -7,7 +7,7 @@ use crate::state::AppState;
 use std::path::PathBuf;
 
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailbox-send-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("corpmail-send-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     (AppState::open(&dir), dir)
@@ -121,7 +121,7 @@ fn dispatch_success_transitions_to_sent() {
         .unwrap();
     let id = queued_email(&state, "peer@x.cn, ops@x.cn");
     let sender = FakeSender::ok();
-    // 发送参数快照：从 mailbox.toml 内存镜像生成（配置不落库）
+    // 发送参数快照：从 corpmail.toml 内存镜像生成（配置不落库）
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     assert_eq!(smtp.host, "smtp.test.cn");
     let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp));

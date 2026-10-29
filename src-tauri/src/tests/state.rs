@@ -111,13 +111,13 @@ fn move_data_dir_snapshots_and_writes_pointer() {
     let msg = state.move_data_dir(dest.to_str().unwrap()).unwrap();
     assert!(msg.contains("重启"), "提示应含重启生效：{msg}");
     // 新库可打开且数据齐全
-    let moved_db = dest.join("mailbox.db");
+    let moved_db = dest.join("corpmail.db");
     let conn = open(&moved_db).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1, "快照应含全部邮件");
-    // 配置不落库（验收拍板）：库无可配置键，配置随 mailbox.toml 常驻锚点
+    // 配置不落库（验收拍板）：库无可配置键，配置随 corpmail.toml 常驻锚点
     assert!(
         settings::get(&conn, keys::ACCOUNT_PREFIX)
             .unwrap()
@@ -128,7 +128,7 @@ fn move_data_dir_snapshots_and_writes_pointer() {
     assert_eq!(
         cfg_after.get(keys::ACCOUNT_PREFIX).map(String::as_str),
         Some("demo"),
-        "配置应在锚点 mailbox.toml（数据目录变更不影响）"
+        "配置应在锚点 corpmail.toml（数据目录变更不影响）"
     );
     assert!(
         dest.join(format!("attachments/2026-10/{id}/1_a.bin.gz"))
@@ -136,18 +136,18 @@ fn move_data_dir_snapshots_and_writes_pointer() {
         "附件文件应复制"
     );
     // 指针仅写独立配置文件（不落库，验收拍板简化）；启动解析定位新目录
-    let anchor_conn = open(&anchor.join("mailbox.db")).unwrap();
+    let anchor_conn = open(&anchor.join("corpmail.db")).unwrap();
     assert!(
         settings::get(&anchor_conn, keys::DATA_DIR)
             .unwrap()
             .is_none(),
-        "迁移指针不得写库（mailbox.toml 为唯一持久源）"
+        "迁移指针不得写库（corpmail.toml 为唯一持久源）"
     );
     let cfg = load(&anchor);
     assert_eq!(
         cfg.get(keys::DATA_DIR).map(String::as_str),
         Some(dest.to_str().unwrap()),
-        "指针应写独立配置文件 mailbox.toml"
+        "指针应写独立配置文件 corpmail.toml"
     );
     assert_eq!(
         AppState::resolve_start_dir(&anchor),
@@ -175,8 +175,8 @@ fn move_data_dir_rejects_invalid_targets() {
     );
     let other = base.join("other");
     std::fs::create_dir_all(&other).unwrap();
-    // 已有 mailbox.db 的目录拒绝
-    std::fs::write(other.join("mailbox.db"), b"exists").unwrap();
+    // 已有 corpmail.db 的目录拒绝
+    std::fs::write(other.join("corpmail.db"), b"exists").unwrap();
     assert!(
         state.move_data_dir(other.to_str().unwrap()).is_err(),
         "占用目录拒绝"
@@ -184,7 +184,7 @@ fn move_data_dir_rejects_invalid_targets() {
     // 相对路径拒绝
     assert!(state.move_data_dir("relative/dir").is_err());
     // 失败不应留下指针（配置文件与库镜像均不得写入）
-    let conn = open(&cur.join("mailbox.db")).unwrap();
+    let conn = open(&cur.join("corpmail.db")).unwrap();
     assert!(
         settings::get(&conn, keys::DATA_DIR).unwrap().is_none(),
         "失败不得写库指针"
@@ -224,8 +224,8 @@ fn resolve_start_dir_falls_back_safely() {
 
 #[test]
 fn resolve_start_dir_survives_anchor_db_deletion() {
-    // 验收反馈场景：迁移后用户删除锚点目录 mailbox.db —— 指针在独立配置文件
-    // mailbox.toml 中，删除库不影响定位，不误判首次启动
+    // 验收反馈场景：迁移后用户删除锚点目录 corpmail.db —— 指针在独立配置文件
+    // corpmail.toml 中，删除库不影响定位，不误判首次启动
     let base = temp_dir("resolve-anchor-del");
     let anchor = base.join("anchor");
     std::fs::create_dir_all(&anchor).unwrap();
@@ -250,20 +250,20 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
     state.move_data_dir(dest.to_str().unwrap()).unwrap();
     drop(state);
     // 迁移后：锚点保留兼容镜像库 + 独立配置文件（配置不随数据迁移）
-    assert!(anchor.join("mailbox.db").is_file(), "锚点兼容镜像库存在");
+    assert!(anchor.join("corpmail.db").is_file(), "锚点兼容镜像库存在");
     assert!(
         anchor.join(crate::conf::CONFIG_FILE).is_file(),
         "独立配置文件已写入"
     );
     // 用户删除锚点库 —— 定位不受影响
-    std::fs::remove_file(anchor.join("mailbox.db")).unwrap();
+    std::fs::remove_file(anchor.join("corpmail.db")).unwrap();
     assert_eq!(
         AppState::resolve_start_dir(&anchor),
         dest,
         "锚点库被删后应经配置文件继续定位自定义目录（不误判首次启动）"
     );
     // 定位到的库可正常打开且数据完整（非空壳）
-    let conn = open(&dest.join("mailbox.db")).unwrap();
+    let conn = open(&dest.join("corpmail.db")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
         .unwrap();
@@ -271,7 +271,7 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
     // 模拟重启后（数据目录已在新位置）：不复活锚点库、无待生效提示
     let state2 = AppState::open_with_anchor(&dest, &anchor);
     assert!(
-        !anchor.join("mailbox.db").exists(),
+        !anchor.join("corpmail.db").exists(),
         "open 不得复活锚点库文件"
     );
     assert_eq!(
@@ -293,7 +293,7 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
 
 #[test]
 fn pending_data_dir_reads_config_file_after_db_delete() {
-    // 未重启状态下删锚点库：待生效目录从 mailbox.toml 读出（迁移待生效仍可见）
+    // 未重启状态下删锚点库：待生效目录从 corpmail.toml 读出（迁移待生效仍可见）
     let base = temp_dir("pending-conf");
     let anchor = base.join("anchor");
     std::fs::create_dir_all(&anchor).unwrap();
@@ -301,7 +301,7 @@ fn pending_data_dir_reads_config_file_after_db_delete() {
     let dest = base.join("moved");
     state.move_data_dir(dest.to_str().unwrap()).unwrap();
     drop(state);
-    std::fs::remove_file(anchor.join("mailbox.db")).unwrap();
+    std::fs::remove_file(anchor.join("corpmail.db")).unwrap();
     // 重新打开（锚点=默认目录，数据目录也还是它——模拟未重启进程）
     let state2 = AppState::open_with_anchor(&anchor, &anchor);
     assert_eq!(
@@ -314,7 +314,7 @@ fn pending_data_dir_reads_config_file_after_db_delete() {
 
 #[test]
 fn resolve_start_dir_rejects_hollow_pointer_target() {
-    // 有效性加强：配置指针指向存在但无 mailbox.db 的目录（空壳）→ 不采纳，回退锚点
+    // 有效性加强：配置指针指向存在但无 corpmail.db 的目录（空壳）→ 不采纳，回退锚点
     let base = temp_dir("resolve-hollow");
     let anchor = base.join("anchor");
     std::fs::create_dir_all(&anchor).unwrap();
@@ -336,7 +336,7 @@ fn resolve_start_dir_rejects_hollow_pointer_target() {
 
 #[test]
 fn config_keys_stored_in_toml_only() {
-    // 配置键仅写 mailbox.toml（唯一持久源，验收拍板简化）：不落库、get 直读回；
+    // 配置键仅写 corpmail.toml（唯一持久源，验收拍板简化）：不落库、get 直读回；
     // 非配置键仅入库；配置文件丢失后无库镜像可回填（by-design：需重新配置）
     let base = temp_dir("conf-solo");
     let dir = base.join("data");
@@ -369,9 +369,9 @@ fn config_keys_stored_in_toml_only() {
         !cfg.contains_key(keys::KEEP_INBOX_DAYS),
         "非配置键不得入配置文件"
     );
-    // 库中无配置键（验收拍板：DB 不保存 mailbox.toml 已有配置）
+    // 库中无配置键（验收拍板：DB 不保存 corpmail.toml 已有配置）
     {
-        let conn = open(&dir.join("mailbox.db")).unwrap();
+        let conn = open(&dir.join("corpmail.db")).unwrap();
         assert!(
             settings::get(&conn, keys::SMTP_HOST).unwrap().is_none(),
             "配置键不得写库"
@@ -423,7 +423,7 @@ fn delete_old_backup_removes_files_but_keeps_config() {
     let (freed, removed) = state2.delete_old_backup().unwrap();
     assert_eq!(freed, bytes, "释放字节应与统计一致");
     assert_eq!(removed, files);
-    assert!(!anchor.join("mailbox.db").exists(), "锚点库应被删除");
+    assert!(!anchor.join("corpmail.db").exists(), "锚点库应被删除");
     assert!(!anchor.join("attachments").exists(), "备份附件目录应被删除");
     assert!(
         anchor.join(crate::conf::CONFIG_FILE).is_file(),
@@ -434,7 +434,7 @@ fn delete_old_backup_removes_files_but_keeps_config() {
         dest,
         "删除备份后定位不受影响"
     );
-    assert!(dest.join("mailbox.db").is_file(), "当前数据完好");
+    assert!(dest.join("corpmail.db").is_file(), "当前数据完好");
     // 重复删除 → 无备份可删
     assert!(state2.delete_old_backup().is_err());
     let _ = std::fs::remove_dir_all(&base);

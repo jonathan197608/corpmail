@@ -2,7 +2,7 @@
 //!
 //! 状态机：`queued →（CAS 抢占）sending → sent / failed`；
 //! sent 终态迁 folder='sent' 并记 sent_at。失败原因写 error 列。
-//! 发送参数快照由 worker 每封从 mailbox.toml 镜像生成（不读库）。
+//! 发送参数快照由 worker 每封从 corpmail.toml 镜像生成（不读库）。
 
 use super::{AppState, e, exec_one, now_epoch};
 use crate::state::{defaults, keys};
@@ -117,8 +117,8 @@ pub fn reopen_failed(state: &AppState, id: i64) -> bool {
 /// 状态机（§3）：`queued →（CAS 抢占）sending → sent / failed`；
 /// sent 终态同步迁 `folder='sent'` 并记 sent_at。失败原因写 error 列。
 /// 返回 Ok(终态)（"sent"/"failed"）；未抢占到排队状态或邮件缺失返回 Err。
-/// 发送参数快照（worker 每封派发前从配置生成；配置源 mailbox.toml，
-/// 不再读库——验收拍板：DB 不保存 mailbox.toml 已有配置）
+/// 发送参数快照（worker 每封派发前从配置生成；配置源 corpmail.toml，
+/// 不再读库——验收拍板：DB 不保存 corpmail.toml 已有配置）
 #[derive(Clone, Debug)]
 pub struct SmtpConfig {
     pub host: String,
@@ -210,7 +210,7 @@ pub fn dispatch_one(
         fail_or_log("收件人为空");
         return Ok("failed");
     }
-    // 发信参数：调用方快照（mailbox.toml）；密码仍走 conn（凭据与配置分离）
+    // 发信参数：调用方快照（corpmail.toml）；密码仍走 conn（凭据与配置分离）
     let password = match crate::secrets::retrieve(conn, &msg.from_addr) {
         crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
         crate::secrets::GetResult::Missing => {

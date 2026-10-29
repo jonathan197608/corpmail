@@ -7,5 +7,5 @@ fn main() {
     // WebView2 Runtime 的安装由官方 NSIS 安装器负责
     // （webviewInstallMode = embedBootstrapper，设计 §11.2 v3.4）；
     // 主程序不做启动自愈，也不携带 Bootstrapper。
-    mailbox_lib::run();
+    corpmail_lib::run();
 }

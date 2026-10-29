@@ -1,7 +1,7 @@
 //! 凭据保管（设计 §5.4）：OS keychain 优先，keyfile 加密回退
 //!
 //! - **主路径** keyring 4：Windows Credential Manager（generic credential，
-//!   service="mailbox"，user=账号）/ macOS Keychain
+//!   service="corpmail"，user=账号）/ macOS Keychain
 //! - **回退** keyring 写失败（权限/组策略）→ keyfile：128-bit 随机 key（0600）+ AES-256-GCM
 //!   加密落库（settings 表同名 `enc:<key>` 行），设置页提示降级状态
 //! - 密码仅运行时读入内存；UI 永不回显明文（输入框留空 = 不修改）
@@ -13,8 +13,9 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use rusqlite::Connection;
 
-/// keyring 的 service 名（Windows Credential Manager / macOS Keychain 通用）
-const KEYRING_SERVICE: &str = "mailbox";
+/// keyring 的 service 名（Windows Credential Manager / macOS Keychain 通用）。
+/// 品牌统一后旧服务名 "mailbox" 下的凭据不迁移（0.2.x 无存量用户）
+const KEYRING_SERVICE: &str = "corpmail";
 
 /// 凭据读取结果
 #[derive(Debug)]

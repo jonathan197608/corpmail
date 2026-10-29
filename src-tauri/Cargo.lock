@@ -718,6 +718,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
+name = "corpmail"
+version = "0.3.0"
+dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "encoding_rs",
+ "flate2",
+ "imap",
+ "jieba-rs",
+ "jiff",
+ "keyring",
+ "lettre",
+ "mailparse",
+ "minijinja",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "toml 0.8.2",
+ "url",
+]
+
+[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2545,33 +2572,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "mailbox"
-version = "0.3.0"
-dependencies = [
- "aes-gcm",
- "base64 0.22.1",
- "encoding_rs",
- "flate2",
- "imap",
- "jieba-rs",
- "jiff",
- "keyring",
- "lettre",
- "mailparse",
- "minijinja",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
- "toml 0.8.2",
- "url",
-]
 
 [[package]]
 name = "mailparse"

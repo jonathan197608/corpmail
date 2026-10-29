@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# Mailbox · Windows 产物签名（SignPath 云签名）
+# CorpMail · Windows 产物签名（SignPath 云签名）
 # 被两个调用方使用（均传待签文件路径为 $1，要求原地替换为已签名版本）：
 #   1) tauri-bundler sign_command：主程序 exe / NSIS 插件 dll / 最终安装器
 #   2) NSIS !uninstfinalize 钩子（makensis 编译期，cwd 可能不同）：
@@ -66,7 +66,7 @@ HTTP_CODE="$(curl -sS -X POST "${BASE}/SigningRequests/SubmitWithArtifact" \
     -F "signingPolicySlug=${SIGNPATH_POLICY_SLUG}" \
     ${SIGNPATH_ARTIFACT_SLUG:+-F "artifactConfigurationSlug=${SIGNPATH_ARTIFACT_SLUG}"} \
     -F "artifact=@${FILE}" \
-    -F "description=mailbox $(basename "${FILE}")" \
+    -F "description=corpmail $(basename "${FILE}")" \
     -D "$HDR" -o "$BODY" -w '%{http_code}')" || die "提交失败：无法连接 ${API_URL}（检查网络/代理与内网拦截）"
 
 [ "$HTTP_CODE" = "201" ] || die "提交失败 HTTP ${HTTP_CODE}：$(tr -d '\r' <"$BODY" | head -c 400)"

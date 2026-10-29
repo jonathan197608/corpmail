@@ -37,8 +37,8 @@ CorpMail（下称「本应用」）是一款本地优先的企业邮箱客户端
 ## 开源可验证
 
 本应用以 MIT 协议开源，全部源代码可公开审阅：
-https://github.com/jonathan197608/mailbox
+https://github.com/jonathan197608/corpmail
 
 ## 联系方式
 
-问题反馈：https://github.com/jonathan197608/mailbox/issues
+问题反馈：https://github.com/jonathan197608/corpmail/issues
