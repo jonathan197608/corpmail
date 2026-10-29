@@ -107,17 +107,15 @@ impl AppState {
     }
 
     /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 mailbox.toml）。
-    /// 启动加载配置：文件缺键时从旧版 DB settings 回填一次（文件为唯一持久源，
-    /// 此后写入仅落文件、不镜像库，验收拍板简化）
+    /// 配置直接从文件加载（唯一持久源，不做任何旧库回填）；文件为空即未配置
     pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
         std::fs::create_dir_all(data_dir).expect("数据目录应可创建");
         let conn = crate::db::open(&data_dir.join("mailbox.db")).expect("数据库应可打开");
-        let config = Self::load_config_with_backfill(&conn, anchor_dir);
         Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
             anchor_dir: anchor_dir.to_path_buf(),
-            config: std::sync::Arc::new(Mutex::new(config)),
+            config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
             send_tx: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
@@ -128,40 +126,8 @@ impl AppState {
         }
     }
 
-    /// 配置启动加载：mailbox.toml 读入，缺失的键从旧版 DB settings 回填
-    /// （0.1.0-0.2.2 升级路径：所有旧版把配置存活跃库；DATA_DIR 额外查锚点库，
-    /// 0.2.x 迁移指针写在锚点库）。回填仅写文件不写库；文件已有键一律以其为准。
-    /// 回填落盘失败仅记日志（内存镜像仍可用，下次启动重试）
-    fn load_config_with_backfill(conn: &Connection, anchor: &Path) -> crate::conf::ConfigMap {
-        let mut cfg = crate::conf::load(anchor);
-        let mut dirty = false;
-        for k in crate::conf::CONFIG_KEYS {
-            if !cfg.contains_key(*k)
-                && let Some(v) = crate::db::settings::get(conn, k).ok().flatten()
-            {
-                cfg.insert((*k).to_string(), v);
-                dirty = true;
-            }
-        }
-        if !cfg.contains_key(keys::DATA_DIR) {
-            let anchor_db = anchor.join("mailbox.db");
-            if anchor_db.is_file()
-                && let Ok(c) = crate::db::open(&anchor_db)
-                && let Ok(Some(p)) = crate::db::settings::get(&c, keys::DATA_DIR)
-                && !p.trim().is_empty()
-            {
-                cfg.insert(keys::DATA_DIR.to_string(), p);
-                dirty = true;
-            }
-        }
-        if dirty && let Err(e) = crate::conf::save(anchor, &cfg) {
-            eprintln!("[conf] 配置文件回填落盘失败（内存镜像仍可用，下次启动重试）：{e}");
-        }
-        cfg
-    }
-
     /// 启动目录解析（lib.rs setup 调用）：独立配置文件 mailbox.toml 的 data_dir_override
-    /// 指针定位自定义数据目录；文件缺失（0.2.1/0.2.2 升级首启）回退锚点库指针。
+    /// 指针定位自定义数据目录；文件缺失/指针失效（目录被删、外置盘拔出）回退锚点目录。
     ///
     /// 有效性 = 目录存在且含 mailbox.db（迁移快照必有；空壳/失效目录不采纳，
     /// 安全回退锚点目录——迁移前的原数据就留在那里）
@@ -173,16 +139,6 @@ impl AppState {
             .filter(|p| usable(p))
         {
             return PathBuf::from(p);
-        }
-        // 兼容 0.2.1/0.2.2：迁移指针在锚点库（仅打开既有文件，探测无副作用建库）
-        let anchor_db = anchor.join("mailbox.db");
-        if anchor_db.is_file() {
-            let over = crate::db::open(&anchor_db)
-                .ok()
-                .and_then(|c| crate::db::settings::get(&c, keys::DATA_DIR).ok().flatten());
-            if let Some(p) = over.filter(|p| usable(p)) {
-                return PathBuf::from(p);
-            }
         }
         anchor.to_path_buf()
     }
@@ -1003,18 +959,6 @@ mod tests {
             anchor,
             "空壳目录不得被当作有效数据目录"
         );
-        // 0.2.1/0.2.2 兼容：锚点库 data_dir_override 同样校验
-        let legacy = base.join("legacy");
-        std::fs::create_dir_all(&legacy).unwrap();
-        {
-            let c = crate::db::open(&legacy.join("mailbox.db")).unwrap();
-            crate::db::settings::set(&c, keys::DATA_DIR, hollow.to_str().unwrap()).unwrap();
-        }
-        assert_eq!(
-            AppState::resolve_start_dir(&legacy),
-            legacy,
-            "旧版库指针指向空壳同样回退"
-        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1084,56 +1028,6 @@ mod tests {
             "配置文件丢失后读不到配置（需重新配置）"
         );
         assert!(!state2.configured(), "应回到未配置态");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn legacy_db_settings_backfill_into_config_file() {
-        // 0.2.2 升级场景：账号/服务器配置与迁移指针都在库里，无 mailbox.toml ——
-        // 首次启动应整体回填到独立配置文件，后续读写以文件为准
-        let base = temp_dir("conf-legacy");
-        let anchor = base.join("anchor");
-        let custom = base.join("custom");
-        std::fs::create_dir_all(&anchor).unwrap();
-        std::fs::create_dir_all(&custom).unwrap();
-        // 自定义库（0.2.2 迁移产物）：账号/服务器配置
-        {
-            let c = crate::db::open(&custom.join("mailbox.db")).unwrap();
-            crate::db::settings::set(&c, keys::ACCOUNT_PREFIX, "zhangw.gd").unwrap();
-            crate::db::settings::set(&c, keys::DISPLAY_NAME, "张伟").unwrap();
-            crate::db::settings::set(&c, keys::RECV_HOST, "imap.test.cn").unwrap();
-        }
-        // 锚点库：0.2.2 迁移指针（活跃库不含此键）
-        {
-            let c = crate::db::open(&anchor.join("mailbox.db")).unwrap();
-            crate::db::settings::set(&c, keys::DATA_DIR, custom.to_str().unwrap()).unwrap();
-        }
-        // 启动：resolve 走锚点库兼容路径定位自定义目录
-        assert_eq!(AppState::resolve_start_dir(&anchor), custom);
-        let state = AppState::open_with_anchor(&custom, &anchor);
-        // 配置文件已回填（含锚点库指针）
-        let cfg = crate::conf::load(&anchor);
-        assert_eq!(
-            cfg.get(keys::ACCOUNT_PREFIX).map(String::as_str),
-            Some("zhangw.gd")
-        );
-        assert_eq!(
-            cfg.get(keys::DISPLAY_NAME).map(String::as_str),
-            Some("张伟")
-        );
-        assert_eq!(
-            cfg.get(keys::RECV_HOST).map(String::as_str),
-            Some("imap.test.cn")
-        );
-        assert_eq!(
-            cfg.get(keys::DATA_DIR).map(String::as_str),
-            Some(custom.to_str().unwrap()),
-            "锚点库指针应回填到配置文件"
-        );
-        // 下次启动走配置文件路径（锚点库删掉也能定位）
-        std::fs::remove_file(anchor.join("mailbox.db")).unwrap();
-        assert_eq!(AppState::resolve_start_dir(&anchor), custom);
-        assert!(state.configured(), "回填后应判定已配置");
         let _ = std::fs::remove_dir_all(&base);
     }
 
