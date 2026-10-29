@@ -29,7 +29,7 @@ pub mod keys {
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
     pub const LAST_UID: &str = "last_uid";
 
-    /// 自定义数据目录指针（存独立配置文件 mailbox.conf，随锚点目录常驻）
+    /// 自定义数据目录指针（存独立配置文件 mailbox.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
 }
 
@@ -65,12 +65,12 @@ pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）
     pub data_dir: PathBuf,
-    /// 锚点目录（系统默认应用数据目录）：独立配置文件 mailbox.conf 在此，
+    /// 锚点目录（系统默认应用数据目录）：独立配置文件 mailbox.toml 在此，
     /// 不随数据目录迁移、不被备份删除影响（resolve_start_dir 亦从此定位）
     anchor_dir: PathBuf,
-    /// 应用配置内存镜像（mailbox.conf：数据目录指针 + 服务器 + 账号；
-    /// 读经 get 路由，写经 set_batch 双写文件与库镜像）
-    config: Mutex<crate::conf::ConfigMap>,
+    /// 应用配置内存镜像（mailbox.toml；Arc 供发送 worker 每封取快照——
+    /// 配置不落库后 dispatch 不能再从 conn 读 SMTP 参数）
+    config: std::sync::Arc<Mutex<crate::conf::ConfigMap>>,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）
@@ -106,18 +106,18 @@ impl AppState {
         Self::open_with_anchor(data_dir, data_dir)
     }
 
-    /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 mailbox.conf）。
-    /// 打开后同步配置：文件 ↔ 库镜像并集（冲突以库为准——库为活跃写入侧；
-    /// 0.2.2 旧版升级首启时库键回填到文件，文件从备份恢复时回填入库）
+    /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 mailbox.toml）。
+    /// 启动加载配置：文件缺键时从旧版 DB settings 回填一次（文件为唯一持久源，
+    /// 此后写入仅落文件、不镜像库，验收拍板简化）
     pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
         std::fs::create_dir_all(data_dir).expect("数据目录应可创建");
         let conn = crate::db::open(&data_dir.join("mailbox.db")).expect("数据库应可打开");
-        let config = Self::load_and_sync_config(&conn, anchor_dir);
+        let config = Self::load_config_with_backfill(&conn, anchor_dir);
         Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
             anchor_dir: anchor_dir.to_path_buf(),
-            config: Mutex::new(config),
+            config: std::sync::Arc::new(Mutex::new(config)),
             send_tx: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
@@ -128,29 +128,19 @@ impl AppState {
         }
     }
 
-    /// 配置启动同步：mailbox.conf ↔ 活跃库镜像并集，任一份缺失的键由另一份回填。
-    /// - 冲突以库为准（库是每次保存的活跃写入侧；文件写失败/落后时以库覆盖）；
-    /// - DATA_DIR 额外回填源：锚点库（0.2.1/0.2.2 迁移指针写在锚点库，活跃库无）；
-    /// - 回填结果双写落盘；文件落盘失败仅记日志（库镜像仍在，下次启动重试）
-    fn load_and_sync_config(conn: &Connection, anchor: &Path) -> crate::conf::ConfigMap {
+    /// 配置启动加载：mailbox.toml 读入，缺失的键从旧版 DB settings 回填
+    /// （0.1.0-0.2.2 升级路径：所有旧版把配置存活跃库；DATA_DIR 额外查锚点库，
+    /// 0.2.x 迁移指针写在锚点库）。回填仅写文件不写库；文件已有键一律以其为准。
+    /// 回填落盘失败仅记日志（内存镜像仍可用，下次启动重试）
+    fn load_config_with_backfill(conn: &Connection, anchor: &Path) -> crate::conf::ConfigMap {
         let mut cfg = crate::conf::load(anchor);
-        let mut file_dirty = false;
-        let mut db_missing: Vec<(String, String)> = Vec::new();
+        let mut dirty = false;
         for k in crate::conf::CONFIG_KEYS {
-            let db_v = crate::db::settings::get(conn, k).ok().flatten();
-            match (cfg.get(*k).cloned(), db_v) {
-                (Some(f), Some(dv)) => {
-                    if f != dv {
-                        cfg.insert((*k).to_string(), dv);
-                        file_dirty = true;
-                    }
-                }
-                (None, Some(dv)) => {
-                    cfg.insert((*k).to_string(), dv);
-                    file_dirty = true;
-                }
-                (Some(fv), None) => db_missing.push(((*k).to_string(), fv)),
-                (None, None) => {}
+            if !cfg.contains_key(*k)
+                && let Some(v) = crate::db::settings::get(conn, k).ok().flatten()
+            {
+                cfg.insert((*k).to_string(), v);
+                dirty = true;
             }
         }
         if !cfg.contains_key(keys::DATA_DIR) {
@@ -160,21 +150,17 @@ impl AppState {
                 && let Ok(Some(p)) = crate::db::settings::get(&c, keys::DATA_DIR)
                 && !p.trim().is_empty()
             {
-                db_missing.push((keys::DATA_DIR.to_string(), p.clone()));
                 cfg.insert(keys::DATA_DIR.to_string(), p);
-                file_dirty = true;
+                dirty = true;
             }
         }
-        for (k, v) in &db_missing {
-            let _ = crate::db::settings::set(conn, k, v);
-        }
-        if file_dirty && let Err(e) = crate::conf::save(anchor, &cfg) {
-            eprintln!("[conf] 配置文件写入失败（库镜像仍有效）：{e}");
+        if dirty && let Err(e) = crate::conf::save(anchor, &cfg) {
+            eprintln!("[conf] 配置文件回填落盘失败（内存镜像仍可用，下次启动重试）：{e}");
         }
         cfg
     }
 
-    /// 启动目录解析（lib.rs setup 调用）：独立配置文件 mailbox.conf 的 data_dir_override
+    /// 启动目录解析（lib.rs setup 调用）：独立配置文件 mailbox.toml 的 data_dir_override
     /// 指针定位自定义数据目录；文件缺失（0.2.1/0.2.2 升级首启）回退锚点库指针。
     ///
     /// 有效性 = 目录存在且含 mailbox.db（迁移快照必有；空壳/失效目录不采纳，
@@ -202,7 +188,7 @@ impl AppState {
     }
 
     /// 迁移数据目录到用户选定位置（M5：在线快照 + 重启生效，避免热切换连接的并发风险）。
-    /// 指针写入独立配置文件 mailbox.conf（随锚点目录常驻，不随数据迁移、
+    /// 指针写入独立配置文件 mailbox.toml（随锚点目录常驻，不随数据迁移、
     /// 不被备份删除影响）；锚点库同步兼容镜像。原目录残留备份可由用户在
     /// 存储页手动删除（delete_old_backup）。
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
@@ -242,7 +228,7 @@ impl AppState {
                 .map_err(|e| format!("附件目录复制失败：{e}"))?;
         }
 
-        // 3) 指针写入独立配置文件（mailbox.conf）+ 锚点库兼容镜像。
+        // 3) 指针写入独立配置文件（mailbox.toml，唯一持久源；不落库）。
         //    配置写失败 → 清理已产出的目标快照与附件目录（保证重试不被"已存在库"拦截）
         {
             let mut cfg = self.config.lock().expect("配置锁中毒");
@@ -259,12 +245,6 @@ impl AppState {
                 }
                 return Err(format!("配置文件写入失败：{e}"));
             }
-        }
-        let anchor_db = self.anchor_dir.join("mailbox.db");
-        if anchor_db.is_file()
-            && let Ok(c) = crate::db::open(&anchor_db)
-        {
-            let _ = crate::db::settings::set(&c, keys::DATA_DIR, &dest_path.to_string_lossy());
         }
 
         Ok(format!(
@@ -296,7 +276,7 @@ impl AppState {
     }
 
     /// 删除迁移备份（存储页按钮，验收功能）：清锚点目录中的 mailbox.db[-wal/-shm]
-    /// 与 attachments/；配置文件 mailbox.conf 与当前数据不受影响。
+    /// 与 attachments/；配置文件 mailbox.toml 与当前数据不受影响。
     /// 返回 (释放字节, 删除文件数)
     pub fn delete_old_backup(&self) -> Result<(u64, u64), String> {
         if self.data_dir == self.anchor_dir {
@@ -469,6 +449,8 @@ impl AppState {
     ///
     /// 独立连接 + MPSC 队列逐封派发（企业 SMTP 串行更稳）；
     /// 启动时扫描残留 queued 一并补发（崩溃恢复）。
+    /// 发送队列装配：启动残留 queued 补发 + 后续入队即时派发。
+    /// worker 持独立连接与配置镜像 Arc（配置源 mailbox.toml，不占库锁）
     pub fn start_send_worker(&self) {
         let mut guard = self.send_tx.lock().expect("发送队列锁中毒");
         if guard.is_some() {
@@ -477,6 +459,7 @@ impl AppState {
         let Ok(conn) = crate::db::open(&self.data_dir.join("mailbox.db")) else {
             return;
         };
+        let config_arc = std::sync::Arc::clone(&self.config);
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
         // 崩溃恢复：残留 queued 补发（按 id 升序）
         let stale: Vec<i64> = conn
@@ -488,7 +471,13 @@ impl AppState {
             .unwrap_or_default();
         std::thread::spawn(move || {
             for id in rx {
-                let _ = crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id);
+                // 发送参数快照：每封派发前重读配置（mailbox.toml；改动即时生效，
+                // 不落库——验收拍板简化）
+                let smtp = {
+                    let cfg = config_arc.lock().expect("配置锁中毒");
+                    crate::mail::SmtpConfig::from_config(&cfg)
+                };
+                let _ = crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id, &smtp);
             }
         });
         for id in stale {
@@ -519,14 +508,19 @@ impl AppState {
 
     /// 读 settings 键（None = 未设置；库错误按未设置处理，页面回退默认值）
     /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）路由到
-    /// mailbox.conf 内存镜像（缺失时兜底库镜像——启动并集同步后罕见）；其余读库
+    /// mailbox.toml 内存镜像（缺失时兜底库镜像——启动并集同步后罕见）；其余读库
+    /// 配置快照（外部线程/测试读 mailbox.toml 镜像用；worker 线程直接持 Arc）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn config_snapshot(&self) -> crate::conf::ConfigMap {
+        self.config.lock().expect("配置锁中毒").clone()
+    }
+
+    /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）仅从 mailbox.toml
+    /// 内存镜像读（文件为唯一持久源，不落库）；其余读库
     pub fn get(&self, key: &str) -> Option<Option<String>> {
         if crate::conf::is_config_key(key) {
             let cfg = self.config.lock().expect("配置锁中毒");
-            if let Some(v) = cfg.get(key) {
-                return Some(Some(v.clone()));
-            }
-            drop(cfg);
+            return Some(cfg.get(key).cloned());
         }
         let conn = self.db.lock().expect("数据库锁中毒");
         crate::db::settings::get(&conn, key).ok()
@@ -543,23 +537,41 @@ impl AppState {
             .map(|(_, v)| (*v).to_string())
     }
 
-    /// 批量写（单事务；单键写入同样走此接口，保持全库单一写入口）。
-    /// 配置键双写：先库镜像后独立配置文件（文件写失败时库已更新且冲突策略
-    /// 以库为准——重启并集同步后自愈）；注意错误类型为 String
+    /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 mailbox.toml
+    /// （先写文件，成功后才处理库键）；非配置键走库单事务（全库单一写入口不变）
     pub fn set_batch(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
-        let has_cfg = pairs.iter().any(|(k, _)| crate::conf::is_config_key(k));
-        if has_cfg {
-            let mut cfg = self.config.lock().expect("配置锁中毒");
-            for (k, v) in pairs {
-                if crate::conf::is_config_key(k) {
+        let cfg_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .copied()
+            .filter(|(k, _)| crate::conf::is_config_key(k))
+            .collect();
+        let db_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .copied()
+            .filter(|(k, _)| !crate::conf::is_config_key(k))
+            .collect();
+        if !cfg_pairs.is_empty() {
+            {
+                let mut cfg = self.config.lock().expect("配置锁中毒");
+                for (k, v) in &cfg_pairs {
                     cfg.insert((*k).to_string(), (*v).to_string());
                 }
             }
+            let cfg = self.config.lock().expect("配置锁中毒");
+            if let Err(e) = crate::conf::save(&self.anchor_dir, &cfg) {
+                // 文件写失败：回滚内存镜像，调用方报错（下次保存重试）
+                drop(cfg);
+                let mut cfg = self.config.lock().expect("配置锁中毒");
+                for (k, _) in &cfg_pairs {
+                    cfg.remove(*k);
+                }
+                return Err(format!("配置文件写入失败：{e}"));
+            }
         }
-        {
+        if !db_pairs.is_empty() {
             let mut conn = self.db.lock().expect("数据库锁中毒");
             let tx = conn.transaction().map_err(|e| e.to_string())?;
-            for (k, v) in pairs {
+            for (k, v) in &db_pairs {
                 tx.execute(
                     "INSERT INTO settings(k, v) VALUES (?1, ?2)
                      ON CONFLICT(k) DO UPDATE SET v = excluded.v",
@@ -568,11 +580,6 @@ impl AppState {
                 .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
-        }
-        if has_cfg {
-            let cfg = self.config.lock().expect("配置锁中毒");
-            crate::conf::save(&self.anchor_dir, &cfg)
-                .map_err(|e| format!("配置文件写入失败：{e}"))?;
         }
         Ok(())
     }
@@ -640,7 +647,7 @@ impl AppState {
         crate::secrets::degraded(&conn, account)
     }
 
-    /// 待生效的数据目录（M5 迁移）：读配置指针（get 路由 mailbox.conf/库镜像）；
+    /// 待生效的数据目录（M5 迁移）：读配置指针（get 路由 mailbox.toml/库镜像）；
     /// 重启后 resolve_start_dir 应用指针、其值 == 当前目录，提示自然消失
     pub fn pending_data_dir(&self) -> Option<String> {
         let over = match self.get(keys::DATA_DIR) {
@@ -780,27 +787,37 @@ mod tests {
             .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "快照应含全部邮件");
-        let prefix = crate::db::settings::get(&conn, keys::ACCOUNT_PREFIX)
-            .unwrap()
-            .unwrap_or_default();
-        assert_eq!(prefix, "demo", "设置随库迁移");
+        // 配置不落库（验收拍板）：库无可配置键，配置随 mailbox.toml 常驻锚点
+        assert!(
+            crate::db::settings::get(&conn, keys::ACCOUNT_PREFIX)
+                .unwrap()
+                .is_none(),
+            "配置键不得入库（迁移库当然也没有）"
+        );
+        let cfg_after = crate::conf::load(&anchor);
+        assert_eq!(
+            cfg_after.get(keys::ACCOUNT_PREFIX).map(String::as_str),
+            Some("demo"),
+            "配置应在锚点 mailbox.toml（数据目录变更不影响）"
+        );
         assert!(
             dest.join(format!("attachments/2026-10/{id}/1_a.bin.gz"))
                 .exists(),
             "附件文件应复制"
         );
-        // 锚点库写入指针；启动解析定位新目录
+        // 指针仅写独立配置文件（不落库，验收拍板简化）；启动解析定位新目录
         let anchor_conn = crate::db::open(&anchor.join("mailbox.db")).unwrap();
-        let ptr = crate::db::settings::get(&anchor_conn, keys::DATA_DIR)
-            .unwrap()
-            .unwrap_or_default();
-        assert_eq!(ptr, dest.to_string_lossy(), "兼容镜像应写锚点库");
-        // 独立配置文件为主指针
+        assert!(
+            crate::db::settings::get(&anchor_conn, keys::DATA_DIR)
+                .unwrap()
+                .is_none(),
+            "迁移指针不得写库（mailbox.toml 为唯一持久源）"
+        );
         let cfg = crate::conf::load(&anchor);
         assert_eq!(
             cfg.get(keys::DATA_DIR).map(String::as_str),
             Some(dest.to_str().unwrap()),
-            "指针应写独立配置文件 mailbox.conf"
+            "指针应写独立配置文件 mailbox.toml"
         );
         assert_eq!(
             AppState::resolve_start_dir(&anchor),
@@ -880,7 +897,7 @@ mod tests {
     #[test]
     fn resolve_start_dir_survives_anchor_db_deletion() {
         // 验收反馈场景：迁移后用户删除锚点目录 mailbox.db —— 指针在独立配置文件
-        // mailbox.conf 中，删除库不影响定位，不误判首次启动
+        // mailbox.toml 中，删除库不影响定位，不误判首次启动
         let base = temp_dir("resolve-anchor-del");
         let anchor = base.join("anchor");
         std::fs::create_dir_all(&anchor).unwrap();
@@ -948,7 +965,7 @@ mod tests {
 
     #[test]
     fn pending_data_dir_reads_config_file_after_db_delete() {
-        // 未重启状态下删锚点库：待生效目录从 mailbox.conf 读出（迁移待生效仍可见）
+        // 未重启状态下删锚点库：待生效目录从 mailbox.toml 读出（迁移待生效仍可见）
         let base = temp_dir("pending-conf");
         let anchor = base.join("anchor");
         std::fs::create_dir_all(&anchor).unwrap();
@@ -1002,9 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn config_keys_dual_write_and_survive_file_loss() {
-        // 配置键双写：mailbox.conf + 库镜像；get 经路由读到
-        let base = temp_dir("conf-dual");
+    fn config_keys_stored_in_toml_only() {
+        // 配置键仅写 mailbox.toml（唯一持久源，验收拍板简化）：不落库、get 直读回；
+        // 非配置键仅入库；配置文件丢失后无库镜像可回填（by-design：需重新配置）
+        let base = temp_dir("conf-solo");
         let dir = base.join("data");
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::open(&dir);
@@ -1035,35 +1053,43 @@ mod tests {
             !cfg.contains_key(keys::KEEP_INBOX_DAYS),
             "非配置键不得入配置文件"
         );
-        // 库镜像存在（直接 db 层可读）
+        // 库中无配置键（验收拍板：DB 不保存 mailbox.toml 已有配置）
         {
             let conn = crate::db::open(&dir.join("mailbox.db")).unwrap();
-            assert_eq!(
+            assert!(
                 crate::db::settings::get(&conn, keys::SMTP_HOST)
                     .unwrap()
+                    .is_none(),
+                "配置键不得写库"
+            );
+            assert_eq!(
+                crate::db::settings::get(&conn, keys::KEEP_INBOX_DAYS)
+                    .unwrap()
                     .as_deref(),
-                Some("smtp.test.cn")
+                Some("60"),
+                "非配置键正常入库"
             );
         }
         drop(state);
-        // 配置文件丢失 → 从库镜像自愈
+        // 配置文件丢失：无镜像可回填（唯一持久源语义），重新打开后未配置
         std::fs::remove_file(dir.join(crate::conf::CONFIG_FILE)).unwrap();
-        let state2 = AppState::open(&dir);
-        assert_eq!(
-            state2.get(keys::SMTP_HOST).unwrap().as_deref(),
-            Some("smtp.test.cn"),
-            "配置文件丢失后应从库镜像回填"
-        );
+        AppState::open(&dir);
         assert!(
-            dir.join(crate::conf::CONFIG_FILE).is_file(),
-            "自愈应重建配置文件"
+            !dir.join(crate::conf::CONFIG_FILE).is_file(),
+            "无库镜像时不得凭空重建配置文件"
         );
+        let state2 = AppState::open(&dir);
+        assert!(
+            state2.get(keys::SMTP_HOST).unwrap().is_none(),
+            "配置文件丢失后读不到配置（需重新配置）"
+        );
+        assert!(!state2.configured(), "应回到未配置态");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn legacy_db_settings_backfill_into_config_file() {
-        // 0.2.2 升级场景：账号/服务器配置与迁移指针都在库里，无 mailbox.conf ——
+        // 0.2.2 升级场景：账号/服务器配置与迁移指针都在库里，无 mailbox.toml ——
         // 首次启动应整体回填到独立配置文件，后续读写以文件为准
         let base = temp_dir("conf-legacy");
         let anchor = base.join("anchor");

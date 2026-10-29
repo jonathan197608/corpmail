@@ -46,14 +46,20 @@ body {
         "Microsoft YaHei", sans-serif;
     background: var(--bg);
     color: var(--ink);
-    overflow: hidden;
+    /* M5 验收：窗口小于内容基础宽度/高度时出现滚动条而非裁剪
+       （配合 .app 的 min-width/min-height；正常尺寸无滚动条） */
+    overflow: auto;
 }
 
 /* ============ 应用窗体（窗口即视口） ============ */
 .app {
     display: none;
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    height: 100%;
+    /* 内容可用的最小尺寸：低于此值 body 出现横/纵滚动条（验收第 3 条）；
+       用 100% 而非 100vw/vh，避免视口滚动条本身触发假横向溢出 */
+    min-width: 720px;
+    min-height: 460px;
     background: var(--bg);
 }
 
@@ -583,7 +589,7 @@ body {
 }
 
 .onboard-inner {
-    width: 540px;
+    width: 640px;
     max-width: calc(100vw - 48px);
     padding: 24px 0;
 }
@@ -952,7 +958,7 @@ body {
 }
 
 .settings-card {
-    max-width: 600px;
+    max-width: 920px;
     margin: 0 auto 8px;
     padding: 11px 16px;
 }

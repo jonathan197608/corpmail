@@ -1308,7 +1308,7 @@ fn settings_storage_clean(state: &AppState) -> Resp {
 }
 
 /// 设置·存储管理：删除旧目录迁移备份（M5 验收功能；清锚点 mailbox.db[-wal/-shm]
-/// 与 attachments/，配置文件 mailbox.conf 与当前数据不受影响；回 pane 带结果）
+/// 与 attachments/，配置文件 mailbox.toml 与当前数据不受影响；回 pane 带结果）
 fn settings_backup_delete(state: &AppState) -> Resp {
     let view = match state.delete_old_backup() {
         Ok((freed, files)) => BackupDeleteView {
@@ -3471,7 +3471,7 @@ mod tests {
         state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
         dump("settings-storage-pending.html", get("/settings/storage"));
 
-        // M5 迁移素材：真迁移（快照 + 附件复制 + mailbox.conf 指针）→ pane 显示"待生效目录"行
+        // M5 迁移素材：真迁移（快照 + 附件复制 + mailbox.toml 指针）→ pane 显示"待生效目录"行
         let pending_target = root.join("pending-target");
         state
             .move_data_dir(pending_target.to_str().unwrap())

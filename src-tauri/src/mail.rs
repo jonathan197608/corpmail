@@ -766,10 +766,40 @@ pub fn reopen_failed(state: &AppState, id: i64) -> bool {
 /// 状态机（§3）：`queued →（CAS 抢占）sending → sent / failed`；
 /// sent 终态同步迁 `folder='sent'` 并记 sent_at。失败原因写 error 列。
 /// 返回 Ok(终态)（"sent"/"failed"）；未抢占到排队状态或邮件缺失返回 Err。
+/// 发送参数快照（worker 每封派发前从配置生成；配置源 mailbox.toml，
+/// 不再读库——验收拍板：DB 不保存 mailbox.toml 已有配置）
+#[derive(Clone, Debug)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+impl SmtpConfig {
+    /// 从配置快照生成（含默认值回退；端口非法回退 465）
+    pub fn from_config(cfg: &crate::conf::ConfigMap) -> Self {
+        let d = defaults();
+        let get = |k: &str| -> String {
+            cfg.get(k)
+                .cloned()
+                .or_else(|| {
+                    d.iter()
+                        .find(|(dk, _)| *dk == k)
+                        .map(|(_, v)| (*v).to_string())
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            host: get(keys::SMTP_HOST),
+            port: get(keys::SMTP_PORT).parse().unwrap_or(465),
+        }
+    }
+}
+
 pub fn dispatch_one(
     conn: &rusqlite::Connection,
     sender: &dyn MailSender,
     id: i64,
+    smtp: &SmtpConfig,
 ) -> Result<&'static str, String> {
     // CAS 抢占：重复派发同一封（双击/崩溃重放）时 0 行，天然幂等
     let n = conn
@@ -817,21 +847,7 @@ pub fn dispatch_one(
         mark("failed", Some("收件人为空"))?;
         return Ok("failed");
     }
-    // 发信参数：settings 优先，回退默认值表（§8）
-    let d = defaults();
-    let setting = |key: &str| -> String {
-        crate::db::settings::get(conn, key)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                d.iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| (*v).to_string())
-            })
-            .unwrap_or_default()
-    };
-    let host = setting(keys::SMTP_HOST);
-    let port: u16 = setting(keys::SMTP_PORT).parse().unwrap_or(465);
+    // 发信参数：调用方快照（mailbox.toml）；密码仍走 conn（凭据与配置分离）
     let password = match crate::secrets::retrieve(conn, &msg.from_addr) {
         crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
         crate::secrets::GetResult::Missing => {
@@ -839,7 +855,7 @@ pub fn dispatch_one(
             return Ok("failed");
         }
     };
-    match sender.send(&host, port, &msg.from_addr, &password, &msg) {
+    match sender.send(&smtp.host, smtp.port, &msg.from_addr, &password, &msg) {
         Ok(()) => {
             mark("sent", None)?;
             Ok("sent")
@@ -2280,7 +2296,10 @@ mod tests {
             .unwrap();
         let id = queued_email(&state, "peer@x.cn, ops@x.cn");
         let sender = FakeSender::ok();
-        let result = state.with_conn(|c| dispatch_one(c, &sender, id));
+        // 发送参数快照：从 mailbox.toml 内存镜像生成（配置不落库）
+        let smtp = SmtpConfig::from_config(&state.config_snapshot());
+        assert_eq!(smtp.host, "smtp.test.cn");
+        let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp));
         assert_eq!(result.unwrap(), "sent");
         let (status, folder, sent_at, error): (String, String, Option<i64>, Option<String>) = state
             .with_conn(|c| {
@@ -2318,7 +2337,8 @@ mod tests {
             .unwrap();
         let id = queued_email(&state, "peer@x.cn");
         let sender = FakeSender::failing("连接超时");
-        let result = state.with_conn(|c| dispatch_one(c, &sender, id));
+        let smtp = SmtpConfig::from_config(&state.config_snapshot());
+        let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp));
         assert_eq!(result.unwrap(), "failed");
         let (status, error): (String, String) = state.with_conn(|c| {
             c.query_row(
@@ -2341,14 +2361,19 @@ mod tests {
             .store_password("demo@chinatelecom.cn", "pw-m3")
             .unwrap();
         let sender = FakeSender::ok();
+        let smtp = SmtpConfig::from_config(&state.config_snapshot());
         // draft 态直接派发：CAS 抢占失败
         let id = save_draft(&state, &draft("未排队", "体")).unwrap();
-        assert!(state.with_conn(|c| dispatch_one(c, &sender, id)).is_err());
+        assert!(
+            state
+                .with_conn(|c| dispatch_one(c, &sender, id, &smtp))
+                .is_err()
+        );
         // 排队但收件人空白：转 failed（凭据存在仍先校验收件人）
         let blank_id = queued_email(&state, "   ");
         assert_eq!(
             state
-                .with_conn(|c| dispatch_one(c, &sender, blank_id))
+                .with_conn(|c| dispatch_one(c, &sender, blank_id, &smtp))
                 .unwrap(),
             "failed"
         );
@@ -2366,11 +2391,15 @@ mod tests {
         let id2 = queued_email(&state, "peer@x.cn");
         let sender2 = FakeSender::ok();
         assert_eq!(
-            state.with_conn(|c| dispatch_one(c, &sender2, id2)).unwrap(),
+            state
+                .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp))
+                .unwrap(),
             "sent"
         );
         assert!(
-            state.with_conn(|c| dispatch_one(c, &sender2, id2)).is_err(),
+            state
+                .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp))
+                .is_err(),
             "已发送邮件不可再派发"
         );
         state.clear_password("demo@chinatelecom.cn");
@@ -2382,8 +2411,11 @@ mod tests {
         let (state, dir) = temp_state("m3-nopw");
         let id = queued_email(&state, "ghost@x.cn");
         let sender = FakeSender::ok();
+        let smtp = SmtpConfig::from_config(&state.config_snapshot());
         assert_eq!(
-            state.with_conn(|c| dispatch_one(c, &sender, id)).unwrap(),
+            state
+                .with_conn(|c| dispatch_one(c, &sender, id, &smtp))
+                .unwrap(),
             "failed"
         );
         let (status, error): (String, String) = state.with_conn(|c| {
