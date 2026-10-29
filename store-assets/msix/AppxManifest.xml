@@ -54,7 +54,7 @@
   </Capabilities>
 
   <Applications>
-    <Application Id="CorpMail" Executable="Mailbox.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="CorpMail" Executable="CorpMail.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="CorpMail 企业邮箱客户端"
         Description="企业邮箱收发一体 · 本地存档 · 中文全文检索"
