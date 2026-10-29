@@ -36,9 +36,10 @@
     </uap10:PackageIntegrity>
   </Properties>
 
+  <!-- 语言声明与应用内 UI 实际一致：纯中文（listing 双语是商店页文案，不属包语言）；
+       未来做英文 UI 时再补 en-US 声明 -->
   <Resources>
     <Resource Language="zh-CN"/>
-    <Resource Language="en-US"/>
   </Resources>
 
   <Dependencies>
