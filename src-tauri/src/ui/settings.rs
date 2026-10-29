@@ -268,6 +268,28 @@ pub(super) fn settings_account_test(
     test_fragment(vec![test_view(label, &outcome)], "", true)
 }
 
+/// 账号配置键值对装配（向导"测试并保存"与设置·账号 tab 保存共用）：
+/// 账号三要素 + 双通道主机/端口。端口传字符串（表单/已存值统一形态）
+pub(super) fn account_pairs<'a>(
+    prefix: &'a str,
+    domain: &'a str,
+    display: &'a str,
+    smtp_host: &'a str,
+    smtp_port: &'a str,
+    recv_host: &'a str,
+    recv_port: &'a str,
+) -> [(&'static str, &'a str); 7] {
+    [
+        (keys::ACCOUNT_PREFIX, prefix),
+        (keys::ACCOUNT_DOMAIN, domain),
+        (keys::DISPLAY_NAME, display),
+        (keys::SMTP_HOST, smtp_host),
+        (keys::SMTP_PORT, smtp_port),
+        (keys::RECV_HOST, recv_host),
+        (keys::RECV_PORT, recv_port),
+    ]
+}
+
 /// 设置·账号 tab：保存（密码留空 = 不变；账号变更自动迁移凭据）
 pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
@@ -303,15 +325,15 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let smtp_port_s = port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT).to_string();
     let recv_port_s = port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT).to_string();
     let display = trimmed_field(&form, "display_name").unwrap_or_default();
-    let pairs = [
-        (keys::ACCOUNT_PREFIX, prefix.as_str()),
-        (keys::ACCOUNT_DOMAIN, domain.as_str()),
-        (keys::DISPLAY_NAME, display.as_str()),
-        (keys::SMTP_HOST, smtp_host.as_str()),
-        (keys::SMTP_PORT, smtp_port_s.as_str()),
-        (keys::RECV_HOST, recv_host.as_str()),
-        (keys::RECV_PORT, recv_port_s.as_str()),
-    ];
+    let pairs = account_pairs(
+        &prefix,
+        &domain,
+        &display,
+        &smtp_host,
+        &smtp_port_s,
+        &recv_host,
+        &recv_port_s,
+    );
     // 2) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
         return account_pane(state, false, &format!("保存失败：{e}"));

@@ -727,7 +727,7 @@ fn fetch_round(job: FetchJob) {
     let last_uid = last.uid;
     let last_uidvalidity = last.uidvalidity;
     let outcome: Result<(crate::mail::FetchOutcome, usize), String> =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let outcome = crate::mail::MailFetcher::fetch(
                 &crate::mail::RealFetcher,
                 &host,
@@ -740,13 +740,11 @@ fn fetch_round(job: FetchJob) {
             // 入库与网络拉取同属关键路径：两者任一 panic 都必须复位状态
             let added = crate::mail::store_incoming_conn(&mut conn, &data_dir, &outcome.mails)?;
             Ok((outcome, added))
-        })) {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
-                Err("收件内部异常终止，请重试收取".into())
-            }
-        };
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
+            Err("收件内部异常终止，请重试收取".into())
+        });
     match outcome {
         Ok((outcome, added)) => {
             // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，

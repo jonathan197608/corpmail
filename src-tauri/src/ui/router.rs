@@ -7,9 +7,9 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use super::settings::{
-    settings_account_save, settings_account_test, settings_backup_delete, settings_page,
-    settings_pane_fragment, settings_storage_clean, settings_storage_move, settings_storage_save,
-    settings_sync_save,
+    account_pairs, settings_account_save, settings_account_test, settings_backup_delete,
+    settings_page, settings_pane_fragment, settings_storage_clean, settings_storage_move,
+    settings_storage_save, settings_sync_save,
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
@@ -815,15 +815,15 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         let display = trimmed_field(&form, "display_name").unwrap_or_default();
         let smtp_port_s = smtp_port.to_string();
         let recv_port_s = recv_port.to_string();
-        let pairs = [
-            (keys::ACCOUNT_PREFIX, prefix.as_str()),
-            (keys::ACCOUNT_DOMAIN, domain.as_str()),
-            (keys::DISPLAY_NAME, display.as_str()),
-            (keys::SMTP_HOST, smtp_host.as_str()),
-            (keys::SMTP_PORT, smtp_port_s.as_str()),
-            (keys::RECV_HOST, recv_host.as_str()),
-            (keys::RECV_PORT, recv_port_s.as_str()),
-        ];
+        let pairs = account_pairs(
+            &prefix,
+            &domain,
+            &display,
+            &smtp_host,
+            &smtp_port_s,
+            &recv_host,
+            &recv_port_s,
+        );
         if let Err(e) = state.set_batch(&pairs) {
             return test_fragment(Vec::new(), &format!("保存失败：{e}"), false);
         }

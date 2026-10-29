@@ -220,7 +220,7 @@ fn imap_since_produces_imap_date_format() {
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0].len(), 2);
     assert_eq!(parts[1].len(), 3, "月份缩写三字母：{s}");
-    assert!(parts[2].len() == 4, "年份四位：{s}");
+    assert_eq!(parts[2].len(), 4, "年份四位：{s}");
 }
 
 #[test]

@@ -45,13 +45,12 @@ fn with_timeout(f: impl FnOnce() -> TestOutcome + Send + 'static) -> TestOutcome
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    match rx.recv_timeout(TEST_TIMEOUT) {
-        Ok(outcome) => outcome,
-        Err(_) => TestOutcome::fail(
+    rx.recv_timeout(TEST_TIMEOUT).unwrap_or_else(|_| {
+        TestOutcome::fail(
             TEST_TIMEOUT.as_millis() as u64,
             "连接超时（15 秒无响应，请检查网络或服务器地址）",
-        ),
-    }
+        )
+    })
 }
 
 /// SMTP 通道测试：连接 + TLS + EHLO（lettre `test_connection`，隐式 TLS 465）
