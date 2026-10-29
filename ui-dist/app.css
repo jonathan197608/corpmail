@@ -1039,19 +1039,6 @@ body {
     font-size: 13px;
 }
 
-.suffix {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 1px solid var(--line);
-    border-radius: 9px;
-    padding: 7px 12px;
-    font-size: 12.5px;
-    color: var(--muted);
-    background: var(--bg);
-    white-space: nowrap;
-}
-
 /* toggle */
 .toggle {
     width: 38px;

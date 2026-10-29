@@ -23,14 +23,4 @@
             {% include "settings_pane_" ~ tab ~ ".html" %}
         </div>
     </main>
-</div>
-<script>
-    // tab 高亮随片段切换（stab 自身不重渲染，点击时同步 .on）
-    document.addEventListener("click", function (e) {
-        var stab = e.target.closest(".stab");
-        if (!stab) { return; }
-        document.querySelectorAll(".settings-tabs .stab").forEach(function (s) { s.classList.remove("on"); });
-        stab.classList.add("on");
-    });
-</script>
-{% endblock %}
+</div>{% endblock %}

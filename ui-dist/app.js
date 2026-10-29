@@ -160,3 +160,11 @@ function mbxClosePreview() {
 document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
+
+// ---------- 设置页 tab 高亮（stab 自身不重渲染，点击时同步 .on） ----------
+document.addEventListener("click", function (e) {
+    var stab = e.target.closest(".stab");
+    if (!stab) { return; }
+    document.querySelectorAll(".settings-tabs .stab").forEach(function (s) { s.classList.remove("on"); });
+    stab.classList.add("on");
+});

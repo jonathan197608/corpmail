@@ -424,7 +424,13 @@ impl AppState {
                     let cfg = config_arc.lock().expect("配置锁中毒");
                     crate::mail::SmtpConfig::from_config(&cfg)
                 };
-                let _ = crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id, &smtp);
+                // 派发内部所有终态（含各类失败）均已落库；此处 Err 仅剩
+                // "抢占失败/读库异常"两条管理性路径，记日志供排查即可
+                if let Err(err) =
+                    crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id, &smtp)
+                {
+                    eprintln!("[send] 邮件 {id} 派发未执行：{err}");
+                }
             }
         });
         for id in stale {
