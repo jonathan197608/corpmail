@@ -1125,13 +1125,116 @@ fn parse_incoming(
     })
 }
 
-/// 正文抽取（§6.1）：multipart 递归，text/plain 优先；仅 text/html 时剥标签存纯文本
+/// cp1252 高位区（0x80-0x9F 的 Unicode 映射）反查表：mojibake 修复用
+fn cp1252_high_inverse(c: char) -> Option<u8> {
+    Some(match c {
+        '\u{20AC}' => 0x80,
+        '\u{201A}' => 0x82,
+        '\u{0192}' => 0x83,
+        '\u{201E}' => 0x84,
+        '\u{2026}' => 0x85,
+        '\u{2020}' => 0x86,
+        '\u{2021}' => 0x87,
+        '\u{02C6}' => 0x88,
+        '\u{2030}' => 0x89,
+        '\u{0160}' => 0x8A,
+        '\u{2039}' => 0x8B,
+        '\u{0152}' => 0x8C,
+        '\u{017D}' => 0x8E,
+        '\u{2018}' => 0x91,
+        '\u{2019}' => 0x92,
+        '\u{201C}' => 0x93,
+        '\u{201D}' => 0x94,
+        '\u{2022}' => 0x95,
+        '\u{2013}' => 0x96,
+        '\u{2014}' => 0x97,
+        '\u{02DC}' => 0x98,
+        '\u{2122}' => 0x99,
+        '\u{0161}' => 0x9A,
+        '\u{203A}' => 0x9B,
+        '\u{0153}' => 0x9C,
+        '\u{017E}' => 0x9E,
+        '\u{0178}' => 0x9F,
+        _ => return None,
+    })
+}
+
+/// 正文 mojibake 修复（M5 验收）：部分邮件网关把 UTF-8 正文误标为
+/// iso-8859-1/windows-1252，mailparse 按声明逐字节解码产生乱码（如"原文"→"åŽŸæ–‡"）。
+/// 探测：文本全部字符可逆映射回 cp1252 字节、且逆推字节恰为合法 UTF-8、含 CJK——
+/// 判定原文实为 UTF-8，返回重解码结果。正常西文邮件逆推后 UTF-8 解码几乎必失败；
+/// 含正常中文的文本提前退出，双重防误伤。
+fn fix_mojibake(body: &str) -> Option<String> {
+    let mut has_high = false;
+    for c in body.chars() {
+        let u = c as u32;
+        if u >= 0x80 {
+            has_high = true;
+            if is_cjk(c) {
+                return None; // 已含正常中文：解码正确（mojibake 不可能恰含 CJK）
+            }
+        }
+    }
+    if !has_high {
+        return None; // 纯 ASCII 无需修复
+    }
+    let mut bytes = Vec::with_capacity(body.len());
+    for c in body.chars() {
+        let u = c as u32;
+        // Latin-1 直通（iso-8859-1 解码路径：0x80-0x9F 为 C1 控制字符直通）
+        // + cp1252 特有映射（windows-1252 解码路径：如 U+017D→0x8E）——两条路径都可逆
+        let b = if u <= 0xFF {
+            u as u8
+        } else {
+            cp1252_high_inverse(c)?
+        };
+        bytes.push(b);
+    }
+    let fixed = String::from_utf8(bytes).ok()?;
+    (fixed != body && fixed.chars().any(is_cjk)).then_some(fixed)
+}
+
+/// 未声明/错误声明 charset 的 GBK 正文兜底：按声明解码丢字（U+FFFD）或落成无 CJK
+/// 高位乱码时，取原始字节（已解传输编码）按 GBK 重解码；无错且含中文才采纳
+/// （正常西文邮件 GBK 解码必然报错，不会误伤）
+fn fix_gbk_fallback(part: &mailparse::ParsedMail, decoded: &str) -> String {
+    let suspect = decoded.contains('\u{FFFD}')
+        || (!decoded.chars().any(is_cjk) && decoded.chars().any(|c| (c as u32) >= 0x80));
+    if !suspect {
+        return decoded.to_string();
+    }
+    let Ok(raw) = part.get_body_raw() else {
+        return decoded.to_string();
+    };
+    // 原始字节本就是合法 UTF-8：丢字另有原因（如 us-ascii 声明截断），不猜测
+    if std::str::from_utf8(&raw).is_ok() {
+        return decoded.to_string();
+    }
+    let (cow, _, had_errors) = encoding_rs::GBK.decode(&raw);
+    if !had_errors && cow.chars().any(is_cjk) {
+        cow.into_owned()
+    } else {
+        decoded.to_string()
+    }
+}
+
+/// 取正文文本并修复编码问题：mojibake（UTF-8 被误标 latin1/1252）优先，GBK 兜底其次
+fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
+    let decoded = part.get_body().unwrap_or_default();
+    if let Some(fixed) = fix_mojibake(&decoded) {
+        return fixed;
+    }
+    fix_gbk_fallback(part, &decoded)
+}
+
+/// 正文抽取（§6.1）：multipart 递归，text/plain 优先；仅 text/html 时剥标签存纯文本；
+/// 编码修复（M5）：mis-declared charset 修复 + GBK 兜底
 fn extract_body(mail: &mailparse::ParsedMail) -> (String, &'static str) {
     if let Some(p) = find_inline_part(mail, "text/plain") {
-        return (p.get_body().unwrap_or_default(), "plain");
+        return (body_text_repaired(p), "plain");
     }
     if let Some(p) = find_inline_part(mail, "text/html") {
-        return (strip_html(&p.get_body().unwrap_or_default()), "html");
+        return (strip_html(&body_text_repaired(p)), "html");
     }
     (String::new(), "plain")
 }
@@ -2533,6 +2636,95 @@ mod tests {
         assert_eq!(parts[0].len(), 2);
         assert_eq!(parts[1].len(), 3, "月份缩写三字母：{s}");
         assert!(parts[2].len() == 4, "年份四位：{s}");
+    }
+
+    #[test]
+    fn extract_body_repairs_utf8_mislabeled_as_latin1() {
+        // 用户实测场景：研发云平台邮件 UTF-8 正文被网关误标 iso-8859-1，
+        // "原文"逐字节解码成 "åŽŸæ–‡"（0x8E→Ž/0x96→– 均为 cp1252 特有映射）
+        let body = "欢迎使用研发云平台！·您已被加入项目组，请查收。";
+        for cs in ["iso-8859-1", "windows-1252"] {
+            let raw = format!("Content-Type: text/plain; charset={cs}\r\n\r\n{body}");
+            let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+            if let Some(p) = find_inline_part(&mail, "text/plain") {
+                let d = p.get_body().unwrap_or_default();
+                let mangled = d.contains("åŽŸ") || !d.chars().any(is_cjk);
+                assert!(mangled, "前提：{cs} 声明下确实产生乱码");
+            }
+            let (extracted, _) = extract_body(&mail);
+            assert_eq!(
+                extracted, body,
+                "{cs} 误标 UTF-8 应被修复为原文：实际 {extracted}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_body_keeps_correct_utf8_and_gbk_labeled() {
+        // 声明正确（utf-8）：回归保护，不改写
+        let body = "正常中文正文，标点（），OK。";
+        let raw = format!("Content-Type: text/plain; charset=utf-8\r\n\r\n{body}");
+        let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        let (extracted, _) = extract_body(&mail);
+        assert_eq!(extracted, body);
+
+        // 声明 gbk 且实为 GBK 字节：语义结果应是中文（mailparse 直解或兜底解均可）
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("已按GBK编码的中文正文。");
+        let mut raw_gbk = b"Content-Type: text/plain; charset=gbk\r\n\r\n".to_vec();
+        raw_gbk.extend_from_slice(&gbk_bytes);
+        let mail2 = mailparse::parse_mail(&raw_gbk).unwrap();
+        let (extracted2, _) = extract_body(&mail2);
+        assert!(
+            extracted2.chars().any(is_cjk),
+            "GBK 语义正文应解出中文：{extracted2}"
+        );
+    }
+
+    #[test]
+    fn extract_body_falls_back_to_gbk_when_charset_undeclared() {
+        // 无 charset 头（mailparse 默认 us-ascii）+ GBK 字节：兜底解回中文
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("无声明场景：中文正文应能显示。");
+        let mut raw = b"Content-Type: text/plain\r\n\r\n".to_vec();
+        raw.extend_from_slice(&gbk_bytes);
+        let mail = mailparse::parse_mail(&raw).unwrap();
+        let (extracted, _) = extract_body(&mail);
+        assert!(
+            extracted.chars().any(is_cjk),
+            "未声明 charset 的 GBK 正文应兜底解出中文：{extracted}"
+        );
+    }
+
+    #[test]
+    fn fix_mojibake_does_not_touch_normal_western_text() {
+        // 正常西文（cp1252 合法文本）：不含 CJK、逆推非合法 UTF-8 或无 CJK → 不改写
+        let french = "Café déjà vu — très bien, ça va.";
+        assert_eq!(fix_mojibake(french), None);
+        // 纯 ASCII 不处理
+        assert_eq!(fix_mojibake("plain ascii text"), None);
+        // 已含正常中文不改写
+        assert_eq!(fix_mojibake("正常中文 with é"), None);
+
+        // 真 mojibake：手动构造（"原文测试"的 UTF-8 字节按 cp1252 解码后的文本）
+        let mangled: String = "原文测试"
+            .as_bytes()
+            .iter()
+            .map(|b| {
+                let u = *b as u32;
+                if (0x80..=0xFF).contains(&u) {
+                    // cp1252 逆推区：0x80-0x9F 特有映射 + 0xA0-0xFF 直通
+                    let bytes = [*b];
+                    encoding_rs::WINDOWS_1252
+                        .decode(&bytes)
+                        .0
+                        .chars()
+                        .next()
+                        .unwrap()
+                } else {
+                    char::from(*b)
+                }
+            })
+            .collect();
+        assert_eq!(fix_mojibake(&mangled).as_deref(), Some("原文测试"));
     }
 
     #[test]

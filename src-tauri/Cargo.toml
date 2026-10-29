@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"                                          # 表单 JSON 数组字段（M2 附件 keep_ids/attach_paths）
 minijinja = { version = "3", features = ["serde"] }
 url = "2"
+encoding_rs = "0.8"                                        # 正文编码修复（M5：latin1 误标 mojibake 逆推 + GBK 兑底）
 
 # --- 邮箱核心（M1 起，设计 §10.2）---
 rusqlite = { version = "0.31", features = ["bundled"] }   # SQLite 3.45，FTS5 默认开启（§3）
