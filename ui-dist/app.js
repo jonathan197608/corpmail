@@ -1,4 +1,4 @@
-// Mailbox 前端辅助（M2：附件选择/另存，__TAURI__.dialog；设计 §2/§5.1）
+// CorpMail 前端辅助（M2：附件选择/另存，__TAURI__.dialog；设计 §2/§5.1）
 // 全局 500ms 防抖由 htmx 触发器表达式承担（hx-trigger="... once:500ms"，设计 §7）
 
 // 启动引导动画移除（M5：base.html 内联 #boot，脚本就绪即撤）

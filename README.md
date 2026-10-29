@@ -1,6 +1,6 @@
-# Mailbox
+# CorpMail
 
-Mailbox 是一款面向中国电信企业邮箱的桌面客户端（Tauri 2 + htmx，Rust 端渲染，无 Node 构建链）。
+CorpMail 是一款面向中国电信企业邮箱的桌面客户端（Tauri 2 + htmx，Rust 端渲染，无 Node 构建链）。
 
 ## 功能特性
 
@@ -13,8 +13,8 @@ Mailbox 是一款面向中国电信企业邮箱的桌面客户端（Tauri 2 + ht
 
 ### Windows 安装
 
-1. 从 [Releases](https://github.com/jonathan197608/mailbox/releases) 下载 `Mailbox_x64-setup.exe`
-2. 运行安装（默认安装到 `C:\Program Files\Mailbox`）
+1. 从 [Releases](https://github.com/jonathan197608/mailbox/releases) 下载 `CorpMail_x64-setup.exe`
+2. 运行安装（默认安装到 `C:\Program Files\CorpMail`）
 3. 首次启动按向导填写邮箱账号（默认服务器已按中国电信企业邮箱预填：IMAP `imap.chinatelecom.cn:993` / SMTP `smtp.chinatelecom.cn:465`）
 
 > 安装器内嵌 WebView2 官方引导器（静默模式），无 WebView2 Runtime 的机器会自动安装（约 150MB，需联网）。

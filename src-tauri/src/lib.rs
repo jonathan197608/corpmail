@@ -1,4 +1,4 @@
-//! Mailbox - Tauri 2 桌面应用入口
+//! CorpMail - Tauri 2 桌面应用入口
 //!
 //! 架构：单一自定义协议 `ui://` 承载全部页面与片段——
 //! - 全部 HTML 由 Rust 端 minijinja 渲染，前端只用 htmx 表达交互
@@ -81,7 +81,7 @@ pub fn run() {
             let url: tauri::Url = APP_URL.parse().expect("入口 URL 为常量，恒合法");
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-                .title("Mailbox")
+                .title("CorpMail")
                 // 默认 1440×900（M5 实测 15 页面零滚动条；内容最高需求 812px @1280 宽）
                 .inner_size(1440.0, 900.0)
                 .min_inner_size(560.0, 400.0)
@@ -95,7 +95,7 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("Mailbox 运行失败");
+        .expect("CorpMail 运行失败");
 }
 
 /// 收件调度线程（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。

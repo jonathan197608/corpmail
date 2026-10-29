@@ -16,7 +16,7 @@
   <!-- 版本四段制，末段固定 0（商店规则）；随应用 CARGO_PKG_VERSION 同步 -->
   <Identity
     Name="JonathanHuang.corpmail"
-    Version="0.2.4.0"
+    Version="0.3.0.0"
     ProcessorArchitecture="x64"
     Publisher="CN=3DAC9C91-AE75-4F8D-A413-16DBAF29757A"/>
 
@@ -26,7 +26,7 @@
     <Logo>assets\Square150x150Logo.png</Logo>
     <!-- 禁用 AppData/注册表写虚拟化：不声明时 MSIX 会把 %APPDATA% 写重定向到包私有
          路径，导致邮件库与 NSIS 渠道分裂（切渠道丢存档、卸载清空数据）。禁用后
-         两渠道共用 %APPDATA%\com.mailbox.desktop，数据互通可迁移 -->
+         两渠道共用 %APPDATA%\com.corpmail.desktop，数据互通可迁移 -->
     <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
     <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
     <!-- 允许在不重写包声明的情况下于 Properties 内使用 desktop6 扩展 -->

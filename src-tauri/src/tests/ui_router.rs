@@ -121,7 +121,7 @@ fn fresh_root_shows_welcome() {
     );
     assert_eq!(resp.status, 200);
     let html = body(&resp);
-    assert!(html.contains("欢迎使用 Mailbox"), "未配置首启应渲染欢迎页");
+    assert!(html.contains("欢迎使用 CorpMail"), "未配置首启应渲染欢迎页");
     assert!(html.contains("开始配置"), "欢迎页应有强制配置入口");
     cleanup(&dir);
 }
@@ -1335,7 +1335,7 @@ fn wizard_done_shows_summary_and_guards_unconfigured() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("欢迎使用 Mailbox"));
+    assert!(body(&resp).contains("欢迎使用 CorpMail"));
     // 配置后展示摘要
     let _ = route(
         &state,

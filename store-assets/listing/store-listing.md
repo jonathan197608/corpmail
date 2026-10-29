@@ -137,7 +137,7 @@ Issues & source code (MIT): https://github.com/jonathan197608/mailbox
 ## 5. 此版本的新增功能（What's new，两者通用模板）
 
 ```
-v0.2.4
+v0.3.0
 · Microsoft Store 首发版本
 · 收发一体（SMTP/IMAP）、草稿与附件、中文全文检索、存储管理
 ```

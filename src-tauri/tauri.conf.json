@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Mailbox",
-  "version": "0.2.4",
-  "identifier": "com.mailbox.desktop",
+  "productName": "CorpMail",
+  "version": "0.3.0",
+  "identifier": "com.corpmail.desktop",
   "build": {
     "frontendDist": "../ui-dist"
   },

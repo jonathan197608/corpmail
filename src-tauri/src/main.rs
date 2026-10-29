@@ -1,4 +1,4 @@
-// Mailbox - Tauri + htmx 桌面应用（Rust 端渲染 HTML，无 Node 构建链）
+// CorpMail - Tauri + htmx 桌面应用（Rust 端渲染 HTML，无 Node 构建链）
 //
 // GUI 程序：release 模式下隐藏 Windows 控制台窗口（debug 保留控制台便于看日志）。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

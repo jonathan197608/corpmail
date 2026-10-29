@@ -28,7 +28,7 @@ store-assets/
 
 - **NSIS 渠道**（官网/GitHub 直发）与 **Store 渠道**（MSIX）可同时装在一台机器上——
   两者身份标识不同，互不覆盖。
-- AppData 虚拟化已声明禁用，两渠道读写**同一个** `%APPDATA%\com.mailbox.desktop` 数据目录：
+- AppData 虚拟化已声明禁用，两渠道读写**同一个** `%APPDATA%\com.corpmail.desktop` 数据目录：
   - 从 NSIS 切 Store：邮件/配置/密码原样继承
   - 但两渠道**同时运行**时会双进程写同一 SQLite——
     单实例互斥体（tauri-plugin-single-instance）**不跨渠道生效**，
