@@ -22,20 +22,48 @@ use url::form_urlencoded;
 
 /// 连接测试注入点（生产实现真连服务器；单测注入假实现避免网络依赖）
 pub trait ConnTester {
-    fn smtp(&self, host: &str, port: u16, account: &str, password: &str) -> TestOutcome;
-    fn imap(&self, host: &str, port: u16, account: &str, password: &str) -> TestOutcome;
+    fn smtp(
+        &self,
+        host: &str,
+        port: u16,
+        mode: crate::net::TlsMode,
+        account: &str,
+        password: &str,
+    ) -> TestOutcome;
+    fn imap(
+        &self,
+        host: &str,
+        port: u16,
+        mode: crate::net::TlsMode,
+        account: &str,
+        password: &str,
+    ) -> TestOutcome;
 }
 
 /// 生产实现：直连真实服务器（设计 §8.1 双通道测试）
 pub struct RealTester;
 
 impl ConnTester for RealTester {
-    fn smtp(&self, host: &str, port: u16, account: &str, password: &str) -> TestOutcome {
-        crate::conncheck::smtp_test(host, port, account, password)
+    fn smtp(
+        &self,
+        host: &str,
+        port: u16,
+        mode: crate::net::TlsMode,
+        account: &str,
+        password: &str,
+    ) -> TestOutcome {
+        crate::conncheck::smtp_test(host, port, mode, account, password)
     }
 
-    fn imap(&self, host: &str, port: u16, account: &str, password: &str) -> TestOutcome {
-        crate::conncheck::imap_test(host, port, account, password)
+    fn imap(
+        &self,
+        host: &str,
+        port: u16,
+        mode: crate::net::TlsMode,
+        account: &str,
+        password: &str,
+    ) -> TestOutcome {
+        crate::conncheck::imap_test(host, port, mode, account, password)
     }
 }
 
@@ -200,8 +228,10 @@ struct SetupCtx {
     display_name: String,
     smtp_host: String,
     smtp_port: String,
+    smtp_security: String,
     recv_host: String,
     recv_port: String,
+    recv_security: String,
     /// 首次拉取范围（向导可设；与设置同步页一致）
     first_fetch_days: String,
     /// 数据保存目录（当前值，供输入框回显；留空=默认）
@@ -459,26 +489,12 @@ fn email_read(state: &AppState, req: &Req) -> Resp {
     Resp::html(String::new())
 }
 
-/// 本地置已读（从未读翻转时）+ 服务器 \Seen 异步回写。
-/// 参数快照在调用线程（协议回调内），网络回写交独立线程，不阻塞回调。
+/// 本地置已读（从未读翻转时同时写 seen_pending 并唤醒回写 worker）。
+///
+/// 旧实现每次点击 spawn 一个线程做完整 IMAP 登录，连点 N 封 = N 次登录（企业服务器
+/// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
 fn mark_read_and_sync_seen(state: &AppState, id: i64) {
-    if !mail::mark_read(state, id) {
-        return; // 原本已读：无需回写
-    }
-    let Some(p) = mail::seen_params_of(state, id) else {
-        return; // 非 in 邮件或凭据缺失：仅本地已读
-    };
-    std::thread::spawn(move || {
-        let _ = mail::MailFetcher::mark_seen(
-            &mail::RealFetcher,
-            &p.host,
-            p.port,
-            &p.account,
-            &p.password,
-            p.uidvalidity,
-            p.uid,
-        );
-    });
+    mail::mark_read(state, id);
 }
 
 /// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
@@ -815,8 +831,10 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         display_name: g(keys::DISPLAY_NAME),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
+        smtp_security: g(keys::SMTP_SECURITY),
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
+        recv_security: g(keys::RECV_SECURITY),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
         data_dir: state.data_dir.display().to_string(),
     };
@@ -859,9 +877,14 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
     let smtp_port = port_or(&form, "smtp_port", SMTP_PORT_DEFAULT);
     let recv_host = host_or(&form, "recv_host", state::RECV_HOST_DEFAULT);
     let recv_port = port_or(&form, "recv_port", RECV_PORT_DEFAULT);
+    // 加密方式：默认按端口推断（465/993 隐式 TLS，其余 STARTTLS），可显式覆盖
+    let smtp_security = security_or(&form, state, keys::SMTP_SECURITY);
+    let recv_security = security_or(&form, state, keys::RECV_SECURITY);
+    let smtp_mode = crate::net::TlsMode::resolve(smtp_port, &smtp_security);
+    let recv_mode = crate::net::TlsMode::resolve(recv_port, &recv_security);
 
-    let smtp = tester.smtp(&smtp_host, smtp_port, &account, &password);
-    let imap = tester.imap(&recv_host, recv_port, &account, &password);
+    let smtp = tester.smtp(&smtp_host, smtp_port, smtp_mode, &account, &password);
+    let imap = tester.imap(&recv_host, recv_port, recv_mode, &account, &password);
     if smtp.ok && imap.ok {
         // 首次邮件拉取范围（7/30/90/全部=0，非法回落 30）
         let first_fetch = match form.get("first_fetch_days") {
@@ -877,8 +900,10 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
             (keys::DISPLAY_NAME, display.as_str()),
             (keys::SMTP_HOST, smtp_host.as_str()),
             (keys::SMTP_PORT, smtp_port_s.as_str()),
+            (keys::SMTP_SECURITY, smtp_security.as_str()),
             (keys::RECV_HOST, recv_host.as_str()),
             (keys::RECV_PORT, recv_port_s.as_str()),
+            (keys::RECV_SECURITY, recv_security.as_str()),
             (keys::FIRST_FETCH_DAYS, first_fetch.as_str()),
         ];
         // C2/C6：配置与密码先落库，迁移最后执行——
@@ -1056,6 +1081,23 @@ fn port_or(form: &HashMap<String, String>, name: &str, fallback: u16) -> u16 {
     form.get(name)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(fallback)
+}
+
+/// 加密方式字段：表单值优先（仅接受四个合法串），否则回落到已保存值。
+/// 返回规范化的配置串（auto|implicit|starttls|plain）
+pub(super) fn security_or(
+    form: &HashMap<String, String>,
+    state: &AppState,
+    key: &str,
+) -> String {
+    let d = defaults();
+    match form.get(key).map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "auto" | "implicit" | "starttls" | "plain") => v,
+        _ => state
+            .get_or(key, &d)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| state::SECURITY_DEFAULT.to_string()),
+    }
 }
 
 pub(super) const SMTP_PORT_DEFAULT: u16 = 465;

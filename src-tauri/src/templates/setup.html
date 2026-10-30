@@ -43,11 +43,29 @@
                         </div>
                     </div>
                     <div class="sfield">
+                        <label>SMTP 加密</label>
+                        <select name="smtp_security">
+                            <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（465 隐式 TLS / 其余 STARTTLS）</option>
+                            <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465）</option>
+                            <option value="starttls" {% if smtp_security == "starttls" %}selected{% endif %}>STARTTLS（587/25）</option>
+                            <option value="plain" {% if smtp_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
+                        </select>
+                    </div>
+                    <div class="sfield">
                         <label>收信服务器（IMAP）</label>
                         <div class="port-row">
                             <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
                             <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
                         </div>
+                    </div>
+                    <div class="sfield">
+                        <label>IMAP 加密</label>
+                        <select name="recv_security">
+                            <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（993 隐式 TLS / 其余 STARTTLS）</option>
+                            <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993）</option>
+                            <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>
+                            <option value="plain" {% if recv_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
+                        </select>
                     </div>
                 </div>
 

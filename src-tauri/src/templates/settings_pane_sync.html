@@ -21,6 +21,13 @@
                 </div>
                 <input class="num" type="text" name="sync_interval_min" value="{{ sync_interval_min }}" inputmode="numeric">
             </div>
+            <div class="tline">
+                <div class="tl-main">
+                    <b>单封收件上限（MB）</b>
+                    <span>超过该体积只拉取信头并保存占位邮件，正文与附件不下载（默认 50，范围 1–200）</span>
+                </div>
+                <input class="num" type="text" name="max_mail_mb" value="{{ max_mail_mb }}" inputmode="numeric">
+            </div>
             <div class="sfield" style="margin-top:10px">
                 <label>首次拉取范围</label>
                 <div class="radio-row">

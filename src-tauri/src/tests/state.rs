@@ -717,3 +717,30 @@ fn fetch_refuses_new_round_at_hang_cap() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 单封收件上限：解析失败/缺省取 50MB，越界钳制到 1..=200MB（0 会让所有邮件成占位）
+#[test]
+fn max_mail_bytes_clamps_to_reasonable_range() {
+    assert_eq!(max_mail_bytes_from("50"), 50 * 1024 * 1024);
+    assert_eq!(max_mail_bytes_from(""), 50 * 1024 * 1024, "缺省 50MB");
+    assert_eq!(max_mail_bytes_from("abc"), 50 * 1024 * 1024, "非法值兜底");
+    assert_eq!(max_mail_bytes_from("0"), MAX_MAIL_MB_MIN as u64 * 1024 * 1024);
+    assert_eq!(max_mail_bytes_from("9999"), MAX_MAIL_MB_MAX as u64 * 1024 * 1024);
+    assert_eq!(max_mail_bytes_from(" 1 "), 1024 * 1024);
+}
+
+/// 已读回写唤醒：装配通道后 notify 立即送达；未装配时为空操作（不 panic）
+#[test]
+fn notify_seen_delivers_when_channel_installed() {
+    let dir = std::env::temp_dir().join(format!("corpmail-state-seen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = AppState::open(&dir);
+    // 未装配：静默忽略
+    state.notify_seen();
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.set_seen_channel(tx);
+    state.notify_seen();
+    assert!(rx.try_recv().is_ok(), "装配后应立即收到唤醒");
+    let _ = std::fs::remove_dir_all(&dir);
+}

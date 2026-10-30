@@ -100,6 +100,8 @@ pub fn run() {
             // M4 收件调度 + M5 清理器：常驻线程（每轮重读设置，改参数即时生效）
             spawn_fetch_scheduler(app.app_handle().clone());
             spawn_clean_scheduler(app.app_handle().clone());
+            // 已读回写 worker：合并窗口 + 单次连接批量 STORE（替代每封一次登录）
+            spawn_seen_worker(app.app_handle().clone());
 
             let url: tauri::Url = APP_URL.parse().expect("入口 URL 为常量，恒合法");
             // 主窗口在运行时创建：入口 URL 依赖平台（自定义协议映射差异），配置文件表达不了
@@ -135,6 +137,52 @@ fn startup_fatal(app: &tauri::App, detail: &str) -> Box<dyn std::error::Error> {
         .title("CorpMail 启动失败")
         .blocking_show();
     detail.to_string().into()
+}
+
+/// 已读回写 worker（审计批 3）：单线程 + 1.5s 合并窗口。
+///
+/// 旧实现每点开一封未读邮件就 spawn 一个线程做完整 IMAP 连接/登录/SELECT/STORE，
+/// 连点 20 封即 20 次登录（企业服务器按登录频次限流，触发后长时间收不到信）。
+/// 现在：本地置已读只写库+唤醒；worker 窗口内合并，一次连接、单条命令覆盖多 UID。
+/// 启动时自唤醒一次：补发上次崩溃遗留的 seen_pending 标志。
+fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    handle.state::<state::AppState>().set_seen_channel(tx);
+    let worker_handle = handle.clone();
+    std::thread::spawn(move || {
+        let mut failures = 0u32;
+        loop {
+            // 阻塞等待唤醒（空闲零开销；channel 关闭说明状态已销毁，线程退出）
+            if rx.recv().is_err() {
+                return;
+            }
+            // 合并窗口：窗口内的后续点击一并带走（连点 N 封 = 1 次登录）
+            std::thread::sleep(mail::seen::MERGE_WINDOW);
+            while rx.try_recv().is_ok() {}
+            let state = worker_handle.state::<state::AppState>();
+            match mail::seen::flush(&state, &mail::RealFetcher) {
+                Ok(n) => {
+                    if n > 0 {
+                        eprintln!("[seen] 已回写 {n} 封的服务器已读状态");
+                    }
+                    failures = 0;
+                }
+                Err(err) => {
+                    failures += 1;
+                    eprintln!("[seen] 回写失败（第 {failures} 次）：{err}");
+                    if failures >= mail::seen::MAX_ATTEMPTS {
+                        // 连续失败达上限：清标志放弃，避免永久重试（本地已读不受影响）
+                        mail::seen::abandon(&state);
+                        failures = 0;
+                        continue;
+                    }
+                    std::thread::sleep(mail::seen::backoff(failures));
+                }
+            }
+        }
+    });
+    // 崩溃残留补发（上次进程在标志置位后退出，server 侧仍显示未读）
+    handle.state::<state::AppState>().notify_seen();
 }
 
 /// 收件调度线程（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。

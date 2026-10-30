@@ -30,13 +30,15 @@ pub trait MailSender {
         &self,
         host: &str,
         port: u16,
+        mode: crate::net::TlsMode,
         account: &str,
         password: &str,
         msg: OutgoingMessage,
     ) -> Result<(), String>;
 }
 
-/// 生产实现：与 conncheck::smtp_test 同 transport 配置（relay + port + credentials，465 隐式 TLS）
+/// 生产实现：与 conncheck::smtp_test 共用 net::TlsMode::smtp_transport
+/// （同一出口构造 TLS，测试连接与真实发信不会因各写一套而漂移）
 pub struct RealSender;
 
 impl MailSender for RealSender {
@@ -45,6 +47,7 @@ impl MailSender for RealSender {
         &self,
         host: &str,
         port: u16,
+        mode: crate::net::TlsMode,
         account: &str,
         password: &str,
         msg: OutgoingMessage,
@@ -52,7 +55,6 @@ impl MailSender for RealSender {
         use lettre::Transport;
         use lettre::message::header::ContentType;
         use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
-        use lettre::transport::smtp::authentication::Credentials;
         let build = |raw: &str, name: &str| -> Result<Mailbox, String> {
             let addr = raw
                 .trim()
@@ -94,14 +96,12 @@ impl MailSender for RealSender {
             builder.multipart(mp)
         }
         .map_err(|err| format!("构建邮件失败：{err}"))?;
-        let transport = lettre::SmtpTransport::relay(host)
-            .map_err(|err| format!("服务器地址无效：{err}"))?
-            .port(port)
-            .credentials(Credentials::new(account.to_string(), password.to_string()))
-            .build();
+        let transport = mode
+            .smtp_transport(host, port, account, password)
+            .map_err(|err| format!("服务器地址无效：{err}"))?;
         transport
             .send(&message)
-            .map_err(|err| format!("发送失败：{err}"))
+            .map_err(|err| format!("发送失败：{err}{}", mode.hint(port)))
             .map(|_| ())
     }
 }
@@ -163,6 +163,8 @@ pub fn reopen_failed(state: &AppState, id: i64) -> bool {
 pub struct SmtpConfig {
     pub host: String,
     pub port: u16,
+    /// 加密方式（auto = 按端口推断：465 隐式 TLS，其余 STARTTLS）
+    pub security: crate::net::TlsMode,
 }
 
 impl SmtpConfig {
@@ -179,9 +181,11 @@ impl SmtpConfig {
                 })
                 .unwrap_or_default()
         };
+        let port: u16 = get(keys::SMTP_PORT).parse().unwrap_or(465);
         Self {
             host: get(keys::SMTP_HOST),
-            port: get(keys::SMTP_PORT).parse().unwrap_or(465),
+            port,
+            security: crate::net::TlsMode::resolve(port, &get(keys::SMTP_SECURITY)),
         }
     }
 }
@@ -283,7 +287,14 @@ pub fn dispatch_one(
             return Ok("failed");
         }
     }
-    match sender.send(&smtp.host, smtp.port, &from_addr, &password, msg) {
+    match sender.send(
+        &smtp.host,
+        smtp.port,
+        smtp.security,
+        &from_addr,
+        &password,
+        msg,
+    ) {
         Ok(()) => {
             if let Err(err) = mark("sent", None) {
                 eprintln!("[send] 邮件 {id} 落定 sent 失败：{err}");

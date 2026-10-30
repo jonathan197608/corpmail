@@ -24,8 +24,10 @@ pub const CONFIG_KEYS: &[&str] = &[
     crate::state::keys::DISPLAY_NAME,
     crate::state::keys::SMTP_HOST,
     crate::state::keys::SMTP_PORT,
+    crate::state::keys::SMTP_SECURITY,
     crate::state::keys::RECV_HOST,
     crate::state::keys::RECV_PORT,
+    crate::state::keys::RECV_SECURITY,
 ];
 
 /// 键是否由配置文件承载

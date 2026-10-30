@@ -128,7 +128,7 @@ fn migrate_v1_to_v2_adds_index_and_narrow_trigger() {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 2, "新库应一步建到当前版本");
+    assert_eq!(v, 3, "新库应一步建到当前版本");
     let idx: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_attach_email'",
@@ -214,4 +214,43 @@ fn migrate_recovers_from_interrupted_first_init() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, SCHEMA_VERSION, "中断残留不应阻断迁移完成");
+}
+
+/// v2 → v3 增量：加 too_large/seen_pending 两列 + 待回写部分索引，
+/// 存量邮件取默认值（0/0）；重复迁移幂等不报错
+#[test]
+fn migrate_v2_to_v3_adds_receive_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.pragma_update(None, "user_version", 2i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 3);
+    let (too_large, pending): (i64, i64) = conn
+        .query_row("SELECT too_large, seen_pending FROM emails", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((too_large, pending), (0, 0), "存量邮件取默认值");
+    let idx: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_seen_pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "待回写部分索引应存在");
+    // 幂等：版本已达标，再调用直接返回
+    migrate(&mut conn).unwrap();
 }

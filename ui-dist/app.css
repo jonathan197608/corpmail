@@ -788,6 +788,25 @@ body {
     padding: 7px 10px;
 }
 
+/* 设置页下拉（加密方式）：与文本框同观感，占满字段列宽 */
+.sfield select {
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-size: 13.5px;
+    outline: none;
+    color: var(--ink);
+    background: var(--panel);
+    width: 100%;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.sfield select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 87, 194, 0.13);
+}
+
 .sfield .mono {
     font-family: var(--mono);
     font-size: 13px;

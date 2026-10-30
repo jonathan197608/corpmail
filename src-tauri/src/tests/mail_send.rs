@@ -73,6 +73,7 @@ impl MailSender for FakeSender {
         &self,
         host: &str,
         port: u16,
+        _mode: crate::net::TlsMode,
         account: &str,
         _password: &str,
         msg: OutgoingMessage,
@@ -473,4 +474,37 @@ fn interrupted_sending_recovers_to_failed() {
     assert!(error.contains("上次发送被中断"), "应写明中断原因：{error}");
     assert!(reopen_failed(&state, id), "自愈后必须能重发");
     cleanup(&dir);
+}
+
+/// 加密方式解析：端口推断（587 STARTTLS / 465 隐式）+ 配置覆盖 + 缺省回退
+#[test]
+fn smtp_config_resolves_security_from_port_and_override() {
+    use crate::net::TlsMode;
+    use crate::state::keys;
+    let mut cfg = crate::conf::ConfigMap::new();
+    cfg.insert(keys::SMTP_HOST.into(), "smtp.test.cn".into());
+    cfg.insert(keys::SMTP_PORT.into(), "587".into());
+    let c = SmtpConfig::from_config(&cfg);
+    assert_eq!(c.security, TlsMode::StartTls, "587 应走 STARTTLS");
+
+    cfg.insert(keys::SMTP_PORT.into(), "465".into());
+    assert_eq!(
+        SmtpConfig::from_config(&cfg).security,
+        TlsMode::Implicit,
+        "465 应走隐式 TLS"
+    );
+
+    cfg.insert(keys::SMTP_PORT.into(), "2525".into());
+    cfg.insert(keys::SMTP_SECURITY.into(), "implicit".into());
+    assert_eq!(
+        SmtpConfig::from_config(&cfg).security,
+        TlsMode::Implicit,
+        "显式覆盖优先于端口推断"
+    );
+
+    // 端口缺省 → 465 隐式 TLS（与历史行为一致，老配置零迁移）
+    cfg.remove(keys::SMTP_PORT);
+    let c = SmtpConfig::from_config(&cfg);
+    assert_eq!((c.port, c.security), (465, TlsMode::Implicit));
+    assert_eq!(c.host, "smtp.test.cn");
 }

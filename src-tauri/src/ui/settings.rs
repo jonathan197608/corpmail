@@ -7,7 +7,7 @@
 
 use super::router::{
     ConnTester, FrameCtx, RECV_PORT_DEFAULT, Req, Resp, SMTP_PORT_DEFAULT, domain_or, frame_of,
-    human_bytes, parse_form, render_html, test_fragment, test_view, trimmed_field,
+    human_bytes, parse_form, render_html, security_or, test_fragment, test_view, trimmed_field,
 };
 use crate::state::{self, AppState, defaults, full_address, keys};
 use serde::Serialize;
@@ -26,11 +26,14 @@ pub(super) struct SettingsCtx {
     // 账号 tab
     smtp_host: String,
     smtp_port: String,
+    /// 加密方式（auto|implicit|starttls|plain；auto = 按端口推断）
+    smtp_security: String,
     account_prefix: String,
     account_domain: String,
     display_name: String,
     recv_host: String,
     recv_port: String,
+    recv_security: String,
     degraded: bool,
     saved: bool,
     error: String,
@@ -38,6 +41,8 @@ pub(super) struct SettingsCtx {
     sync_on_start: bool,
     sync_interval_min: String,
     first_fetch_days: String,
+    /// 单封收件上限（MB）：超出只拉信头存占位
+    max_mail_mb: String,
     last_sync_label: String,
     /// 收件同步 tab：刚触发「按当前范围重新拉取」（清游标+启动首拉）
     refetch_notice: bool,
@@ -167,17 +172,20 @@ pub(super) fn settings_ctx(
         tab: tab.into(),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
+        smtp_security: g(keys::SMTP_SECURITY),
         account_prefix: prefix,
         account_domain: domain,
         display_name: display,
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
+        recv_security: g(keys::RECV_SECURITY),
         degraded,
         saved,
         error: error.into(),
         sync_on_start: g(keys::SYNC_ON_START) == "true",
         sync_interval_min: g(keys::SYNC_INTERVAL_MIN),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
+        max_mail_mb: g(keys::MAX_MAIL_MB),
         refetch_notice: false,
         refetch_busy: false,
         last_sync_label: {
@@ -264,42 +272,59 @@ pub(super) fn settings_account_test(
             }
         },
     };
-    let (label, host, port) = if imap_channel {
+    let (label, host, port, mode) = if imap_channel {
         let host = host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT);
         let port = port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT);
-        ("收信通道", host, port)
+        let security = security_or(&form, state, keys::RECV_SECURITY);
+        (
+            "收信通道",
+            host,
+            port,
+            crate::net::TlsMode::resolve(port, &security),
+        )
     } else {
         let host = host_state_or(&form, state, keys::SMTP_HOST, state::SMTP_HOST_DEFAULT);
         let port = port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT);
-        ("发信通道", host, port)
+        let security = security_or(&form, state, keys::SMTP_SECURITY);
+        (
+            "发信通道",
+            host,
+            port,
+            crate::net::TlsMode::resolve(port, &security),
+        )
     };
     let outcome = if imap_channel {
-        tester.imap(&host, port, &account, &password)
+        tester.imap(&host, port, mode, &account, &password)
     } else {
-        tester.smtp(&host, port, &account, &password)
+        tester.smtp(&host, port, mode, &account, &password)
     };
     test_fragment(vec![test_view(label, &outcome)], "", true)
 }
 
 /// 账号配置键值对装配（向导"测试并保存"与设置·账号 tab 保存共用）：
-/// 账号三要素 + 双通道主机/端口。端口传字符串（表单/已存值统一形态）
+/// 账号三要素 + 双通道主机/端口/加密方式。端口与方式传字符串（表单/已存值统一形态）
+#[allow(clippy::too_many_arguments)]
 pub(super) fn account_pairs<'a>(
     prefix: &'a str,
     domain: &'a str,
     display: &'a str,
     smtp_host: &'a str,
     smtp_port: &'a str,
+    smtp_security: &'a str,
     recv_host: &'a str,
     recv_port: &'a str,
-) -> [(&'static str, &'a str); 7] {
+    recv_security: &'a str,
+) -> [(&'static str, &'a str); 9] {
     [
         (keys::ACCOUNT_PREFIX, prefix),
         (keys::ACCOUNT_DOMAIN, domain),
         (keys::DISPLAY_NAME, display),
         (keys::SMTP_HOST, smtp_host),
         (keys::SMTP_PORT, smtp_port),
+        (keys::SMTP_SECURITY, smtp_security),
         (keys::RECV_HOST, recv_host),
         (keys::RECV_PORT, recv_port),
+        (keys::RECV_SECURITY, recv_security),
     ]
 }
 
@@ -337,6 +362,8 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let recv_host = host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT);
     let smtp_port_s = port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT).to_string();
     let recv_port_s = port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT).to_string();
+    let smtp_security = security_or(&form, state, keys::SMTP_SECURITY);
+    let recv_security = security_or(&form, state, keys::RECV_SECURITY);
     let display = trimmed_field(&form, "display_name").unwrap_or_default();
     let pairs = account_pairs(
         &prefix,
@@ -344,8 +371,10 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         &display,
         &smtp_host,
         &smtp_port_s,
+        &smtp_security,
         &recv_host,
         &recv_port_s,
+        &recv_security,
     );
     // 2) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
@@ -393,10 +422,22 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         Some(v) if matches!(v.as_str(), "7" | "30" | "90" | "0") => v.clone(),
         _ => cur(keys::FIRST_FETCH_DAYS),
     };
+    // 单封收件上限：空/非法保持现值；合法值钳制 1..=200 MB
+    // （0 会让所有邮件都成占位，巨值则等于关掉保护——收件峰值内存不可控）
+    let max_mail = match form
+        .get("max_mail_mb")
+        .map(|v| v.trim().parse::<u32>())
+    {
+        Some(Ok(v)) => v
+            .clamp(state::MAX_MAIL_MB_MIN, state::MAX_MAIL_MB_MAX)
+            .to_string(),
+        _ => cur(keys::MAX_MAIL_MB),
+    };
     let pairs = [
         (keys::SYNC_ON_START, if on { "true" } else { "false" }),
         (keys::SYNC_INTERVAL_MIN, interval.as_str()),
         (keys::FIRST_FETCH_DAYS, days.as_str()),
+        (keys::MAX_MAIL_MB, max_mail.as_str()),
     ];
     if state.set_batch(&pairs).is_err() {
         // 保存失败回渲染当前值，用户重试（库错误在此无更优交互）

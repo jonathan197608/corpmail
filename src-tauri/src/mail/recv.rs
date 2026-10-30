@@ -1,18 +1,40 @@
 //! IMAP 收件子模块（M4，设计 §6.1/§6.2）
 //!
 //! RealFetcher：连接 → SELECT INBOX → 增量 UID 搜索（uid+1:* 续拉，空命中 SINCE 兜底）
-//! → 逐封 FETCH → mailparse 解析（编码修复：latin1/cp1252 误标 mojibake 逆推 + GBK 兜底）。
+//! → 大小预检 → 逐封 FETCH → mailparse 解析（编码修复：latin1/cp1252 误标 mojibake 逆推 + GBK 兜底）。
 //! 入库 store_incoming_conn：每封一事务（正文行 + 附件原子提交），remote_uid/message_id 双去重。
+//!
+//! 收敛：`fetch_batched` 是**唯一**拉取实现，trait 的 `fetch` 只是把批次收集成整包
+//! （旧实现两处各写一遍搜索/拉取/解析，任何修复都要改两次，已出现过漂移）。
 
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
     mark_read, month_dir_conn, now_epoch, safe_filename, sync_attach_stats, tokenize, zoned_of,
 };
+use crate::net::TlsMode;
 use crate::state::{defaults, full_address, keys};
 use rusqlite::OptionalExtension;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// 单批拉取封数上限
+const BATCH: usize = 25;
+
+/// 单批累计原始字节上限（超出即提前 flush）：整封 + 附件 + gzip 副本同时驻留内存，
+/// 只按封数分批时 25 封 × 25MB 仍可达 600MB 级峰值（审计批 0+2）
+const BATCH_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 大小预检的 UID 分块：一条 FETCH 命令里塞几千个 UID 会撞服务器命令行长度上限
+const SIZE_CHECK_CHUNK: usize = 200;
+
+/// 已读回写的 UID 分块（单条 STORE 命令的 UID 集合上限）
+const SEEN_CHUNK: usize = 200;
+
+/// UIDVALIDITY 变化时的固定错误前缀（worker 据此决定"清标志放弃"而非重试）
+pub const ERR_UIDVALIDITY_CHANGED: &str = "邮箱 UID 已重排";
+
 /// 收件附件（内存字节；来自 MIME 解析）
+#[derive(Clone)]
 pub struct IncomingAttach {
     pub filename: String,
     pub mime: String,
@@ -20,6 +42,7 @@ pub struct IncomingAttach {
 }
 
 /// 收件结果单封形态（fetcher 返回；入库走 store_incoming）
+#[derive(Clone)]
 pub struct IncomingMail {
     pub uidvalidity: u32,
     pub uid: u32,
@@ -34,6 +57,8 @@ pub struct IncomingMail {
     pub body_text: String,
     pub body_kind: String,
     pub attachments: Vec<IncomingAttach>,
+    /// 超过单封上限：只拉了信头，正文/附件未下载（正文为占位说明）
+    pub too_large: bool,
 }
 
 /// 收件游标（settings 的 last_uidvalidity/last_uid 快照）
@@ -44,7 +69,7 @@ pub struct LastCursor {
 }
 
 /// 一轮收件结果（游标推进依据 = 搜索层 max_uid，解析失败/入库去重不阻塞游标）
-#[allow(dead_code)] // 供单测 MockFetcher 实现 trait fetch；生产走 fetch_batched 分批路径
+#[allow(dead_code)] // 供单测 MockFetcher 的 fetch 实现；生产走 fetch_batched 分批路径
 pub struct FetchOutcome {
     /// 服务器 INBOX 的 UIDVALIDITY（空轮也记录，防 uidvalidity 变化后误判）
     pub uidvalidity: u32,
@@ -58,32 +83,53 @@ pub struct FetchOutcome {
 pub trait MailFetcher {
     /// 增量拉取：last.uid > 0 且 uidvalidity 未变时从 uid+1 续拉；
     /// uidvalidity 变化或首次按 SINCE 范围（设计 §6.1：提示全量重拉由调用方清理语义）
-    #[allow(dead_code)] // 生产 fetch_round 走 RealFetcher::fetch_batched；trait 保留供单测 MockFetcher 注入
+    #[allow(dead_code)] // 生产 fetch_round 走 RealFetcher::fetch_batched；trait 保留供单测注入
+    #[allow(clippy::too_many_arguments)]
     fn fetch(
         &self,
         host: &str,
         port: u16,
+        mode: TlsMode,
         account: &str,
         password: &str,
         first_days: i64,
         last: LastCursor,
+        max_mail_bytes: u64,
     ) -> Result<FetchOutcome, String>;
 
     /// 服务器未读回写（SELECT 校验 uidvalidity 后 STORE +Flags \Seen）
+    #[allow(clippy::too_many_arguments)]
     fn mark_seen(
         &self,
         host: &str,
         port: u16,
+        mode: TlsMode,
         account: &str,
         password: &str,
         uidvalidity: u32,
         uid: u32,
+    ) -> Result<(), String> {
+        self.mark_seen_batch(host, port, mode, account, password, uidvalidity, &[uid])
+    }
+
+    /// 批量已读回写：单次连接、单条命令覆盖多个 UID（合并窗口，避免 N 次登录）
+    #[allow(clippy::too_many_arguments)]
+    fn mark_seen_batch(
+        &self,
+        host: &str,
+        port: u16,
+        mode: TlsMode,
+        account: &str,
+        password: &str,
+        uidvalidity: u32,
+        uids: &[u32],
     ) -> Result<(), String>;
 }
 
-/// 生产实现：imap 3.0.0-alpha.15（隐式 TLS）+ mailparse 0.18（MIME 解析，spike 已验证）
+/// 生产实现：imap 3.0.0-alpha.15 + mailparse 0.18（MIME 解析，spike 已验证）
 pub struct RealFetcher;
-/// 首拉范围 UID 搜索（fetch / fetch_batched 共用；C3 惰性化：仅在无游标首拉、
+
+/// 首拉范围 UID 搜索（fetch_batched 用；C3 惰性化：仅在无游标首拉、
 /// 或增量命中为空需窗口兜底比对时才调用，不占用常规增量轮）。
 /// C1：uid_search 返回 HashSet（哈希迭代无序）；调用方必须对结果升序排序，
 /// 否则断点游标会越过未入库邮件造成永久漏信。
@@ -103,26 +149,94 @@ fn first_pull_search<T: std::io::Read + std::io::Write>(
     }
 }
 
+/// 本轮要拉的 UID 列表（fetch_batched 唯一实现）：
+/// 增量优先（C3）——命中 0 封不再回退全窗正文重拉，仅以首拉范围做 UID 级比对
+/// 兜底：个别服务器对 N:* 范围有 quirk，若窗口内确有游标之上的新 UID（增量漏报）
+/// 则精确补拉这些；全部不大于游标 = 真无新邮件，零正文拉取。
+/// C1：结果必须升序（uid_search 返回无序 HashSet），断点游标才只会越过连续已入库前缀。
+fn resolve_uids<T: std::io::Read + std::io::Write>(
+    sess: &mut imap::Session<T>,
+    first_days: i64,
+    last: LastCursor,
+    uidvalidity: u32,
+) -> Result<Vec<u32>, String> {
+    let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+        let inc: Vec<u32> = sess
+            .uid_search(format!("{}:*", last.uid + 1))
+            .map_err(|e| format!("检索新邮件失败：{e}"))?
+            .into_iter()
+            .filter(|u| *u > last.uid)
+            .collect();
+        if inc.is_empty() {
+            first_pull_search(sess, first_days)?
+                .into_iter()
+                .filter(|u| *u > last.uid)
+                .collect()
+        } else {
+            inc
+        }
+    } else {
+        first_pull_search(sess, first_days)?
+    };
+    uids.sort_unstable();
+    Ok(uids)
+}
+
+/// IMAP 序列集合（"1,2,3"）：UID STORE/FETCH 的 set 参数
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 大小预检：分块 `(UID RFC822.SIZE)`，返回 uid → 字节数。
+/// 预检失败不阻断收件（部分服务器对 UID 数据项支持不佳）——退化为"不知道大小"，
+/// 按旧行为整封拉取，仍受 BATCH_MAX_BYTES 分批保护。
+fn prefetch_sizes<T: std::io::Read + std::io::Write>(
+    sess: &mut imap::Session<T>,
+    uids: &[u32],
+) -> HashMap<u32, u32> {
+    let mut out: HashMap<u32, u32> = HashMap::new();
+    for chunk in uids.chunks(SIZE_CHECK_CHUNK) {
+        match sess.uid_fetch(uid_set(chunk), "(UID RFC822.SIZE)") {
+            Ok(fetches) => {
+                for f in fetches.iter() {
+                    if let (Some(uid), Some(size)) = (f.uid, f.size) {
+                        out.insert(uid, size);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("[fetch] 大小预检失败（按整封拉取继续）：{err}");
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl RealFetcher {
-    /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调
+    /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调。
     /// on_batch 回调参数：已解析邮件、累计处理数、总数、uidvalidity、本批最大 UID。
     /// uidvalidity 与 batch_max_uid 用于每批入库后立即持久化游标（需求2 断点续传）。
-    #[allow(clippy::too_many_arguments)] // 收件参数集（host/port/account/password/range/游标/回调）本就完整
+    #[allow(clippy::too_many_arguments)]
     pub fn fetch_batched(
         &self,
         host: &str,
         port: u16,
+        mode: TlsMode,
         account: &str,
         password: &str,
         first_days: i64,
         last: LastCursor,
+        max_mail_bytes: u64,
         mut on_batch: impl FnMut(&[IncomingMail], usize, usize, u32, u32) -> Result<(), String>,
     ) -> Result<(u32, u32), String> {
-        const BATCH: usize = 25;
         let client = imap::ClientBuilder::new(host, port)
-            .mode(imap::ConnectionMode::Tls)
+            .mode(mode.imap_mode())
             .connect()
-            .map_err(|e| format!("连接失败：{e}"))?;
+            .map_err(|e| format!("连接失败：{e}{}", mode.hint(port)))?;
         let mut sess = client
             .login(account, password)
             .map_err(|(e, _)| format!("登录失败：{e}"))?;
@@ -130,62 +244,80 @@ impl RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 增量优先（C3）：命中 0 封不再回退全窗正文重拉，仅以首拉范围做 UID 级比对
-        // 兜底：个别服务器对 N:* 范围有 quirk，若窗口内确有游标之上的新 UID
-        // （增量漏报）则精确补拉这些；全部不大于游标 = 真无新邮件，零正文拉取
-        let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
-            let inc: Vec<u32> = sess
-                .uid_search(format!("{}:*", last.uid + 1))
-                .map_err(|e| format!("检索新邮件失败：{e}"))?
-                .into_iter()
-                .filter(|u| *u > last.uid)
-                .collect();
-            if inc.is_empty() {
-                first_pull_search(&mut sess, first_days)?
-                    .into_iter()
-                    .filter(|u| *u > last.uid)
-                    .collect()
-            } else {
-                inc
-            }
-        } else {
-            first_pull_search(&mut sess, first_days)?
-        };
-        // C1：uid_search 返回 HashSet（哈希迭代无序）。必须升序排序，断点游标
-        // （每批入库后持久化到本批最大 UID）才只会越过“连续已入库前缀”；
-        // 未排序时首批可能含全箱最大 UID，中途失败后游标越过未入库邮件，
-        // 增量与窗口两路都命中不到 → 永久漏信
-        uids.sort_unstable();
-        // 分批拉取 + 回调入库（每批 BATCH 封；处理数 processed 作进度 done）
+        let uids = resolve_uids(&mut sess, first_days, last, uidvalidity)?;
+        // 大小预检（审计批 0+2）：超过单封上限的只拉信头，避免整封 + 附件 + gzip
+        // 副本同时驻留内存。已知超限 → 占位入库；未知大小 → 按整封拉（旧行为）
+        let sizes = prefetch_sizes(&mut sess, &uids);
         let total = uids.len();
         let mut processed = 0usize;
         let mut batch: Vec<IncomingMail> = Vec::with_capacity(BATCH);
         let mut batch_uids: Vec<u32> = Vec::with_capacity(BATCH);
+        let mut batch_bytes: u64 = 0;
         for uid in uids.iter().copied() {
+            let size = sizes.get(&uid).copied().map(u64::from);
+            let over = size.is_some_and(|s| s > max_mail_bytes);
+            let query = if over {
+                "(FLAGS INTERNALDATE BODY.PEEK[HEADER])"
+            } else {
+                "(FLAGS INTERNALDATE BODY.PEEK[])"
+            };
             let fetches = sess
-                .uid_fetch(uid.to_string(), "(FLAGS INTERNALDATE BODY.PEEK[])")
+                .uid_fetch(uid.to_string(), query)
                 .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
+            // 超限邮件必须有占位行：服务器对 BODY[HEADER] 返回空时也要落一条，
+            // 否则游标越过它、用户永远看不到这封邮件（静默漏信）
+            let mut placed = false;
             for f in fetches.iter() {
                 let seen = f
                     .flags()
                     .iter()
                     .any(|flag| flag.to_string().contains("\\Seen"));
                 let internal_date = f.internal_date().map(|dt| dt.timestamp());
+                if over {
+                    let header = f.header().unwrap_or_default();
+                    batch_bytes += header.len() as u64;
+                    batch.push(placeholder_mail(
+                        uidvalidity,
+                        uid,
+                        seen,
+                        internal_date,
+                        header,
+                        size.unwrap_or(0),
+                        max_mail_bytes,
+                    ));
+                    placed = true;
+                    continue;
+                }
                 let Some(body) = f.body() else {
                     eprintln!("[fetch] uid={uid} 无 BODY，跳过");
                     continue;
                 };
+                batch_bytes += body.len() as u64;
                 if let Some(mail) = parse_incoming(uidvalidity, uid, seen, internal_date, body) {
                     batch.push(mail);
                 }
             }
+            if over && !placed {
+                eprintln!("[fetch] uid={uid} 超限但服务器未返回邮件头，落最小占位");
+                batch.push(placeholder_mail(
+                    uidvalidity,
+                    uid,
+                    false,
+                    None,
+                    &[],
+                    size.unwrap_or(0),
+                    max_mail_bytes,
+                ));
+            }
             batch_uids.push(uid);
             processed += 1;
-            if batch_uids.len() >= BATCH {
+            // 双阈值 flush：封数或累计字节任一超限即入库，控制解析峰值内存
+            if batch_uids.len() >= BATCH || batch_bytes >= BATCH_MAX_BYTES {
                 let bmax = batch_uids.iter().copied().max().unwrap_or(0);
                 on_batch(&batch, processed, total, uidvalidity, bmax)?;
                 batch.clear();
                 batch_uids.clear();
+                batch_bytes = 0;
             }
         }
         if !batch_uids.is_empty() {
@@ -196,107 +328,27 @@ impl RealFetcher {
         let _ = sess.logout();
         Ok((uidvalidity, max_uid))
     }
-}
 
-impl MailFetcher for RealFetcher {
-    fn fetch(
+    /// 批量已读回写核心：单次连接 + 单次 SELECT，UID 每 SEEN_CHUNK 一批 STORE。
+    /// uidvalidity 不匹配直接报错（UID 空间已重排，旧 UID 指向别的邮件，绝不写入）
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_seen(
         &self,
         host: &str,
         port: u16,
-        account: &str,
-        password: &str,
-        first_days: i64,
-        last: LastCursor,
-    ) -> Result<FetchOutcome, String> {
-        let client = imap::ClientBuilder::new(host, port)
-            .mode(imap::ConnectionMode::Tls)
-            .connect()
-            .map_err(|e| format!("连接失败：{e}"))?;
-        let mut sess = client
-            .login(account, password)
-            .map_err(|(e, _)| format!("登录失败：{e}"))?;
-        let mailbox = sess
-            .select("INBOX")
-            .map_err(|e| format!("无法打开收件箱：{e}"))?;
-        let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则用首拉范围（§6.1）。
-        // 范围写法必须是 "N:*"（UID 范围）；曾误写 "N,*"（set 语义 = UID 恰为 N 或最大值），
-        // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复。
-        // 增量命中 0 封改 UID 级比对兜底（C3）：不再全窗重拉正文；窗口内存在游标
-        // 之上的新 UID（服务器 quirk 漏报）则精确补拉，否则零正文拉取直接收工
-        let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
-            let inc: Vec<u32> = sess
-                .uid_search(format!("{}:*", last.uid + 1))
-                .map_err(|e| format!("检索新邮件失败：{e}"))?
-                .into_iter()
-                .filter(|u| *u > last.uid)
-                .collect();
-            if inc.is_empty() {
-                eprintln!("[fetch] 增量命中 0 封，窗口 UID 级比对兜底");
-                first_pull_search(&mut sess, first_days)?
-                    .into_iter()
-                    .filter(|u| *u > last.uid)
-                    .collect()
-            } else {
-                inc
-            }
-        } else {
-            first_pull_search(&mut sess, first_days)?
-        };
-        // C1：uid_search 返回 HashSet（哈希迭代无序），必须升序拉取（断点游标正确性前提）
-        uids.sort_unstable();
-        eprintln!(
-            "[fetch] INBOX uidvalidity={uidvalidity} 游标 uid={} 命中 {} 封",
-            last.uid,
-            uids.len()
-        );
-        let mut mails = Vec::new();
-        for uid in uids.iter().copied() {
-            let fetches = sess
-                .uid_fetch(uid.to_string(), "(FLAGS INTERNALDATE BODY.PEEK[])")
-                .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
-            for f in fetches.iter() {
-                let seen = f
-                    .flags()
-                    .iter()
-                    .any(|flag| flag.to_string().contains("\\Seen"));
-                let internal_date = f.internal_date().map(|dt| dt.timestamp());
-                let Some(body) = f.body() else {
-                    eprintln!("[fetch] uid={uid} 无 BODY，跳过");
-                    continue;
-                };
-                match parse_incoming(uidvalidity, uid, seen, internal_date, body) {
-                    Some(mail) => mails.push(mail),
-                    None => eprintln!("[fetch] uid={uid} MIME 解析失败，跳过"),
-                }
-            }
-        }
-        let _ = sess.logout();
-        eprintln!(
-            "[fetch] 拉取完成：命中 {} 封，解析成功 {} 封",
-            uids.len(),
-            mails.len()
-        );
-        Ok(FetchOutcome {
-            uidvalidity,
-            max_uid: uids.iter().copied().max().unwrap_or(0),
-            mails,
-        })
-    }
-
-    fn mark_seen(
-        &self,
-        host: &str,
-        port: u16,
+        mode: TlsMode,
         account: &str,
         password: &str,
         uidvalidity: u32,
-        uid: u32,
+        uids: &[u32],
     ) -> Result<(), String> {
+        if uids.is_empty() {
+            return Ok(());
+        }
         let client = imap::ClientBuilder::new(host, port)
-            .mode(imap::ConnectionMode::Tls)
+            .mode(mode.imap_mode())
             .connect()
-            .map_err(|e| format!("连接失败：{e}"))?;
+            .map_err(|e| format!("连接失败：{e}{}", mode.hint(port)))?;
         let mut sess = client
             .login(account, password)
             .map_err(|(e, _)| format!("登录失败：{e}"))?;
@@ -304,13 +356,71 @@ impl MailFetcher for RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         if mailbox.uid_validity.unwrap_or(0) != uidvalidity {
-            return Err("邮箱 UID 已重排，跳过回写（下次收件自动对齐）".into());
+            let _ = sess.logout();
+            return Err(format!("{ERR_UIDVALIDITY_CHANGED}，跳过回写（下次收件自动对齐）"));
         }
-        sess.uid_store(uid.to_string(), "+FLAGS (\\Seen)")
-            .map(|_| ())
-            .map_err(|e| format!("回写已读失败：{e}"))?;
+        for chunk in uids.chunks(SEEN_CHUNK) {
+            sess.uid_store(uid_set(chunk), "+FLAGS (\\Seen)")
+                .map_err(|e| format!("回写已读失败：{e}"))?;
+        }
         let _ = sess.logout();
         Ok(())
+    }
+}
+
+impl MailFetcher for RealFetcher {
+    /// 整包拉取（供单测/同步调用）：内部复用 `fetch_batched`，不再另写一套
+    /// 搜索/拉取/解析（两处重复已导致修复漂移，见模块头注释）
+    #[allow(clippy::too_many_arguments)]
+    fn fetch(
+        &self,
+        host: &str,
+        port: u16,
+        mode: TlsMode,
+        account: &str,
+        password: &str,
+        first_days: i64,
+        last: LastCursor,
+        max_mail_bytes: u64,
+    ) -> Result<FetchOutcome, String> {
+        let mut mails: Vec<IncomingMail> = Vec::new();
+        let mut last_uv = 0u32;
+        let mut last_max = 0u32;
+        let (uidvalidity, max_uid) = self.fetch_batched(
+            host,
+            port,
+            mode,
+            account,
+            password,
+            first_days,
+            last,
+            max_mail_bytes,
+            |batch, _done, _total, uv, batch_max| {
+                mails.extend_from_slice(batch);
+                last_uv = uv;
+                last_max = last_max.max(batch_max);
+                Ok(())
+            },
+        )?;
+        Ok(FetchOutcome {
+            uidvalidity: if last_uv == 0 { uidvalidity } else { last_uv },
+            max_uid: max_uid.max(last_max),
+            mails,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_seen_batch(
+        &self,
+        host: &str,
+        port: u16,
+        mode: TlsMode,
+        account: &str,
+        password: &str,
+        uidvalidity: u32,
+        uids: &[u32],
+    ) -> Result<(), String> {
+        self.set_seen(host, port, mode, account, password, uidvalidity, uids)
     }
 }
 
@@ -326,17 +436,19 @@ fn imap_since(days: i64) -> String {
     format!("{:02}-{month}-{}", z.day() as u32, z.year())
 }
 
-/// MIME 解析为 IncomingMail（mailparse：主题/地址自动解码 RFC2047，spike 已验证）
-fn parse_incoming(
-    uidvalidity: u32,
-    uid: u32,
-    seen: bool,
-    internal_date: Option<i64>,
-    raw: &[u8],
-) -> Option<IncomingMail> {
+/// 头部字段抽取（parse_incoming 与 placeholder_mail 共用）：
+/// 主题/地址/Message-Id（RFC2047 解码由 mailparse 完成）
+struct HeaderFields {
+    subject: String,
+    from_addr: String,
+    from_name: String,
+    to_addrs: String,
+    message_id: String,
+}
+
+fn header_fields(part: &mailparse::ParsedMail) -> HeaderFields {
     use mailparse::MailHeaderMap;
-    let mail = mailparse::parse_mail(raw).ok()?;
-    let headers = mail.get_headers();
+    let headers = part.get_headers();
     // RFC2047 解码需 get_first_header + get_value（get_first_value 返回原始值不解码）
     let header_value = |key: &str| -> String {
         headers
@@ -346,7 +458,6 @@ fn parse_incoming(
             .trim()
             .to_string()
     };
-    let subject = header_value("Subject");
     // From/To：addrparse 解析出地址与显示名
     let (from_addr, from_name) = headers
         .get_first_header("From")
@@ -378,7 +489,77 @@ fn parse_incoming(
             out.join(",")
         })
         .unwrap_or_default();
-    let message_id = header_value("Message-Id");
+    HeaderFields {
+        subject: header_value("Subject"),
+        from_addr,
+        from_name,
+        to_addrs,
+        message_id: header_value("Message-Id"),
+    }
+}
+
+/// 超大邮件的占位形态：只有信头派生字段 + 一段说明正文，附件与正文均不下载。
+/// 明确告诉用户"邮件在服务器上、本地只存了占位"，而不是显示一封空邮件
+fn placeholder_mail(
+    uidvalidity: u32,
+    uid: u32,
+    seen: bool,
+    internal_date: Option<i64>,
+    header: &[u8],
+    size: u64,
+    max_mail_bytes: u64,
+) -> IncomingMail {
+    let fields = mailparse::parse_mail(header)
+        .map(|m| header_fields(&m))
+        .unwrap_or(HeaderFields {
+            subject: "（邮件头无法解析）".into(),
+            from_addr: String::new(),
+            from_name: String::new(),
+            to_addrs: String::new(),
+            message_id: String::new(),
+        });
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let body_text = if size > 0 {
+        format!(
+            "（该邮件约 {:.1} MB，超过本地单封收件上限 {:.0} MB，正文与附件未下载。\
+             可用网页邮箱查看完整内容，或调高「设置 → 收件同步 → 单封收件上限」后重新拉取。）",
+            mb(size),
+            mb(max_mail_bytes)
+        )
+    } else {
+        format!(
+            "（该邮件超过本地单封收件上限 {:.0} MB，正文与附件未下载。\
+             可用网页邮箱查看完整内容，或调高「设置 → 收件同步 → 单封收件上限」后重新拉取。）",
+            mb(max_mail_bytes)
+        )
+    };
+    IncomingMail {
+        uidvalidity,
+        uid,
+        seen,
+        internal_date,
+        message_id: fields.message_id,
+        subject: fields.subject,
+        from_addr: fields.from_addr,
+        from_name: fields.from_name,
+        to_addrs: fields.to_addrs,
+        body_text,
+        body_kind: "plain".into(),
+        attachments: Vec::new(),
+        too_large: true,
+    }
+}
+
+/// MIME 解析为 IncomingMail（mailparse：主题/地址自动解码 RFC2047，spike 已验证）
+fn parse_incoming(
+    uidvalidity: u32,
+    uid: u32,
+    seen: bool,
+    internal_date: Option<i64>,
+    raw: &[u8],
+) -> Option<IncomingMail> {
+    let mail = mailparse::parse_mail(raw).ok()?;
+    let fields = header_fields(&mail);
     let (body_text, body_kind) = extract_body(&mail);
     let attachments = collect_attachments(&mail);
     Some(IncomingMail {
@@ -386,14 +567,15 @@ fn parse_incoming(
         uid,
         seen,
         internal_date,
-        message_id,
-        subject,
-        from_addr,
-        from_name,
-        to_addrs,
+        message_id: fields.message_id,
+        subject: fields.subject,
+        from_addr: fields.from_addr,
+        from_name: fields.from_name,
+        to_addrs: fields.to_addrs,
         body_text,
         body_kind: body_kind.to_string(),
         attachments,
+        too_large: false,
     })
 }
 
@@ -650,9 +832,9 @@ pub fn store_incoming_conn(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                 subject, body_text, body_kind, subject_tokens, body_tokens,
                                 attach_cnt, attach_bytes, unread, remote_uid, message_id,
-                                created_at, received_at)
+                                created_at, received_at, too_large)
              VALUES ('in', 'inbox', 'received', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                     ?11, ?12, ?13, ?14, ?15)",
+                     ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
@@ -669,6 +851,7 @@ pub fn store_incoming_conn(
                 m.message_id,
                 now,
                 m.internal_date.unwrap_or(now),
+                m.too_large,
             ],
         )
         .map_err(e)?;
@@ -714,8 +897,7 @@ pub fn store_incoming_conn(
 /// 本地已读 + 服务器 \Seen 回写（§6.1）：
 /// 参数快照在调用线程（协议回调内，纯本地查询）完成后，
 /// 网络回写交由调用方 spawn 的线程执行（fetcher 不依赖 AppState）。
-/// 本地已读 + 服务器 \Seen 回写（§6.1）：同步语义版（单测验证回写参数）；
-/// 生产路径见路由 mark_read_and_sync_seen（参数快照 + 异步 spawn）。
+/// 同步语义版（单测验证回写参数）；生产路径见 seen worker（mail::seen）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn mark_seen(state: &AppState, fetcher: &dyn MailFetcher, id: i64) -> Result<(), String> {
     // 本地置已读（幂等；无 remote_uid 时仅本地）
@@ -726,6 +908,7 @@ pub fn mark_seen(state: &AppState, fetcher: &dyn MailFetcher, id: i64) -> Result
     fetcher.mark_seen(
         &p.host,
         p.port,
+        p.security,
         &p.account,
         &p.password,
         p.uidvalidity,
@@ -733,10 +916,11 @@ pub fn mark_seen(state: &AppState, fetcher: &dyn MailFetcher, id: i64) -> Result
     )
 }
 
-/// 已读回写的参数快照（无网络操作；路由层取快照后可自由移交线程）
+/// 已读回写的参数快照（无网络操作；worker 取快照后可自由移交线程）
 pub struct SeenParams {
     pub host: String,
     pub port: u16,
+    pub security: TlsMode,
     pub account: String,
     pub password: String,
     pub uidvalidity: u32,
@@ -765,6 +949,10 @@ pub fn seen_params_of(state: &AppState, id: i64) -> Option<SeenParams> {
         .get_or(keys::RECV_PORT, &d)
         .and_then(|p| p.parse().ok())
         .unwrap_or(993);
+    let security = TlsMode::resolve(
+        port,
+        &state.get_or(keys::RECV_SECURITY, &d).unwrap_or_default(),
+    );
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let account = full_address(&prefix, &domain);
@@ -775,6 +963,7 @@ pub fn seen_params_of(state: &AppState, id: i64) -> Option<SeenParams> {
     Some(SeenParams {
         host,
         port,
+        security,
         account,
         password,
         uidvalidity,

@@ -31,7 +31,14 @@ struct FakeTester {
 }
 
 impl ConnTester for FakeTester {
-    fn smtp(&self, _host: &str, _port: u16, _account: &str, _password: &str) -> TestOutcome {
+    fn smtp(
+        &self,
+        _host: &str,
+        _port: u16,
+        _mode: crate::net::TlsMode,
+        _account: &str,
+        _password: &str,
+    ) -> TestOutcome {
         TestOutcome {
             ok: self.smtp_ok,
             elapsed_ms: 3,
@@ -43,7 +50,14 @@ impl ConnTester for FakeTester {
         }
     }
 
-    fn imap(&self, _host: &str, _port: u16, _account: &str, _password: &str) -> TestOutcome {
+    fn imap(
+        &self,
+        _host: &str,
+        _port: u16,
+        _mode: crate::net::TlsMode,
+        _account: &str,
+        _password: &str,
+    ) -> TestOutcome {
         TestOutcome {
             ok: self.imap_ok,
             elapsed_ms: 4,
@@ -2550,5 +2564,151 @@ fn router_tolerates_malformed_requests() {
         );
     }
     std::fs::remove_dir_all(&fdir).unwrap();
+    cleanup(&dir);
+}
+
+/// 设置·账号：加密方式落盘（conf 键）且端口推断生效；表单非法值回落已存值
+#[test]
+fn settings_account_saves_security_mode() {
+    use crate::net::TlsMode;
+    let (state, dir) = temp_state("acct-security");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/save",
+            &form(&[
+                ("account_prefix", "demo"),
+                ("account_domain", "@chinatelecom.cn"),
+                ("smtp_host", "smtp.test.cn"),
+                ("smtp_port", "587"),
+                ("smtp_security", "starttls"),
+                ("recv_host", "imap.test.cn"),
+                ("recv_port", "143"),
+                ("recv_security", "starttls"),
+                ("display_name", "张伟"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(body(&resp).contains("✓ 已保存"), "{}", body(&resp));
+    let d = defaults();
+    assert_eq!(
+        state.get_or(keys::SMTP_SECURITY, &d).as_deref(),
+        Some("starttls"),
+        "加密方式应写入配置（corpmail.toml 键）"
+    );
+    assert_eq!(
+        state.get_or(keys::RECV_SECURITY, &d).as_deref(),
+        Some("starttls")
+    );
+    assert_eq!(
+        TlsMode::resolve(587, &state.get_or(keys::SMTP_SECURITY, &d).unwrap()),
+        TlsMode::StartTls
+    );
+    // 页面回显：选中项与端口值
+    let pages = route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/panes/account", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let html = body(&pages);
+    assert!(html.contains("name=\"smtp_security\""), "账号页应有加密方式选择");
+    assert!(html.contains("name=\"recv_security\""));
+    assert!(html.contains("value=\"587\""));
+
+    // 非法值：保持现值（不得被空串/垃圾值覆盖）
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/save",
+            &form(&[
+                ("account_prefix", "demo"),
+                ("account_domain", "@chinatelecom.cn"),
+                ("smtp_host", "smtp.test.cn"),
+                ("smtp_port", "587"),
+                ("smtp_security", "bogus"),
+                ("recv_host", "imap.test.cn"),
+                ("recv_port", "143"),
+                ("recv_security", ""),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(
+        state.get_or(keys::SMTP_SECURITY, &d).as_deref(),
+        Some("starttls"),
+        "非法加密方式应保持原值"
+    );
+    cleanup(&dir);
+}
+
+/// 设置·收件同步：单封上限落盘并钳制到 1..=200MB
+#[test]
+fn settings_sync_saves_max_mail_mb_with_clamp() {
+    let (state, dir) = temp_state("max-mail");
+    let save = |value: &str| {
+        let _ = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/sync/save",
+                &form(&[
+                    ("sync_on_start", "true"),
+                    ("sync_interval_min", "30"),
+                    ("first_fetch_days", "30"),
+                    ("max_mail_mb", value),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        );
+    };
+    let d = defaults();
+    save("80");
+    assert_eq!(
+        state.get_or(keys::MAX_MAIL_MB, &d).as_deref(),
+        Some("80")
+    );
+    save("0");
+    assert_eq!(
+        state.get_or(keys::MAX_MAIL_MB, &d).as_deref(),
+        Some("1"),
+        "0 会令所有邮件都成占位，应钳到下限 1"
+    );
+    save("9999");
+    assert_eq!(
+        state.get_or(keys::MAX_MAIL_MB, &d).as_deref(),
+        Some("200"),
+        "上限 200 防止内存失控"
+    );
+    // 页面回显
+    let pane = route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/panes/sync", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(body(&pane).contains("name=\"max_mail_mb\""));
     cleanup(&dir);
 }

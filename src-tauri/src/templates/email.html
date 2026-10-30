@@ -13,6 +13,9 @@
 
         {% if notice %}<div class="compose-note err">{{ notice }}</div>{% endif %}
 
+        {% if email.too_large %}
+        <div class="md-status sending">⚠ 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
+        {% endif %}
         {% if email.status == 'queued' %}
         <div class="md-status sending">⏳ 排队中，即将发送…</div>
         {% elif email.status == 'sending' %}

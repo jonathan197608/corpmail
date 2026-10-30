@@ -6,8 +6,8 @@ use crate::mail::{get, save_draft};
 use crate::state::AppState;
 use std::path::PathBuf;
 
-/// 假收件器：记录 mark_seen 调用参数（fetch 路径由真实 fetcher 单独覆盖，不测网络）
-type SeenCall = (String, u16, String, u32, u32);
+/// 假收件器：记录批量回写调用参数（fetch 路径由真实 fetcher 单独覆盖，不测网络）
+type SeenCall = (String, u16, String, u32, Vec<u32>);
 
 struct FakeFetcher {
     seen_marks: std::sync::Mutex<Vec<SeenCall>>,
@@ -26,10 +26,12 @@ impl MailFetcher for FakeFetcher {
         &self,
         _host: &str,
         _port: u16,
+        _mode: TlsMode,
         _account: &str,
         _password: &str,
         _first_days: i64,
         _last: LastCursor,
+        _max_mail_bytes: u64,
     ) -> Result<FetchOutcome, String> {
         Ok(FetchOutcome {
             uidvalidity: 0,
@@ -38,19 +40,23 @@ impl MailFetcher for FakeFetcher {
         })
     }
 
-    fn mark_seen(
+    fn mark_seen_batch(
         &self,
         host: &str,
         port: u16,
+        _mode: TlsMode,
         account: &str,
         _password: &str,
         uidvalidity: u32,
-        uid: u32,
+        uids: &[u32],
     ) -> Result<(), String> {
-        self.seen_marks
-            .lock()
-            .unwrap()
-            .push((host.into(), port, account.into(), uidvalidity, uid));
+        self.seen_marks.lock().unwrap().push((
+            host.into(),
+            port,
+            account.into(),
+            uidvalidity,
+            uids.to_vec(),
+        ));
         Ok(())
     }
 }
@@ -80,6 +86,7 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
         body_text: "请查收本月激励清单。".into(),
         body_kind: "plain".into(),
         attachments: Vec::new(),
+        too_large: false,
     }
 }
 
@@ -166,9 +173,15 @@ fn mark_seen_local_and_delegates_to_fetcher() {
             calls[0].1,
             calls[0].2.as_str(),
             calls[0].3,
-            calls[0].4
+            calls[0].4.clone()
         ),
-        ("imap.test.cn", 993, "demo@chinatelecom.cn", 42, 7),
+        (
+            "imap.test.cn",
+            993,
+            "demo@chinatelecom.cn",
+            42,
+            vec![7u32]
+        ),
         "回写参数应来自设置与 remote_uid"
     );
     // 已读后再次调用：本地无变化、不再回写
@@ -387,4 +400,65 @@ fn walk_attachments_tolerates_deep_nesting() {
     raw.push_str("--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B--\r\n");
     let parsed = mailparse::parse_mail(raw.as_bytes()).unwrap();
     let _ = collect_attachments(&parsed); // 不 panic 即过
+}
+
+/// 超大邮件占位：保留信头派生字段（主题/发件人/Message-Id），标记 too_large，
+/// 正文为可操作的说明，附件为空
+#[test]
+fn placeholder_mail_keeps_headers_and_flags_too_large() {
+    let header = b"From: =?utf-8?B?6YOo6Zeo6aKG5a+8?=<boss@x.cn>\r\n\
+                   To: demo@chinatelecom.cn\r\n\
+                   Subject: =?utf-8?B?5pyI5bqm6YWN5qGI?=\r\n\
+                   Message-Id: <big@x.cn>\r\n\r\n";
+    let m = placeholder_mail(
+        42,
+        5,
+        false,
+        Some(1234),
+        header,
+        120 * 1024 * 1024,
+        50 * 1024 * 1024,
+    );
+    assert!(m.too_large, "超限邮件必须标记");
+    assert_eq!(m.subject, "月度配案");
+    assert_eq!(m.from_addr, "boss@x.cn");
+    assert_eq!(m.message_id, "<big@x.cn>");
+    assert!(m.attachments.is_empty(), "超限不下载附件");
+    assert!(
+        m.body_text.contains("120.0 MB") && m.body_text.contains("50 MB"),
+        "正文应说明实际大小与上限：{}",
+        m.body_text
+    );
+    assert!(m.body_text.contains("收件同步"), "正文应给出改法");
+    assert_eq!((m.uidvalidity, m.uid), (42, 5));
+}
+
+/// 占位邮件入库：too_large 持久化，详情页据此显示提示条
+#[test]
+fn store_incoming_persists_too_large_flag() {
+    let (state, dir) = temp_state("m4-toolarge");
+    let mut m = incoming(11, false, "超大附件", "<big-11@x.cn>");
+    m.too_large = true;
+    m.body_text = "（该邮件约 120.0 MB，超过本地单封收件上限 50 MB…）".into();
+    assert_eq!(store_incoming(&state, &[m]).unwrap(), 1);
+    let id: i64 = state.with_conn(|c| {
+        c.query_row("SELECT id FROM emails WHERE remote_uid = '42:11'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    let d = get(&state, id).unwrap();
+    assert!(d.too_large, "详情应带超限标记");
+    assert_eq!(d.attach_cnt, 0);
+    // 普通邮件不受影响
+    let normal = incoming(12, false, "正常邮件", "<n-12@x.cn>");
+    store_incoming(&state, &[normal]).unwrap();
+    let normal_id: i64 = state.with_conn(|c| {
+        c.query_row("SELECT id FROM emails WHERE remote_uid = '42:12'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert!(!get(&state, normal_id).unwrap().too_large);
+    cleanup(&dir);
 }

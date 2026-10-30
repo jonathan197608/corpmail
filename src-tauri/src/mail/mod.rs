@@ -11,11 +11,15 @@
 //! 子模块：`send`（SMTP 发送队列状态机）、`recv`（IMAP 收件与 MIME 解析入库）。
 
 mod recv;
+pub(crate) mod seen;
 mod send;
 
 pub use recv::{
     IncomingMail, LastCursor, MailFetcher, RealFetcher, seen_params_of, store_incoming_conn,
 };
+// 仅单测使用的入口：生产收件走 fetch_batched + store_incoming_conn（避免为测试放宽生产可见性）
+#[cfg(test)]
+pub use recv::{FetchOutcome, store_incoming};
 pub use send::{
     RealSender, SmtpConfig, dispatch_one, enqueue_draft, recover_interrupted_sends, reopen_failed,
 };
@@ -606,6 +610,8 @@ pub struct EmailDetail {
     pub in_reply_to: Option<i64>,
     pub error: String,
     pub time_full: String,
+    /// 超过单封收件上限：只拉了信头，正文为占位说明（详情页据此显示提示条）
+    pub too_large: bool,
     pub attachments: Vec<AttachView>,
 }
 
@@ -616,7 +622,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
             .query_row(
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
                         cc_addrs, body_text, attach_cnt, attach_bytes, unread, in_reply_to,
-                        COALESCE(error, ''), COALESCE(received_at, sent_at, created_at)
+                        COALESCE(error, ''), COALESCE(received_at, sent_at, created_at), too_large
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -637,6 +643,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         in_reply_to: r.get(12)?,
                         error: r.get(13)?,
                         time_full: time_full(r.get(14)?),
+                        too_large: r.get::<_, i64>(15)? == 1,
                         attachments: Vec::new(),
                     })
                 },
@@ -674,15 +681,27 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
     .unwrap_or_default()
 }
 
-/// 本地标记已读（IMAP 服务器回写为 M4；§6.1）。返回是否生效
+/// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。返回是否生效
+///
+/// `seen_pending = 1` 与 `unread = 0` 同一语句写入：业务状态与"待回写"意向一起落盘，
+/// 进程被杀后标志仍在，重启由 worker 补发（旧实现每次点击 spawn 一个线程各登录一次，
+/// 连点 N 封 = N 次 IMAP 登录，企业服务器易限流）
 pub fn mark_read(state: &AppState, id: i64) -> bool {
-    state.with_conn(|conn| {
+    let flipped = state.with_conn(|conn| {
         exec_one(
             conn,
-            "UPDATE emails SET unread = 0 WHERE id = ?1 AND unread = 1",
+            "UPDATE emails SET unread = 0,
+                    seen_pending = CASE
+                        WHEN direction = 'in' AND remote_uid IS NOT NULL THEN 1
+                        ELSE seen_pending END
+             WHERE id = ?1 AND unread = 1",
             id,
         )
-    })
+    });
+    if flipped {
+        state.notify_seen();
+    }
+    flipped
 }
 
 /// 单行 CAS 更新：仅当恰好影响 1 行返回 true（0 行 = 条件不满足/重复提交，幂等）

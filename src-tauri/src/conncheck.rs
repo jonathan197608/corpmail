@@ -53,42 +53,45 @@ fn with_timeout(f: impl FnOnce() -> TestOutcome + Send + 'static) -> TestOutcome
     })
 }
 
-/// SMTP 通道测试：连接 + TLS + EHLO（lettre `test_connection`，隐式 TLS 465）
-pub fn smtp_test(host: &str, port: u16, account: &str, password: &str) -> TestOutcome {
+/// SMTP 通道测试：连接 + TLS（按模式）+ EHLO（lettre `test_connection`）
+pub fn smtp_test(
+    host: &str,
+    port: u16,
+    mode: crate::net::TlsMode,
+    account: &str,
+    password: &str,
+) -> TestOutcome {
     let (host, account, password) = (host.to_string(), account.to_string(), password.to_string());
     with_timeout(move || {
         let t = Instant::now();
+        let ms = || t.elapsed().as_millis() as u64;
         // 先做有界 TCP 探活：imap/lettre 自身无连接超时，探活把"不可达"从
         // 15 秒整体超时降为 10 秒内的明确原因（并避免后台线程长期挂起）
         if let Err(e) = crate::net::probe_tcp(&host, port) {
-            return TestOutcome::fail(t.elapsed().as_millis() as u64, e);
+            return TestOutcome::fail(ms(), e);
         }
-        let builder = match lettre::SmtpTransport::relay(&host) {
-            Ok(b) => b,
-            Err(e) => {
-                return TestOutcome::fail(
-                    t.elapsed().as_millis() as u64,
-                    format!("服务器地址无效：{e}"),
-                );
-            }
+        let transport = match mode.smtp_transport(&host, port, &account, &password) {
+            Ok(t) => t,
+            Err(e) => return TestOutcome::fail(ms(), e),
         };
-        let transport = builder
-            .port(port)
-            .credentials(lettre::transport::smtp::authentication::Credentials::new(
-                account, password,
-            ))
-            .build();
         // test_connection：TCP+TLS+EHLO（不做 AUTH——凭据正确性在发信时最终校验）
         match transport.test_connection() {
-            Ok(true) => TestOutcome::ok(t.elapsed().as_millis() as u64),
-            Ok(false) => TestOutcome::fail(t.elapsed().as_millis() as u64, "服务器无响应"),
-            Err(e) => TestOutcome::fail(t.elapsed().as_millis() as u64, format!("连接失败：{e}")),
+            Ok(true) => TestOutcome::ok(ms()),
+            Ok(false) => TestOutcome::fail(ms(), "服务器无响应"),
+            // 失败文案必须带端口与改法：587/143 填错模式的用户才能自己纠正
+            Err(e) => TestOutcome::fail(ms(), format!("连接失败：{e}{}", mode.hint(port))),
         }
     })
 }
 
-/// IMAP 通道测试：隐式 TLS(993) + LOGIN + SELECT INBOX（设计 §8.1）
-pub fn imap_test(host: &str, port: u16, account: &str, password: &str) -> TestOutcome {
+/// IMAP 通道测试：按模式连接 + LOGIN + SELECT INBOX（设计 §8.1）
+pub fn imap_test(
+    host: &str,
+    port: u16,
+    mode: crate::net::TlsMode,
+    account: &str,
+    password: &str,
+) -> TestOutcome {
     let (host, account, password) = (host.to_string(), account.to_string(), password.to_string());
     with_timeout(move || {
         let t = Instant::now();
@@ -98,11 +101,16 @@ pub fn imap_test(host: &str, port: u16, account: &str, password: &str) -> TestOu
             return TestOutcome::fail(ms(), e);
         }
         let client = match imap::ClientBuilder::new(&host, port)
-            .mode(imap::ConnectionMode::Tls)
+            .mode(mode.imap_mode())
             .connect()
         {
             Ok(c) => c,
-            Err(e) => return TestOutcome::fail(ms(), format!("连接失败：{e}")),
+            Err(e) => {
+                return TestOutcome::fail(
+                    ms(),
+                    format!("连接失败：{e}{}", mode.hint(port)),
+                );
+            }
         };
         let mut sess = match client.login(&account, &password) {
             Ok(s) => s,

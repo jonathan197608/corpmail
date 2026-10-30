@@ -26,9 +26,10 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
-/// 增量迁移表：v_n = 从 n-1 升到 n 的 DDL（只允许不可回退的加列/建索引/建表）
+/// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
+/// （只允许不可回退的加列/建索引/建表）
 const MIGRATIONS: &[&str] = &[
     // v1 → v2：附件邮箱外键索引（级联删/详情附件查询免全表扫）
     // + AU 触发器收窄为列限定（unread/status 等更新不再引发 FTS 重写 churn）
@@ -56,21 +57,53 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     if v == 0 {
         // 新库：v1 基线 + 全部增量一次性建到当前版本
         tx.execute_batch(SCHEMA_V1)?;
-        for sql in MIGRATIONS {
-            tx.execute_batch(sql)?;
-        }
-    } else {
-        // 旧库：按序应用增量（v → v+1 → … → 当前）
-        for sql in MIGRATIONS
-            .iter()
-            .take((SCHEMA_VERSION - v) as usize)
-            .skip((v - 1) as usize)
-        {
-            tx.execute_batch(sql)?;
-        }
+    }
+    // 增量逐级应用（v0 建完基线后从 v1 继续）；每级独立函数，便于做
+    // "列是否已存在"这类幂等判断（SQLite 的 ADD COLUMN 无 IF NOT EXISTS）
+    for from in (if v == 0 { 1 } else { v })..SCHEMA_VERSION {
+        apply_step(&tx, from)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
+}
+
+/// 应用一级增量（from → from+1）
+fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
+    match from {
+        1 => tx.execute_batch(MIGRATIONS[0]),
+        2 => migrate_v3(tx),
+        _ => Ok(()),
+    }
+}
+
+/// v2 → v3：收件大小上限的占位标记 + 已读回写批处理标志。
+/// 加列用"先查 table_info 再 ALTER"（SQLite 不支持 ADD COLUMN IF NOT EXISTS）：
+/// 事务已能保证原子性，这里再兜一层——历史上出现过进程被杀后残留半迁移库。
+fn migrate_v3(tx: &Connection) -> rusqlite::Result<()> {
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        let mut stmt = tx.prepare("PRAGMA table_info(emails)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let col: String = row.get(1)?;
+            if col == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    // too_large：1 = 邮件超过单封上限，只拉了信头（正文为占位说明）
+    if !has_column("too_large")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // seen_pending：1 = 本地已读但服务器 \Seen 尚未回写成功（worker 消费）
+    if !has_column("seen_pending")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // 部分索引：worker 每轮只扫待回写行，不为历史邮件做全表扫
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_seen_pending ON emails(seen_pending)
+         WHERE seen_pending = 1",
+    )
 }
 
 /// 初始 schema（设计 §3 DDL + §4.2 触发器，v1）。

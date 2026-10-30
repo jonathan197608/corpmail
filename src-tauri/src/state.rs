@@ -19,8 +19,14 @@ pub mod keys {
     pub const DISPLAY_NAME: &str = "display_name";
     pub const SMTP_HOST: &str = "smtp_host";
     pub const SMTP_PORT: &str = "smtp_port";
+    /// 发信加密方式（auto|implicit|starttls|plain；auto = 按端口推断）
+    pub const SMTP_SECURITY: &str = "smtp_security";
     pub const RECV_HOST: &str = "recv_host";
     pub const RECV_PORT: &str = "recv_port";
+    /// 收信加密方式（auto|implicit|starttls|plain；auto = 按端口推断）
+    pub const RECV_SECURITY: &str = "recv_security";
+    /// 单封收件大小上限（MB）：超出只拉信头存占位邮件，避免整封驻留内存
+    pub const MAX_MAIL_MB: &str = "max_mail_mb";
     pub const SYNC_ON_START: &str = "sync_on_start";
     pub const SYNC_INTERVAL_MIN: &str = "sync_interval_min";
     pub const FIRST_FETCH_DAYS: &str = "first_fetch_days";
@@ -46,14 +52,28 @@ pub const SMTP_PORT_DEFAULT: &str = "465";
 pub const RECV_HOST_DEFAULT: &str = "imap.chinatelecom.cn";
 pub const RECV_PORT_DEFAULT: &str = "993";
 
+/// 加密方式默认值：auto = 按端口推断（465/993 隐式 TLS，其余 STARTTLS）
+pub const SECURITY_DEFAULT: &str = "auto";
+
+/// 单封收件大小上限默认值（MB）
+pub const MAX_MAIL_MB_DEFAULT: &str = "50";
+
+/// 单封收件大小上限区间（MB）：下限 1（0 会让所有邮件都成占位），
+/// 上限 200（再大单封解析峰值内存不可控，且企业邮箱极少超过 50MB）
+pub const MAX_MAIL_MB_MIN: u32 = 1;
+pub const MAX_MAIL_MB_MAX: u32 = 200;
+
 /// 全部 settings 键的默认值（未配置时表单回显用）
 pub fn defaults() -> Vec<(&'static str, &'static str)> {
     vec![
         (keys::ACCOUNT_DOMAIN, ACCOUNT_DOMAIN_DEFAULT),
         (keys::SMTP_HOST, SMTP_HOST_DEFAULT),
         (keys::SMTP_PORT, SMTP_PORT_DEFAULT),
+        (keys::SMTP_SECURITY, SECURITY_DEFAULT),
         (keys::RECV_HOST, RECV_HOST_DEFAULT),
         (keys::RECV_PORT, RECV_PORT_DEFAULT),
+        (keys::RECV_SECURITY, SECURITY_DEFAULT),
+        (keys::MAX_MAIL_MB, MAX_MAIL_MB_DEFAULT),
         (keys::SYNC_ON_START, "true"),
         (keys::SYNC_INTERVAL_MIN, "30"),
         (keys::FIRST_FETCH_DAYS, "30"),
@@ -77,6 +97,8 @@ pub struct AppState {
     config: std::sync::Arc<Mutex<crate::conf::ConfigMap>>,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
+    /// 已读服务器回写唤醒口（seen worker；None = 未装配/测试环境，本地已读照常生效）
+    seen_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）。
     /// pub(crate)：路由层回归测试需注入运行中态（C5 拒绝重拉）
     pub(crate) fetch_state: std::sync::Arc<Mutex<FetchState>>,
@@ -146,6 +168,7 @@ impl AppState {
             anchor_dir: anchor_dir.to_path_buf(),
             config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
             send_tx: Mutex::new(None),
+            seen_tx: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
                 new_count: 0,
@@ -416,6 +439,10 @@ impl AppState {
             }
         };
         let first_days = first_fetch_days_from_raw(&g(keys::FIRST_FETCH_DAYS));
+        // 加密方式：端口推断 + 显式覆盖（465/993 隐式 TLS，其余 STARTTLS）
+        let security = crate::net::TlsMode::resolve(port, &g(keys::RECV_SECURITY));
+        // 单封上限：超出只拉信头存占位（防止整封 + 附件 + gzip 副本同时驻留内存）
+        let max_mail_bytes = max_mail_bytes_from(&g(keys::MAX_MAIL_MB));
         let last = crate::mail::LastCursor {
             uidvalidity: g(keys::LAST_UIDVALIDITY).parse().unwrap_or(0),
             uid: g(keys::LAST_UID).parse().unwrap_or(0),
@@ -434,6 +461,8 @@ impl AppState {
                 data_dir,
                 host,
                 port,
+                security,
+                max_mail_bytes,
                 account,
                 password,
                 first_days,
@@ -573,6 +602,24 @@ impl AppState {
             .as_ref()
         {
             let _ = tx.send(id);
+        }
+    }
+
+    /// 装配已读回写 worker 的唤醒口（lib.rs 启动时调用一次）
+    pub fn set_seen_channel(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self.seen_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// 唤醒已读回写 worker（合并窗口由 worker 侧实现）。
+    /// 无 worker（测试/未装配）时为空操作：本地已读已生效，服务器状态下次收件自然对齐
+    pub fn notify_seen(&self) {
+        if let Some(tx) = self
+            .seen_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(());
         }
     }
 
@@ -838,6 +885,17 @@ fn first_fetch_days_from_raw(raw: &str) -> i64 {
     raw.parse::<i64>().unwrap_or(30)
 }
 
+/// 单封收件上限（字节）：解析失败/未配置取默认 50MB；超出区间钳制到 1..=200MB
+/// （设置页与收件线程同源，防手改配置把上限推成天文数字或 0）
+pub fn max_mail_bytes_from(raw: &str) -> u64 {
+    let mb = raw
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(50)
+        .clamp(MAX_MAIL_MB_MIN, MAX_MAIL_MB_MAX);
+    u64::from(mb) * 1024 * 1024
+}
+
 /// 收件线程名额归还（Drop 时递减：正常结束、提前 return、panic 展开均生效）
 struct RoundGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -854,6 +912,10 @@ struct FetchJob {
     data_dir: PathBuf,
     host: String,
     port: u16,
+    /// 加密方式（端口推断 + 配置覆盖）
+    security: crate::net::TlsMode,
+    /// 单封大小上限（字节）：超出只拉信头
+    max_mail_bytes: u64,
     account: String,
     password: String,
     first_days: i64,
@@ -911,6 +973,8 @@ fn fetch_round(job: FetchJob) {
         data_dir,
         host,
         port,
+        security,
+        max_mail_bytes,
         account,
         password,
         first_days,
@@ -979,10 +1043,12 @@ fn fetch_round(job: FetchJob) {
             crate::mail::RealFetcher.fetch_batched(
                 &host,
                 port,
+                security,
                 &account,
                 &password,
                 first_days,
                 last,
+                max_mail_bytes,
                 &mut on_batch,
             )
         }))
