@@ -2,7 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
-use crate::mail::{DraftInput, save_draft};
+use crate::mail::{DraftInput, add_attachments, save_draft};
 use crate::state::AppState;
 use std::path::PathBuf;
 
@@ -75,21 +75,12 @@ impl MailSender for FakeSender {
         port: u16,
         account: &str,
         _password: &str,
-        msg: &OutgoingMessage,
+        msg: OutgoingMessage,
     ) -> Result<(), String> {
-        self.seen.lock().unwrap().push((
-            host.into(),
-            port,
-            account.into(),
-            OutgoingMessage {
-                from_addr: msg.from_addr.clone(),
-                from_name: msg.from_name.clone(),
-                to_addrs: msg.to_addrs.clone(),
-                cc_addrs: msg.cc_addrs.clone(),
-                subject: msg.subject.clone(),
-                body_text: msg.body_text.clone(),
-            },
-        ));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((host.into(), port, account.into(), msg));
         match self.fail {
             Some(r) => Err(r.into()),
             None => Ok(()),
@@ -124,7 +115,7 @@ fn dispatch_success_transitions_to_sent() {
     // 发送参数快照：从 corpmail.toml 内存镜像生成（配置不落库）
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     assert_eq!(smtp.host, "smtp.test.cn");
-    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp));
+    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")));
     assert_eq!(result.unwrap(), "sent");
     let (status, folder, sent_at, error): (String, String, Option<i64>, Option<String>) = state
         .with_conn(|c| {
@@ -163,7 +154,7 @@ fn dispatch_failure_marks_failed_with_reason() {
     let id = queued_email(&state, "peer@x.cn");
     let sender = FakeSender::failing("连接超时");
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
-    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp));
+    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")));
     assert_eq!(result.unwrap(), "failed");
     let (status, error): (String, String) = state.with_conn(|c| {
         c.query_row(
@@ -191,14 +182,14 @@ fn dispatch_rejects_non_queued_and_blank_recipients() {
     let id = save_draft(&state, &draft("未排队", "体")).unwrap();
     assert!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp))
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")))
             .is_err()
     );
     // 排队但收件人空白：转 failed（凭据存在仍先校验收件人）
     let blank_id = queued_email(&state, "   ");
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, blank_id, &smtp))
+            .with_conn(|c| dispatch_one(c, &sender, blank_id, &smtp, &dir.join("attachments")))
             .unwrap(),
         "failed"
     );
@@ -217,13 +208,13 @@ fn dispatch_rejects_non_queued_and_blank_recipients() {
     let sender2 = FakeSender::ok();
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp))
+            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp, &dir.join("attachments")))
             .unwrap(),
         "sent"
     );
     assert!(
         state
-            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp))
+            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp, &dir.join("attachments")))
             .is_err(),
         "已发送邮件不可再派发"
     );
@@ -239,7 +230,7 @@ fn dispatch_reports_missing_credential() {
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp))
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")))
             .unwrap(),
         "failed"
     );
@@ -293,5 +284,134 @@ fn enqueue_is_cas_idempotent() {
             .unwrap()
     });
     assert_eq!(status, "queued");
+    cleanup(&dir);
+}
+
+/// 附件必须随邮件真正发出（审计 P0-2：旧实现只发正文，界面仍显示"已发送"）
+#[test]
+fn attachments_travel_with_message() {
+    let (state, dir) = temp_state("m3-att");
+    state
+        .store_password("demo@chinatelecom.cn", "pw-m3")
+        .unwrap();
+    let id = queued_email(&state, "peer@x.cn");
+    let src = dir.join("report.txt");
+    std::fs::write(&src, b"hello-attachment").unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let root = dir.join("attachments");
+    assert_eq!(
+        state
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .unwrap(),
+        "sent"
+    );
+    let seen = sender.seen.lock().unwrap();
+    let msg = &seen[0].3;
+    assert_eq!(msg.attachments.len(), 1, "附件必须进入出站消息");
+    assert_eq!(msg.attachments[0].filename, "report.txt");
+    assert_eq!(msg.attachments[0].bytes, b"hello-attachment");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// 附件文件已被清理（detached）→ 明确失败，绝不"少发一个附件"静默成功
+#[test]
+fn detached_attachment_blocks_send() {
+    let (state, dir) = temp_state("m3-att-detached");
+    state
+        .store_password("demo@chinatelecom.cn", "pw-m3")
+        .unwrap();
+    let id = queued_email(&state, "peer@x.cn");
+    let src = dir.join("plan.pdf");
+    std::fs::write(&src, b"%PDF-1.4").unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+    state.with_conn(|c| {
+        c.execute("UPDATE attachments SET detached = 1 WHERE email_id = ?1", [id])
+            .unwrap();
+    });
+
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let root = dir.join("attachments");
+    assert_eq!(
+        state
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .unwrap(),
+        "failed"
+    );
+    let error: String = state.with_conn(|c| {
+        c.query_row(
+            "SELECT COALESCE(error,'') FROM emails WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert!(error.contains("已按清理策略删除"), "应指出附件不可用：{error}");
+    assert!(sender.seen.lock().unwrap().is_empty(), "阻断时不得调用 MTA");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// 附件总大小超过上限 → 提前失败（避免在 SMTP 传输阶段被服务器拒绝且文案不可读）
+#[test]
+fn oversized_attachments_block_send() {
+    let (state, dir) = temp_state("m3-att-big");
+    state
+        .store_password("demo@chinatelecom.cn", "pw-m3")
+        .unwrap();
+    let id = queued_email(&state, "peer@x.cn");
+    // 全零内容 gzip 后入库体积很小，解压后才计入上限
+    let src = dir.join("big.bin");
+    std::fs::write(&src, vec![0u8; 51 * 1024 * 1024]).unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+    let _ = std::fs::remove_file(&src);
+
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let root = dir.join("attachments");
+    assert_eq!(
+        state
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .unwrap(),
+        "failed"
+    );
+    let error: String = state.with_conn(|c| {
+        c.query_row(
+            "SELECT COALESCE(error,'') FROM emails WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert!(error.contains("超过 50 MB 上限"), "应给出上限提示：{error}");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// 进程在发送中被杀 → 启动自愈把 sending 复位为 failed，用户可重发
+#[test]
+fn interrupted_sending_recovers_to_failed() {
+    let (state, dir) = temp_state("m3-recover");
+    let id = queued_email(&state, "peer@x.cn");
+    state.with_conn(|c| {
+        c.execute("UPDATE emails SET status='sending' WHERE id=?1", [id])
+            .unwrap();
+    });
+    assert_eq!(state.with_conn(|c| recover_interrupted_sends(c)), 1);
+    let (status, error): (String, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT status, COALESCE(error,'') FROM emails WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(status, "failed");
+    assert!(error.contains("上次发送被中断"), "应写明中断原因：{error}");
+    assert!(reopen_failed(&state, id), "自愈后必须能重发");
     cleanup(&dir);
 }

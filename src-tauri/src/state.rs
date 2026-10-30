@@ -76,6 +76,10 @@ pub struct AppState {
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）。
     /// pub(crate)：路由层回归测试需注入运行中态（C5 拒绝重拉）
     pub(crate) fetch_state: std::sync::Arc<Mutex<FetchState>>,
+    /// 活跃收件线程数（含看门狗复位后仍在挂起的旧轮）。看门狗只复位 UI 状态，
+    /// 线程本身因 imap 无网络超时仍可能卡死——达到上限即拒绝新轮，
+    /// 防止挂起线程 + TcpStream + SQLite 连接无限累积（审计 P1-5）
+    pub(crate) active_rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// 收件状态快照（收件按钮 spinner/禁用与状态片段共用）
@@ -100,6 +104,11 @@ pub struct FetchState {
 /// 避免收件按钮永久卡死（挂起线程自身因 epoch 失配无法再污染新一轮状态）
 const FETCH_WATCHDOG_SECS: i64 = 300;
 
+/// 同时存在的收件线程上限（含看门狗已复位但线程仍挂起的旧轮）。
+/// 取 2 = 允许一个挂起轮等网络自愈，再多即拒绝新轮——每轮占 1 个 TcpStream
+/// 与 1 个 SQLite 连接，无限重试会在网络黑洞下持续泄漏资源
+const MAX_CONCURRENT_FETCH_ROUNDS: usize = 2;
+
 /// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
 pub fn full_address(prefix: &str, domain: &str) -> String {
     let d = domain.trim().trim_start_matches('@');
@@ -112,18 +121,22 @@ pub fn full_address(prefix: &str, domain: &str) -> String {
 
 impl AppState {
     /// 打开/初始化数据库（schema 幂等迁移在 db::open 内完成；锚点=数据目录本身，
-    /// 适用于测试与未启用自定义目录的场景。生产入口为 open_with_anchor）
+    /// 适用于测试与未启用自定义目录的场景）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(data_dir: &Path) -> Self {
         Self::open_with_anchor(data_dir, data_dir)
     }
 
     /// 打开/初始化数据库（lib.rs 专用：锚点目录存独立配置文件 corpmail.toml）。
-    /// 配置直接从文件加载（唯一持久源，不做任何旧库回填）；文件为空即未配置
-    pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
-        std::fs::create_dir_all(data_dir).expect("数据目录应可创建");
-        let conn = crate::db::open(&data_dir.join("corpmail.db")).expect("数据库应可打开");
-        Self {
+    /// 失败返回原因，由调用方决定降级或报错——生产路径不得 panic：
+    /// 数据目录失效（外置盘拔出/权限变更）时旧实现的 `.expect` 会让进程直接退出，
+    /// Windows GUI 子系统无控制台，用户看到的现象就是「双击没反应」。
+    pub fn try_open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| format!("数据目录无法创建（{}）：{e}", data_dir.display()))?;
+        let conn = crate::db::open(&data_dir.join("corpmail.db"))
+            .map_err(|e| format!("数据库无法打开（{}）：{e}", data_dir.display()))?;
+        Ok(Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
             anchor_dir: anchor_dir.to_path_buf(),
@@ -139,7 +152,16 @@ impl AppState {
                 fetch_done: 0,
                 fetch_total: 0,
             })),
-        }
+            active_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// 打开/初始化数据库（锚点=数据目录本身，测试便捷入口）。
+    /// 生产入口为 `try_open_with_anchor`（返回 Result，不 panic）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Self {
+        Self::try_open_with_anchor(data_dir, anchor_dir)
+            .unwrap_or_else(|e| panic!("应用数据目录不可用：{e}"))
     }
 
     /// 启动目录解析（lib.rs setup 调用）：独立配置文件 corpmail.toml 的 data_dir_override
@@ -190,6 +212,13 @@ impl AppState {
         if dest_path.join("corpmail.db").exists() {
             return Err("目标目录已存在 corpmail.db，请选择空目录".into());
         }
+        // 目标已有 attachments/ 时拒绝：复制是合并语义，一旦后续步骤失败，
+        // 回滚无法区分"本次写入"与"用户原有文件"，只能整目录删除 → 误删用户数据
+        if dest_path.join("attachments").exists() {
+            return Err(
+                "目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into(),
+            );
+        }
         std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
         // 写入探针：目标可写
         let probe = dest_path.join(".corpmail-write-probe");
@@ -207,9 +236,11 @@ impl AppState {
         //    并恢复内存镜像中的指针——保证调用方（向导/存储页）原地重试不被
         //    "目标已存在 corpmail.db"拦截（C6 半保存态修复）
         let src_att = cur.join("attachments");
+        // 本次实际写入的文件清单：回滚只删这些，不碰目标目录里任何既有内容
+        let mut written: Vec<PathBuf> = Vec::new();
         let migrated: Result<(), String> = (|| {
             if src_att.is_dir() {
-                copy_dir_recursive(&src_att, &dest_path.join("attachments"))
+                copy_dir_recursive(&src_att, &dest_path.join("attachments"), &mut written)
                     .map_err(|e| format!("附件目录复制失败：{e}"))?;
             }
             let (prev, save_res) = {
@@ -238,9 +269,13 @@ impl AppState {
         })();
         if let Err(e) = migrated {
             let _ = std::fs::remove_file(&new_db);
-            if dest_path.join("attachments").is_dir() {
-                let _ = std::fs::remove_dir_all(dest_path.join("attachments"));
+            // 精确回滚：只删本次复制出的文件，再回收本次创建的空目录。
+            // 旧实现对 dest/attachments 直接 remove_dir_all——目标目录里用户
+            // 原有的附件会被连带删除（指针写入失败即触发，破坏不可逆）
+            for f in &written {
+                let _ = std::fs::remove_file(f);
             }
+            crate::mail::prune_empty_dirs(&dest_path.join("attachments"));
             return Err(e);
         }
 
@@ -342,6 +377,19 @@ impl AppState {
     /// 参数快照与状态 CAS 在调用线程完成后，网络拉取与入库交由独立线程执行
     /// （独立连接，同发送 worker 模式；完成后更新游标/last_sync_at 并置 just_finished）。
     pub fn start_fetch(&self) {
+        // 挂起轮上限（审计 P1-5）：看门狗只复位 UI 状态，挂起线程仍在跑。
+        // 达到上限即拒绝新轮并给出明确原因，而不是继续叠加线程
+        if self
+            .active_rounds
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= MAX_CONCURRENT_FETCH_ROUNDS
+        {
+            self.set_fetch_error(format!(
+                "已有 {MAX_CONCURRENT_FETCH_ROUNDS} 轮收件在后台无响应（网络可能中断），\
+                 请检查网络后重启应用"
+            ));
+            return;
+        }
         let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
         };
@@ -363,9 +411,13 @@ impl AppState {
             uid: g(keys::LAST_UID).parse().unwrap_or(0),
         };
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
+        let active_rounds = std::sync::Arc::clone(&self.active_rounds);
         let db_path = self.data_dir.join("corpmail.db");
         let data_dir = self.data_dir.clone();
+        active_rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
+            // RAII：任何退出路径（含 panic 越过 fetch_round 内部 catch_unwind）都归还名额
+            let _guard = RoundGuard(active_rounds);
             fetch_round(FetchJob {
                 fetch_state,
                 db_path,
@@ -379,6 +431,16 @@ impl AppState {
                 epoch,
             });
         });
+    }
+
+    /// 写入一条收件错误（不改变 running：正在收件时由收件线程负责收尾）
+    fn set_fetch_error(&self, msg: String) {
+        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        if s.running {
+            return;
+        }
+        s.last_error = msg;
+        s.just_finished = true;
     }
 
     /// 收件状态 CAS：空闲→进行中（成功 true；已在收件返回 false）
@@ -426,8 +488,18 @@ impl AppState {
             return;
         };
         let config_arc = std::sync::Arc::clone(&self.config);
+        // 附件根目录：worker 线程独立取路径（不持 AppState；附件随信发送时读盘解压）
+        let attach_root = self.data_dir.join("attachments");
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
-        // 崩溃恢复：残留 queued 补发（按 id 升序）
+        // 崩溃恢复 1/2：`sending` 是仅存在于进程内的中间态，跨进程无合法含义。
+        // 进程在发送中被杀（关机/崩溃/强退）后该邮件会永久停在 sending：
+        // 启动补发只查 queued、reopen_failed 只收 failed、详情页 2s 轮询永不停止，
+        // 用户既不能重发也不能删除重来。这里复位为 failed 并写明原因，把决策权交回用户
+        let recovered = crate::mail::recover_interrupted_sends(&conn);
+        if recovered > 0 {
+            eprintln!("[send] 启动自愈：{recovered} 封中断的 sending 邮件已复位为 failed");
+        }
+        // 崩溃恢复 2/2：残留 queued 补发（按 id 升序）
         let stale: Vec<i64> = conn
             .prepare("SELECT id FROM emails WHERE status = 'queued' ORDER BY id")
             .and_then(|mut s| {
@@ -445,9 +517,13 @@ impl AppState {
                 };
                 // 派发内部所有终态（含各类失败）均已落库；此处 Err 仅剩
                 // "抢占失败/读库异常"两条管理性路径，记日志供排查即可
-                if let Err(err) =
-                    crate::mail::dispatch_one(&conn, &crate::mail::RealSender, id, &smtp)
-                {
+                if let Err(err) = crate::mail::dispatch_one(
+                    &conn,
+                    &crate::mail::RealSender,
+                    id,
+                    &smtp,
+                    &attach_root,
+                ) {
                     eprintln!("[send] 邮件 {id} 派发未执行：{err}");
                 }
             }
@@ -681,8 +757,9 @@ fn dir_stats(p: &Path) -> (u64, u64) {
 }
 
 /// 递归复制目录（M5 迁移用：附件目录两级结构 {YYYY-MM}/{email_id}/ 文件）；
-/// 目标已存在的同名文件覆盖，缺失目录逐级创建
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
+/// 目标已存在的同名文件覆盖，缺失目录逐级创建。写入成功的目标路径追加进
+/// `written`，供失败回滚精确删除本次产出物（不误伤目标目录既有文件）
+fn copy_dir_recursive(src: &Path, dest: &Path, written: &mut Vec<PathBuf>) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("创建目录失败：{e}"))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
         let entry = entry.map_err(|e| format!("遍历失败：{e}"))?;
@@ -691,9 +768,10 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
             .map_err(|e| format!("读取类型失败：{e}"))?;
         let to = dest.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &to)?;
+            copy_dir_recursive(&entry.path(), &to, written)?;
         } else {
             std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
+            written.push(to);
         }
     }
     Ok(())
@@ -706,6 +784,15 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 /// 误判为非法并回退到 7 天，导致用户在设置里选"全部"实际只拉近 7 天邮件。
 fn first_fetch_days_from_raw(raw: &str) -> i64 {
     raw.parse::<i64>().unwrap_or(30)
+}
+
+/// 收件线程名额归还（Drop 时递减：正常结束、提前 return、panic 展开均生效）
+struct RoundGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for RoundGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// 收件轮次任务参数（start_fetch 快照 → fetch_round 线程体）
@@ -795,6 +882,13 @@ fn fetch_round(job: FetchJob) {
         finish(0, "本地数据库打开失败".into());
         return;
     };
+    // 网络探活（P1-5）：imap 无连接超时接口，先做一次有界 TCP 连接，
+    // 把"根本不可达"（内网设备丢包/DNS 错误/端口不通）的轮次在 10s 内结束。
+    // 探活成功不代表协议可用，后续握手仍由 imap 完成
+    if let Err(e) = crate::net::probe_tcp(&host, port) {
+        finish(0, format!("{e}；本轮已终止（服务器不可达）"));
+        return;
+    }
     // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
     // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
     // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。

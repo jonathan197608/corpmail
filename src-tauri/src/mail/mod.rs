@@ -16,7 +16,9 @@ mod send;
 pub use recv::{
     IncomingMail, LastCursor, MailFetcher, RealFetcher, seen_params_of, store_incoming_conn,
 };
-pub use send::{RealSender, SmtpConfig, dispatch_one, enqueue_draft, reopen_failed};
+pub use send::{
+    RealSender, SmtpConfig, dispatch_one, enqueue_draft, recover_interrupted_sends, reopen_failed,
+};
 
 use crate::err as e;
 use crate::state::AppState;
@@ -1015,6 +1017,72 @@ pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Resul
     let (_, bytes) =
         attachment_bytes(state, attach_id).ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
     std::fs::write(dest, &bytes).map_err(|err| format!("另存失败：{err}"))
+}
+
+/// 出站附件载荷（发送路径用：解压后的原始字节，交 lettre 编码为 multipart）
+#[derive(Clone, Debug)]
+pub struct SendAttachment {
+    pub filename: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 读取待发邮件的全部附件（发送前置校验，独立连接版）。
+///
+/// 语义：任何一个附件不可用即整体报错——**绝不"少发一个附件"静默成功**，
+/// 静默丢附件比发送失败更伤用户信任（审计 P0-2）。detached（清理器已删文件）
+/// 明确要求重新添加；记录损坏/文件缺失同样阻断并指出具体附件名。
+pub fn outgoing_attachments(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    email_id: i64,
+) -> Result<Vec<SendAttachment>, String> {
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+        bool,
+    )> = crate::db::collect_rows(
+        conn,
+        "SELECT filename, COALESCE(mime,'application/octet-stream'), storage,
+                file_path, data, detached = 1
+         FROM attachments WHERE email_id = ?1 ORDER BY id",
+        &[&email_id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
+    )
+    .map_err(|err| format!("读取附件清单失败：{err}"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (filename, mime, storage, file_path, data, detached) in rows {
+        if detached {
+            return Err(format!(
+                "附件「{filename}」的文件已按清理策略删除，无法随本次邮件发送；请移除后重新添加"
+            ));
+        }
+        let gz = match storage.as_str() {
+            "inline" => data
+                .ok_or_else(|| format!("附件「{filename}」数据缺失（inline 记录为空）"))?,
+            _ => std::fs::read(root.join(file_path.unwrap_or_default()))
+                .map_err(|err| format!("附件「{filename}」读取失败：{err}"))?,
+        };
+        let bytes = gunzip(&gz).ok_or_else(|| format!("附件「{filename}」数据损坏（解压失败）"))?;
+        out.push(SendAttachment {
+            filename,
+            mime,
+            bytes,
+        });
+    }
+    Ok(out)
 }
 
 // ---------- 内部辅助 ----------

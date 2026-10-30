@@ -8,6 +8,7 @@ use super::{AppState, e, exec_one, now_epoch};
 use crate::state::{defaults, keys};
 
 /// 出站消息（lettre Message 的平台无关形态；注入测试可检视内容）
+#[derive(Clone, Debug)]
 pub struct OutgoingMessage {
     pub from_addr: String,
     pub from_name: String,
@@ -15,7 +16,13 @@ pub struct OutgoingMessage {
     pub cc_addrs: Vec<String>,
     pub subject: String,
     pub body_text: String,
+    /// 附件（原始字节；空 = 纯文本单段邮件）
+    pub attachments: Vec<super::SendAttachment>,
 }
+
+/// 发送参数总大小上限（字节）。企业 SMTP 普遍限制 20–50MB，超出时 lettre 只在
+/// 传输阶段被服务器拒绝（耗时且错误文案不可读）；提前阻断并给出可操作提示。
+const MAX_OUTGOING_ATTACH_BYTES: u64 = 50 * 1024 * 1024;
 
 /// SMTP 发送注入点（生产 lettre SMTPS；单测注入假实现，避免网络依赖——与 ConnTester 同模式）
 pub trait MailSender {
@@ -25,7 +32,7 @@ pub trait MailSender {
         port: u16,
         account: &str,
         password: &str,
-        msg: &OutgoingMessage,
+        msg: OutgoingMessage,
     ) -> Result<(), String>;
 }
 
@@ -40,10 +47,11 @@ impl MailSender for RealSender {
         port: u16,
         account: &str,
         password: &str,
-        msg: &OutgoingMessage,
+        msg: OutgoingMessage,
     ) -> Result<(), String> {
         use lettre::Transport;
-        use lettre::message::Mailbox;
+        use lettre::message::header::ContentType;
+        use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
         use lettre::transport::smtp::authentication::Credentials;
         let build = |raw: &str, name: &str| -> Result<Mailbox, String> {
             let addr = raw
@@ -64,10 +72,27 @@ impl MailSender for RealSender {
         for c in &msg.cc_addrs {
             builder = builder.cc(build(c, "")?);
         }
-        let message = builder
-            .subject(msg.subject.clone())
-            .body(msg.body_text.clone())
-            .map_err(|err| format!("构建邮件失败：{err}"))?;
+        let builder = builder.subject(msg.subject.clone());
+        // 正文 + 附件：无附件保持单段 text/plain（与历史行为逐字节一致）；
+        // 有附件才升为 multipart/mixed，附件以原始文件名/类型逐段编码
+        let message = if msg.attachments.is_empty() {
+            builder.body(msg.body_text)
+        } else {
+            let text = SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(msg.body_text);
+            let mut mp = MultiPart::mixed().singlepart(text);
+            for a in msg.attachments {
+                // 附件类型来自库内记录（收件时从 MIME 头取得 / 本地按扩展名推断）；
+                // 非法 MIME 回退 octet-stream，绝不因类型串异常放弃整封邮件
+                let ct = ContentType::parse(&a.mime)
+                    .unwrap_or_else(|_| ContentType::parse("application/octet-stream")
+                        .unwrap_or(ContentType::TEXT_PLAIN));
+                mp = mp.singlepart(Attachment::new(a.filename).body(a.bytes, ct));
+            }
+            builder.multipart(mp)
+        }
+        .map_err(|err| format!("构建邮件失败：{err}"))?;
         let transport = lettre::SmtpTransport::relay(host)
             .map_err(|err| format!("服务器地址无效：{err}"))?
             .port(port)
@@ -98,6 +123,20 @@ pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
             id,
         )
     })
+}
+
+/// 崩溃恢复：把残留 `sending` 复位为 `failed`（返回复位行数）。
+///
+/// `sending` 是仅存在于进程内的中间态，跨进程无合法含义。进程在发送中被杀
+/// （关机/崩溃/强退）后该邮件会永久停在 sending：启动补发只查 queued、
+/// `reopen_failed` 只收 failed、详情页 2s 轮询永不停止——用户既不能重发也不能删除重来。
+pub fn recover_interrupted_sends(conn: &rusqlite::Connection) -> usize {
+    conn.execute(
+        "UPDATE emails SET status = 'failed', error = '上次发送被中断（应用异常退出），请重发'
+         WHERE status = 'sending'",
+        [],
+    )
+    .unwrap_or(0)
 }
 
 /// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）
@@ -151,6 +190,7 @@ pub fn dispatch_one(
     sender: &dyn MailSender,
     id: i64,
     smtp: &SmtpConfig,
+    attach_root: &std::path::Path,
 ) -> Result<&'static str, String> {
     // CAS 抢占：重复派发同一封（双击/崩溃重放）时 0 行，天然幂等
     let n = conn
@@ -188,6 +228,7 @@ pub fn dispatch_one(
                 cc_addrs: split_addrs(&r.get::<_, String>(3)?),
                 subject: r.get(4)?,
                 body_text: r.get(5)?,
+                attachments: Vec::new(),
             })
         },
     );
@@ -199,7 +240,7 @@ pub fn dispatch_one(
             eprintln!("[send] 邮件 {id} 落定 failed 失败：{err}");
         }
     };
-    let msg = match row {
+    let mut msg = match row {
         Ok(m) => m,
         Err(err) => {
             fail_or_log(&format!("读取待发邮件失败：{err}"));
@@ -210,15 +251,36 @@ pub fn dispatch_one(
         fail_or_log("收件人为空");
         return Ok("failed");
     }
+    // 附件（P0-2）：附件随信发出。任一附件不可用即阻断整封——旧实现只发正文、
+    // 界面仍显示"已发送"，属静默丢用户数据，代价远高于一次明确失败
+    match crate::mail::outgoing_attachments(conn, attach_root, id) {
+        Ok(list) => {
+            let total: u64 = list.iter().map(|a| a.bytes.len() as u64).sum();
+            if total > MAX_OUTGOING_ATTACH_BYTES {
+                fail_or_log(&format!(
+                    "附件总大小 {:.1} MB 超过 {} MB 上限（企业邮箱普遍限制 20–50 MB），请精简后重发",
+                    total as f64 / (1024.0 * 1024.0),
+                    MAX_OUTGOING_ATTACH_BYTES / (1024 * 1024)
+                ));
+                return Ok("failed");
+            }
+            msg.attachments = list;
+        }
+        Err(err) => {
+            fail_or_log(&err);
+            return Ok("failed");
+        }
+    }
     // 发信参数：调用方快照（corpmail.toml）；密码仍走 conn（凭据与配置分离）
-    let password = match crate::secrets::retrieve(conn, &msg.from_addr) {
+    let from_addr = msg.from_addr.clone();
+    let password = match crate::secrets::retrieve(conn, &from_addr) {
         crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
         crate::secrets::GetResult::Missing => {
             fail_or_log("凭据缺失，请在设置中重新保存密码");
             return Ok("failed");
         }
     };
-    match sender.send(&smtp.host, smtp.port, &msg.from_addr, &password, &msg) {
+    match sender.send(&smtp.host, smtp.port, &from_addr, &password, msg) {
         Ok(()) => {
             if let Err(err) = mark("sent", None) {
                 eprintln!("[send] 邮件 {id} 落定 sent 失败：{err}");
