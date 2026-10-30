@@ -709,6 +709,32 @@ struct FetchJob {
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
 /// 独立连接访问数据库（与主连接、发送 worker 并行，WAL 读写不互阻）。
+/// 每批入库成功后持久化收件游标（需求2 断点续传）：崩溃/异常退出后重开，
+/// last.uid 已停在已入库批末 UID，下一轮走 `last.uid+1:*` 增量续拉，不重不漏。
+/// 游标单调规则与尾部 push_cursor 一致：uidvalidity 无条件采纳（跨空间重置）；
+/// uid 只在 batch_max>0 且（uidvalidity 变化 或 batch_max>当前已写 uid）时推进。
+/// 失败返回 Err —— 本批邮件已入库但游标未推进，重启靠去重兜底，邮件不丢。
+fn persist_fetch_cursor(
+    conn: &mut Connection,
+    uidvalidity: u32,
+    batch_max: u32,
+    cur_uidvalidity: &mut u32,
+    cur_uid: &mut u32,
+) -> Result<(), String> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("游标事务开启失败：{e}"))?;
+    crate::db::settings::set(&tx, keys::LAST_UIDVALIDITY, &uidvalidity.to_string())
+        .map_err(|e| format!("uidvalidity 写入失败：{e}"))?;
+    if batch_max > 0 && (uidvalidity != *cur_uidvalidity || batch_max > *cur_uid) {
+        crate::db::settings::set(&tx, keys::LAST_UID, &batch_max.to_string())
+            .map_err(|e| format!("uid 写入失败：{e}"))?;
+        *cur_uid = batch_max;
+    }
+    *cur_uidvalidity = uidvalidity;
+    tx.commit().map_err(|e| format!("游标提交失败：{e}"))
+}
+
 fn fetch_round(job: FetchJob) {
     let FetchJob {
         fetch_state,
@@ -742,8 +768,8 @@ fn fetch_round(job: FetchJob) {
     // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
     // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
     // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
-    let last_uid = last.uid;
-    let last_uidvalidity = last.uidvalidity;
+    let mut last_uid = last.uid;
+    let mut last_uidvalidity = last.uidvalidity;
     let mut added = 0usize;
     let outcome: Result<(u32, u32), String> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -751,9 +777,21 @@ fn fetch_round(job: FetchJob) {
             // 入库与网络拉取同属关键路径，任一 panic 都必须复位状态。
             let mut on_batch = |mails: &[crate::mail::IncomingMail],
                                 done: usize,
-                                total: usize|
+                                total: usize,
+                                uidvalidity: u32,
+                                batch_max: u32|
              -> Result<(), String> {
                 added += crate::mail::store_incoming_conn(&mut conn, &data_dir, mails)?;
+                // 需求2 断点续传：每批成功入库后立即持久化游标到本批最大 UID。
+                // 崩溃/退出后重启，last.uid 已推进，下一轮增量续拉，不重不漏；
+                // 本批入库失败会提前 ? 返回，游标不推进，靠去重兜底。
+                persist_fetch_cursor(
+                    &mut conn,
+                    uidvalidity,
+                    batch_max,
+                    &mut last_uidvalidity,
+                    &mut last_uid,
+                )?;
                 let mut s = fetch_state.lock().expect("收件状态锁中毒");
                 if s.epoch == epoch {
                     s.fetch_done = done;

@@ -85,9 +85,8 @@ pub trait MailFetcher {
 pub struct RealFetcher;
 impl RealFetcher {
     /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调
-    /// on_batch 入库。实现"边拉边入库边显示进度"，不再等整批拉完才落库。
-    /// 首拉/增量/兜底搜索语义与 fetch 完全一致；返回 (uidvalidity, max_uid)。
-    /// （fetch_round 走此方法；trait fetch 保留供 Mock 与批量一次性场景）
+    /// on_batch 回调参数：已解析邮件、累计处理数、总数、uidvalidity、本批最大 UID。
+    /// uidvalidity 与 batch_max_uid 用于每批入库后立即持久化游标（需求2 断点续传）。
     #[allow(clippy::too_many_arguments)] // 收件参数集（host/port/account/password/range/游标/回调）本就完整
     pub fn fetch_batched(
         &self,
@@ -97,7 +96,7 @@ impl RealFetcher {
         password: &str,
         first_days: i64,
         last: LastCursor,
-        mut on_batch: impl FnMut(&[IncomingMail], usize, usize) -> Result<(), String>,
+        mut on_batch: impl FnMut(&[IncomingMail], usize, usize, u32, u32) -> Result<(), String>,
     ) -> Result<(u32, u32), String> {
         const BATCH: usize = 25;
         let client = imap::ClientBuilder::new(host, port)
@@ -161,13 +160,15 @@ impl RealFetcher {
             batch_uids.push(uid);
             processed += 1;
             if batch_uids.len() >= BATCH {
-                on_batch(&batch, processed, total)?;
+                let bmax = batch_uids.iter().copied().max().unwrap_or(0);
+                on_batch(&batch, processed, total, uidvalidity, bmax)?;
                 batch.clear();
                 batch_uids.clear();
             }
         }
         if !batch_uids.is_empty() {
-            on_batch(&batch, processed, total)?;
+            let bmax = batch_uids.iter().copied().max().unwrap_or(0);
+            on_batch(&batch, processed, total, uidvalidity, bmax)?;
         }
         let max_uid = uids.iter().copied().max().unwrap_or(0);
         let _ = sess.logout();

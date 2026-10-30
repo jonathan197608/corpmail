@@ -512,3 +512,61 @@ fn full_address_appends_domain() {
     );
     assert_eq!(full_address("demo", ""), "demo", "空域名退化为前缀");
 }
+
+#[test]
+fn persist_fetch_cursor_advances_monotonically_and_resets_on_uidvalidity_change() {
+    // 需求2 断点续传：每批入库后立即持久化游标；游标单调推进、uidvalidity 变化无条件采纳。
+    let dir = temp_dir("cursor");
+    let state = AppState::open(&dir);
+    let (mut uv, mut cu) = (0u32, 0u32);
+    let read_uid = |state: &AppState| {
+        state
+            .with_conn(|c| settings::get(c, keys::LAST_UID))
+            .unwrap()
+    };
+    let read_uv = |state: &AppState| {
+        state
+            .with_conn(|c| settings::get(c, keys::LAST_UIDVALIDITY))
+            .unwrap()
+    };
+
+    // 1) 首拉后首个批次：uidvalidity + uid 落库
+    state
+        .with_conn(|conn| persist_fetch_cursor(conn, 1, 100, &mut uv, &mut cu))
+        .unwrap();
+    assert_eq!((uv, cu), (1, 100));
+    assert_eq!(read_uv(&state).as_deref(), Some("1"));
+    assert_eq!(read_uid(&state).as_deref(), Some("100"));
+
+    // 2) 同空间下一批 uid 更大：推进
+    state
+        .with_conn(|conn| persist_fetch_cursor(conn, 1, 150, &mut uv, &mut cu))
+        .unwrap();
+    assert_eq!(cu, 150);
+    assert_eq!(read_uid(&state).as_deref(), Some("150"));
+
+    // 3) 单调不回退：batch_max 更小（游标层 SINCE 兜底可能低于已推进值）不得改写
+    state
+        .with_conn(|conn| persist_fetch_cursor(conn, 1, 120, &mut uv, &mut cu))
+        .unwrap();
+    assert_eq!(cu, 150);
+    assert_eq!(read_uid(&state).as_deref(), Some("150"));
+
+    // 4) 空批（batch_max=0）：只采纳 uidvalidity，uid 保持上一值
+    state
+        .with_conn(|conn| persist_fetch_cursor(conn, 2, 0, &mut uv, &mut cu))
+        .unwrap();
+    assert_eq!(uv, 2);
+    assert_eq!(read_uv(&state).as_deref(), Some("2"));
+    assert_eq!(read_uid(&state).as_deref(), Some("150"));
+
+    // 5) uidvalidity 变化（UID 空间重置）：无条件采纳新空间，uid 落到新 batch_max
+    state
+        .with_conn(|conn| persist_fetch_cursor(conn, 3, 5, &mut uv, &mut cu))
+        .unwrap();
+    assert_eq!((uv, cu), (3, 5));
+    assert_eq!(read_uv(&state).as_deref(), Some("3"));
+    assert_eq!(read_uid(&state).as_deref(), Some("5"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
