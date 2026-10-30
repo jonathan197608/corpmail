@@ -14,6 +14,7 @@ mod conf;
 mod conncheck;
 mod db;
 mod mail;
+mod net;
 mod secrets;
 mod state;
 mod templates;
@@ -69,7 +70,29 @@ pub fn run() {
             // 指针，指针有效（目录存在）则定位用户目录，否则安全回退锚点目录
             let anchor = app.path().app_data_dir()?;
             let data_dir = state::AppState::resolve_start_dir(&anchor);
-            let state = state::AppState::open_with_anchor(&data_dir, &anchor);
+            // 启动降级（审计 P1-3）：自定义数据目录不可用（外置盘拔出/权限变更/
+            // 库损坏）时回退锚点目录重试一次——迁移前的原数据就留在锚点，
+            // 用户至少能进应用；两者皆失败才报错退出，且必须有可见提示
+            let state = match state::AppState::try_open_with_anchor(&data_dir, &anchor) {
+                Ok(s) => s,
+                Err(err) if data_dir != anchor => {
+                    eprintln!(
+                        "[startup] 自定义数据目录不可用（{err}），回退默认目录 {}",
+                        anchor.display()
+                    );
+                    match state::AppState::try_open_with_anchor(&anchor, &anchor) {
+                        Ok(s) => s,
+                        // 回退仍失败：错误信息里同时保留两条原因，便于定位
+                        Err(err2) => {
+                            return Err(startup_fatal(
+                                app,
+                                &format!("{err}\n\n回退默认目录同样失败：{err2}"),
+                            ));
+                        }
+                    }
+                }
+                Err(err) => return Err(startup_fatal(app, &err)),
+            };
             // M3 发送队列：单飞 worker（崩溃残留 queued 补发），窗口创建前就绪
             state.start_send_worker();
             app.manage(state);
@@ -96,6 +119,22 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("CorpMail 运行失败");
+}
+
+/// 启动致命错误：原生对话框告知用户（GUI 子系统无控制台，stderr 无人可见），
+/// 并把原因交回 setup 由 `run()` 统一终止。
+fn startup_fatal(app: &tauri::App, detail: &str) -> Box<dyn std::error::Error> {
+    use tauri_plugin_dialog::DialogExt;
+    app.handle()
+        .dialog()
+        .message(format!(
+            "CorpMail 无法启动。\n\n{detail}\n\n\
+             请检查数据目录是否存在且可写；若曾修改数据目录，可删除配置文件 \
+             corpmail.toml 中的 data_dir_override 后重新启动。"
+        ))
+        .title("CorpMail 启动失败")
+        .blocking_show();
+    detail.to_string().into()
 }
 
 /// 收件调度线程（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。

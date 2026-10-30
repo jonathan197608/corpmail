@@ -13,7 +13,7 @@ use std::path::Path;
 ///
 /// 幂等：`user_version` 标记 schema 版本，未升级则跳过 DDL。
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -21,7 +21,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // 是显式固化该行为——防将来依赖环境差异。本应用无长读事务
     // （所有 with_conn 闭包均为短查询），autocheckpoint 不会被持续推迟
     conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
-    migrate(&conn)?;
+    migrate(&mut conn)?;
     Ok(conn)
 }
 
@@ -43,16 +43,21 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if v >= SCHEMA_VERSION {
         return Ok(());
     }
+    // DDL 与 user_version 必须同进同退：旧实现分开提交，首次启动建库途中被杀
+    // （关机/强退）→ 表已建而 user_version 仍为 0 → 下次启动 CREATE TABLE 冲突
+    // → 打不开库 → 应用永久起不来（用户只能删库，等于清空数据）。
+    // SQLite 的 DDL 支持事务，整体包进 transaction 后中断即完整回滚。
+    let tx = conn.transaction()?;
     if v == 0 {
         // 新库：v1 基线 + 全部增量一次性建到当前版本
-        conn.execute_batch(SCHEMA_V1)?;
+        tx.execute_batch(SCHEMA_V1)?;
         for sql in MIGRATIONS {
-            conn.execute_batch(sql)?;
+            tx.execute_batch(sql)?;
         }
     } else {
         // 旧库：按序应用增量（v → v+1 → … → 当前）
@@ -61,15 +66,19 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             .take((SCHEMA_VERSION - v) as usize)
             .skip((v - 1) as usize)
         {
-            conn.execute_batch(sql)?;
+            tx.execute_batch(sql)?;
         }
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
 }
 
-/// 初始 schema（设计 §3 DDL + §4.2 触发器，v1）
+/// 初始 schema（设计 §3 DDL + §4.2 触发器，v1）。
+///
+/// 全部语句 `IF NOT EXISTS`：与 migrate 的事务配合，使"建库途中被杀 → 重入"
+/// 成为幂等操作（即使事务未能完整回滚，残留对象也不会阻断下次启动）。
 const SCHEMA_V1: &str = r#"
-CREATE TABLE emails (
+CREATE TABLE IF NOT EXISTS emails (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   direction     TEXT NOT NULL,                -- 'in' 收件 | 'out' 发出（含草稿）
   folder        TEXT NOT NULL,                -- 'inbox'|'sent'|'draft'
@@ -95,10 +104,10 @@ CREATE TABLE emails (
   sent_at       INTEGER,                      -- out 终态时间 epoch 秒
   received_at   INTEGER                       -- in 收到时间 epoch 秒
 );
-CREATE UNIQUE INDEX idx_remote ON emails(remote_uid);
-CREATE INDEX idx_folder_time ON emails(folder, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_remote ON emails(remote_uid);
+CREATE INDEX IF NOT EXISTS idx_folder_time ON emails(folder, created_at DESC);
 
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   email_id    INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
   filename    TEXT NOT NULL,
@@ -115,7 +124,7 @@ CREATE TABLE attachments (
 -- 全文检索：FTS5 外部内容表（不存原文副本；分词在应用层完成后空格拼接入库，设计 §4）
 -- 列名与内容表 emails 对齐（subject / body_text）：FTS5 外部内容表按列名回查内容表
 -- （count(*) 等路径），列名错位在 SQLite 3.45 会触发 "no such column"（3.54 已不敏感）
-CREATE VIRTUAL TABLE email_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS email_fts USING fts5(
   subject, body_text,
   content='emails', content_rowid='id',
   tokenize='unicode61', prefix='2 3'
@@ -124,20 +133,20 @@ CREATE VIRTUAL TABLE email_fts USING fts5(
 -- 索引源为预分词影子列 subject_tokens/body_tokens（设计 §4.1：分词在应用层完成，
 -- SQL 触发器无法调 jieba，故由写入方先分词落列、触发器搬运列值进 FTS）。
 -- 外部内容表的 'delete' 命令要求提供与建索引时相同的值 → 删除同样取影子列。
-CREATE TRIGGER emails_ai AFTER INSERT ON emails BEGIN
+CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
   INSERT INTO email_fts(rowid, subject, body_text) VALUES (new.id, new.subject_tokens, new.body_tokens);
 END;
-CREATE TRIGGER emails_ad AFTER DELETE ON emails BEGIN
+CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
   INSERT INTO email_fts(email_fts, rowid, subject, body_text)
     VALUES('delete', old.id, old.subject_tokens, old.body_tokens);
 END;
-CREATE TRIGGER emails_au AFTER UPDATE OF subject_tokens, body_tokens ON emails BEGIN
+CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE OF subject_tokens, body_tokens ON emails BEGIN
   INSERT INTO email_fts(email_fts, rowid, subject, body_text)
     VALUES('delete', old.id, old.subject_tokens, old.body_tokens);
   INSERT INTO email_fts(rowid, subject, body_text) VALUES (new.id, new.subject_tokens, new.body_tokens);
 END;
 
-CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 "#;
 
 /// 多行查询（prepare → query_map → collect 的共用封装；mail/clean 复用，消除散落的样板）

@@ -628,3 +628,69 @@ fn move_data_dir_cleans_residue_and_restores_pointer_on_save_failure() {
     let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 目标目录已有 attachments/ → 拒绝迁移（避免合并后回滚整目录删除误伤用户文件）
+#[test]
+fn move_data_dir_rejects_existing_attachments() {
+    let base = temp_dir("move-att-exists");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let dest = base.join("dest");
+    std::fs::create_dir_all(dest.join("attachments")).unwrap();
+    std::fs::write(dest.join("attachments/user-file.txt"), b"keep").unwrap();
+
+    let err = state.move_data_dir(dest.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("attachments"), "应指出冲突来源：{err}");
+    assert!(
+        dest.join("attachments/user-file.txt").is_file(),
+        "拒绝迁移时不得触碰目标目录既有文件"
+    );
+    assert!(!dest.join("corpmail.db").exists(), "拒绝时不应产生快照库");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 指针写入失败 → 回滚只删本次产出物：目标目录里用户既有文件必须原样保留
+/// （旧实现对 dest/attachments 直接 remove_dir_all，属不可逆误删）
+#[test]
+fn move_data_dir_rollback_spares_preexisting_files() {
+    let base = temp_dir("move-rollback");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let dest = base.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("notes.txt"), b"keep-me").unwrap();
+    // 让配置写入必然失败：原子保存的临时文件路径被同名目录占位
+    std::fs::create_dir_all(anchor.join(format!("{}.tmp", crate::conf::CONFIG_FILE))).unwrap();
+
+    let err = state.move_data_dir(dest.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("配置文件写入失败"), "应停在指针写入步骤：{err}");
+    assert!(!dest.join("corpmail.db").exists(), "回滚应删除本次快照库");
+    assert_eq!(
+        std::fs::read(dest.join("notes.txt")).unwrap(),
+        b"keep-me",
+        "回滚不得删除目标目录既有文件"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 挂起轮达到上限：拒绝开新轮并说明原因（不再叠加线程/TcpStream/连接）
+#[test]
+fn fetch_refuses_new_round_at_hang_cap() {
+    let dir = temp_dir("fetch-cap");
+    let state = AppState::open(&dir);
+    state.active_rounds.store(
+        MAX_CONCURRENT_FETCH_ROUNDS,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    state.start_fetch();
+    let snap = state.fetch_snapshot();
+    assert!(!snap.running, "达到上限时不得开新轮");
+    assert!(
+        snap.last_error.contains("后台无响应"),
+        "应说明拒绝原因：{}",
+        snap.last_error
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -58,6 +58,11 @@ pub fn smtp_test(host: &str, port: u16, account: &str, password: &str) -> TestOu
     let (host, account, password) = (host.to_string(), account.to_string(), password.to_string());
     with_timeout(move || {
         let t = Instant::now();
+        // 先做有界 TCP 探活：imap/lettre 自身无连接超时，探活把"不可达"从
+        // 15 秒整体超时降为 10 秒内的明确原因（并避免后台线程长期挂起）
+        if let Err(e) = crate::net::probe_tcp(&host, port) {
+            return TestOutcome::fail(t.elapsed().as_millis() as u64, e);
+        }
         let builder = match lettre::SmtpTransport::relay(&host) {
             Ok(b) => b,
             Err(e) => {
@@ -88,7 +93,10 @@ pub fn imap_test(host: &str, port: u16, account: &str, password: &str) -> TestOu
     with_timeout(move || {
         let t = Instant::now();
         let ms = || t.elapsed().as_millis() as u64;
-
+        // 同 smtp_test：先用有界探活给出明确原因（imap 无连接/读超时接口）
+        if let Err(e) = crate::net::probe_tcp(&host, port) {
+            return TestOutcome::fail(ms(), e);
+        }
         let client = match imap::ClientBuilder::new(&host, port)
             .mode(imap::ConnectionMode::Tls)
             .connect()

@@ -4,9 +4,9 @@
 use super::*;
 
 fn mem() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-    migrate(&conn).unwrap();
+    migrate(&mut conn).unwrap();
     conn
 }
 
@@ -172,11 +172,11 @@ fn migrate_v1_to_v2_adds_index_and_narrow_trigger() {
 #[test]
 fn migrate_old_v1_db_upgrades_in_place() {
     // 模拟旧库：建 v1（无索引、无条件 AU 触发器）后跑 migrate
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     conn.execute_batch(SCHEMA_V1).unwrap();
     conn.pragma_update(None, "user_version", 1).unwrap();
-    migrate(&conn).unwrap();
+    migrate(&mut conn).unwrap();
     let idx: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_attach_email'",
@@ -193,10 +193,25 @@ fn migrate_old_v1_db_upgrades_in_place() {
 
 #[test]
 fn migrate_is_idempotent() {
-    let conn = mem();
-    migrate(&conn).unwrap(); // 第二次应无副作用
+    let mut conn = mem();
+    migrate(&mut conn).unwrap(); // 第二次应无副作用
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, SCHEMA_VERSION);
+}
+
+/// 首次建库途中被杀：v1 语句已逐条执行完（旧实现每条自动提交），
+/// 但 user_version 尚未写入 → 下次启动 user_version 仍为 0。
+/// 旧实现重跑即 "table emails already exists"，打不开库 = 应用永久起不来
+#[test]
+fn migrate_recovers_from_interrupted_first_init() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.pragma_update(None, "user_version", 0).unwrap();
+    migrate(&mut conn).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION, "中断残留不应阻断迁移完成");
 }
