@@ -733,8 +733,12 @@ impl AppState {
         crate::secrets::store(&conn, account, password)
     }
 
-    /// 读密码（keychain 优先，keyfile 回退）
+    /// 读密码（keychain 优先，keyfile 回退）。
+    /// 命中进程内缓存时不取 DB 锁：keychain 授权窗口可能长等，不能连带阻塞 UI
     pub fn retrieve_password(&self, account: &str) -> crate::secrets::GetResult {
+        if let Some(hit) = crate::secrets::cached(account) {
+            return hit;
+        }
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::retrieve(&conn, account)
     }

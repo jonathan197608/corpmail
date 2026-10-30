@@ -34,3 +34,39 @@ fn keyfile_missing_returns_missing() {
     let c = conn();
     assert!(matches!(keyfile_retrieve(&c, "nobody"), GetResult::Missing));
 }
+
+/// 缓存命中即返回：既不查 keychain 也不查库（库中没有任何凭据记录）。
+/// 这条同时证明了弹窗主机路径被短路——retrieve 不再每次调用都过一遍
+/// SecKeychainFindGenericPassword
+#[test]
+fn retrieve_hits_process_cache() {
+    let account = "cache-hit@invalid.test";
+    cache_put(account, GetResult::Keychain("pw-cached".into()));
+    let c = conn();
+    assert_eq!(
+        retrieve(&c, account),
+        GetResult::Keychain("pw-cached".into()),
+        "命中缓存应直接返回"
+    );
+    cache_drop(account);
+}
+
+/// 缓存保留原始来源：Keyfile 值仍报 Keyfile，degraded 据此判定降级态
+#[test]
+fn degraded_follows_cached_source() {
+    let account = "cache-degraded@invalid.test";
+    cache_put(account, GetResult::Keyfile("pw-local".into()));
+    let c = conn();
+    assert!(degraded(&c, account), "keyfile 缓存应判为降级态");
+    cache_drop(account);
+}
+
+/// clear 路径的缓存失效（不经 keyring，只验缓存原语）
+#[test]
+fn cache_drop_clears_entry() {
+    let account = "cache-drop@invalid.test";
+    cache_put(account, GetResult::Keyfile("pw".into()));
+    assert!(cached(account).is_some());
+    cache_drop(account);
+    assert!(cached(account).is_none());
+}
