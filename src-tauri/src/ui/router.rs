@@ -838,24 +838,6 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
             Some(v) if matches!(v.as_str(), "7" | "30" | "90" | "0") => v.clone(),
             _ => "30".to_string(),
         };
-        // 数据保存目录：非空且不同于当前时迁移（迁移在账号落库前，失败不产生半保存态）
-        let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
-        if !data_dir_input.is_empty() {
-            let cur = state
-                .data_dir
-                .to_string_lossy()
-                .trim_end_matches(['/', '\\'])
-                .to_string();
-            let want = data_dir_input
-                .trim()
-                .trim_end_matches(['/', '\\'])
-                .to_string();
-            if want != cur
-                && let Err(e) = state.move_data_dir(&data_dir_input)
-            {
-                return test_fragment(Vec::new(), &format!("数据目录设置失败：{e}"), false);
-            }
-        }
         let display = trimmed_field(&form, "display_name").unwrap_or_default();
         let smtp_port_s = smtp_port.to_string();
         let recv_port_s = recv_port.to_string();
@@ -869,11 +851,49 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
             (keys::RECV_PORT, recv_port_s.as_str()),
             (keys::FIRST_FETCH_DAYS, first_fetch.as_str()),
         ];
+        // C2/C6：配置与密码先落库，迁移最后执行——
+        // C2：first_fetch_days 存 DB（非 corpmail.toml 键），若迁移在前，快照发生于
+        //     落库之前，重启后新目录丢首拉范围回退默认 30；先保存再迁移，VACUUM
+        //     快照即包含最新值；
+        // C6：迁移最后执行，失败时账号配置已完整保存（无半保存态），指针未推进，
+        //     目标残留已被 move_data_dir 清理，可清空目录字段重提或稍后在
+        //     设置→存储管理 重试更换位置
         if let Err(e) = state.set_batch(&pairs) {
             return test_fragment(Vec::new(), &format!("保存失败：{e}"), false);
         }
         if let Err(e) = state.store_password(&account, &password) {
             return test_fragment(Vec::new(), &format!("密码保存失败：{e}"), false);
+        }
+        // 数据保存目录：非空且不同于当前时迁移；已是"迁移完成待重启"状态则跳过
+        let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
+        if !data_dir_input.is_empty() {
+            let cur = state
+                .data_dir
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            let want = data_dir_input
+                .trim()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            // 指针已指向 want 且快照已存在 = 该目录已迁移、等重启生效 → 幂等跳过
+            let already_pending = state
+                .get(keys::DATA_DIR)
+                .flatten()
+                .is_some_and(|p| p.trim_end_matches(['/', '\\']) == want)
+                && std::path::Path::new(&want).join("corpmail.db").is_file();
+            if want != cur
+                && !already_pending
+                && let Err(e) = state.move_data_dir(&data_dir_input)
+            {
+                return test_fragment(
+                    Vec::new(),
+                    &format!(
+                        "账号已保存，但数据目录迁移失败：{e}（可清空目录后重新提交，或稍后在 设置 → 存储管理 更换位置）"
+                    ),
+                    false,
+                );
+            }
         }
         return Resp::hx_redirect("/welcome/done");
     }

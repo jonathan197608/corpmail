@@ -42,6 +42,7 @@
             </div>
 
             {% if refetch_notice %}<div class="sec-note" style="color:var(--ok)">✓ 已按所选范围触发重新拉取，请在收件箱查看</div>{% endif %}
+            {% if refetch_busy %}<div class="sec-note" style="color:#b45309">⚠ 收件进行中，请等待当前收取完成后再重新拉取（本次未改动任何设置）</div>{% endif %}
             <div class="sec-note">{{ last_sync_label }}</div>
 
             <div class="settings-actions">

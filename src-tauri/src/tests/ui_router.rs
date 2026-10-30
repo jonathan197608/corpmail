@@ -1592,6 +1592,58 @@ fn settings_sync_refetch_resets_cursor_and_keeps_range() {
 }
 
 #[test]
+fn sync_refetch_rejected_while_fetch_running() {
+    // C5：收件进行中点「重新拉取」必须拒绝——运行轮每批把游标写回，
+    // 叠加 start_fetch 防抖，若不拒绝则重拉意图静默丢失（既不清游标也不拉）
+    let (state, dir) = temp_state("refetch-busy");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::FIRST_FETCH_DAYS, "90"),
+            (keys::LAST_UID, "9503"),
+            (keys::LAST_UIDVALIDITY, "1"),
+        ])
+        .unwrap();
+    // 白盒注入：模拟收件进行中（started_at 必须同步置当前时刻，
+    // 否则 fetch_snapshot 的看门狗会当作挂起轮立刻复位 running）
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = true;
+        s.started_at = mail::now_epoch();
+    }
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/refetch",
+            &form(&[("first_fetch_days", "0")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let d = defaults();
+    let html = body(&resp);
+    assert!(html.contains("收件进行中"), "进行中应拒绝并给出明确提示");
+    assert!(!html.contains("触发重新拉取"), "不得同时出现成功触发提示");
+    assert_eq!(
+        state.get_or(keys::LAST_UID, &d).as_deref(),
+        Some("9503"),
+        "拒绝路径不得清游标"
+    );
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(),
+        Some("90"),
+        "拒绝路径不得改动范围设置"
+    );
+    // 收件结束后（running=false）重试即可正常触发（路径由既有测试覆盖）
+    cleanup(&dir);
+}
+
+#[test]
 fn settings_storage_save_roundtrip_with_blank_semantics() {
     let (state, dir) = temp_state("sto-save");
     let resp = route(
@@ -1790,6 +1842,39 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
         "done 页应提示数据目录已迁移待重启生效"
     );
     assert!(target.join("corpmail.db").exists(), "目标目录应产生快照库");
+
+    // 1b) C2 回归——重启视角必须保留向导保存的首拉范围：
+    //     first_fetch_days 存 DB（非 corpmail.toml 键），旧实现"先迁移后保存"
+    //     时 VACUUM 快照不含该值，重启后回退默认 30 天
+    {
+        let state3 = AppState::open_with_anchor(&target, &dir);
+        assert_eq!(
+            state3
+                .get_or(keys::FIRST_FETCH_DAYS, &defaults())
+                .as_deref(),
+            Some("7"),
+            "重启视角（新目录库）应保留向导保存的首拉范围，不得回退默认 30"
+        );
+        assert!(state3.configured(), "重启视角账号配置完好（锚点 toml）");
+    }
+
+    // 1c) C6——迁移已完成待重启，重跑向导同目录：幂等跳过重复迁移，正常跳转
+    let resp_retry = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp_retry
+            .extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "已迁移待重启状态重提向导应幂等跳过迁移并正常跳转"
+    );
 
     // 2) 非法范围回落默认 30；未指定目录则沿用当前目录、done 页无迁移提示
     let (state2, dir2) = temp_state("wiz-range2");

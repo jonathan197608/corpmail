@@ -83,6 +83,26 @@ pub trait MailFetcher {
 
 /// 生产实现：imap 3.0.0-alpha.15（隐式 TLS）+ mailparse 0.18（MIME 解析，spike 已验证）
 pub struct RealFetcher;
+/// 首拉范围 UID 搜索（fetch / fetch_batched 共用；C3 惰性化：仅在无游标首拉、
+/// 或增量命中为空需窗口兜底比对时才调用，不占用常规增量轮）。
+/// C1：uid_search 返回 HashSet（哈希迭代无序）；调用方必须对结果升序排序，
+/// 否则断点游标会越过未入库邮件造成永久漏信。
+fn first_pull_search<T: std::io::Read + std::io::Write>(
+    sess: &mut imap::Session<T>,
+    first_days: i64,
+) -> Result<Vec<u32>, String> {
+    if first_days <= 0 {
+        sess.uid_search("ALL")
+            .map_err(|e| format!("检索全部邮件失败：{e}"))
+            .map(|s| s.into_iter().collect())
+    } else {
+        let since = imap_since(first_days);
+        sess.uid_search(format!("SINCE {since}"))
+            .map_err(|e| format!("检索新邮件失败：{e}"))
+            .map(|s| s.into_iter().collect())
+    }
+}
+
 impl RealFetcher {
     /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调
     /// on_batch 回调参数：已解析邮件、累计处理数、总数、uidvalidity、本批最大 UID。
@@ -110,30 +130,32 @@ impl RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 首拉范围 / 增量 / 兜底（与 fetch 相同语义）
-        let first_pull: Vec<u32> = if first_days <= 0 {
-            sess.uid_search("ALL")
-                .map_err(|e| format!("检索全部邮件失败：{e}"))?
-                .into_iter()
-                .collect()
-        } else {
-            let since = imap_since(first_days);
-            sess.uid_search(format!("SINCE {since}"))
-                .map_err(|e| format!("检索新邮件失败：{e}"))?
-                .into_iter()
-                .collect()
-        };
-        let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+        // 增量优先（C3）：命中 0 封不再回退全窗正文重拉，仅以首拉范围做 UID 级比对
+        // 兜底：个别服务器对 N:* 范围有 quirk，若窗口内确有游标之上的新 UID
+        // （增量漏报）则精确补拉这些；全部不大于游标 = 真无新邮件，零正文拉取
+        let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
             let inc: Vec<u32> = sess
                 .uid_search(format!("{}:*", last.uid + 1))
                 .map_err(|e| format!("检索新邮件失败：{e}"))?
                 .into_iter()
                 .filter(|u| *u > last.uid)
                 .collect();
-            if inc.is_empty() { first_pull } else { inc }
+            if inc.is_empty() {
+                first_pull_search(&mut sess, first_days)?
+                    .into_iter()
+                    .filter(|u| *u > last.uid)
+                    .collect()
+            } else {
+                inc
+            }
         } else {
-            first_pull
+            first_pull_search(&mut sess, first_days)?
         };
+        // C1：uid_search 返回 HashSet（哈希迭代无序）。必须升序排序，断点游标
+        // （每批入库后持久化到本批最大 UID）才只会越过“连续已入库前缀”；
+        // 未排序时首批可能含全箱最大 UID，中途失败后游标越过未入库邮件，
+        // 增量与窗口两路都命中不到 → 永久漏信
+        uids.sort_unstable();
         // 分批拉取 + 回调入库（每批 BATCH 封；处理数 processed 作进度 done）
         let total = uids.len();
         let mut processed = 0usize;
@@ -197,26 +219,12 @@ impl MailFetcher for RealFetcher {
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
-        // 首拉范围：0 = 全部（UID SEARCH ALL，不限天数）；>0 = SINCE 天数。
-        // 首拉只发生在无游标/uidvalidity 变化时；巨箱建议先用 7/30 天再补全。
-        let first_pull: Vec<u32> = if first_days <= 0 {
-            sess.uid_search("ALL")
-                .map_err(|e| format!("检索全部邮件失败：{e}"))?
-                .into_iter()
-                .collect()
-        } else {
-            let since = imap_since(first_days);
-            sess.uid_search(format!("SINCE {since}"))
-                .map_err(|e| format!("检索新邮件失败：{e}"))?
-                .into_iter()
-                .collect()
-        };
         // 增量范围：uidvalidity 未变且有游标 → uid+1 起续拉；否则用首拉范围（§6.1）。
         // 范围写法必须是 "N:*"（UID 范围）；曾误写 "N,*"（set 语义 = UID 恰为 N 或最大值），
         // 部分服务器（如 Coremail）下增量结果不可靠 —— M5 实测修复。
-        // 增量命中 0 封时再用首拉范围兜底重查（个别服务器对 UID 范围的返回仍有 quirk；
-        // 入库按 remote_uid/message_id 幂等去重，重复拉取无害）
-        let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+        // 增量命中 0 封改 UID 级比对兜底（C3）：不再全窗重拉正文；窗口内存在游标
+        // 之上的新 UID（服务器 quirk 漏报）则精确补拉，否则零正文拉取直接收工
+        let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
             let inc: Vec<u32> = sess
                 .uid_search(format!("{}:*", last.uid + 1))
                 .map_err(|e| format!("检索新邮件失败：{e}"))?
@@ -224,17 +232,19 @@ impl MailFetcher for RealFetcher {
                 .filter(|u| *u > last.uid)
                 .collect();
             if inc.is_empty() {
-                eprintln!(
-                    "[fetch] 增量命中 0 封，按首拉范围兜底重查（{} 封）",
-                    first_pull.len()
-                );
-                first_pull
+                eprintln!("[fetch] 增量命中 0 封，窗口 UID 级比对兜底");
+                first_pull_search(&mut sess, first_days)?
+                    .into_iter()
+                    .filter(|u| *u > last.uid)
+                    .collect()
             } else {
                 inc
             }
         } else {
-            first_pull
+            first_pull_search(&mut sess, first_days)?
         };
+        // C1：uid_search 返回 HashSet（哈希迭代无序），必须升序拉取（断点游标正确性前提）
+        uids.sort_unstable();
         eprintln!(
             "[fetch] INBOX uidvalidity={uidvalidity} 游标 uid={} 命中 {} 封",
             last.uid,

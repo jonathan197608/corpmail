@@ -73,8 +73,9 @@ pub struct AppState {
     config: std::sync::Arc<Mutex<crate::conf::ConfigMap>>,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
-    /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）
-    fetch_state: std::sync::Arc<Mutex<FetchState>>,
+    /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）。
+    /// pub(crate)：路由层回归测试需注入运行中态（C5 拒绝重拉）
+    pub(crate) fetch_state: std::sync::Arc<Mutex<FetchState>>,
 }
 
 /// 收件状态快照（收件按钮 spinner/禁用与状态片段共用）
@@ -202,30 +203,45 @@ impl AppState {
                 .map_err(|e| format!("数据库快照失败：{e}"))
         })?;
 
-        // 2) 附件目录复制（大附件独立文件；崩溃中断则目标残留，下次迁移前有 corpmail.db 检查拦住）
+        // 2) 附件复制 + 3) 指针写入：任一步失败都回滚已产出物（快照库/附件副本），
+        //    并恢复内存镜像中的指针——保证调用方（向导/存储页）原地重试不被
+        //    "目标已存在 corpmail.db"拦截（C6 半保存态修复）
         let src_att = cur.join("attachments");
-        if src_att.is_dir() {
-            copy_dir_recursive(&src_att, &dest_path.join("attachments"))
-                .map_err(|e| format!("附件目录复制失败：{e}"))?;
-        }
-
-        // 3) 指针写入独立配置文件（corpmail.toml，唯一持久源；不落库）。
-        //    配置写失败 → 清理已产出的目标快照与附件目录（保证重试不被"已存在库"拦截）
-        {
-            let mut cfg = self.config.lock().expect("配置锁中毒");
-            cfg.insert(
-                keys::DATA_DIR.to_string(),
-                dest_path.to_string_lossy().into_owned(),
-            );
-            let snapshot = cfg.clone();
-            drop(cfg);
-            if let Err(e) = crate::conf::save(&self.anchor_dir, &snapshot) {
-                let _ = std::fs::remove_file(&new_db);
-                if dest_path.join("attachments").is_dir() {
-                    let _ = std::fs::remove_dir_all(dest_path.join("attachments"));
-                }
-                return Err(format!("配置文件写入失败：{e}"));
+        let migrated: Result<(), String> = (|| {
+            if src_att.is_dir() {
+                copy_dir_recursive(&src_att, &dest_path.join("attachments"))
+                    .map_err(|e| format!("附件目录复制失败：{e}"))?;
             }
+            let (prev, save_res) = {
+                let mut cfg = self.config.lock().expect("配置锁中毒");
+                let prev = cfg.get(keys::DATA_DIR).cloned();
+                cfg.insert(
+                    keys::DATA_DIR.to_string(),
+                    dest_path.to_string_lossy().into_owned(),
+                );
+                let snapshot = cfg.clone();
+                (prev, crate::conf::save(&self.anchor_dir, &snapshot))
+            };
+            save_res.map_err(|e| {
+                // 配置写失败：镜像恢复指针（镜像必须反映文件内容）
+                let mut cfg = self.config.lock().expect("配置锁中毒");
+                match prev {
+                    Some(v) => {
+                        cfg.insert(keys::DATA_DIR.to_string(), v);
+                    }
+                    None => {
+                        cfg.remove(keys::DATA_DIR);
+                    }
+                }
+                format!("配置文件写入失败：{e}")
+            })
+        })();
+        if let Err(e) = migrated {
+            let _ = std::fs::remove_file(&new_db);
+            if dest_path.join("attachments").is_dir() {
+                let _ = std::fs::remove_dir_all(dest_path.join("attachments"));
+            }
+            return Err(e);
         }
 
         Ok(format!(
@@ -709,29 +725,43 @@ struct FetchJob {
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
 /// 独立连接访问数据库（与主连接、发送 worker 并行，WAL 读写不互阻）。
-/// 每批入库成功后持久化收件游标（需求2 断点续传）：崩溃/异常退出后重开，
-/// last.uid 已停在已入库批末 UID，下一轮走 `last.uid+1:*` 增量续拉，不重不漏。
-/// 游标单调规则与尾部 push_cursor 一致：uidvalidity 无条件采纳（跨空间重置）；
-/// uid 只在 batch_max>0 且（uidvalidity 变化 或 batch_max>当前已写 uid）时推进。
-/// 失败返回 Err —— 本批邮件已入库但游标未推进，重启靠去重兜底，邮件不丢。
+/// 收件游标持久化（需求2 断点续传；C4 并发加固）：单事务写 uidvalidity/uid
+/// （可选 last_sync_at）。单调性以 DB 侧现值为准——内存快照看不见其它轮已写值，
+/// 看门狗复位后的旧轮与本轮并发写时，若用内存快照判断会用旧游标改写新轮已推进的值。
+/// uidvalidity 变化时 UID 空间重置，uid 无条件采纳（允许变小）。
+/// /// 顺序约束：调用方必须先成功入库再调本函数——“游标只越过已入库邮件”
+/// 是断点不漏信的根基。
 fn persist_fetch_cursor(
     conn: &mut Connection,
     uidvalidity: u32,
-    batch_max: u32,
-    cur_uidvalidity: &mut u32,
-    cur_uid: &mut u32,
+    uid: u32,
+    sync_at: bool,
 ) -> Result<(), String> {
     let tx = conn
         .transaction()
         .map_err(|e| format!("游标事务开启失败：{e}"))?;
+    let cur_uv: u32 = crate::db::settings::get(&tx, keys::LAST_UIDVALIDITY)
+        .map_err(|e| format!("uidvalidity 读取失败：{e}"))?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let cur_uid: u32 = crate::db::settings::get(&tx, keys::LAST_UID)
+        .map_err(|e| format!("uid 读取失败：{e}"))?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     crate::db::settings::set(&tx, keys::LAST_UIDVALIDITY, &uidvalidity.to_string())
         .map_err(|e| format!("uidvalidity 写入失败：{e}"))?;
-    if batch_max > 0 && (uidvalidity != *cur_uidvalidity || batch_max > *cur_uid) {
-        crate::db::settings::set(&tx, keys::LAST_UID, &batch_max.to_string())
+    if uid > 0 && (uidvalidity != cur_uv || uid > cur_uid) {
+        crate::db::settings::set(&tx, keys::LAST_UID, &uid.to_string())
             .map_err(|e| format!("uid 写入失败：{e}"))?;
-        *cur_uid = batch_max;
     }
-    *cur_uidvalidity = uidvalidity;
+    if sync_at {
+        crate::db::settings::set(
+            &tx,
+            keys::LAST_SYNC_AT,
+            &crate::mail::now_epoch().to_string(),
+        )
+        .map_err(|e| format!("last_sync_at 写入失败：{e}"))?;
+    }
     tx.commit().map_err(|e| format!("游标提交失败：{e}"))
 }
 
@@ -768,8 +798,6 @@ fn fetch_round(job: FetchJob) {
     // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
     // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
     // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
-    let mut last_uid = last.uid;
-    let mut last_uidvalidity = last.uidvalidity;
     let mut added = 0usize;
     let outcome: Result<(u32, u32), String> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -781,17 +809,20 @@ fn fetch_round(job: FetchJob) {
                                 uidvalidity: u32,
                                 batch_max: u32|
              -> Result<(), String> {
+                // C4：看门狗已复位/新一轮已开始 → 立即终止本轮（Err 会中断
+                // fetch_batched 后续批次下载），防止旧轮维续写库与游标
+                {
+                    let s = fetch_state.lock().expect("收件状态锁中毒");
+                    if s.epoch != epoch {
+                        return Err("收件轮已中止".into());
+                    }
+                }
                 added += crate::mail::store_incoming_conn(&mut conn, &data_dir, mails)?;
                 // 需求2 断点续传：每批成功入库后立即持久化游标到本批最大 UID。
                 // 崩溃/退出后重启，last.uid 已推进，下一轮增量续拉，不重不漏；
                 // 本批入库失败会提前 ? 返回，游标不推进，靠去重兜底。
-                persist_fetch_cursor(
-                    &mut conn,
-                    uidvalidity,
-                    batch_max,
-                    &mut last_uidvalidity,
-                    &mut last_uid,
-                )?;
+                // C4：单调性以 DB 侧现值为准，防旧轮与新轮并发回退。
+                persist_fetch_cursor(&mut conn, uidvalidity, batch_max, false)?;
                 let mut s = fetch_state.lock().expect("收件状态锁中毒");
                 if s.epoch == epoch {
                     s.fetch_done = done;
@@ -815,30 +846,14 @@ fn fetch_round(job: FetchJob) {
         });
     match outcome {
         Ok((uidvalidity, max_uid)) => {
-            // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
-            // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
-            // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
-            // uidvalidity 变化时 UID 空间重置，必须无条件采纳新值。
-            // 游标三键单事务写入：崩溃窗口内不得出现 uidvalidity 已变而 uid 滞留
-            // 旧空间的错配（会导致跨空间跳号漏信）
-            let mut push_cursor = || -> rusqlite::Result<()> {
-                let tx = conn.transaction()?;
-                crate::db::settings::set(&tx, keys::LAST_UIDVALIDITY, &uidvalidity.to_string())?;
-                if max_uid > 0 && (uidvalidity != last_uidvalidity || max_uid > last_uid) {
-                    crate::db::settings::set(&tx, keys::LAST_UID, &max_uid.to_string())?;
-                }
-                crate::db::settings::set(
-                    &tx,
-                    keys::LAST_SYNC_AT,
-                    &crate::mail::now_epoch().to_string(),
-                )?;
-                tx.commit()
-            };
-            if let Err(err) = push_cursor() {
+            // 收尾游标（与每批持久化共用同一 DB 侧单调实现，C4）：
+            // max_uid 覆盖解析失败/去重跳过的邮件；并写 last_sync_at。
+            // 失败仅记日志——本轮邮件已入库，下轮重拉去重兜底。
+            if let Err(err) = persist_fetch_cursor(&mut conn, uidvalidity, max_uid, true) {
                 eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
             }
             eprintln!(
-                "[fetch] 完成：命中游标 uid={}，入库 {added} 封（分批拉取）",
+                "[fetch] 完成：命中游标 uid={}，入库 {added} 封（分批持久化）",
                 max_uid
             );
             finish(added as i64, String::new());

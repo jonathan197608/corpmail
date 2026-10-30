@@ -36,6 +36,8 @@ pub(super) struct SettingsCtx {
     last_sync_label: String,
     /// 收件同步 tab：刚触发「按当前范围重新拉取」（清游标+启动首拉）
     refetch_notice: bool,
+    /// 收件同步 tab：收件进行中，重新拉取被拒绝（C5）
+    refetch_busy: bool,
     // 存储管理 tab
     data_dir: String,
     inline_max: String,
@@ -170,6 +172,7 @@ pub(super) fn settings_ctx(
         sync_interval_min: g(keys::SYNC_INTERVAL_MIN),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
         refetch_notice: false,
+        refetch_busy: false,
         last_sync_label: {
             let at = g(keys::LAST_SYNC_AT).parse::<i64>().unwrap_or(0);
             if at > 0 {
@@ -400,6 +403,14 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
 /// 清游标让下次 fetch 走进「无游标→首拉」分支，按新范围（全部/天数）全量重拉，
 /// 解决"改首拉范围后历史不补拉"的缺口。
 pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
+    // C5：收件进行中直接拒绝——运行轮每批会把游标写回库，叠加 start_fetch 防抖
+    // （CAS 失败静默忽略），若不拒绝，用户点「重新拉取」实际既清不掉游标也不拉，
+    // 重拉意图丢失且无任何反馈。等待当前收取完成后重试即可。
+    if state.fetch_snapshot().running {
+        let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+        ctx.refetch_busy = true;
+        return render_html(&pane_template("sync"), &ctx);
+    }
     let form = parse_form(&req.body);
     let d = defaults();
     let days = match form.get("first_fetch_days") {

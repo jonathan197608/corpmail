@@ -515,10 +515,10 @@ fn full_address_appends_domain() {
 
 #[test]
 fn persist_fetch_cursor_advances_monotonically_and_resets_on_uidvalidity_change() {
-    // 需求2 断点续传：每批入库后立即持久化游标；游标单调推进、uidvalidity 变化无条件采纳。
+    // 需求2 断点续传 + C4 并发加固：每批入库后立即持久化游标；
+    // 单调性以 DB 侧现值为准（不看内存快照），uidvalidity 变化无条件采纳。
     let dir = temp_dir("cursor");
     let state = AppState::open(&dir);
-    let (mut uv, mut cu) = (0u32, 0u32);
     let read_uid = |state: &AppState| {
         state
             .with_conn(|c| settings::get(c, keys::LAST_UID))
@@ -529,44 +529,102 @@ fn persist_fetch_cursor_advances_monotonically_and_resets_on_uidvalidity_change(
             .with_conn(|c| settings::get(c, keys::LAST_UIDVALIDITY))
             .unwrap()
     };
+    let push = |state: &AppState, uv: u32, uid: u32, sync: bool| {
+        state.with_conn(|conn| persist_fetch_cursor(conn, uv, uid, sync))
+    };
 
-    // 1) 首拉后首个批次：uidvalidity + uid 落库
-    state
-        .with_conn(|conn| persist_fetch_cursor(conn, 1, 100, &mut uv, &mut cu))
-        .unwrap();
-    assert_eq!((uv, cu), (1, 100));
+    // 1) 首拉后首个批次：uidvalidity + uid 落库；sync=false 不写 last_sync_at
+    push(&state, 1, 100, false).unwrap();
     assert_eq!(read_uv(&state).as_deref(), Some("1"));
     assert_eq!(read_uid(&state).as_deref(), Some("100"));
+    assert!(
+        state
+            .with_conn(|c| settings::get(c, keys::LAST_SYNC_AT))
+            .unwrap()
+            .is_none(),
+        "非收尾调用不得写 last_sync_at"
+    );
 
     // 2) 同空间下一批 uid 更大：推进
-    state
-        .with_conn(|conn| persist_fetch_cursor(conn, 1, 150, &mut uv, &mut cu))
-        .unwrap();
-    assert_eq!(cu, 150);
+    push(&state, 1, 150, false).unwrap();
     assert_eq!(read_uid(&state).as_deref(), Some("150"));
 
-    // 3) 单调不回退：batch_max 更小（游标层 SINCE 兜底可能低于已推进值）不得改写
-    state
-        .with_conn(|conn| persist_fetch_cursor(conn, 1, 120, &mut uv, &mut cu))
-        .unwrap();
-    assert_eq!(cu, 150);
+    // 3) 单调不回退：uid 更小（SINCE 兜底命中可能低于已推进值）不得改写
+    push(&state, 1, 120, false).unwrap();
     assert_eq!(read_uid(&state).as_deref(), Some("150"));
 
-    // 4) 空批（batch_max=0）：只采纳 uidvalidity，uid 保持上一值
-    state
-        .with_conn(|conn| persist_fetch_cursor(conn, 2, 0, &mut uv, &mut cu))
-        .unwrap();
-    assert_eq!(uv, 2);
+    // 4) C4 竞态模拟：无视内存状态的"旧轮迟写"——DB 已推进到 200，
+    //    旧轮携带过期快照值 150 写入也不得回退（DB 侧单调）
+    push(&state, 1, 200, false).unwrap();
+    push(&state, 1, 150, false).unwrap(); // 旧轮迟到写
+    assert_eq!(read_uid(&state).as_deref(), Some("200"));
+
+    // 5) 空批（uid=0）：只采纳 uidvalidity，uid 保持上一值
+    push(&state, 2, 0, false).unwrap();
     assert_eq!(read_uv(&state).as_deref(), Some("2"));
-    assert_eq!(read_uid(&state).as_deref(), Some("150"));
+    assert_eq!(read_uid(&state).as_deref(), Some("200"));
 
-    // 5) uidvalidity 变化（UID 空间重置）：无条件采纳新空间，uid 落到新 batch_max
-    state
-        .with_conn(|conn| persist_fetch_cursor(conn, 3, 5, &mut uv, &mut cu))
-        .unwrap();
-    assert_eq!((uv, cu), (3, 5));
+    // 6) uidvalidity 变化（UID 空间重置）：无条件采纳新空间，uid 允许变小
+    push(&state, 3, 5, false).unwrap();
     assert_eq!(read_uv(&state).as_deref(), Some("3"));
     assert_eq!(read_uid(&state).as_deref(), Some("5"));
 
+    // 7) 收尾（sync=true）：补写 last_sync_at
+    push(&state, 3, 5, true).unwrap();
+    assert!(
+        state
+            .with_conn(|c| settings::get(c, keys::LAST_SYNC_AT))
+            .unwrap()
+            .is_some(),
+        "收尾调用应写 last_sync_at"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)] // chmod 只读目录仅在 Unix 可靠（C6 清理回归）
+#[test]
+fn move_data_dir_cleans_residue_and_restores_pointer_on_save_failure() {
+    // C6：迁移中途失败必须清目标残留（快照/附件副本）并回滚内存镜像指针，
+    // 否则向导重试同目录被"目标已存在 corpmail.db"拦死，形成无出口的半保存态
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("mig-fail");
+    let state = AppState::open(&dir);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let target = std::env::temp_dir().join(format!("mbx-mig-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+
+    // 锚点目录置只读 → conf::save（写 corpmail.toml.tmp）失败
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let res = state.move_data_dir(target.to_str().unwrap());
+    // 恢复可写（后续清理依赖）
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    let err = res.expect_err("锚点只读时配置写入应失败");
+    assert!(
+        err.contains("配置文件写入失败"),
+        "错误信息应指明配置写入：{err}"
+    );
+    assert!(
+        !target.join("corpmail.db").exists(),
+        "失败后必须清理目标快照残留，否则重试被拦（C6）"
+    );
+    assert!(
+        state.get(keys::DATA_DIR).unwrap().is_none(),
+        "失败后内存镜像指针必须回滚（镜像须与文件一致）"
+    );
+    // 失败后原地重试：目标已无残留，锚点恢复可写 → 应成功
+    state
+        .move_data_dir(target.to_str().unwrap())
+        .expect("重试应成功（无残留 + 可写）");
+    assert!(
+        target.join("corpmail.db").exists(),
+        "重试成功后目标应含快照库"
+    );
+    let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&dir);
 }
