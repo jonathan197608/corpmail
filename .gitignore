@@ -24,6 +24,9 @@ design/
 *.pem
 *.pfx
 
+# MSIX 打包产物（build-msix.ps1 输出，不入库）
+store-assets/msix/out/
+
 # 本地环境
 *.local
 .env

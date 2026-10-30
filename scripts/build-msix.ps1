@@ -1,45 +1,47 @@
 ﻿# ============================================================
-# CorpMail · MSIX 商店包构建（Microsoft Store 渠道）· PowerShell 原生版
-# 宿主：Windows（需 Windows SDK：makeappx 打包 + WACK 校验）
+# CorpMail · MSIX 商店包构建（微软官方 WinApp CLI）
 #
-# 【编码】本文件必须为 UTF-8 with BOM（当前已是）。Windows PowerShell 5.1
-#   对无 BOM 脚本按系统 ANSI（中文系统 = GBK）解码，中文注释与
-#   Write-Host 输出会乱码，甚至引发语法错误。
-#   编辑后请保留 BOM，勿转存为无 BOM UTF-8。
+# 【一次性准备】（每台打包机只做一次）
+#   winget install Microsoft.winappcli --source winget
+#   首次 pack 需联网从 nuget.org 下载 makeappx 等工具（之后走本地缓存）
+#   文档：https://learn.microsoft.com/windows/apps/dev-tools/winapp-cli/
 #
-# 前置链路（部署方案确认）：
-#   1) macOS 交叉编译出 NSIS：scripts/build-windows.sh
-#   2) 本机（Windows）安装 CorpMail_x.y.z_x64-setup.exe 一次
-#   3) 本脚本取安装目录 → 重打包 MSIX
+# 【流程】本机已用 NSIS 包安装并测试过（部署链路第 1 步），
+#   本脚本只做一件事：出未签名商店提交包（商店认证后微软代签，
+#   上传时的签名一律被替换，无需本地证书）
+#   → Product identity 校验全靠 manifest Identity 三件套（已定稿）
+#   → NSIS 渠道的本地验收/功能测试先行，本包直接进商店提交流程
 #
-# 产物：store-assets/msix/out/CorpMail_x.y.z.0_x64.msix（未签名，
-#       商店认证后由微软代签）
-# 用法：powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1 [-InstallDir "D:\CorpMail"]
+#   powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
+#   产物：store-assets\msix\out\CorpMail_x.y.z.0_x64.msix（未签名）
+#
+# 【编码】本文件必须为 UTF-8 with BOM（PS5.1 无 BOM 按 GBK 解码会乱码），
+#   编辑后请保留 BOM。
 # ============================================================
 param(
-    # CorpMail 安装目录（NSIS 默认装到 Program Files；自装位置可传参覆盖）
-    [string]$InstallDir = ""
+    # exe/dll 来源：NSIS 安装目录（默认自动探测；自定义位置传参覆盖）
+    [string]$InstallDir = "",
+    # winapp.exe 路径（默认 PATH 探测；standalone zip 安装时指定）
+    [string]$WinApp = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-# ---- 定位仓库根（脚本在 <repo>/scripts/ 下；也支持从任意 cwd 调用）----
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ManifestDir = Join-Path $Root "store-assets\msix"
 $AssetsDir = Join-Path $ManifestDir "assets"
 $OutDir = Join-Path $ManifestDir "out"
 
-# ---- 版本：读 src-tauri/Cargo.toml（与商店 manifest 注入同源）----
-# 【中文兼容】Cargo.toml 含中文注释，无 BOM；PS5.1 的 -Raw 默认按 ANSI
-#   （GBK）解码会乱码，必须显式 -Encoding UTF8。下同（AppxManifest）。
+# ---- 版本号（读 Cargo.toml，注入 manifest）----
+# 【中文兼容】Cargo.toml/AppxManifest 含中文且无 BOM，-Raw 必须显式
+#   -Encoding UTF8，否则 PS5.1 按 ANSI（GBK）解码会乱码
 $CargoToml = Get-Content (Join-Path $Root "src-tauri\Cargo.toml") -Raw -Encoding UTF8
 if ($CargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
     Write-Error "[msix] 无法从 src-tauri/Cargo.toml 解析版本号"
 }
 $Version = $Matches[1]
-Write-Host "[msix] 版本 $Version.0"
 
-# ---- 安装目录：未传参则自动探测（NSIS perMachine 默认位置 + 常见自装位置）----
+# ---- exe/dll 来源：安装目录（未传参则探测 NSIS perMachine 默认位置）----
 if (-not $InstallDir) {
     $candidates = @(
         "$env:ProgramFiles\CorpMail",
@@ -48,72 +50,57 @@ if (-not $InstallDir) {
     )
     $InstallDir = $candidates | Where-Object { Test-Path (Join-Path $_ "CorpMail.exe") } | Select-Object -First 1
     if (-not $InstallDir) {
-        Write-Error "[msix] 未探测到 CorpMail 安装目录（找 CorpMail.exe）。请先安装 CorpMail_${Version}_x64-setup.exe，或以 -InstallDir 指定。探测过：$($candidates -join ' | ')"
+        Write-Error "[msix] 未找到 CorpMail.exe。先装 CorpMail_${Version}_x64-setup.exe，或传 -InstallDir。探测过：$($candidates -join ' | ')"
     }
 }
-if (-not (Test-Path (Join-Path $InstallDir "CorpMail.exe"))) {
-    Write-Error "[msix] $InstallDir 下没有 CorpMail.exe（入口文件缺失）"
-}
-Write-Host "[msix] 源目录（安装目录）：$InstallDir"
+Write-Host "[msix] 来源（安装目录）：$InstallDir"
 
-# ---- makeappx：取 Windows SDK 最新版 ----
-$sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
-if (-not (Test-Path $sdkRoot)) {
-    Write-Error "[msix] 未找到 Windows SDK（$sdkRoot）。请安装 Windows SDK（任意近版，勾选 SDK 桌版工具）。"
+# ---- winapp 定位 ----
+if ($WinApp) {
+    $winapp = (Resolve-Path $WinApp).Path
+} else {
+    $cmd = Get-Command winapp -ErrorAction SilentlyContinue
+    if (-not $cmd) { Write-Error "[msix] 未找到 WinApp CLI（winget install Microsoft.winappcli --source winget；standalone 安装则以 -WinApp 指定 winapp.exe 路径）" }
+    $winapp = $cmd.Source
 }
-$makeappx = Get-ChildItem $sdkRoot -Directory |
-    # SDK 目录名为版本号（10.0.26100.0 等）：[version] 数值排序取最新；
-    # 字符串排序会把 10.0.9xxx 误排在 10.0.26xxx 前
-    Sort-Object { if ($_.Name -match '^\d+(\.\d+)+$') { [version]$_.Name } else { [version]'0.0' } } -Descending |
-    ForEach-Object { Join-Path $_.FullName "x64\makeappx.exe" } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $makeappx) {
-    Write-Error "[msix] SDK 已装但未找到 x64\makeappx.exe（安装 SDK 时需包含桌面工具）"
-}
-Write-Host "[msix] makeappx：$makeappx"
 
-# ---- 1) 布包：manifest + 图标 + 安装目录内容 ----
+# ---- 复制：manifest + 图标 + exe/dll 到同一目录 ----
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("corpmail-msix-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Path $Stage | Out-Null
 try {
     Copy-Item (Join-Path $ManifestDir "AppxManifest.xml") $Stage
     New-Item -ItemType Directory -Path (Join-Path $Stage "assets") | Out-Null
     Copy-Item (Join-Path $AssetsDir "*.png") (Join-Path $Stage "assets")
-
-    # 安装目录全量拷入（CorpMail.exe / WebView2Loader.dll 等）；剔除卸载器与安装日志
     Copy-Item "$InstallDir\*" $Stage -Recurse -Force
+    # 剔除卸载器与安装日志（不属于应用负载）
     @("Uninstall.exe", "uninstall.exe", "install.log") | ForEach-Object {
         $p = Join-Path $Stage $_
         if (Test-Path $p) { Remove-Item $p -Force }
     }
 
-    # ---- 2) 版本号注入 manifest（四段制，末段 0）----
-    # 读显式 -Encoding UTF8（manifest 无 BOM 且含中文注释/名称，防 GBK 乱码）；
-    # 写回 -Encoding UTF8（PS5.1 = UTF-8 with BOM，XML 规范允许，makeappx 接受）
+    # ---- 版本注入 <Identity>（四段制末段 0）----
+    # 分组正则只锚定 <Identity> 的 Version；裸 'Version="[0-9.]+"' 会把
+    # MinVersion="10.0.17763.0" 一起误替换成应用版本。校验恰好 1 处。
     $manifestPath = Join-Path $Stage "AppxManifest.xml"
-    (Get-Content $manifestPath -Raw -Encoding UTF8) -replace 'Version="[0-9.]+"', "Version="$Version.0"" |
+    $identPattern = '(<Identity\b[^>]*?\bVersion=")[0-9.]+(")'
+    $manifestText = Get-Content $manifestPath -Raw -Encoding UTF8
+    if ([regex]::Matches($manifestText, $identPattern).Count -ne 1) {
+        Write-Error "[msix] manifest 中 <Identity> Version 匹配数异常（应为 1）"
+    }
+    $manifestText -replace $identPattern, ('${1}' + $Version + '.0' + '${2}') |
         Set-Content $manifestPath -Encoding UTF8 -NoNewline
 
-    # ---- 3) MakeAppx 打包 ----
+    # ---- winapp pack（未签名：商店认证后微软代签，上传签名一律被替换）----
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $msix = Join-Path $OutDir "CorpMail_$Version.0_x64.msix"
-    & $makeappx pack /d $Stage /p $msix /o
-    if ($LASTEXITCODE -ne 0) { Write-Error "[msix] makeappx 失败（exit $LASTEXITCODE）" }
+    & $winapp pack $Stage --output $msix --no-sign
+    if ($LASTEXITCODE -ne 0) { Write-Error "[msix] winapp pack 失败（exit $LASTEXITCODE）" }
 
-    # ---- 4) 输出与 WACK 提示 ----
+    # ---- 输出 ----
     Write-Host ""
     Write-Host "[msix] 产物：$msix" -ForegroundColor Green
-    $sizeMb = [math]::Round((Get-Item $msix).Length / 1MB, 2)
-    Write-Host "[msix] 大小：$sizeMb MB"
-
-    Write-Host ""
-    Write-Host "本地验证（可选，自签名临时安装）："
-    Write-Host "  Add-AppxPackage -Path `"$msix`" -ForceApplicationShutdown"
-    Write-Host "提交前请跑 WACK 认证预检："
-    $wack = "${env:ProgramFiles(x86)}\Windows Kits\10\App Certification Kit\appcert.exe"
-    Write-Host "  `"$wack`" reset"
-    Write-Host "  `"$wack`" test -apptype desktop -appxpath `"$msix`""
-    Write-Host "确认项：virtualization 禁用生效、Identity 三件套与 Partner Center 一致、WACK 零 FAIL"
+    Write-Host ("[msix] 大小：{0} MB" -f [math]::Round((Get-Item $msix).Length / 1MB, 2))
+    Write-Host "[msix] 下一步：上传 Partner Center（商店认证后微软代签）"
 }
 finally {
     if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }

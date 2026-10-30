@@ -1,9 +1,9 @@
 # CorpMail · Microsoft Store 上架方案
 
-> 版本：v1.1（2026-10-29）｜目标版本 0.3.0｜保留名 JonathanHuang.corpmail
+> 版本：v1.2（2026-10-30）｜目标版本 0.3.0｜保留名 JonathanHuang.corpmail
 > 本文档为执行总纲：阶段、步骤、责任分工、提交物与回退策略。
-> v1.1 修订：修复 v1.0 编辑事故导致的全文档重复；统一安装路径为 CorpMail；
-> 增加 WACK 通过后打 v0.3.0 tag 收尾步骤。
+> v1.2 修订：打包改用 WinApp CLI（免装 Windows SDK，只出未签名包）；
+> WACK 预检移除（非必要，商店认证自带检测），tag 收尾改为商店提交后。
 
 ---
 
@@ -29,21 +29,27 @@ AppData 虚拟化已禁用，两渠道数据互通；单实例互斥不跨渠道
 ## 二、阶段 1：构建商店包（Windows 机）
 
 ### 前置（一次性）
-1. Windows 10/11 机器装 **Windows SDK**（任一近版，含 makeappx 与 WACK）
-2. 该机已用 `CorpMail_0.3.0_x64-setup.exe` 安装应用（记下安装目录，默认
-   `C:\Program Files\CorpMail`，下文以 `D:\CorpMail` 为例）
+1. Windows 10/11 机器装 **WinApp CLI**（微软官方 microsoft/winappCli）：
+   `winget install Microsoft.winappcli --source winget`
+   （打包引擎 makeappx 由 CLI 自动从 NuGet 拉取，无需任何 Windows SDK 组件）
+2. 该机已用 `CorpMail_0.3.0_x64-setup.exe` 安装并验证应用（NSIS 渠道，
+   记下安装目录，默认 `C:\Program Files\CorpMail`，下文以 `D:\CorpMail` 为例）
+
+> 本机测试与功能验收均在 NSIS 渠道完成，MSIX 只出未签名商店提交包
+> （商店认证后微软代签，上传时的签名一律被替换，无需本地证书）
 
 ### 部署链路（已确认：macOS 编译，Windows 打商店包）
 
 ```
 [macOS]   scripts/build-windows.sh
    └→ 产物 CorpMail_0.3.0_x64-setup.exe（NSIS）→ 拷贝到 Windows 机
-[Windows] 运行安装器，安装 CorpMail（默认 C:\Program Files\CorpMail）
-[Windows] 装 Windows SDK（含桌面工具）
+[Windows] 运行安装器，安装并测试 CorpMail（默认 C:\Program Files\CorpMail）
+[Windows] 装 WinApp CLI（winget install Microsoft.winappcli --source winget）
 [Windows] git clone 本仓库最新 main
    └→ powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
-        （自动探测安装目录与版本；可 -InstallDir "D:\CorpMail" 覆盖）
-   └→ 产物 store-assets\msix\out\CorpMail_0.3.0.0_x64.msix（未签名，商店代签）
+          （自动探测安装目录与版本，出未签名商店提交包；
+           -InstallDir / -WinApp 可覆盖）
+   └→ 产物 store-assets\msix\out\CorpMail_0.3.0.0_x64.msix（未签名，微软代签）
 ```
 
 ### 步骤
@@ -51,29 +57,21 @@ AppData 虚拟化已禁用，两渠道数据互通；单实例互斥不跨渠道
 # 1) 从 GitHub 拉取本仓库最新 main（含 store-assets/）
 git clone https://github.com/jonathan197608/corpmail && cd corpmail
 
-# 2) 打 MSIX（PowerShell 原生脚本：自动探测安装目录与版本，无需参数）
+# 2) 安装并测试 NSIS 包（功能验收在本机 NSIS 渠道完成）
+#    验证点：① 首启向导正常 ② 数据目录 = %APPDATA%\com.corpmail.desktop
+
+# 3) 出商店提交包（复制 manifest + 图标 + exe/dll 到同一目录 → winapp pack）
 powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
-# 产物：store-assets/msix/out/CorpMail_0.3.0.0_x64.msix（未签名）
-
-# 3) 本地安装验证（自签名用一下，仅本机测试用）
-Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceApplicationShutdown
-# 验证点：① 首启向导正常 ② 数据目录 = %APPDATA%\com.corpmail.desktop
-#（若与 NSIS 版同装，确认无虚拟化重定向：安装后收几封信，再在 NSIS 版里能看到 = 数据互通）
-
-# 4) WACK 认证预检
-& "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe" reset
-& "...\appcert.exe" test -apptype desktop -appxpath "...\CorpMail_0.3.0.0_x64.msix"
-# 要求：PASS，0 fail（FAIL 项按报告修后再提）
+# 产物：store-assets/msix/out/CorpMail_0.3.0.0_x64.msix（未签名，微软代签）
 ```
 
 ### 提交物
 - `CorpMail_0.3.0.0_x64.msix`（上传商店）
-- WACK 报告截图（留档）
 
-### 收尾（WACK 通过后，Mac 侧）
-- 打版本基线 tag（已确认此时机）：
-  `git tag v0.3.0 && git push origin v0.3.0`
-  （遵循 v0.1.0 / v0.2.3 惯例；tag 落在提交商店的最终 commit 上）
+### 收尾（商店提交后，Mac 侧）
+- 打版本基线 tag（商店包提交后）：
+   `git tag v0.3.0 && git push origin v0.3.0`
+   （遵循 v0.1.0 / v0.2.3 惯例；tag 落在提交商店的最终 commit 上）
 
 ## 三、阶段 2：Partner Center 逐字段提交（按 store-listing.md）
 
@@ -95,7 +93,6 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 - 新应用通常 **1~3 个工作日**（最长 7 天）
 - 遭驳回的 TOP 原因与预案：
   - `身份不一致`：Publisher/Name 逐字比对 Partner Center 产品标识页
-  - `WACK 失败`：本地 appcert 先跑（阶段 1 已做）
   - `隐私`：确认 URL 公网可访问
   - `WebView2 缺失启动失败`：商店测试机一般已装；备注已说明 + 兜底引导
 - 收到审核意见 48h 内可回复解释或改包重提
@@ -125,7 +122,7 @@ Add-AppxPackage -Path .\store-assets\msix\out\CorpMail_0.3.0.0_x64.msix -ForceAp
 | listing 中英双语 + 认证备注英文 | ✅ |
 | 隐私声明（zh-CN 主用 + en-US 备用） | ✅ 本次推根目录公开路径 |
 | 截图 5 张 1920×1080 | ✅ |
-| build-msix.ps1（PowerShell 原生）+ WACK 校验提示 | ✅ |
+| build-msix.ps1（PowerShell 原生，WinApp CLI 打包） | ✅ |
 | 版本 0.3.0 全链统一 | ✅ |
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
 | 本体品牌 CorpMail（productName/窗口标题/页面/启动动画） | ✅ 本版统一 |

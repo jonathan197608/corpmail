@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   CorpMail（仓库 github.com/jonathan197608/corpmail）· MSIX 清单（Microsoft Store 上架包）
-  配套：scripts/build-msix.ps1（PowerShell）—— 拷贝 NSIS 装好的产物目录 + 本 manifest + assets → MakeAppx
+  配套：scripts/build-msix.ps1（PowerShell）—— 拷贝 NSIS 装好的产物目录 + 本 manifest + assets → WinApp CLI（winapp pack，微软官方）
   发布者/身份：三件套已按 Partner Center「产品标识」页定稿——
   Name=JonathanHuang.corpmail / Publisher=CN=3DAC91…757A / PublisherDisplayName=Jonathan Huang
   签名：商店渠道由微软认证后代签，本地打包不签名

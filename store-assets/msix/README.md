@@ -51,11 +51,17 @@ store-assets/
 ## 构建流程（Windows 机上）
 
 ```powershell
-# 1) [macOS] scripts/build-windows.sh 出 NSIS → 拷到 Windows 机安装
-# 2) [Windows] 装 Windows SDK 后：
+# 1) [macOS] scripts/build-windows.sh 出 NSIS → 拷到 Windows 机安装并测试
+#    （功能验收在 NSIS 渠道完成；MSIX 只出商店提交包，无需本地测试证书）
+
+# 2) [Windows] 装 WinApp CLI（一次性）：winget install Microsoft.winappcli --source winget
+
+# 3) [每次] 打包（自动复制 manifest + 图标 + exe/dll 并调 winapp pack）：
 powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
-#    （自动探测安装目录/版本；可 -InstallDir "D:\CorpMail" 覆盖）
-# 3) WACK 校验 → Partner Center 提交（.msix 上传，商店代签）
+#    产物：store-assets\msix\out\CorpMail_0.3.0.0_x64.msix（未签名，微软代签）
+#    （可 -InstallDir 覆盖安装目录；-WinApp 指定 winapp.exe 路径）
+
+# 4) Partner Center 提交（商店认证后微软代签）
 ```
 
 ## 版本规则
