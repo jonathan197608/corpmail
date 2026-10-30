@@ -476,3 +476,91 @@ fn placeholder_mail_empty_header_gets_subject_fallback() {
     assert!(m.too_large);
     assert!(m.body_text.contains("60.0 MB"));
 }
+
+/// run 计划：连续同类归并 + 升序不变量（红线：绝不按类别重排，否则崩溃时
+/// 游标越过未拉邮件 = 静默漏信）+ 双阈值断 run + 超限块上限
+#[test]
+fn plan_runs_merges_same_class_and_preserves_order() {
+    use super::{BATCH, FetchRun, OVER_CHUNK, plan_runs};
+    let mb = 1024u64 * 1024;
+    let max = 50 * mb;
+
+    // 空集
+    assert!(plan_runs(&[], &HashMap::new(), max).is_empty());
+
+    // 正常/超限交替：按类别断 run 且全局升序
+    let uids = [1u32, 2, 3];
+    let mut sizes = HashMap::new();
+    sizes.insert(2u32, (60 * mb) as u32);
+    let runs = plan_runs(&uids, &sizes, max);
+    assert_eq!(
+        runs,
+        vec![
+            FetchRun {
+                uids: vec![1],
+                over: false
+            },
+            FetchRun {
+                uids: vec![2],
+                over: true
+            },
+            FetchRun {
+                uids: vec![3],
+                over: false
+            },
+        ],
+        "类别翻转即断 run，顺序不重排"
+    );
+
+    // 无大小信息（预检失败）：全部按正常拉取，仅 BATCH 封数兜底
+    let uids: Vec<u32> = (1..=60).collect();
+    let runs = plan_runs(&uids, &HashMap::new(), max);
+    assert_eq!(runs.len(), 3);
+    assert!(runs.iter().all(|r| !r.over));
+    assert_eq!(runs[0].uids.len(), BATCH);
+    assert_eq!(runs[2].uids.len(), 10);
+
+    // 字节预算：已知大小累计超 32MB 即断 run（与 flush 预算同源）
+    let uids = [1u32, 2];
+    let mut sizes = HashMap::new();
+    sizes.insert(1u32, (20 * mb) as u32);
+    sizes.insert(2u32, (20 * mb) as u32);
+    let runs = plan_runs(&uids, &sizes, 200 * mb);
+    assert_eq!(runs.len(), 2, "20+20MB 超 32MB 预算应断开");
+    assert!(runs.iter().all(|r| !r.over));
+
+    // 单封大但未超限（max=200MB）：自成一个 run，不把后续邮件拖进同一响应
+    let uids = [1u32, 2];
+    let mut sizes = HashMap::new();
+    sizes.insert(1u32, (100 * mb) as u32);
+    sizes.insert(2u32, mb as u32);
+    let runs = plan_runs(&uids, &sizes, 200 * mb);
+    assert_eq!(runs.len(), 2, "100MB 单封独占一个响应，峰值受控");
+
+    // 全超限：OVER_CHUNK 封一块，不受字节预算约束（只拉信头，代价低）
+    let uids: Vec<u32> = (1..=250).collect();
+    let mut sizes = HashMap::new();
+    for u in &uids {
+        sizes.insert(*u, (60 * mb) as u32);
+    }
+    let runs = plan_runs(&uids, &sizes, max);
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|r| r.over));
+    assert_eq!(runs[0].uids.len(), OVER_CHUNK);
+    assert_eq!(runs[1].uids.len(), 50);
+
+    // 升序不变量：任意混合输入，拼接全部 run 的 uids == 输入（无重排、无丢失）
+    let uids: Vec<u32> = [3, 9, 9, 1, 1, 1, 2, 5]
+        .iter()
+        .map(|&x| x + 10)
+        .collect();
+    let mut sizes = HashMap::new();
+    for (i, u) in uids.iter().enumerate() {
+        if i % 3 == 0 {
+            sizes.insert(*u, (60 * mb) as u32);
+        }
+    }
+    let runs = plan_runs(&uids, &sizes, max);
+    let flattened: Vec<u32> = runs.iter().flat_map(|r| r.uids.iter().copied()).collect();
+    assert_eq!(flattened, uids, "run 划分必须保序保量");
+}

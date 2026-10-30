@@ -276,3 +276,62 @@ fn local_mail_never_pends() {
     assert_eq!(pending_count(&state), 0);
     cleanup(&dir);
 }
+
+/// 畸形 remote_uid 行（手改库形态）：清标志跳过——不占 LIMIT 窗口、
+/// 不阻塞正常行回写、不触发自唤醒空转
+#[test]
+fn malformed_remote_uid_rows_are_cleared_not_stuck() {
+    let (state, dir) = temp_state("malformed-uid");
+    state
+        .set_batch(&[
+            (crate::state::keys::RECV_HOST, "imap.test.cn"),
+            (crate::state::keys::RECV_PORT, "993"),
+            (crate::state::keys::ACCOUNT_PREFIX, "demo"),
+            (crate::state::keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+        ])
+        .unwrap();
+    state
+        .store_password("demo@chinatelecom.cn", "pw-seen")
+        .unwrap();
+    // 畸形行排前（小 id，ORDER BY id LIMIT 窗口头部），正常待回写行排后
+    state
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO emails(id, direction, folder, status, from_addr, to_addrs,
+                                    created_at, remote_uid, seen_pending, unread)
+                 VALUES (1, 'in', 'inbox', 'received', 'a@x.cn', 'b@x.cn',
+                         1, 'garbage', 1, 0)",
+                [],
+            )
+        })
+        .unwrap()
+        ;
+    let mails = vec![incoming(42, 7)];
+    store_incoming(&state, &mails).unwrap();
+    let valid_id: i64 = state.with_conn(|conn| {
+        conn.query_row("SELECT id FROM emails WHERE remote_uid = '42:7'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert!(mark_read(&state, valid_id), "正常行应置为待回写");
+
+    let fetcher = FakeFetcher::ok();
+    assert_eq!(flush(&state, &fetcher).unwrap(), 1, "只有正常行计入回写");
+    assert_eq!(
+        fetcher.calls().len(),
+        1,
+        "畸形行不得产生网络调用"
+    );
+    assert_eq!(fetcher.calls()[0].4, vec![7]);
+    let stuck: i64 = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT count(*) FROM emails WHERE seen_pending = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(stuck, 0, "畸形行与正常行的标志都应清零");
+    cleanup(&dir);
+}

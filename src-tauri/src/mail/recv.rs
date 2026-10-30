@@ -1,7 +1,8 @@
 //! IMAP 收件子模块（M4，设计 §6.1/§6.2）
 //!
 //! RealFetcher：连接 → SELECT INBOX → 增量 UID 搜索（uid+1:* 续拉，空命中 SINCE 兜底）
-//! → 大小预检 → 逐封 FETCH → mailparse 解析（编码修复：latin1/cp1252 误标 mojibake 逆推 + GBK 兜底）。
+//! → 大小预检 → 分 run FETCH（连续同类 UID 归并，一条命令拉一塊；超限只拉信头）
+//! → mailparse 解析（编码修复：latin1/cp1252 误标 mojibake 逆推 + GBK 兜底）。
 //! 入库 store_incoming_conn：每封一事务（正文行 + 附件原子提交），remote_uid/message_id 双去重。
 //!
 //! 收敛：`fetch_batched` 是**唯一**拉取实现，trait 的 `fetch` 只是把批次收集成整包
@@ -32,6 +33,62 @@ const SEEN_CHUNK: usize = 200;
 
 /// UIDVALIDITY 变化时的固定错误前缀（worker 据此决定"清标志放弃"而非重试）
 pub const ERR_UIDVALIDITY_CHANGED: &str = "邮箱 UID 已重排";
+
+/// 一次网络往返要拉的连续同类 UID 块（over = 超限只拉信头）
+#[derive(Debug, PartialEq, Eq)]
+struct FetchRun {
+    uids: Vec<u32>,
+    over: bool,
+}
+
+/// 超限 run 的块大小（只拉 HEADER，代价低，不受字节预算约束）
+const OVER_CHUNK: usize = 200;
+
+/// 计划拉取 run（纯函数，单测覆盖）。逐条 FETCH（每封一次往返）在大邮箱首拉时
+/// 是万次 RTT 级，这里把**连续同类**的 UID 归并成一个 run、一条命令拉完：
+/// - 全局升序不变量（红线）：只做"连续同类归并"，绝不按类别重排。若拆成
+///   "先全部正常、再全部超限"两个列表，崩溃时游标已推到大 UID，夹在中间
+///   未拉的邮件会被增量续拉永久跳过（静默漏信）
+/// - 正常 run 双阈值：≤BATCH 封且已知累计字节 ≤BATCH_MAX_BYTES（与 flush
+///   预算同源，单次响应体驻留内存的峰值不劣化）；大小未知时仅按封数兜底
+/// - 超限判定完全来自 prefetch_sizes 预检；预检失败 = 全按正常处理（旧行为）
+fn plan_runs(uids: &[u32], sizes: &HashMap<u32, u32>, max_mail_bytes: u64) -> Vec<FetchRun> {
+    let mut runs: Vec<FetchRun> = Vec::new();
+    let mut run_uids: Vec<u32> = Vec::new();
+    let mut run_over: Option<bool> = None;
+    let mut run_bytes = 0u64;
+    for &uid in uids {
+        let over = sizes.get(&uid).is_some_and(|&s| u64::from(s) > max_mail_bytes);
+        let size = sizes.get(&uid).copied().map(u64::from).unwrap_or(0);
+        let switch = run_over != Some(over);
+        let full = match run_over {
+            None => false,
+            Some(true) => run_uids.len() >= OVER_CHUNK,
+            Some(false) => {
+                run_uids.len() >= BATCH || (size > 0 && run_bytes + size > BATCH_MAX_BYTES)
+            }
+        };
+        if run_over.is_some() && (switch || full) {
+            runs.push(FetchRun {
+                uids: std::mem::take(&mut run_uids),
+                over: run_over.unwrap_or(false),
+            });
+            run_bytes = 0;
+        }
+        run_over = Some(over);
+        run_uids.push(uid);
+        if !over {
+            run_bytes += size;
+        }
+    }
+    if !run_uids.is_empty() {
+        runs.push(FetchRun {
+            uids: run_uids,
+            over: run_over.unwrap_or(false),
+        });
+    }
+    runs
+}
 
 /// 收件附件（内存字节；来自 MIME 解析）
 #[derive(Clone)]
@@ -248,76 +305,101 @@ impl RealFetcher {
         // 大小预检（审计批 0+2）：超过单封上限的只拉信头，避免整封 + 附件 + gzip
         // 副本同时驻留内存。已知超限 → 占位入库；未知大小 → 按整封拉（旧行为）
         let sizes = prefetch_sizes(&mut sess, &uids);
+        // 分 run 拉取：连续同类 UID 归并成一条 FETCH（大邮箱首拉从万次 RTT
+        // 降到 千封/千分之一 量级）；升序不变量见 plan_runs 注释
+        let runs = plan_runs(&uids, &sizes, max_mail_bytes);
         let total = uids.len();
         let mut processed = 0usize;
         let mut batch: Vec<IncomingMail> = Vec::with_capacity(BATCH);
         let mut batch_uids: Vec<u32> = Vec::with_capacity(BATCH);
         let mut batch_bytes: u64 = 0;
-        for uid in uids.iter().copied() {
-            let size = sizes.get(&uid).copied().map(u64::from);
-            let over = size.is_some_and(|s| s > max_mail_bytes);
-            let query = if over {
+        for run in &runs {
+            let query = if run.over {
                 "(FLAGS INTERNALDATE BODY.PEEK[HEADER])"
             } else {
                 "(FLAGS INTERNALDATE BODY.PEEK[])"
             };
             let fetches = sess
-                .uid_fetch(uid.to_string(), query)
-                .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
-            // 超限邮件必须有占位行：服务器对 BODY[HEADER] 返回空时也要落一条，
-            // 否则游标越过它、用户永远看不到这封邮件（静默漏信）
-            let mut placed = false;
-            for f in fetches.iter() {
-                let seen = f
-                    .flags()
-                    .iter()
-                    .any(|flag| flag.to_string().contains("\\Seen"));
-                let internal_date = f.internal_date().map(|dt| dt.timestamp());
-                if over {
-                    let header = f.header().unwrap_or_default();
-                    batch_bytes += header.len() as u64;
-                    batch.push(placeholder_mail(
-                        uidvalidity,
-                        uid,
-                        seen,
-                        internal_date,
-                        header,
-                        size.unwrap_or(0),
-                        max_mail_bytes,
-                    ));
-                    placed = true;
-                    continue;
+                .uid_fetch(uid_set(&run.uids), query)
+                .map_err(|e| {
+                    format!(
+                        "拉取邮件（{} 封，uid 自 {} 起）失败：{e}",
+                        run.uids.len(),
+                        run.uids[0]
+                    )
+                })?;
+            // 响应顺序由服务器决定：建 uid 索引，仍沿 run 的升序遍历
+            let fetched: HashMap<u32, &imap::types::Fetch> = fetches
+                .iter()
+                .filter_map(|f| f.uid.map(|u| (u, f)))
+                .collect();
+            for &uid in &run.uids {
+                let size = sizes.get(&uid).copied().map(u64::from);
+                batch_uids.push(uid);
+                processed += 1;
+                match fetched.get(&uid) {
+                    // 超限：只拿了信头，落占位邮件（服务器对 HEADER 返回空时
+                    // placeholder_mail 自带主题兜底，不会显示空行）
+                    Some(f) if run.over => {
+                        let seen = f
+                            .flags()
+                            .iter()
+                            .any(|flag| flag.to_string().contains("\\Seen"));
+                        let internal_date = f.internal_date().map(|dt| dt.timestamp());
+                        let header = f.header().unwrap_or_default();
+                        batch_bytes += header.len() as u64;
+                        batch.push(placeholder_mail(
+                            uidvalidity,
+                            uid,
+                            seen,
+                            internal_date,
+                            header,
+                            size.unwrap_or(0),
+                            max_mail_bytes,
+                        ));
+                    }
+                    Some(f) => {
+                        let seen = f
+                            .flags()
+                            .iter()
+                            .any(|flag| flag.to_string().contains("\\Seen"));
+                        let internal_date = f.internal_date().map(|dt| dt.timestamp());
+                        match f.body() {
+                            Some(body) => {
+                                batch_bytes += body.len() as u64;
+                                if let Some(mail) =
+                                    parse_incoming(uidvalidity, uid, seen, internal_date, body)
+                                {
+                                    batch.push(mail);
+                                }
+                            }
+                            None => eprintln!("[fetch] uid={uid} 无 BODY，跳过"),
+                        }
+                    }
+                    // 超限邮件必须有占位行：服务器未返回该 uid 也要落一条，
+                    // 否则游标越过它、用户永远看不到这封邮件（静默漏信）
+                    None if run.over => {
+                        eprintln!("[fetch] uid={uid} 超限但服务器未返回邮件头，落最小占位");
+                        batch.push(placeholder_mail(
+                            uidvalidity,
+                            uid,
+                            false,
+                            None,
+                            &[],
+                            size.unwrap_or(0),
+                            max_mail_bytes,
+                        ));
+                    }
+                    None => eprintln!("[fetch] uid={uid} 服务器未返回，跳过"),
                 }
-                let Some(body) = f.body() else {
-                    eprintln!("[fetch] uid={uid} 无 BODY，跳过");
-                    continue;
-                };
-                batch_bytes += body.len() as u64;
-                if let Some(mail) = parse_incoming(uidvalidity, uid, seen, internal_date, body) {
-                    batch.push(mail);
+                // 双阈值 flush：封数或累计字节任一超限即入库，控制解析峰值内存
+                if batch_uids.len() >= BATCH || batch_bytes >= BATCH_MAX_BYTES {
+                    let bmax = batch_uids.iter().copied().max().unwrap_or(0);
+                    on_batch(&batch, processed, total, uidvalidity, bmax)?;
+                    batch.clear();
+                    batch_uids.clear();
+                    batch_bytes = 0;
                 }
-            }
-            if over && !placed {
-                eprintln!("[fetch] uid={uid} 超限但服务器未返回邮件头，落最小占位");
-                batch.push(placeholder_mail(
-                    uidvalidity,
-                    uid,
-                    false,
-                    None,
-                    &[],
-                    size.unwrap_or(0),
-                    max_mail_bytes,
-                ));
-            }
-            batch_uids.push(uid);
-            processed += 1;
-            // 双阈值 flush：封数或累计字节任一超限即入库，控制解析峰值内存
-            if batch_uids.len() >= BATCH || batch_bytes >= BATCH_MAX_BYTES {
-                let bmax = batch_uids.iter().copied().max().unwrap_or(0);
-                on_batch(&batch, processed, total, uidvalidity, bmax)?;
-                batch.clear();
-                batch_uids.clear();
-                batch_bytes = 0;
             }
         }
         if !batch_uids.is_empty() {

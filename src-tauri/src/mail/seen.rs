@@ -40,7 +40,9 @@ struct Pending {
     uid: u32,
 }
 
-/// 读待回写行（按 id 升序；单轮上限 MAX_UIDS_PER_ROUND）
+/// 读待回写行（按 id 升序；单轮上限 MAX_UIDS_PER_ROUND）。
+/// remote_uid 解析失败的行直接清标志：它们永远不具回写能力，保留只会占用
+/// LIMIT 窗口（畸形行排前时正常行永远选不中）并造成每轮自唤醒空转
 fn pending_rows(state: &AppState) -> Result<Vec<Pending>, String> {
     let rows: Vec<(i64, String)> = state.with_conn(|conn| -> Result<Vec<_>, String> {
         let mut stmt = conn
@@ -57,17 +59,28 @@ fn pending_rows(state: &AppState) -> Result<Vec<Pending>, String> {
             .collect();
         Ok(out)
     })?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, remote)| {
-            let (v, u) = remote.split_once(':')?;
-            Some(Pending {
+    let (mut good, mut bad): (Vec<Pending>, Vec<i64>) = (Vec::new(), Vec::new());
+    for (id, remote) in rows {
+        match remote
+            .split_once(':')
+            .and_then(|(v, u)| Some((v.parse::<u32>().ok()?, u.parse::<u32>().ok()?)))
+        {
+            Some((uidvalidity, uid)) => good.push(Pending {
                 id,
-                uidvalidity: v.parse().ok()?,
-                uid: u.parse().ok()?,
-            })
-        })
-        .collect())
+                uidvalidity,
+                uid,
+            }),
+            None => bad.push(id),
+        }
+    }
+    if !bad.is_empty() {
+        eprintln!(
+            "[seen] {} 行 remote_uid 无法解析，清标志跳过（该形态不可能成功回写）",
+            bad.len()
+        );
+        clear_pending(state, &bad);
+    }
+    Ok(good)
 }
 
 /// 清待回写标志（成功/放弃时调用；本地 unread 保持已读不受影响）
