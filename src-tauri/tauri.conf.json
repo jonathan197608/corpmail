@@ -17,6 +17,9 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.ico", "icons/icon.png"],
+    "macOS": {
+      "signingIdentity": "CorpMail Local"
+    },
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper",

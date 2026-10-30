@@ -32,6 +32,20 @@ cargo tauri build --target x86_64-pc-windows-gnu \
 
 > macOS 宿主构建 NSIS 需自建 patched makensis（macOS libiconv 对 "wchar_t" 转换通道存在 EILSEQ 回归，详见设计文档 §11.4——该问题在 Linux/Windows 宿主不存在）。Linux 宿主直接 `apt install nsis` 即可。
 
+### macOS 本地开发
+
+首次需创建本地代码签名证书（每台机器一次）：
+
+```bash
+scripts/setup-macos-signing.sh   # 建自签名证书到登录钥匙串
+scripts/dev-macos.sh             # 构建 → 重签 → 启动
+```
+
+不要直接用 `cargo tauri dev` 或 `cargo run`：链接器会给产物打 ad-hoc 签名，其 designated requirement 是 cdhash，每次重新链接都变；钥匙串条目的 ACL 按 DR 校验，于是每次构建后首次读密码都会弹授权窗口，点「始终允许」也只对当次 cdhash 生效。`dev-macos.sh` 在构建后用固定证书重签，DR 变为 `identifier + certificate leaf`，跨构建恒定。
+
+`tauri build` 打包时使用 `tauri.conf.json` 的 `bundle.macOS.signingIdentity`（默认 `CorpMail Local`）；需要临时换证书时用环境变量 `APPLE_SIGNING_IDENTITY` 覆盖。该证书**不在信任链内**，仅供本地签名，分发请改用 Developer ID 并公证。
+
+
 ## 技术栈
 
 | 组件 | 选型 |
