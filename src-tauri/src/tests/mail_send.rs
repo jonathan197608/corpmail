@@ -329,8 +329,11 @@ fn detached_attachment_blocks_send() {
     std::fs::write(&src, b"%PDF-1.4").unwrap();
     add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
     state.with_conn(|c| {
-        c.execute("UPDATE attachments SET detached = 1 WHERE email_id = ?1", [id])
-            .unwrap();
+        c.execute(
+            "UPDATE attachments SET detached = 1 WHERE email_id = ?1",
+            [id],
+        )
+        .unwrap();
     });
 
     let sender = FakeSender::ok();
@@ -350,7 +353,10 @@ fn detached_attachment_blocks_send() {
         )
         .unwrap()
     });
-    assert!(error.contains("已按清理策略删除"), "应指出附件不可用：{error}");
+    assert!(
+        error.contains("已按清理策略删除"),
+        "应指出附件不可用：{error}"
+    );
     assert!(sender.seen.lock().unwrap().is_empty(), "阻断时不得调用 MTA");
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);

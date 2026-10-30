@@ -188,6 +188,8 @@ struct ComposeCtx {
     keep_ids_json: String,
     saved: bool,
     error: String,
+    /// 本次被跳过的 0 字节文件数（附件选择误选空文件时提示，不阻断整单保存）
+    skipped: usize,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -532,6 +534,10 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
     let saved = req.query_param("saved").map(|v| v == "1").unwrap_or(false);
     // query_param 已解码，勿再 urldecode（二次解码会破坏含 %/+ 的错误文案）
     let error = req.query_param("error").unwrap_or_default();
+    let skipped = req
+        .query_param("skipped")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut ctx = ComposeCtx {
         frame: frame_ctx(state, "draft"),
         draft_id: 0,
@@ -544,6 +550,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         keep_ids_json: "[]".into(),
         saved,
         error,
+        skipped,
     };
     if let Some(id) = req
         .query_param("draft_id")
@@ -590,14 +597,26 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
         return render_html("welcome.html", &());
     }
     match save_compose_form(state, req) {
-        Ok(id) => Resp::hx_redirect(&format!("/compose?draft_id={id}&saved=1")),
+        Ok((id, skipped)) => Resp::hx_redirect(&format!(
+            "/compose?draft_id={id}&saved=1{}",
+            skipped_suffix(skipped)
+        )),
         Err((draft_id, e)) => redirect_compose(draft_id, &e),
     }
 }
 
+/// 跳过的空文件数 → 查询串片段（0 时不加参数，保持既有 URL 形态）
+fn skipped_suffix(skipped: usize) -> String {
+    if skipped == 0 {
+        String::new()
+    } else {
+        format!("&skipped={skipped}")
+    }
+}
+
 /// 撰写表单公共保存（存草稿与发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
-/// 失败返回 (原 draft_id, 原因) 供回撰写页提示。
-fn save_compose_form(state: &AppState, req: &Req) -> Result<i64, (i64, String)> {
+/// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回 (邮件 id, 被跳过的空文件数)。
+fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
@@ -617,10 +636,14 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<i64, (i64, String)> 
     let id = mail::save_draft(state, &input).map_err(|e| (draft_id.unwrap_or(0), e))?;
     mail::remove_attachments_except(state, id, &keep_ids)
         .map_err(|e| (id, format!("附件裁剪失败：{e}")))?;
+    let mut skipped = 0usize;
     if !paths.is_empty() {
-        mail::add_attachments(state, id, &paths).map_err(|e| (id, format!("附件保存失败：{e}")))?;
+        let (_, skipped_names) = mail::add_attachments(state, id, &paths)
+            .map_err(|e| (id, format!("附件保存失败：{e}")))?;
+        // 0 字节文件被跳过（不再整单失败），数量回传给页面提示
+        skipped = skipped_names.len();
     }
-    Ok(id)
+    Ok((id, skipped))
 }
 
 /// 发送（POST /compose/send §9）：先存最新内容 → 原子排队（重复提交 0 行，幂等 §7）
@@ -630,7 +653,14 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
         return render_html("welcome.html", &());
     }
     match save_compose_form(state, req) {
-        Ok(id) => {
+        Ok((id, skipped)) => {
+            // 有空文件被跳过时先回撰写页确认：绝不带着"以为已附加"的认知把信发出去
+            if skipped > 0 {
+                return redirect_compose(
+                    id,
+                    &format!("已跳过 {skipped} 个 0 字节文件（未附加），请确认附件后再次发送"),
+                );
+            }
             if mail::enqueue_draft(state, id) {
                 state.enqueue_send(id);
             }

@@ -138,7 +138,10 @@ fn startup_fatal(app: &tauri::App, detail: &str) -> Box<dyn std::error::Error> {
 }
 
 /// 收件调度线程（§6.2）：启动 2s 首收（sync_on_start 默认开）+ sync_interval_min 循环。
-/// 每轮重读设置（改参数即时生效；间隔 0 = 仅手动）。
+/// 每轮重读设置；间隔 0 = 仅手动。
+///
+/// 等待期按 30s 分片：旧实现一次 `sleep(整个周期)`，改间隔最长要等满一个旧周期才生效
+/// （注释称"即时生效"不成立）。分片后设置改动最多 30s 生效（审计 P2-17）。
 fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -151,19 +154,39 @@ fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
         if on_start {
             state.start_fetch();
         }
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            let state = handle.state::<state::AppState>();
-            let interval = state
+        // 间隔读取（秒；0 = 仅手动）
+        let read_interval = |handle: &tauri::AppHandle<R>| -> u64 {
+            handle
+                .state::<state::AppState>()
                 .get(state::keys::SYNC_INTERVAL_MIN)
                 .flatten()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30);
+                .unwrap_or(30)
+        };
+        loop {
+            let mut interval = read_interval(&handle);
+            if interval == 0 {
+                // 仅手动：小睡后重读，不触发（也避免忙等）
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                continue;
+            }
+            let mut waited = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                waited += 30;
+                let now = read_interval(&handle);
+                if now != interval {
+                    interval = now;
+                    if interval == 0 {
+                        break;
+                    }
+                }
+                if waited >= interval.saturating_mul(60) {
+                    break;
+                }
+            }
             if interval > 0 {
-                std::thread::sleep(std::time::Duration::from_secs(
-                    interval.saturating_sub(1).saturating_mul(60),
-                ));
-                state.start_fetch();
+                handle.state::<state::AppState>().start_fetch();
             }
         }
     });

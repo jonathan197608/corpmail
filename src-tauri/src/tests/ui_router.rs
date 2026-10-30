@@ -1688,6 +1688,46 @@ fn settings_storage_save_roundtrip_with_blank_semantics() {
     cleanup(&dir);
 }
 
+/// 附件内联上限钳制到 1..=2048 MB（旧实现只校验"是数字"，可写成 40 亿 → 全走 BLOB）
+#[test]
+fn settings_storage_clamps_inline_limit() {
+    let (state, dir) = temp_state("sto-clamp");
+    let post = |v: &str| {
+        route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                "/settings/storage/save",
+                &form(&[
+                    ("inline_attach_max_mb", v),
+                    ("clean_sent_bulk_days", "7"),
+                    ("keep_inbox_days", "365"),
+                    ("keep_sent_days", "180"),
+                ]),
+            ),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        )
+    };
+    let d = defaults();
+    let _ = post("999999");
+    assert_eq!(
+        state.get_or(keys::INLINE_ATTACH_MAX_MB, &d).as_deref(),
+        Some("2048"),
+        "超大值应钳制到上限"
+    );
+    let _ = post("0");
+    assert_eq!(
+        state.get_or(keys::INLINE_ATTACH_MAX_MB, &d).as_deref(),
+        Some("1"),
+        "0 应钳制到下限（0 等于全部走独立文件）"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn settings_account_save_keeps_credential_when_blank() {
     let (state, dir) = temp_state("acc-save");

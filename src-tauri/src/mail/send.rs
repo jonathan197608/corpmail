@@ -85,9 +85,10 @@ impl MailSender for RealSender {
             for a in msg.attachments {
                 // 附件类型来自库内记录（收件时从 MIME 头取得 / 本地按扩展名推断）；
                 // 非法 MIME 回退 octet-stream，绝不因类型串异常放弃整封邮件
-                let ct = ContentType::parse(&a.mime)
-                    .unwrap_or_else(|_| ContentType::parse("application/octet-stream")
-                        .unwrap_or(ContentType::TEXT_PLAIN));
+                let ct = ContentType::parse(&a.mime).unwrap_or_else(|_| {
+                    ContentType::parse("application/octet-stream")
+                        .unwrap_or(ContentType::TEXT_PLAIN)
+                });
                 mp = mp.singlepart(Attachment::new(a.filename).body(a.bytes, ct));
             }
             builder.multipart(mp)
@@ -251,6 +252,16 @@ pub fn dispatch_one(
         fail_or_log("收件人为空");
         return Ok("failed");
     }
+    // 发信参数：调用方快照（corpmail.toml）；密码仍走 conn（凭据与配置分离）
+    // 先校验凭据再读附件：凭据缺失是常见失败，避免白读几十 MB 附件
+    let from_addr = msg.from_addr.clone();
+    let password = match crate::secrets::retrieve(conn, &from_addr) {
+        crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
+        crate::secrets::GetResult::Missing => {
+            fail_or_log("凭据缺失，请在设置中重新保存密码");
+            return Ok("failed");
+        }
+    };
     // 附件（P0-2）：附件随信发出。任一附件不可用即阻断整封——旧实现只发正文、
     // 界面仍显示"已发送"，属静默丢用户数据，代价远高于一次明确失败
     match crate::mail::outgoing_attachments(conn, attach_root, id) {
@@ -271,15 +282,6 @@ pub fn dispatch_one(
             return Ok("failed");
         }
     }
-    // 发信参数：调用方快照（corpmail.toml）；密码仍走 conn（凭据与配置分离）
-    let from_addr = msg.from_addr.clone();
-    let password = match crate::secrets::retrieve(conn, &from_addr) {
-        crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
-        crate::secrets::GetResult::Missing => {
-            fail_or_log("凭据缺失，请在设置中重新保存密码");
-            return Ok("failed");
-        }
-    };
     match sender.send(&smtp.host, smtp.port, &from_addr, &password, msg) {
         Ok(()) => {
             if let Err(err) = mark("sent", None) {

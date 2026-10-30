@@ -13,6 +13,11 @@ use crate::state::{self, AppState, defaults, full_address, keys};
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// 附件走 inline BLOB 的上限区间（MB）：下限 1（0 等于全走独立文件，
+/// 徒增文件数），上限 2048（再大单库体积失控，且远超邮件服务商单封上限）
+const INLINE_ATTACH_MIN_MB: u32 = 1;
+const INLINE_ATTACH_MAX_MB: u32 = 2048;
+
 /// 设置页（四 tab 全量上下文：整页与 pane 片段共用一份）
 #[derive(Serialize)]
 pub(super) struct SettingsCtx {
@@ -74,6 +79,8 @@ pub(super) struct CleanView {
     removed: u64,
     orphans: u64,
     error: String,
+    /// 部分成功提示（步骤 1/2 已生效但孤儿回收被跳过）
+    warning: String,
 }
 
 /// 删除迁移备份结果展示（存储页；ok=false 时展示失败原因）
@@ -438,9 +445,15 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
     let d = defaults();
     let cur = |k: &str| state.get_or(k, &d).unwrap_or_default();
 
-    // 必填数字：空/非法保持现值
-    let inline = match form.get("inline_attach_max_mb") {
-        Some(v) if v.trim().parse::<u32>().is_ok() => v.trim().to_string(),
+    // 必填数字：空/非法保持现值；合法值钳制到 1..=2048 MB
+    // （旧实现只校验"是数字"，填 40 亿会让所有附件都走 inline BLOB，撑爆单库）
+    let inline = match form
+        .get("inline_attach_max_mb")
+        .map(|v| v.trim().parse::<u32>())
+    {
+        Some(Ok(v)) => v
+            .clamp(INLINE_ATTACH_MIN_MB, INLINE_ATTACH_MAX_MB)
+            .to_string(),
         _ => cur(keys::INLINE_ATTACH_MAX_MB),
     };
     // 数字或空：空 = 永久保留（设计 §5.2）；非法保持现值
@@ -495,6 +508,7 @@ pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
             removed: report.removed_emails,
             orphans: report.orphan_files,
             error: String::new(),
+            warning: report.warning,
         },
         Err(err) => CleanView {
             ok: false,
@@ -503,6 +517,7 @@ pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
             removed: 0,
             orphans: 0,
             error: err,
+            warning: String::new(),
         },
     };
     render_html(

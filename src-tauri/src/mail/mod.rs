@@ -189,7 +189,7 @@ const TZ_TTL_SECS: i64 = 3600;
 
 fn local_tz() -> jiff::tz::TimeZone {
     {
-        let guard = LOCAL_TZ.read().expect("时区缓存锁中毒");
+        let guard = LOCAL_TZ.read().unwrap_or_else(|e| e.into_inner());
         if let Some((tz, at)) = guard.as_ref()
             && now_epoch() - at < TZ_TTL_SECS
         {
@@ -198,7 +198,7 @@ fn local_tz() -> jiff::tz::TimeZone {
     }
     let fresh = jiff::Zoned::now().time_zone().clone();
     // 双检防并发重复加载（多线程同时过期）：后到者抢到写锁时可能已被刷新
-    let mut guard = LOCAL_TZ.write().expect("时区缓存锁中毒");
+    let mut guard = LOCAL_TZ.write().unwrap_or_else(|e| e.into_inner());
     *guard = Some((fresh.clone(), now_epoch()));
     fresh
 }
@@ -837,7 +837,26 @@ fn insert_attachment(
             )
             .map_err(e)?;
     } else {
-        let rel = format!("{}/{}/{}_{}.gz", ctx.month, ctx.email_id, n, filename);
+        // 序号避让：`{n}_{name}.gz` 若已存在（删中间附件后序号复用、或同名文件重复添加）
+        // 必须递增，否则后写覆盖前一个附件文件，两条 DB 行指向同一路径（审计 P2-10）
+        let mut rel = String::new();
+        for seq in n..n.saturating_add(10_000) {
+            let candidate = format!("{}/{}/{}_{}.gz", ctx.month, ctx.email_id, seq, filename);
+            if !ctx.root.join(&candidate).exists() {
+                rel = candidate;
+                break;
+            }
+        }
+        if rel.is_empty() {
+            // 极端兜底：内容寻址命名（sha256 前 16 位），仍保证唯一
+            rel = format!(
+                "{}/{}/{}_{}.gz",
+                ctx.month,
+                ctx.email_id,
+                &sha[..16.min(sha.len())],
+                filename
+            );
+        }
         let dest = ctx.root.join(&rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|err| format!("创建附件目录失败：{err}"))?;
@@ -880,10 +899,16 @@ fn sync_attach_stats(tx: &rusqlite::Connection, email_id: i64) -> Result<(), Str
 /// 追加附件（写入方：草稿保存/M4 收件）。
 ///
 /// 读文件 → gzip → 按上限分级：≤ 上限 inline BLOB；超限独立文件（月份目录取邮件时间）。
-/// 任一文件读取失败则整体失败（事务回滚，不留半成品）。
-pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Result<usize, String> {
+/// 任一文件读取失败则整体失败（事务回滚，不留半成品）；**0 字节文件跳过并回报**——
+/// 旧实现遇空文件直接整单失败，用户选错一个文件就白填整封信（审计 P2-9）。
+/// 返回 (成功入库数, 被跳过的空文件名)。
+pub fn add_attachments(
+    state: &AppState,
+    email_id: i64,
+    paths: &[String],
+) -> Result<(usize, Vec<String>), String> {
     if paths.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     let limit = inline_limit(state);
     let root = attach_root(state);
@@ -892,17 +917,19 @@ pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Res
     let result = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         let mut count = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
         for p in paths {
             let orig = std::fs::read(p)
                 .map_err(|err| format!("读取附件失败 {}: {err}", safe_filename(p)))?;
-            if orig.is_empty() {
-                return Err("附件为空文件".into());
-            }
             let filename = Path::new(p)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(safe_filename)
                 .unwrap_or_else(|| "attachment".into());
+            if orig.is_empty() {
+                skipped.push(filename);
+                continue;
+            }
             insert_attachment(
                 &AttachCtx {
                     tx: &tx,
@@ -920,7 +947,7 @@ pub fn add_attachments(state: &AppState, email_id: i64, paths: &[String]) -> Res
         }
         sync_attach_stats(&tx, email_id)?;
         tx.commit().map_err(e)?;
-        Ok(count)
+        Ok((count, skipped))
     });
     if result.is_err() {
         // 事务失败：清理本次已写盘的独立文件（防残留）
@@ -1027,6 +1054,16 @@ pub struct SendAttachment {
     pub bytes: Vec<u8>,
 }
 
+/// 出站附件读取行：(filename, mime, storage, file_path, data, detached)
+type AttachSendRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    bool,
+);
+
 /// 读取待发邮件的全部附件（发送前置校验，独立连接版）。
 ///
 /// 语义：任何一个附件不可用即整体报错——**绝不"少发一个附件"静默成功**，
@@ -1037,14 +1074,7 @@ pub fn outgoing_attachments(
     root: &Path,
     email_id: i64,
 ) -> Result<Vec<SendAttachment>, String> {
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<Vec<u8>>,
-        bool,
-    )> = crate::db::collect_rows(
+    let rows: Vec<AttachSendRow> = crate::db::collect_rows(
         conn,
         "SELECT filename, COALESCE(mime,'application/octet-stream'), storage,
                 file_path, data, detached = 1
@@ -1070,8 +1100,9 @@ pub fn outgoing_attachments(
             ));
         }
         let gz = match storage.as_str() {
-            "inline" => data
-                .ok_or_else(|| format!("附件「{filename}」数据缺失（inline 记录为空）"))?,
+            "inline" => {
+                data.ok_or_else(|| format!("附件「{filename}」数据缺失（inline 记录为空）"))?
+            }
             _ => std::fs::read(root.join(file_path.unwrap_or_default()))
                 .map_err(|err| format!("附件「{filename}」读取失败：{err}"))?,
         };

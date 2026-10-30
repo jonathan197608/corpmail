@@ -33,16 +33,37 @@ pub fn is_config_key(key: &str) -> bool {
     CONFIG_KEYS.contains(&key)
 }
 
-/// 读取全部配置（文件缺失/损坏 → 空 map，即未配置状态；未知键过滤——
-/// 配置文件内仅承载 CONFIG_KEYS）
+/// 读取全部配置（文件缺失 → 空 map，即未配置状态；未知键过滤——
+/// 配置文件内仅承载 CONFIG_KEYS）。
+///
+/// 文件存在但解析失败（手改坏、编码损坏、磁盘写一半）时：先把原文改名留证，
+/// 再以空配置继续。旧实现直接静默降级为空 map，且下一次保存会用默认值覆盖
+/// 唯一可恢复的原文，用户表现为"账号配置凭空消失"（审计 P2-12）。
 pub fn load(anchor: &Path) -> BTreeMap<String, String> {
-    std::fs::read_to_string(anchor.join(CONFIG_FILE))
-        .ok()
-        .and_then(|t| toml::from_str::<BTreeMap<String, String>>(&t).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(k, _)| is_config_key(k))
-        .collect()
+    let path = anchor.join(CONFIG_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    match toml::from_str::<BTreeMap<String, String>>(&text) {
+        Ok(map) => map.into_iter().filter(|(k, _)| is_config_key(k)).collect(),
+        Err(err) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup = anchor.join(format!("{CONFIG_FILE}.broken-{stamp}"));
+            let kept = std::fs::rename(&path, &backup).is_ok();
+            eprintln!(
+                "[conf] 配置文件解析失败（{err}）；{}，本次按未配置启动",
+                if kept {
+                    format!("原文已备份为 {}", backup.display())
+                } else {
+                    "原文备份失败（保留原文件）".to_string()
+                }
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 /// 原子保存（临时文件 + rename：防写一半崩溃留残片）。

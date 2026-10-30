@@ -32,6 +32,9 @@ pub struct CleanReport {
     pub removed_emails: u64,
     /// 步骤 3：回收的孤儿文件数
     pub orphan_files: u64,
+    /// 部分成功警告（步骤 3 读引用集合失败时非空：前两步已提交，
+    /// 不能整体报"清理失败"误导用户，见 run 的降级逻辑）
+    pub warning: String,
 }
 
 /// 清理预估（estimate 返回；存储页"预计可释放"明细）
@@ -313,15 +316,25 @@ pub fn run(state: &AppState) -> Result<CleanReport, String> {
         }
     }
 
-    // 步骤 3：孤儿回收（引用集合读取失败即中止本步，宁可保留不可误删）
-    let refs = state.with_conn(|conn| referenced_paths(conn))?;
-    for (path, size) in orphan_files(&root, &refs, now) {
-        if std::fs::remove_file(&path).is_ok() {
-            report.orphan_files += 1;
-            report.freed_bytes += size;
+    // 步骤 3：孤儿回收（引用集合读取失败即跳过本步，宁可保留不可误删）。
+    // 步骤 1/2 此时已提交，绝不能把失败向上抛——那会让 UI 报"清理失败"，
+    // 而实际已删掉邮件与附件，属误导；降级为警告，下轮清理自动重试（审计 P2-8）
+    match state.with_conn(|conn| referenced_paths(conn)) {
+        Ok(refs) => {
+            for (path, size) in orphan_files(&root, &refs, now) {
+                if std::fs::remove_file(&path).is_ok() {
+                    report.orphan_files += 1;
+                    report.freed_bytes += size;
+                }
+            }
+            crate::mail::prune_empty_dirs(&root);
+        }
+        Err(err) => {
+            eprintln!("[clean] 孤儿回收跳过（引用集合读取失败）：{err}");
+            report.warning =
+                format!("孤儿文件回收已跳过（读取附件引用失败：{err}），下次清理会自动重试");
         }
     }
-    crate::mail::prune_empty_dirs(&root);
     Ok(report)
 }
 

@@ -453,6 +453,26 @@ fn delete_old_backup_removes_files_but_keeps_config() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// 迁移后未重启：本进程仍直连旧库，删旧备份会让后续写入落进已 unlink 的文件
+/// → 重启后只剩迁移时快照，期间变更全丢。必须拒绝（审计 P2-7）
+#[test]
+fn delete_old_backup_refuses_before_restart() {
+    let base = temp_dir("backup-pending");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let dest = base.join("moved");
+    state.move_data_dir(dest.to_str().unwrap()).unwrap();
+    assert!(
+        state.pending_data_dir().is_some(),
+        "未重启时指针应处于待生效态"
+    );
+    let err = state.delete_old_backup().unwrap_err();
+    assert!(err.contains("尚未重启生效"), "应提示先重启：{err}");
+    assert!(anchor.join("corpmail.db").is_file(), "拒绝时不得删除旧库");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn delete_old_backup_refuses_without_migration() {
     // 未迁移（数据就在默认目录）：无可删除备份
@@ -665,7 +685,10 @@ fn move_data_dir_rollback_spares_preexisting_files() {
     std::fs::create_dir_all(anchor.join(format!("{}.tmp", crate::conf::CONFIG_FILE))).unwrap();
 
     let err = state.move_data_dir(dest.to_str().unwrap()).unwrap_err();
-    assert!(err.contains("配置文件写入失败"), "应停在指针写入步骤：{err}");
+    assert!(
+        err.contains("配置文件写入失败"),
+        "应停在指针写入步骤：{err}"
+    );
     assert!(!dest.join("corpmail.db").exists(), "回滚应删除本次快照库");
     assert_eq!(
         std::fs::read(dest.join("notes.txt")).unwrap(),

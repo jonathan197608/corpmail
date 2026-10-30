@@ -10,6 +10,7 @@
 
         <div class="card compose-card">
             {% if saved %}<div class="compose-note ok">✓ 草稿已保存</div>{% endif %}
+            {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个 0 字节文件（未附加）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
 
             <form hx-post="/compose/draft" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button[type=submit]">

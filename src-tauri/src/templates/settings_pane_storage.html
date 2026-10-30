@@ -119,6 +119,7 @@
         <div class="test-result {% if clean_view.ok %}ok{% else %}fail{% endif %}">
             {% if clean_view.ok %}
             ✓ 清理完成：释放 {{ clean_view.freed }}（大附件 {{ clean_view.detached }} · 过期邮件 {{ clean_view.removed }} · 孤儿文件 {{ clean_view.orphans }}）
+            {% if clean_view.warning %}<div class="compose-note">{{ clean_view.warning }}</div>{% endif %}
             {% else %}
             ✗ 清理失败：{{ clean_view.error }}
             {% endif %}

@@ -405,3 +405,75 @@ fn local_tz_cache_returns_fresh_zone() {
     assert_eq!(z1, z2, "两次取时区对同一时刻的换算应一致");
     assert!(z1.is_some(), "合法 epoch 应可换算");
 }
+
+/// 0 字节文件跳过并回报，其余附件照常入库（旧实现整单失败，白填整封信）
+#[test]
+fn add_attachments_skips_empty_file() {
+    let (state, dir) = temp_state("attach-empty");
+    let id = save_draft(&state, &draft("空附件", "体")).unwrap();
+    let empty = dir.join("empty.txt");
+    std::fs::write(&empty, b"").unwrap();
+    let good = dir.join("good.txt");
+    std::fs::write(&good, b"data").unwrap();
+    let (added, skipped) = add_attachments(
+        &state,
+        id,
+        &[
+            empty.to_string_lossy().into_owned(),
+            good.to_string_lossy().into_owned(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(added, 1, "非空文件应正常入库");
+    assert_eq!(
+        skipped,
+        vec!["empty.txt".to_string()],
+        "空文件应回报而非报错"
+    );
+    let d = get(&state, id).unwrap();
+    assert_eq!(d.attach_cnt, 1);
+    assert_eq!(d.attachments[0].filename, "good.txt");
+    cleanup(&dir);
+}
+
+/// 独立文件序号不复用：删中间附件后再加同名文件不得覆盖既有文件
+/// （旧实现按 count+1 命名，两条 DB 行会指向同一路径）
+#[test]
+fn attachment_file_names_never_collide() {
+    let (state, dir) = temp_state("attach-collide");
+    // 上限设为 0 → 所有附件都走独立文件（无需造 20MB 文件）
+    state
+        .set_batch(&[(crate::state::keys::INLINE_ATTACH_MAX_MB, "0")])
+        .unwrap();
+    let id = save_draft(&state, &draft("同名附件", "体")).unwrap();
+    let src = dir.join("a.txt");
+    std::fs::write(&src, b"first").unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+
+    let d = get(&state, id).unwrap();
+    assert_eq!(d.attach_cnt, 2);
+    // 删掉第一条（模拟用户在草稿里移除中间附件）
+    remove_attachments_except(&state, id, &[d.attachments[1].id]).unwrap();
+    std::fs::write(&src, b"third").unwrap();
+    add_attachments(&state, id, &[src.to_string_lossy().into_owned()]).unwrap();
+
+    let paths: Vec<String> = state.with_conn(|c| {
+        crate::db::collect_rows(
+            c,
+            "SELECT file_path FROM attachments WHERE email_id = ?1 ORDER BY id",
+            &[&id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1], "两条附件行不得指向同一文件");
+    for rel in &paths {
+        assert!(
+            dir.join("attachments").join(rel).is_file(),
+            "附件文件应实际存在：{rel}"
+        );
+    }
+    cleanup(&dir);
+}

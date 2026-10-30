@@ -2,6 +2,10 @@
 //!
 //! 设计 §2/§13-R6：全库走单一 `Mutex<Connection>`，WAL 模式读写不互阻。
 //! 账号密码不落库（经 `secrets` 走 OS keychain，keyfile 回退，设计 §5.4）。
+//!
+//! 锁策略：全部 Mutex/RwLock 一律 `unwrap_or_else(|e| e.into_inner())` 恢复中毒锁。
+//! 中毒只说明某次持锁写入被 panic 打断，锁内数据本身通常仍可用；沿用 `.expect`
+//! 会让一次 panic 演变为全应用连锁 panic（审计 P2-11）。
 
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -215,9 +219,7 @@ impl AppState {
         // 目标已有 attachments/ 时拒绝：复制是合并语义，一旦后续步骤失败，
         // 回滚无法区分"本次写入"与"用户原有文件"，只能整目录删除 → 误删用户数据
         if dest_path.join("attachments").exists() {
-            return Err(
-                "目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into(),
-            );
+            return Err("目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into());
         }
         std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
         // 写入探针：目标可写
@@ -244,7 +246,7 @@ impl AppState {
                     .map_err(|e| format!("附件目录复制失败：{e}"))?;
             }
             let (prev, save_res) = {
-                let mut cfg = self.config.lock().expect("配置锁中毒");
+                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 let prev = cfg.get(keys::DATA_DIR).cloned();
                 cfg.insert(
                     keys::DATA_DIR.to_string(),
@@ -255,7 +257,7 @@ impl AppState {
             };
             save_res.map_err(|e| {
                 // 配置写失败：镜像恢复指针（镜像必须反映文件内容）
-                let mut cfg = self.config.lock().expect("配置锁中毒");
+                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 match prev {
                     Some(v) => {
                         cfg.insert(keys::DATA_DIR.to_string(), v);
@@ -311,6 +313,13 @@ impl AppState {
     /// 与 attachments/；配置文件 corpmail.toml 与当前数据不受影响。
     /// 返回 (释放字节, 删除文件数)
     pub fn delete_old_backup(&self) -> Result<(u64, u64), String> {
+        // 迁移尚未重启生效：本进程仍直连旧目录库，删掉它会让后续收件/删信写进
+        // 已 unlink 的 inode——重启后新目录只剩迁移时的快照，期间变更全部丢失。
+        // 必须先重启（指针生效、data_dir 变为新目录）才允许清理。
+        // 放在"默认目录"判断之前：此时 data_dir 仍等于锚点，否则会误报"无迁移备份"
+        if self.pending_data_dir().is_some() {
+            return Err("数据目录迁移尚未重启生效，请先重启应用再删除旧目录备份".into());
+        }
         if self.data_dir == self.anchor_dir {
             return Err("当前使用默认数据目录，无迁移备份".into());
         }
@@ -344,14 +353,17 @@ impl AppState {
     /// 收件状态快照（克隆；just_finished 读取后由 clear_fetch_finish 显式清除）
     pub fn fetch_snapshot(&self) -> FetchState {
         self.fetch_guard_hung();
-        self.fetch_state.lock().expect("收件状态锁中毒").clone()
+        self.fetch_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 看门狗：挂起轮（超出 FETCH_WATCHDOG_SECS 无进展）强制复位。
     /// 由 fetch_snapshot（状态轮询链，进行中 2s 一次）驱动。复位即 epoch+1，
     /// 挂起线程即便之后网络恢复，其 finish 也会因 epoch 失配被丢弃。
     fn fetch_guard_hung(&self) {
-        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running && crate::mail::now_epoch() - s.started_at > FETCH_WATCHDOG_SECS {
             eprintln!("[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，强制复位");
             s.running = false;
@@ -368,7 +380,7 @@ impl AppState {
     pub fn clear_fetch_finish(&self) {
         self.fetch_state
             .lock()
-            .expect("收件状态锁中毒")
+            .unwrap_or_else(|e| e.into_inner())
             .just_finished = false;
     }
 
@@ -379,9 +391,7 @@ impl AppState {
     pub fn start_fetch(&self) {
         // 挂起轮上限（审计 P1-5）：看门狗只复位 UI 状态，挂起线程仍在跑。
         // 达到上限即拒绝新轮并给出明确原因，而不是继续叠加线程
-        if self
-            .active_rounds
-            .load(std::sync::atomic::Ordering::SeqCst)
+        if self.active_rounds.load(std::sync::atomic::Ordering::SeqCst)
             >= MAX_CONCURRENT_FETCH_ROUNDS
         {
             self.set_fetch_error(format!(
@@ -435,7 +445,7 @@ impl AppState {
 
     /// 写入一条收件错误（不改变 running：正在收件时由收件线程负责收尾）
     fn set_fetch_error(&self, msg: String) {
-        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running {
             return;
         }
@@ -446,7 +456,7 @@ impl AppState {
     /// 收件状态 CAS：空闲→进行中（成功 true；已在收件返回 false）
     /// 开始新轮（CAS）：成功返回该轮 epoch（finish 写状态的凭证）
     fn fetch_cas_begin(&self) -> Option<u64> {
-        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running {
             return None;
         }
@@ -463,7 +473,7 @@ impl AppState {
     /// 收件结束（凭据缺失等同步失败路径；线程路径在闭包内直接更新 Arc）
     /// 同步失败收尾（start_fetch 线程前路径）。带 epoch 凭证校验
     fn fetch_end(&self, epoch: u64, new_count: i64, error: &str) {
-        let mut s = self.fetch_state.lock().expect("收件状态锁中毒");
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.epoch != epoch {
             return; // 看门狗已复位或新一轮已开始：迟到结果丢弃
         }
@@ -480,7 +490,7 @@ impl AppState {
     /// 发送队列装配：启动残留 queued 补发 + 后续入队即时派发。
     /// worker 持独立连接与配置镜像 Arc（配置源 corpmail.toml，不占库锁）
     pub fn start_send_worker(&self) {
-        let mut guard = self.send_tx.lock().expect("发送队列锁中毒");
+        let mut guard = self.send_tx.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return;
         }
@@ -512,19 +522,36 @@ impl AppState {
                 // 发送参数快照：每封派发前重读配置（corpmail.toml；改动即时生效，
                 // 不落库——验收拍板简化）
                 let smtp = {
-                    let cfg = config_arc.lock().expect("配置锁中毒");
+                    let cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
                     crate::mail::SmtpConfig::from_config(&cfg)
                 };
                 // 派发内部所有终态（含各类失败）均已落库；此处 Err 仅剩
-                // "抢占失败/读库异常"两条管理性路径，记日志供排查即可
-                if let Err(err) = crate::mail::dispatch_one(
-                    &conn,
-                    &crate::mail::RealSender,
-                    id,
-                    &smtp,
-                    &attach_root,
-                ) {
-                    eprintln!("[send] 邮件 {id} 派发未执行：{err}");
+                // "抢占失败/读库异常"两条管理性路径，记日志供排查即可。
+                // catch_unwind：lettre/MIME 编码等任何 panic 不得打死 worker 线程
+                // ——worker 一死 channel 关闭，此后所有 enqueue_send 静默无效，
+                // 邮件停在 queued 直到重启（审计 P2-16）
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::mail::dispatch_one(
+                        &conn,
+                        &crate::mail::RealSender,
+                        id,
+                        &smtp,
+                        &attach_root,
+                    )
+                }));
+                match outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => eprintln!("[send] 邮件 {id} 派发未执行：{err}"),
+                    Err(_) => {
+                        eprintln!("[send] 邮件 {id} 派发 panic（已捕获，标记失败后继续）");
+                        // 已抢占到 sending 的邮件必须落定，否则只能等下次启动自愈
+                        let _ = conn.execute(
+                            "UPDATE emails SET status = 'failed',
+                                    error = '发送过程异常中断，请重发'
+                             WHERE id = ?1 AND status = 'sending'",
+                            [id],
+                        );
+                    }
                 }
             }
         });
@@ -536,7 +563,12 @@ impl AppState {
 
     /// 入队发送（无 worker 时为空操作：邮件停留 queued 态，下次启动补发）
     pub fn enqueue_send(&self, id: i64) {
-        if let Some(tx) = self.send_tx.lock().expect("发送队列锁中毒").as_ref() {
+        if let Some(tx) = self
+            .send_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             let _ = tx.send(id);
         }
     }
@@ -550,24 +582,27 @@ impl AppState {
 
     /// 借出连接执行闭包（邮件存储层 mail 模块使用；锁随闭包返回释放）
     pub fn with_conn<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
-        let mut conn = self.db.lock().expect("数据库锁中毒");
+        let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut conn)
     }
 
     /// 配置镜像快照（外部线程/测试读 corpmail.toml 内存镜像用；worker 线程直接持 Arc）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn config_snapshot(&self) -> crate::conf::ConfigMap {
-        self.config.lock().expect("配置锁中毒").clone()
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 读键。配置键（conf::CONFIG_KEYS：数据目录/服务器/账号）仅从 corpmail.toml
     /// 内存镜像读（文件为唯一持久源，不落库）；其余读库
     pub fn get(&self, key: &str) -> Option<Option<String>> {
         if crate::conf::is_config_key(key) {
-            let cfg = self.config.lock().expect("配置锁中毒");
+            let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             return Some(cfg.get(key).cloned());
         }
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::settings::get(&conn, key).ok()
     }
 
@@ -598,24 +633,24 @@ impl AppState {
         if !cfg_pairs.is_empty() {
             // 写前快照旧值：文件写失败时恢复原镜像（覆盖写失败不得丢掉旧值）
             let prev: Vec<(String, Option<String>)> = {
-                let cfg = self.config.lock().expect("配置锁中毒");
+                let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 cfg_pairs
                     .iter()
                     .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
                     .collect()
             };
             {
-                let mut cfg = self.config.lock().expect("配置锁中毒");
+                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in &cfg_pairs {
                     cfg.insert((*k).to_string(), (*v).to_string());
                 }
             }
             let save_res = {
-                let cfg = self.config.lock().expect("配置锁中毒");
+                let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 crate::conf::save(&self.anchor_dir, &cfg)
             };
             if let Err(e) = save_res {
-                let mut cfg = self.config.lock().expect("配置锁中毒");
+                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, old) in prev {
                     match old {
                         Some(v) => {
@@ -630,7 +665,7 @@ impl AppState {
             }
         }
         if !db_pairs.is_empty() {
-            let mut conn = self.db.lock().expect("数据库锁中毒");
+            let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             for (k, v) in &db_pairs {
                 tx.execute(
@@ -656,14 +691,14 @@ impl AppState {
 
     /// SQLite 版本串（关于页展示）
     pub fn sqlite_version(&self) -> String {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))
             .unwrap_or_default()
     }
 
     /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（5 个计数）
     pub fn folder_counts(&self) -> HashMap<&'static str, i64> {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let row = conn.query_row(
             "SELECT COALESCE(SUM(folder = 'inbox'), 0),
                     COALESCE(SUM(folder = 'inbox' AND unread = 1), 0),
@@ -694,25 +729,25 @@ impl AppState {
 
     /// 存密码（secrets 封装；返回是否发生 keyfile 降级）
     pub fn store_password(&self, account: &str, password: &str) -> Result<bool, String> {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::store(&conn, account, password)
     }
 
     /// 读密码（keychain 优先，keyfile 回退）
     pub fn retrieve_password(&self, account: &str) -> crate::secrets::GetResult {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::retrieve(&conn, account)
     }
 
     /// 删除密码（账号变更迁移时用；两条路径都清，幂等）
     pub fn clear_password(&self, account: &str) {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::clear(&conn, account);
     }
 
     /// keychain 是否处于 keyfile 降级态（设置·账号提示用）
     pub fn secrets_degraded(&self, account: &str) -> bool {
-        let conn = self.db.lock().expect("数据库锁中毒");
+        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::degraded(&conn, account)
     }
 
@@ -868,7 +903,7 @@ fn fetch_round(job: FetchJob) {
     // finish 携带轮次凭证：epoch 失配（看门狗已复位/新一轮已开始）则仅记日志不写状态，
     // 防止挂起轮迟到完成污染当前轮的展示
     let finish = |new_count: i64, error: String| {
-        let mut s = fetch_state.lock().expect("收件状态锁中毒");
+        let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.epoch != epoch {
             eprintln!("[fetch] 迟到结果（epoch {epoch} ≠ {}）丢弃", s.epoch);
             return;
@@ -906,7 +941,7 @@ fn fetch_round(job: FetchJob) {
                 // C4：看门狗已复位/新一轮已开始 → 立即终止本轮（Err 会中断
                 // fetch_batched 后续批次下载），防止旧轮维续写库与游标
                 {
-                    let s = fetch_state.lock().expect("收件状态锁中毒");
+                    let s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
                     if s.epoch != epoch {
                         return Err("收件轮已中止".into());
                     }
@@ -917,7 +952,7 @@ fn fetch_round(job: FetchJob) {
                 // 本批入库失败会提前 ? 返回，游标不推进，靠去重兜底。
                 // C4：单调性以 DB 侧现值为准，防旧轮与新轮并发回退。
                 persist_fetch_cursor(&mut conn, uidvalidity, batch_max, false)?;
-                let mut s = fetch_state.lock().expect("收件状态锁中毒");
+                let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
                 if s.epoch == epoch {
                     s.fetch_done = done;
                     s.fetch_total = total;
