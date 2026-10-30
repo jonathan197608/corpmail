@@ -839,6 +839,21 @@ body {
     flex-wrap: wrap;
 }
 
+/* 重新拉取行：作为 .sfield（108px 1fr 两列 grid）的后续子元素，
+   不跨列会落回 108px 窄列导致按钮与提示语逐字换行 */
+.refetch-row {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.refetch-hint {
+    font-size: 12px;
+    color: var(--muted);
+}
+
 .radio {
     display: flex;
     gap: 7px;
