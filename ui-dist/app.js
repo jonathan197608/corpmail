@@ -106,6 +106,19 @@ async function mbxMoveDataDir() {
     }
 }
 
+// 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——
+// 迁移由向导保存时按表单值处理）：选中后写回表单 input，用户仍可手改
+async function mbxPickSetupDir(btn) {
+    try {
+        const dir = await window.__TAURI__.dialog.open({ directory: true });
+        if (!dir) return;
+        const input = btn.closest('.port-row')?.querySelector('input[name="data_dir"]');
+        if (input) input.value = dir;
+    } catch (e) {
+        console.error('[mbx] 打开目录对话框失败', e);
+    }
+}
+
 // ---------- 附件预览（M5）：img / pdf / text 三类内嵌渲染 ----------
 // text 类服务端强制 text/plain 返回（防 text/html 脚本执行），前端 pre 渲染
 
