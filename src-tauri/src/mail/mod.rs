@@ -14,7 +14,7 @@ mod recv;
 mod send;
 
 pub use recv::{
-    FetchOutcome, LastCursor, MailFetcher, RealFetcher, seen_params_of, store_incoming_conn,
+    IncomingMail, LastCursor, MailFetcher, RealFetcher, seen_params_of, store_incoming_conn,
 };
 pub use send::{RealSender, SmtpConfig, dispatch_one, enqueue_draft, reopen_failed};
 

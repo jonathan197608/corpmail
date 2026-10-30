@@ -1545,6 +1545,53 @@ fn settings_sync_save_roundtrip() {
 }
 
 #[test]
+fn settings_sync_refetch_resets_cursor_and_keeps_range() {
+    let (state, dir) = temp_state("sync-refetch");
+    // 预置：已拉过 90 天并落游标（模拟真实首拉后的状态）
+    state
+        .set_batch(&[
+            (keys::FIRST_FETCH_DAYS, "90"),
+            (keys::LAST_UID, "9503"),
+            (keys::LAST_UIDVALIDITY, "1"),
+        ])
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/refetch",
+            &form(&[("first_fetch_days", "0")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let d = defaults();
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(),
+        Some("0"),
+        "重拉应采纳所选范围(全部)"
+    );
+    assert_eq!(
+        state.get_or(keys::LAST_UID, &d).as_deref(),
+        Some("0"),
+        "游标须清空以触发首拉"
+    );
+    assert_eq!(
+        state.get_or(keys::LAST_UIDVALIDITY, &d).as_deref(),
+        Some("0"),
+        "uidvalidity 须清空"
+    );
+    assert!(
+        body(&resp).contains("触发重新拉取"),
+        "pane 应提示已触发重拉"
+    );
+    cleanup(&dir);
+}
+
+#[test]
 fn settings_storage_save_roundtrip_with_blank_semantics() {
     let (state, dir) = temp_state("sto-save");
     let resp = route(
@@ -1694,6 +1741,101 @@ fn wizard_save_with_custom_domain() {
     );
     state.clear_password("unit.router@custom.cn");
     cleanup(&dir);
+}
+
+#[test]
+fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
+    // 需求：首次配置向导新增「首次拉取范围」与「数据保存目录」两项配置
+    let (state, dir) = temp_state("wiz-range-dir");
+    let target = std::env::temp_dir().join(format!("mbx-wiz-mig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+
+    // 1) 合法范围 7 + 指定新目录 → 保存成功、范围落库、done 页提示待生效目录
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("first_fetch_days", "7"));
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "含新增配置项的向导保存应跳转完成页"
+    );
+    assert!(state.configured(), "应已落库");
+    let d = defaults();
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(),
+        Some("7"),
+        "向导应保存所选首拉范围"
+    );
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/done", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        body(&resp).contains("数据目录已迁移"),
+        "done 页应提示数据目录已迁移待重启生效"
+    );
+    assert!(target.join("corpmail.db").exists(), "目标目录应产生快照库");
+
+    // 2) 非法范围回落默认 30；未指定目录则沿用当前目录、done 页无迁移提示
+    let (state2, dir2) = temp_state("wiz-range2");
+    let mut pairs2: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs2.push(("first_fetch_days", "x"));
+    let resp2 = route(
+        &state2,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs2)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp2
+            .extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "非法范围应仍可保存（回落默认）"
+    );
+    assert_eq!(
+        state2
+            .get_or(keys::FIRST_FETCH_DAYS, &defaults())
+            .as_deref(),
+        Some("30"),
+        "非法范围应回落默认 30"
+    );
+    let resp2 = route(
+        &state2,
+        &assets(),
+        &req("GET", "/welcome/done", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        !body(&resp2).contains("数据目录已迁移"),
+        "未指定目录时不应出现迁移提示"
+    );
+    state.clear_password("unit.router@chinatelecom.cn");
+    state2.clear_password("unit.router@chinatelecom.cn");
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+    cleanup(&dir2);
 }
 
 #[test]

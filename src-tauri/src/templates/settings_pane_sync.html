@@ -33,8 +33,15 @@
                     <label class="radio"><input type="radio" name="first_fetch_days" value="0"
                         {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
                 </div>
+                <div class="refetch-row" style="margin-top:8px">
+                    <button type="button" class="btn"
+                            hx-post="/settings/sync/refetch" hx-target="#settings-pane" hx-swap="outerHTML"
+                            hx-include="closest form" hx-trigger="click" hx-disabled-elt="this">⟳ 按当前范围重新拉取</button>
+                    <span class="refetch-hint" style="color:var(--muted)">重置收件游标并按上方所选范围全量重拉</span>
+                </div>
             </div>
 
+            {% if refetch_notice %}<div class="sec-note" style="color:var(--ok)">✓ 已按所选范围触发重新拉取，请在收件箱查看</div>{% endif %}
             <div class="sec-note">{{ last_sync_label }}</div>
 
             <div class="settings-actions">

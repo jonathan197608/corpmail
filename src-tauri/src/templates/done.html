@@ -14,6 +14,9 @@
             <div class="setup-card">
                 <h3>配置完成</h3>
                 <p class="desc">账号与服务器已保存，密码已存入本机凭据保管。</p>
+                {% if pending_dir %}
+                <div class="sec-note">📁 数据目录已迁移到 <b>{{ pending_dir }}</b>，重启应用后生效。</div>
+                {% endif %}
 
                 <div class="kv"><span class="k">邮箱账号</span><b>{{ account }}</b></div>
                 <div class="kv"><span class="k">发件显示名</span><b>{{ display_name }}</b></div>

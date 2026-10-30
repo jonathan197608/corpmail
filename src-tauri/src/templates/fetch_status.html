@@ -1,8 +1,8 @@
-{# 收件状态片段（顶栏 #fetch-status 容器 outerHTML 自替换；M4 §6.2）#}
-<div id="fetch-status" class="fetch-status"
+{# 收件状态片段（全局浮条 #fetch-status 容器 outerHTML 自替换；M4 §6.2）#}
+<div id="fetch-status" class="fetch-status fetch-status-global"
     {% if running %} hx-get="/emails/fetch/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
     {% if running %}
-    ⏳ 正在收取新邮件…
+    ⏳ 正在收取新邮件…{% if total > 0 %}（{{ done }}/{{ total }}）{% endif %}
     {% else %}
     {% if error %}<span class="fs-err">{{ error }}</span>{% endif %}
     {% if new_count > 0 %}<span class="fs-new">✓ 新收 {{ new_count }} 封</span>{% endif %}

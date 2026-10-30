@@ -44,6 +44,7 @@ pub struct LastCursor {
 }
 
 /// 一轮收件结果（游标推进依据 = 搜索层 max_uid，解析失败/入库去重不阻塞游标）
+#[allow(dead_code)] // 供单测 MockFetcher 实现 trait fetch；生产走 fetch_batched 分批路径
 pub struct FetchOutcome {
     /// 服务器 INBOX 的 UIDVALIDITY（空轮也记录，防 uidvalidity 变化后误判）
     pub uidvalidity: u32,
@@ -57,6 +58,7 @@ pub struct FetchOutcome {
 pub trait MailFetcher {
     /// 增量拉取：last.uid > 0 且 uidvalidity 未变时从 uid+1 续拉；
     /// uidvalidity 变化或首次按 SINCE 范围（设计 §6.1：提示全量重拉由调用方清理语义）
+    #[allow(dead_code)] // 生产 fetch_round 走 RealFetcher::fetch_batched；trait 保留供单测 MockFetcher 注入
     fn fetch(
         &self,
         host: &str,
@@ -81,6 +83,97 @@ pub trait MailFetcher {
 
 /// 生产实现：imap 3.0.0-alpha.15（隐式 TLS）+ mailparse 0.18（MIME 解析，spike 已验证）
 pub struct RealFetcher;
+impl RealFetcher {
+    /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调
+    /// on_batch 入库。实现"边拉边入库边显示进度"，不再等整批拉完才落库。
+    /// 首拉/增量/兜底搜索语义与 fetch 完全一致；返回 (uidvalidity, max_uid)。
+    /// （fetch_round 走此方法；trait fetch 保留供 Mock 与批量一次性场景）
+    #[allow(clippy::too_many_arguments)] // 收件参数集（host/port/account/password/range/游标/回调）本就完整
+    pub fn fetch_batched(
+        &self,
+        host: &str,
+        port: u16,
+        account: &str,
+        password: &str,
+        first_days: i64,
+        last: LastCursor,
+        mut on_batch: impl FnMut(&[IncomingMail], usize, usize) -> Result<(), String>,
+    ) -> Result<(u32, u32), String> {
+        const BATCH: usize = 25;
+        let client = imap::ClientBuilder::new(host, port)
+            .mode(imap::ConnectionMode::Tls)
+            .connect()
+            .map_err(|e| format!("连接失败：{e}"))?;
+        let mut sess = client
+            .login(account, password)
+            .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        let mailbox = sess
+            .select("INBOX")
+            .map_err(|e| format!("无法打开收件箱：{e}"))?;
+        let uidvalidity = mailbox.uid_validity.unwrap_or(0);
+        // 首拉范围 / 增量 / 兜底（与 fetch 相同语义）
+        let first_pull: Vec<u32> = if first_days <= 0 {
+            sess.uid_search("ALL")
+                .map_err(|e| format!("检索全部邮件失败：{e}"))?
+                .into_iter()
+                .collect()
+        } else {
+            let since = imap_since(first_days);
+            sess.uid_search(format!("SINCE {since}"))
+                .map_err(|e| format!("检索新邮件失败：{e}"))?
+                .into_iter()
+                .collect()
+        };
+        let uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+            let inc: Vec<u32> = sess
+                .uid_search(format!("{}:*", last.uid + 1))
+                .map_err(|e| format!("检索新邮件失败：{e}"))?
+                .into_iter()
+                .filter(|u| *u > last.uid)
+                .collect();
+            if inc.is_empty() { first_pull } else { inc }
+        } else {
+            first_pull
+        };
+        // 分批拉取 + 回调入库（每批 BATCH 封；处理数 processed 作进度 done）
+        let total = uids.len();
+        let mut processed = 0usize;
+        let mut batch: Vec<IncomingMail> = Vec::with_capacity(BATCH);
+        let mut batch_uids: Vec<u32> = Vec::with_capacity(BATCH);
+        for uid in uids.iter().copied() {
+            let fetches = sess
+                .uid_fetch(uid.to_string(), "(FLAGS INTERNALDATE BODY.PEEK[])")
+                .map_err(|e| format!("拉取邮件 {uid} 失败：{e}"))?;
+            for f in fetches.iter() {
+                let seen = f
+                    .flags()
+                    .iter()
+                    .any(|flag| flag.to_string().contains("\\Seen"));
+                let internal_date = f.internal_date().map(|dt| dt.timestamp());
+                let Some(body) = f.body() else {
+                    eprintln!("[fetch] uid={uid} 无 BODY，跳过");
+                    continue;
+                };
+                if let Some(mail) = parse_incoming(uidvalidity, uid, seen, internal_date, body) {
+                    batch.push(mail);
+                }
+            }
+            batch_uids.push(uid);
+            processed += 1;
+            if batch_uids.len() >= BATCH {
+                on_batch(&batch, processed, total)?;
+                batch.clear();
+                batch_uids.clear();
+            }
+        }
+        if !batch_uids.is_empty() {
+            on_batch(&batch, processed, total)?;
+        }
+        let max_uid = uids.iter().copied().max().unwrap_or(0);
+        let _ = sess.logout();
+        Ok((uidvalidity, max_uid))
+    }
+}
 
 impl MailFetcher for RealFetcher {
     fn fetch(

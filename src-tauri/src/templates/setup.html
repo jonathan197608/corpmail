@@ -51,6 +51,25 @@
                     </div>
                 </div>
 
+                <div class="sfield">
+                    <label>首次邮件拉取范围</label>
+                    <div class="radio-row">
+                        <label class="radio"><input type="radio" name="first_fetch_days" value="7"
+                            {% if first_fetch_days == "7" %}checked{% endif %}><span class="dot"></span>最近 7 天</label>
+                        <label class="radio"><input type="radio" name="first_fetch_days" value="30"
+                            {% if first_fetch_days == "30" %}checked{% endif %}><span class="dot"></span>30 天</label>
+                        <label class="radio"><input type="radio" name="first_fetch_days" value="90"
+                            {% if first_fetch_days == "90" %}checked{% endif %}><span class="dot"></span>90 天</label>
+                        <label class="radio"><input type="radio" name="first_fetch_days" value="0"
+                            {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
+                    </div>
+                </div>
+                <div class="sfield">
+                    <label>数据保存目录<small class="hint">留空使用默认目录</small></label>
+                    <input class="mono" type="text" name="data_dir" value="{{ data_dir }}" spellcheck="false"
+                        placeholder="选填：迁移邮件数据到自定义目录（填了新目录才会迁移，重启后生效）">
+                </div>
+
                 <div class="sec-note">🔒 密码保存进本机凭据保管（Windows 凭据管理器 / macOS 钥匙串），服务器与邮件数据保存在本机数据库。</div>
 
                 <div id="test-results" class="test-row"></div>

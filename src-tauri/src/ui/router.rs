@@ -7,9 +7,9 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use super::settings::{
-    account_pairs, settings_account_save, settings_account_test, settings_backup_delete,
-    settings_page, settings_pane_fragment, settings_storage_clean, settings_storage_move,
-    settings_storage_save, settings_sync_save,
+    settings_account_save, settings_account_test, settings_backup_delete, settings_page,
+    settings_pane_fragment, settings_storage_clean, settings_storage_move, settings_storage_save,
+    settings_sync_refetch, settings_sync_save,
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
@@ -200,6 +200,10 @@ struct SetupCtx {
     smtp_port: String,
     recv_host: String,
     recv_port: String,
+    /// 首次拉取范围（向导可设；与设置同步页一致）
+    first_fetch_days: String,
+    /// 数据保存目录（当前值，供输入框回显；留空=默认）
+    data_dir: String,
 }
 
 /// 首启向导·完成页
@@ -211,6 +215,8 @@ struct DoneCtx {
     smtp_port: String,
     recv_host: String,
     recv_port: String,
+    /// 若向导中迁移了数据目录：待重启生效的目录（done 页提示）
+    pending_dir: Option<String>,
 }
 
 /// 连接测试结果片段
@@ -228,6 +234,9 @@ struct FetchStatusCtx {
     new_count: i64,
     error: String,
     last_sync_label: String,
+    /// M6 分批进度：已入库 / 应拉总数（running 且 total>0 时展示）
+    done: usize,
+    total: usize,
 }
 
 #[derive(Serialize)]
@@ -308,6 +317,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
             Some(settings_account_test(state, req, tester, true))
         }
         ("POST", "/settings/sync/save") => Some(settings_sync_save(state, req)),
+        ("POST", "/settings/sync/refetch") => Some(settings_sync_refetch(state, req)),
         ("POST", "/settings/storage/save") => Some(settings_storage_save(state, req)),
         ("POST", "/settings/storage/clean") => Some(settings_storage_clean(state)),
         ("POST", "/settings/storage/move") => Some(settings_storage_move(state, req)),
@@ -481,6 +491,12 @@ fn fetch_start(state: &AppState) -> Resp {
 /// 收件状态片段（GET /emails/fetch/status 轮询）：进行中每 2s 自轮询；
 /// 刚完成时消费标记并回 HX-Refresh 整页刷新（列表/计数全新）
 fn fetch_status(state: &AppState, consume: bool) -> Resp {
+    if !state.configured() {
+        // 未配置：浮条留空（.fetch-status:empty 隐藏），避免欢迎页出现"没有新邮件"
+        return Resp::html(
+            r#"<div id="fetch-status" class="fetch-status fetch-status-global"></div>"#.into(),
+        );
+    }
     let s = state.fetch_snapshot();
     let d = defaults();
     let last_sync = state
@@ -496,6 +512,8 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
         } else {
             "尚未收取".into()
         },
+        done: s.fetch_done,
+        total: s.fetch_total,
     };
     let mut resp = render_html("fetch_status.html", &ctx);
     if consume && s.just_finished {
@@ -769,6 +787,8 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         smtp_port: g(keys::SMTP_PORT),
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
+        first_fetch_days: g(keys::FIRST_FETCH_DAYS),
+        data_dir: state.data_dir.display().to_string(),
     };
     render_html("setup.html", &ctx)
 }
@@ -787,6 +807,7 @@ fn wizard_done(state: &AppState) -> Resp {
         smtp_port: g(keys::SMTP_PORT),
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
+        pending_dir: state.pending_data_dir(),
     };
     render_html("done.html", &ctx)
 }
@@ -812,18 +833,42 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
     let smtp = tester.smtp(&smtp_host, smtp_port, &account, &password);
     let imap = tester.imap(&recv_host, recv_port, &account, &password);
     if smtp.ok && imap.ok {
+        // 首次邮件拉取范围（7/30/90/全部=0，非法回落 30）
+        let first_fetch = match form.get("first_fetch_days") {
+            Some(v) if matches!(v.as_str(), "7" | "30" | "90" | "0") => v.clone(),
+            _ => "30".to_string(),
+        };
+        // 数据保存目录：非空且不同于当前时迁移（迁移在账号落库前，失败不产生半保存态）
+        let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
+        if !data_dir_input.is_empty() {
+            let cur = state
+                .data_dir
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            let want = data_dir_input
+                .trim()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            if want != cur
+                && let Err(e) = state.move_data_dir(&data_dir_input)
+            {
+                return test_fragment(Vec::new(), &format!("数据目录设置失败：{e}"), false);
+            }
+        }
         let display = trimmed_field(&form, "display_name").unwrap_or_default();
         let smtp_port_s = smtp_port.to_string();
         let recv_port_s = recv_port.to_string();
-        let pairs = account_pairs(
-            &prefix,
-            &domain,
-            &display,
-            &smtp_host,
-            &smtp_port_s,
-            &recv_host,
-            &recv_port_s,
-        );
+        let pairs: Vec<(&str, &str)> = vec![
+            (keys::ACCOUNT_PREFIX, prefix.as_str()),
+            (keys::ACCOUNT_DOMAIN, &domain),
+            (keys::DISPLAY_NAME, display.as_str()),
+            (keys::SMTP_HOST, smtp_host.as_str()),
+            (keys::SMTP_PORT, smtp_port_s.as_str()),
+            (keys::RECV_HOST, recv_host.as_str()),
+            (keys::RECV_PORT, recv_port_s.as_str()),
+            (keys::FIRST_FETCH_DAYS, first_fetch.as_str()),
+        ];
         if let Err(e) = state.set_batch(&pairs) {
             return test_fragment(Vec::new(), &format!("保存失败：{e}"), false);
         }

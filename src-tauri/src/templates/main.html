@@ -18,7 +18,6 @@
                 {% if q %}<a class="search-clear" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索">×</a>{% endif %}
             </form>
         </div>
-        <div id="fetch-status" class="fetch-status"></div>
 
         {% include "mail_list.html" %}
     </main>

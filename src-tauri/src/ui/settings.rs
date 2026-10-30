@@ -34,6 +34,8 @@ pub(super) struct SettingsCtx {
     sync_interval_min: String,
     first_fetch_days: String,
     last_sync_label: String,
+    /// 收件同步 tab：刚触发「按当前范围重新拉取」（清游标+启动首拉）
+    refetch_notice: bool,
     // 存储管理 tab
     data_dir: String,
     inline_max: String,
@@ -167,6 +169,7 @@ pub(super) fn settings_ctx(
         sync_on_start: g(keys::SYNC_ON_START) == "true",
         sync_interval_min: g(keys::SYNC_INTERVAL_MIN),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
+        refetch_notice: false,
         last_sync_label: {
             let at = g(keys::LAST_SYNC_AT).parse::<i64>().unwrap_or(0);
             if at > 0 {
@@ -390,6 +393,32 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         return sync_pane(state, false);
     }
     sync_pane(state, true)
+}
+
+/// 设置·收件同步 tab：「按当前范围重新拉取」（M6）
+/// 读取选中范围 → 清空收件游标（LAST_UID/LAST_UIDVALIDITY）→ 立即触发一轮首拉。
+/// 清游标让下次 fetch 走进「无游标→首拉」分支，按新范围（全部/天数）全量重拉，
+/// 解决"改首拉范围后历史不补拉"的缺口。
+pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
+    let form = parse_form(&req.body);
+    let d = defaults();
+    let days = match form.get("first_fetch_days") {
+        Some(v) if matches!(v.as_str(), "7" | "30" | "90" | "0") => v.clone(),
+        _ => state.get_or(keys::FIRST_FETCH_DAYS, &d).unwrap_or_default(),
+    };
+    let pairs = [
+        (keys::FIRST_FETCH_DAYS, days.as_str()),
+        // 清空游标 → 走首拉分支（无游标 = 首次拉取），按新范围 UID SEARCH ALL / SINCE
+        (keys::LAST_UID, "0"),
+        (keys::LAST_UIDVALIDITY, "0"),
+    ];
+    if state.set_batch(&pairs).is_err() {
+        return sync_pane(state, false);
+    }
+    state.start_fetch(); // 后台立即拉取；已在收件中则防抖忽略
+    let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+    ctx.refetch_notice = true;
+    render_html(&pane_template("sync"), &ctx)
 }
 
 /// 设置·存储管理 tab：保存（清理参数在 M5 清理器实施时生效）

@@ -90,6 +90,9 @@ pub struct FetchState {
     pub epoch: u64,
     /// 当前轮开始时间（epoch 秒）：看门狗判定挂起依据
     pub started_at: i64,
+    /// 本轮拉取进度（M6 分批入库）：已入库 / 应拉总数；正在首拉前为 0/0
+    pub fetch_done: usize,
+    pub fetch_total: usize,
 }
 
 /// 收件轮看门狗上限（秒）：imap 无网络超时，挂起轮超过此时长由轮询链复位，
@@ -132,6 +135,8 @@ impl AppState {
                 just_finished: false,
                 epoch: 0,
                 started_at: 0,
+                fetch_done: 0,
+                fetch_total: 0,
             })),
         }
     }
@@ -372,6 +377,8 @@ impl AppState {
         s.epoch += 1;
         s.started_at = crate::mail::now_epoch();
         s.last_error.clear();
+        s.fetch_done = 0;
+        s.fetch_total = 0;
         Some(s.epoch)
     }
 
@@ -737,27 +744,39 @@ fn fetch_round(job: FetchJob) {
     // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
     let last_uid = last.uid;
     let last_uidvalidity = last.uidvalidity;
-    let outcome: Result<(crate::mail::FetchOutcome, usize), String> =
+    let mut added = 0usize;
+    let outcome: Result<(u32, u32), String> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let outcome = crate::mail::MailFetcher::fetch(
-                &crate::mail::RealFetcher,
+            // 分批拉取（M6）：每批解析后立即入库并推进进度，边拉边显示；
+            // 入库与网络拉取同属关键路径，任一 panic 都必须复位状态。
+            let mut on_batch = |mails: &[crate::mail::IncomingMail],
+                                done: usize,
+                                total: usize|
+             -> Result<(), String> {
+                added += crate::mail::store_incoming_conn(&mut conn, &data_dir, mails)?;
+                let mut s = fetch_state.lock().expect("收件状态锁中毒");
+                if s.epoch == epoch {
+                    s.fetch_done = done;
+                    s.fetch_total = total;
+                }
+                Ok(())
+            };
+            crate::mail::RealFetcher.fetch_batched(
                 &host,
                 port,
                 &account,
                 &password,
                 first_days,
                 last,
-            )?;
-            // 入库与网络拉取同属关键路径：两者任一 panic 都必须复位状态
-            let added = crate::mail::store_incoming_conn(&mut conn, &data_dir, &outcome.mails)?;
-            Ok((outcome, added))
+                &mut on_batch,
+            )
         }))
         .unwrap_or_else(|_| {
             eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
             Err("收件内部异常终止，请重试收取".into())
         });
     match outcome {
-        Ok((outcome, added)) => {
+        Ok((uidvalidity, max_uid)) => {
             // 游标推进（M5 修复）：uidvalidity 恒记录；uid 以搜索层最大命中为准，
             // 解析失败/去重跳过的邮件不再阻塞游标（否则永远重试同一封）。
             // 游标单调：SINCE 兜底命中可能低于旧游标，不得回退；
@@ -766,15 +785,9 @@ fn fetch_round(job: FetchJob) {
             // 旧空间的错配（会导致跨空间跳号漏信）
             let mut push_cursor = || -> rusqlite::Result<()> {
                 let tx = conn.transaction()?;
-                crate::db::settings::set(
-                    &tx,
-                    keys::LAST_UIDVALIDITY,
-                    &outcome.uidvalidity.to_string(),
-                )?;
-                if outcome.max_uid > 0
-                    && (outcome.uidvalidity != last_uidvalidity || outcome.max_uid > last_uid)
-                {
-                    crate::db::settings::set(&tx, keys::LAST_UID, &outcome.max_uid.to_string())?;
+                crate::db::settings::set(&tx, keys::LAST_UIDVALIDITY, &uidvalidity.to_string())?;
+                if max_uid > 0 && (uidvalidity != last_uidvalidity || max_uid > last_uid) {
+                    crate::db::settings::set(&tx, keys::LAST_UID, &max_uid.to_string())?;
                 }
                 crate::db::settings::set(
                     &tx,
@@ -787,9 +800,8 @@ fn fetch_round(job: FetchJob) {
                 eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
             }
             eprintln!(
-                "[fetch] 完成：命中游标 uid={}，解析 {} 封，入库 {added} 封",
-                outcome.max_uid,
-                outcome.mails.len()
+                "[fetch] 完成：命中游标 uid={}，入库 {added} 封（分批拉取）",
+                max_uid
             );
             finish(added as i64, String::new());
         }
