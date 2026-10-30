@@ -7,6 +7,19 @@ use crate::db::{open, settings};
 use crate::mail::{now_epoch, save_draft};
 
 #[test]
+fn first_fetch_days_parses_full_zero() {
+    // 回归：选"全部"（配置=0）曾因 .filter(|v| *v>0) 被吞成默认 7 天，只拉近一周。
+    // 0 是合法值 = 全部（UID SEARCH ALL），必须原样透传给 fetch。
+    assert_eq!(first_fetch_days_from_raw("0"), 0, "0=全部，不得被过滤");
+    assert_eq!(first_fetch_days_from_raw("7"), 7);
+    assert_eq!(first_fetch_days_from_raw("30"), 30);
+    assert_eq!(first_fetch_days_from_raw("90"), 90);
+    // 解析失败/未配置 → 兜底默认 30（与 defaults 一致）
+    assert_eq!(first_fetch_days_from_raw(""), 30);
+    assert_eq!(first_fetch_days_from_raw("abc"), 30);
+}
+
+#[test]
 fn fetch_watchdog_resets_hung_round() {
     let dir = temp_dir("wd");
     let state = AppState::open(&dir);

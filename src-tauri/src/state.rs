@@ -336,11 +336,7 @@ impl AppState {
                 return;
             }
         };
-        let first_days = g(keys::FIRST_FETCH_DAYS)
-            .parse::<i64>()
-            .ok()
-            .filter(|v| *v > 0)
-            .unwrap_or(7);
+        let first_days = first_fetch_days_from_raw(&g(keys::FIRST_FETCH_DAYS));
         let last = crate::mail::LastCursor {
             uidvalidity: g(keys::LAST_UIDVALIDITY).parse().unwrap_or(0),
             uid: g(keys::LAST_UID).parse().unwrap_or(0),
@@ -678,6 +674,15 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 首拉天数解析：0 = 全部（UID SEARCH ALL，合法值，不得作非法过滤）；
+/// >0 = SINCE 天数（7/30/90 等）；解析失败（未配置/非法）兜底默认 30（与 defaults 一致）。
+///
+/// 修复：旧实现 `.parse().ok().filter(|v| *v > 0).unwrap_or(7)` 把"全部"(=0)
+/// 误判为非法并回退到 7 天，导致用户在设置里选"全部"实际只拉近 7 天邮件。
+fn first_fetch_days_from_raw(raw: &str) -> i64 {
+    raw.parse::<i64>().unwrap_or(30)
 }
 
 /// 收件轮次任务参数（start_fetch 快照 → fetch_round 线程体）
