@@ -423,6 +423,12 @@ impl AppState {
             ));
             return;
         }
+        // 未配置静默忽略：启动 2s 首收跑在向导之前，此时账号为空，若不拦截
+        // 会以空账号写一条「凭据缺失」——用户完成向导后状态条立刻显示这条
+        // 假错误（真实凭据其实已存好），且要等下一个定时周期才被正常轮冲掉
+        if !self.configured() {
+            return;
+        }
         let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
         };

@@ -973,6 +973,9 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                 );
             }
         }
+        // 首拉立即触发：启动调度线程的 2s 首收跑在向导之前（未配置已被
+        // start_fetch 静默忽略），不等这一单，下次收信要等满一个定时周期
+        state.start_fetch();
         return Resp::hx_redirect("/welcome/done");
     }
     let tests = vec![test_view("发信通道", &smtp), test_view("收信通道", &imap)];

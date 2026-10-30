@@ -698,6 +698,24 @@ fn move_data_dir_rollback_spares_preexisting_files() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn start_fetch_skips_when_unconfigured() {
+    // 回归：启动 2s 首收跑在向导之前，未拦截时会以空账号写一条
+    // 「凭据缺失」假错误——用户完成首配后状态条立刻显示这条陈旧错误
+    let dir = temp_dir("fetch-unconfigured");
+    let state = AppState::open(&dir);
+    state.start_fetch();
+    let snap = state.fetch_snapshot();
+    assert!(!snap.running, "未配置不得开轮");
+    assert!(
+        snap.last_error.is_empty(),
+        "未配置不得写错误：{}",
+        snap.last_error
+    );
+    assert_eq!(snap.epoch, 0, "未配置不得推进代际");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 挂起轮达到上限：拒绝开新轮并说明原因（不再叠加线程/TcpStream/连接）
 #[test]
 fn fetch_refuses_new_round_at_hang_cap() {
