@@ -115,7 +115,16 @@ fn dispatch_success_transitions_to_sent() {
     // 发送参数快照：从 corpmail.toml 内存镜像生成（配置不落库）
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     assert_eq!(smtp.host, "smtp.test.cn");
-    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")));
+    let result = state.with_conn(|c| {
+        dispatch_one(
+            c,
+            &sender,
+            id,
+            &smtp,
+            &dir.join("attachments"),
+            &state.key_file(),
+        )
+    });
     assert_eq!(result.unwrap(), "sent");
     let (status, folder, sent_at, error): (String, String, Option<i64>, Option<String>) = state
         .with_conn(|c| {
@@ -154,7 +163,16 @@ fn dispatch_failure_marks_failed_with_reason() {
     let id = queued_email(&state, "peer@x.cn");
     let sender = FakeSender::failing("连接超时");
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
-    let result = state.with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")));
+    let result = state.with_conn(|c| {
+        dispatch_one(
+            c,
+            &sender,
+            id,
+            &smtp,
+            &dir.join("attachments"),
+            &state.key_file(),
+        )
+    });
     assert_eq!(result.unwrap(), "failed");
     let (status, error): (String, String) = state.with_conn(|c| {
         c.query_row(
@@ -182,14 +200,28 @@ fn dispatch_rejects_non_queued_and_blank_recipients() {
     let id = save_draft(&state, &draft("未排队", "体")).unwrap();
     assert!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")))
+            .with_conn(|c| dispatch_one(
+                c,
+                &sender,
+                id,
+                &smtp,
+                &dir.join("attachments"),
+                &state.key_file()
+            ))
             .is_err()
     );
     // 排队但收件人空白：转 failed（凭据存在仍先校验收件人）
     let blank_id = queued_email(&state, "   ");
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, blank_id, &smtp, &dir.join("attachments")))
+            .with_conn(|c| dispatch_one(
+                c,
+                &sender,
+                blank_id,
+                &smtp,
+                &dir.join("attachments"),
+                &state.key_file()
+            ))
             .unwrap(),
         "failed"
     );
@@ -208,13 +240,27 @@ fn dispatch_rejects_non_queued_and_blank_recipients() {
     let sender2 = FakeSender::ok();
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp, &dir.join("attachments")))
+            .with_conn(|c| dispatch_one(
+                c,
+                &sender2,
+                id2,
+                &smtp,
+                &dir.join("attachments"),
+                &state.key_file()
+            ))
             .unwrap(),
         "sent"
     );
     assert!(
         state
-            .with_conn(|c| dispatch_one(c, &sender2, id2, &smtp, &dir.join("attachments")))
+            .with_conn(|c| dispatch_one(
+                c,
+                &sender2,
+                id2,
+                &smtp,
+                &dir.join("attachments"),
+                &state.key_file()
+            ))
             .is_err(),
         "已发送邮件不可再派发"
     );
@@ -230,7 +276,14 @@ fn dispatch_reports_missing_credential() {
     let smtp = SmtpConfig::from_config(&state.config_snapshot());
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &dir.join("attachments")))
+            .with_conn(|c| dispatch_one(
+                c,
+                &sender,
+                id,
+                &smtp,
+                &dir.join("attachments"),
+                &state.key_file()
+            ))
             .unwrap(),
         "failed"
     );
@@ -304,7 +357,7 @@ fn attachments_travel_with_message() {
     let root = dir.join("attachments");
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root, &state.key_file()))
             .unwrap(),
         "sent"
     );
@@ -341,7 +394,7 @@ fn detached_attachment_blocks_send() {
     let root = dir.join("attachments");
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root, &state.key_file()))
             .unwrap(),
         "failed"
     );
@@ -381,7 +434,7 @@ fn oversized_attachments_block_send() {
     let root = dir.join("attachments");
     assert_eq!(
         state
-            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root))
+            .with_conn(|c| dispatch_one(c, &sender, id, &smtp, &root, &state.key_file()))
             .unwrap(),
         "failed"
     );

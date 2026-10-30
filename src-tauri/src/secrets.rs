@@ -2,8 +2,9 @@
 //!
 //! - **主路径** keyring 4：Windows Credential Manager（generic credential，
 //!   service="corpmail"，user=账号）/ macOS Keychain
-//! - **回退** keyring 写失败（权限/组策略）→ keyfile：128-bit 随机 key（0600）+ AES-256-GCM
-//!   加密落库（settings 表同名 `enc:<key>` 行），设置页提示降级状态
+//! - **回退** keyring 写失败（权限/组策略）→ keyfile：AES-256-GCM 加密落库
+//!   （settings 表 `enc:<account>` 行），密钥单独存**库外文件** `corpmail.key`
+//!   （锚点目录，0600），设置页提示降级状态
 //! - 密码仅运行时读入内存；UI 永不回显明文（输入框留空 = 不修改）
 
 use crate::db;
@@ -13,6 +14,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// keyring 的 service 名（Windows Credential Manager / macOS Keychain 通用）。
@@ -82,7 +84,14 @@ fn cache_drop(account: &str) {
 /// 存储密码：keychain 优先，写失败自动走 keyfile 回退。
 /// 返回是否发生降级（调用方据此在设置页提示）。成功后立即刷新缓存，
 /// 保证本进程后续读取拿到新密码而不是旧缓存。
-pub fn store(conn: &Connection, account: &str, password: &str) -> Result<bool, String> {
+///
+/// `key_file`：回退密钥文件路径（锚点目录）。只有走回退分支才会被创建。
+pub fn store(
+    conn: &Connection,
+    key_file: &Path,
+    account: &str,
+    password: &str,
+) -> Result<bool, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
     match entry.set_password(password) {
         Ok(()) => {
@@ -90,8 +99,8 @@ pub fn store(conn: &Connection, account: &str, password: &str) -> Result<bool, S
             Ok(false)
         }
         Err(_) => {
-            // 回退：keyfile + AES-256-GCM 落 settings 表（设计 §5.4）
-            keyfile_store(conn, account, password).map_err(|e| e.to_string())?;
+            // 回退：AES-256-GCM 落库，密钥在库外文件（设计 §5.4）
+            keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
             cache_put(account, GetResult::Keyfile(password.to_string()));
             Ok(true)
         }
@@ -101,16 +110,16 @@ pub fn store(conn: &Connection, account: &str, password: &str) -> Result<bool, S
 /// 读取密码：先查进程内缓存，未命中再试 keychain，keychain 不可用/无条目时
 /// 落到 keyfile 回退（平台后端异常与 NoEntry 同处处理——两者都只剩 keyfile 一条路）。
 /// Missing 不入缓存：用户可能随后在设置页补录，缓存空结果会让补录白做。
-pub fn retrieve(conn: &Connection, account: &str) -> GetResult {
+pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
     if let Some(hit) = cache_get(account) {
         return hit;
     }
     let out = match keyring::Entry::new(KEYRING_SERVICE, account) {
         Ok(entry) => match entry.get_password() {
             Ok(p) => GetResult::Keychain(p),
-            Err(_) => keyfile_retrieve(conn, account),
+            Err(_) => keyfile_retrieve(conn, key_file, account),
         },
-        Err(_) => keyfile_retrieve(conn, account),
+        Err(_) => keyfile_retrieve(conn, key_file, account),
     };
     if !matches!(out, GetResult::Missing) {
         cache_put(account, out.clone());
@@ -133,38 +142,143 @@ pub fn clear(conn: &Connection, account: &str) {
 /// 直接复用 retrieve：缓存命中时不再触碰 keychain（此前每次渲染设置页都调一次
 /// get_password，是 macOS 弹窗的第二个来源）。语义上要求 keyfile 记录**可解密**
 /// 才算降级——行存在但解不开属数据损坏，不该再报"密码已存本地"
-pub fn degraded(conn: &Connection, account: &str) -> bool {
-    matches!(retrieve(conn, account), GetResult::Keyfile(_))
+pub fn degraded(conn: &Connection, key_file: &Path, account: &str) -> bool {
+    matches!(retrieve(conn, key_file, account), GetResult::Keyfile(_))
 }
 
-// ---------- keyfile 回退实现（AES-256-GCM） ----------
+// ---------- keyfile 回退实现（AES-256-GCM + 库外密钥文件） ----------
 
-/// 取回退密钥：settings 表 `enc:keyfile` 存 base64(32 字节 AES-256 key)；
-/// 不存在则生成（OS 随机源），并以 base64 落库。
-/// 说明：设计称"128-bit 随机 key 文件 + AES-256-GCM"——keyfile 语义落在库内一行
-/// （桌面单用户场景与独立文件等效，且随库备份），AES 密钥本身 256-bit。
-fn keyfile_key(conn: &Connection) -> Result<[u8; 32], String> {
-    if let Some(b64) = db::settings::get(conn, "enc:keyfile").map_err(|e| e.to_string())? {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| e.to_string())?;
-        if raw.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&raw);
-            return Ok(key);
-        }
-        return Err("keyfile key 长度异常".into());
+/// 回退密钥文件名（位于锚点目录，即 corpmail.toml 同处）。
+///
+/// **必须与数据库分开存放**：历史实现把密钥写在 settings 表的 `enc:keyfile` 行，
+/// 与密文同库——拿到 corpmail.db 的人可直接解出全部密码，加密等同于明文。
+/// 分离后单靠库文件（备份、同步盘、误传）无法解密。锚点目录不随数据目录迁移，
+/// 因此数据目录放到外置盘/U 盘也不会把密钥一起带走。
+pub const KEY_FILE: &str = "corpmail.key";
+
+/// 历史版本存放密钥的 settings 行（迁移用，见 `keyfile_key`）
+const LEGACY_KEY_ROW: &str = "enc:keyfile";
+
+fn decode_key(text: &[u8]) -> Option<[u8; 32]> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    if raw.len() != 32 {
+        return None;
     }
-    // 生成新 key（熵来自 OS RNG）
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&raw);
+    Some(key)
+}
+
+/// 读取密钥文件：`Ok(None)` = 文件不存在；`Err` = 存在但不可用。
+///
+/// 必须区分这两种情况：文件损坏时若当作"不存在"去重新生成，会把唯一能解开
+/// 现有密文的密钥覆盖掉，等于静默销毁全部已存密码。
+fn read_key_file(path: &Path) -> Result<Option<[u8; 32]>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match decode_key(text.trim().as_bytes()) {
+            Some(key) => Ok(Some(key)),
+            None => Err(format!(
+                "回退密钥文件格式异常（{}），已拒绝覆盖以免现有密码永久不可解",
+                path.display()
+            )),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("读取回退密钥失败（{}）：{err}", path.display())),
+    }
+}
+
+/// 紧凑权限（unix 0600）：密钥文件只允许属主读写。
+/// Windows 侧依赖 %APPDATA% 目录的默认用户级 ACL，不做额外设置。
+#[cfg(unix)]
+fn harden_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn harden_perms(_path: &Path) {}
+
+/// 原子写密钥文件（0600）：先写同目录临时文件再 rename。
+/// 直接覆盖原文件时若进程中途被杀，会留下半截密钥——那等于现有密文永久不可解。
+fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| KEY_FILE.to_string());
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| format!("创建密钥文件失败（{}）：{e}", tmp.display()))?;
+        file.write_all(b64.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("写入密钥文件失败（{}）：{e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("落定密钥文件失败（{}）：{e}", path.display())
+    })?;
+    harden_perms(path);
+    Ok(())
+}
+
+/// 密钥文件创建锁。
+///
+/// 首次走回退路径时可能有两个调用方同时到达（UI 保存密码 + 收件线程读密码）：
+/// 各自生成一把 key 时，先写的密文会被后一次 rename 覆盖成另一把 key，
+/// 该密码从此解不开。锁只覆盖本地文件读写，不含任何用户交互，不会长等。
+fn key_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 取回退密钥。
+///
+/// 顺序：密钥文件 → 历史库内密钥（一次性迁出后删行）→ 生成新密钥（仅 `ensure`）。
+/// 迁移只在密钥落盘成功后才删库内行：写盘失败要保持库内副本，否则该机器上
+/// 所有已存密码会随一次磁盘异常一起消失。
+fn keyfile_key(conn: &Connection, key_file: &Path, ensure: bool) -> Result<[u8; 32], String> {
+    let _guard = key_lock().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(key) = read_key_file(key_file)? {
+        return Ok(key);
+    }
+    // 历史迁移：旧版本把密钥与密文放同一个库
+    if let Some(key) = db::settings::get(conn, LEGACY_KEY_ROW)
+        .map_err(|e| e.to_string())?
+        .and_then(|b64| decode_key(b64.trim().as_bytes()))
+    {
+        write_key_file(key_file, &key)?;
+        let _ = conn.execute("DELETE FROM settings WHERE k = ?1", [LEGACY_KEY_ROW]);
+        return Ok(key);
+    }
+    if !ensure {
+        return Err("回退密钥不存在".into());
+    }
+    // 生成新 key（熵来自 OS RNG）；**只写文件，绝不落库**
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
-    db::settings::set(conn, "enc:keyfile", &b64).map_err(|e| e.to_string())?;
+    write_key_file(key_file, &key)?;
     Ok(key)
 }
 
-fn keyfile_store(conn: &Connection, account: &str, password: &str) -> Result<(), String> {
-    let key = keyfile_key(conn)?;
+fn keyfile_store(
+    conn: &Connection,
+    key_file: &Path,
+    account: &str,
+    password: &str,
+) -> Result<(), String> {
+    let key = keyfile_key(conn, key_file, true)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     // nonce 96-bit（NIST 建议；同 key 下唯一即可）
     let mut nonce_bytes = [0u8; 12];
@@ -180,8 +294,8 @@ fn keyfile_store(conn: &Connection, account: &str, password: &str) -> Result<(),
     db::settings::set(conn, &format!("enc:{account}"), &b64).map_err(|e| e.to_string())
 }
 
-fn keyfile_retrieve(conn: &Connection, account: &str) -> GetResult {
-    let key = match keyfile_key(conn) {
+fn keyfile_retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
+    let key = match keyfile_key(conn, key_file, false) {
         Ok(k) => k,
         Err(_) => return GetResult::Missing,
     };

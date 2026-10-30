@@ -192,6 +192,7 @@ pub fn dispatch_one(
     id: i64,
     smtp: &SmtpConfig,
     attach_root: &std::path::Path,
+    key_file: &std::path::Path,
 ) -> Result<&'static str, String> {
     // CAS 抢占：重复派发同一封（双击/崩溃重放）时 0 行，天然幂等
     let n = conn
@@ -255,7 +256,7 @@ pub fn dispatch_one(
     // 发信参数：调用方快照（corpmail.toml）；密码仍走 conn（凭据与配置分离）
     // 先校验凭据再读附件：凭据缺失是常见失败，避免白读几十 MB 附件
     let from_addr = msg.from_addr.clone();
-    let password = match crate::secrets::retrieve(conn, &from_addr) {
+    let password = match crate::secrets::retrieve(conn, key_file, &from_addr) {
         crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
         crate::secrets::GetResult::Missing => {
             fail_or_log("凭据缺失，请在设置中重新保存密码");

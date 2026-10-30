@@ -59,6 +59,14 @@ scripts/dev-macos.sh             # 构建 → 重签 → 启动
 
 [隐私声明](PRIVACY.md)：数据仅存储于本机，网络传输仅发往您配置的 IMAP/SMTP 服务器。
 
+## 凭据存储
+
+邮箱密码优先存系统钥匙串（Windows 凭据管理器 / macOS 钥匙串）。钥匙串不可用时
+（权限受限、组策略禁用）降级为本地加密：密文存数据库 `settings` 表，**AES-256-GCM
+密钥单独存 `<应用配置目录>/corpmail.key`（权限 0600）**，与数据库分开放置。
+因此单独拿到 `corpmail.db`（备份、同步盘、误传）无法解出任何密码；密钥文件丢失
+则需重新输入一次密码。
+
 ## 代码签名
 
 本项目的 Windows 发布物由 SignPath Foundation 免费提供代码签名，详见 [代码签名政策](CODE_SIGNING.md)。

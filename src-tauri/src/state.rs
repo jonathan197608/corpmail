@@ -500,6 +500,8 @@ impl AppState {
         let config_arc = std::sync::Arc::clone(&self.config);
         // 附件根目录：worker 线程独立取路径（不持 AppState；附件随信发送时读盘解压）
         let attach_root = self.data_dir.join("attachments");
+        // 凭据回退密钥（锚点目录；库外文件，见 secrets::KEY_FILE）
+        let key_file = self.key_file();
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
         // 崩溃恢复 1/2：`sending` 是仅存在于进程内的中间态，跨进程无合法含义。
         // 进程在发送中被杀（关机/崩溃/强退）后该邮件会永久停在 sending：
@@ -537,6 +539,7 @@ impl AppState {
                         id,
                         &smtp,
                         &attach_root,
+                        &key_file,
                     )
                 }));
                 match outcome {
@@ -727,10 +730,18 @@ impl AppState {
         ])
     }
 
+    /// 回退密钥文件路径（锚点目录，与 corpmail.toml 同处）。
+    /// 放锚点而非数据目录：数据目录可被迁到外置盘/U 盘，密钥跟着走就失去
+    /// 「密钥与密文分离」的意义（审计：库内容易外流，备份/同步盘/误传）
+    pub fn key_file(&self) -> PathBuf {
+        self.anchor_dir.join(crate::secrets::KEY_FILE)
+    }
+
     /// 存密码（secrets 封装；返回是否发生 keyfile 降级）
     pub fn store_password(&self, account: &str, password: &str) -> Result<bool, String> {
+        let key_file = self.key_file();
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::store(&conn, account, password)
+        crate::secrets::store(&conn, &key_file, account, password)
     }
 
     /// 读密码（keychain 优先，keyfile 回退）。
@@ -739,8 +750,9 @@ impl AppState {
         if let Some(hit) = crate::secrets::cached(account) {
             return hit;
         }
+        let key_file = self.key_file();
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::retrieve(&conn, account)
+        crate::secrets::retrieve(&conn, &key_file, account)
     }
 
     /// 删除密码（账号变更迁移时用；两条路径都清，幂等）
@@ -751,8 +763,9 @@ impl AppState {
 
     /// keychain 是否处于 keyfile 降级态（设置·账号提示用）
     pub fn secrets_degraded(&self, account: &str) -> bool {
+        let key_file = self.key_file();
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::degraded(&conn, account)
+        crate::secrets::degraded(&conn, &key_file, account)
     }
 
     /// 待生效的数据目录（M5 迁移）：读 corpmail.toml 指针；
