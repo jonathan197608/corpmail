@@ -174,6 +174,35 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
 
+// ---------- 后台收取完成 → 整页自动刷新（看门狗，双通道兜底） ----------
+// 依赖链「htmx 轮询 → just_finished 消费 → HX-Refresh 头 → reload」中，
+// htmx 轮询元素靠响应自替换延续触发器，任一环节断裂（触发器未重建/请求未
+// 发出）都会让刷新永不发生。这里用两条独立通道兜底，服务端在消费 just_finished
+// 时同时下发 HX-Refresh 头与片段根节点 data-just-finished 标记：
+// 通道1 afterSwap：htmx 轮询响应换入的片段若带标记，立即整页刷新（不依赖响应头）；
+// 通道2 原生 fetch 每 10s 轮询：htmx 请求本身未发出时由此检测（fetch 对自定义
+//      协议可用——附件预览 mbxPreviewAttachment 已验证）
+document.body.addEventListener('htmx:afterSwap', () => {
+    const el = document.getElementById('fetch-status');
+    if (el && el.hasAttribute('data-just-finished')) location.reload();
+});
+
+(function fetchRefreshWatchdog() {
+    if (!document.getElementById('fetch-status')) return; // 欢迎/向导页无状态条，不启动
+    const TICK_MS = 10000;
+    setTimeout(async function poll() {
+        try {
+            const r = await fetch('/emails/fetch/status', { cache: 'no-store' });
+            const t = await r.text();
+            if (r.headers.get('HX-Refresh') === 'true' || t.includes('data-just-finished')) {
+                location.reload();
+                return; // 刷新后本轮看门狗终止，新页面重新启动
+            }
+        } catch (e) { /* 本地协议异常：下轮再试 */ }
+        setTimeout(poll, TICK_MS);
+    }, TICK_MS);
+})();
+
 // ---------- 设置页 tab 高亮（stab 自身不重渲染，点击时同步 .on） ----------
 document.addEventListener("click", function (e) {
     var stab = e.target.closest(".stab");

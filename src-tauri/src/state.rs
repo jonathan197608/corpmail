@@ -905,6 +905,33 @@ impl Drop for RoundGuard {
     }
 }
 
+/// 单轮收件自动尝试次数（首次 + 2 次重试）：大邮箱首拉的 IMAP 会话可能被
+/// 服务器/防火墙中途掐断（企业服务器常限制单连接时长或命令数），或遇瞬时
+/// 网络抖动。游标已按批持久化（断点续传），重试从 last.uid+1 增量续拉，
+/// 代价仅为重连；imap crate 无会话级读超时 API，挂死连接由看门狗兜底
+const FETCH_ATTEMPTS: usize = 3;
+
+/// 第 n 次失败后的重试等待（秒）：给服务器限流/网络抖动留恢复窗口
+fn fetch_retry_delay(attempt: u32) -> u64 {
+    15 * u64::from(attempt)
+}
+
+/// 从轮次专用连接读当前游标（重试前调用）：上一轮尝试的批次已持久化，
+/// 重读游标即可从断点续传，无需重拉已入库邮件（入库侧另有去重兜底）
+fn read_fetch_cursor(conn: &Connection) -> crate::mail::LastCursor {
+    let parse = |key: &str| -> u32 {
+        crate::db::settings::get(conn, key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    crate::mail::LastCursor {
+        uidvalidity: parse(keys::LAST_UIDVALIDITY),
+        uid: parse(keys::LAST_UID),
+    }
+}
+
 /// 收件轮次任务参数（start_fetch 快照 → fetch_round 线程体）
 struct FetchJob {
     fetch_state: std::sync::Arc<Mutex<FetchState>>,
@@ -998,19 +1025,38 @@ fn fetch_round(job: FetchJob) {
         finish(0, "本地数据库打开失败".into());
         return;
     };
-    // 网络探活（P1-5）：imap 无连接超时接口，先做一次有界 TCP 连接，
-    // 把"根本不可达"（内网设备丢包/DNS 错误/端口不通）的轮次在 10s 内结束。
-    // 探活成功不代表协议可用，后续握手仍由 imap 完成
-    if let Err(e) = crate::net::probe_tcp(&host, port) {
-        finish(0, format!("{e}；本轮已终止（服务器不可达）"));
-        return;
-    }
-    // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
-    // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
-    // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
+    // 自动重试（FETCH_ATTEMPTS）：大邮箱首拉的会话可能被服务器/防火墙中途
+    // 掐断，或遇瞬时网络抖动。游标已按批持久化，重试前重读游标即从断点续传；
+    // 看门狗已复位/新一轮已开始（epoch 失配）时不再重试——迟到结果会被
+    // finish 丢弃，重试只是空耗连接
     let mut added = 0usize;
-    let outcome: Result<(u32, u32), String> =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut outcome: Result<(u32, u32), String> = Err(String::new());
+    for attempt in 1..=FETCH_ATTEMPTS {
+        let last = if attempt == 1 {
+            last
+        } else {
+            read_fetch_cursor(&conn)
+        };
+        if attempt > 1 {
+            if let Err(prev) = &outcome {
+                eprintln!("[fetch] 自动重试 {attempt}/{FETCH_ATTEMPTS}（上次失败：{prev}）");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(fetch_retry_delay(
+                (attempt - 1) as u32,
+            )));
+        }
+        // 网络探活（P1-5）：imap 无连接超时接口，先做一次有界 TCP 连接，
+        // 把"根本不可达"（内网设备丢包/DNS 错误/端口不通）的尝试在 10s 内
+        // 结束。探活成功不代表协议可用，后续握手仍由 imap 完成。
+        // 探活失败与拉取失败同等对待：进重试循环，等退避后网络可能自愈
+        if let Err(e) = crate::net::probe_tcp(&host, port) {
+            outcome = Err(format!("{e}；服务器不可达"));
+            continue;
+        }
+        // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
+        // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
+        // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
+        outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // 分批拉取（M6）：每批解析后立即入库并推进进度，边拉边显示；
             // 入库与网络拉取同属关键路径，任一 panic 都必须复位状态。
             let mut on_batch = |mails: &[crate::mail::IncomingMail],
@@ -1037,6 +1083,11 @@ fn fetch_round(job: FetchJob) {
                 if s.epoch == epoch {
                     s.fetch_done = done;
                     s.fetch_total = total;
+                    // 进展即续命：大邮箱首拉远超看门狗 300s，有批间进展说明轮次
+                    // 健康存活，刷新看门狗起点——否则健康长轮被误杀（epoch+1），
+                    // 后续批次中止，用户表现为"只在失败（超时）时才刷新页面，
+                    // 部分更新从不触发"。真挂起轮无进展，仍会被正常复位
+                    s.started_at = crate::mail::now_epoch();
                 }
                 Ok(())
             };
@@ -1056,6 +1107,18 @@ fn fetch_round(job: FetchJob) {
             eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
             Err("收件内部异常终止，请重试收取".into())
         });
+        match outcome {
+            Ok(_) => break,
+            Err(ref e) => {
+                let aborted =
+                    fetch_state.lock().unwrap_or_else(|e| e.into_inner()).epoch != epoch;
+                if aborted {
+                    eprintln!("[fetch] 轮次已失效（看门狗复位/新一轮开始），停止重试：{e}");
+                    break;
+                }
+            }
+        }
+    }
     match outcome {
         Ok((uidvalidity, max_uid)) => {
             // 收尾游标（与每批持久化共用同一 DB 侧单调实现，C4）：

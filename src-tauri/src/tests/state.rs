@@ -744,3 +744,29 @@ fn notify_seen_delivers_when_channel_installed() {
     assert!(rx.try_recv().is_ok(), "装配后应立即收到唤醒");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 重试前重读游标：写游标后 read_fetch_cursor 应读回（断点续传依据）
+#[test]
+fn read_fetch_cursor_reads_persisted_values() {
+    let dir = temp_dir("read-cursor");
+    let state = AppState::open(&dir);
+    let mut conn = open(&state.data_dir.join("corpmail.db")).unwrap();
+    persist_fetch_cursor(&mut conn, 42, 1000, false).unwrap();
+    let cur = read_fetch_cursor(&conn);
+    assert_eq!((cur.uidvalidity, cur.uid), (42, 1000));
+    // 未写游标：全 0，不影响增量判断
+    let dir2 = temp_dir("read-cursor-empty");
+    let state2 = AppState::open(&dir2);
+    let conn2 = open(&state2.data_dir.join("corpmail.db")).unwrap();
+    let empty = read_fetch_cursor(&conn2);
+    assert_eq!((empty.uidvalidity, empty.uid), (0, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// 重试退避：15s 起线性增长（给服务器限流/网络抖动留恢复窗口）
+#[test]
+fn fetch_retry_delay_grows_linearly() {
+    assert_eq!(fetch_retry_delay(1), 15);
+    assert_eq!(fetch_retry_delay(2), 30);
+}

@@ -506,7 +506,7 @@ fn storage_move_returns_pane_with_pending_dir() {
         smtp_ok: true,
         imap_ok: true,
     };
-    // POST 迁移成功 → 回 pane 片段：待生效目录行 + 新路径
+    // POST 迁移成功 → 回 pane 片段：主数据目录行显示新路径 + 重启生效徽标
     let html = body(&route(
         &state,
         &assets(),
@@ -518,13 +518,20 @@ fn storage_move_returns_pane_with_pending_dir() {
         &tester,
     ));
     assert!(
-        html.contains("待生效目录"),
-        "成功后 pane 应显示待生效目录行：{html}"
+        html.contains("重启后生效"),
+        "成功后 pane 应在数据目录旁显示重启生效徽标：{html}"
     );
     // minijinja 按规范将 / 转义为 &#x2f;（浏览器解码后即原路径），断言按渲染原文比较
     let dest_escaped = dest.to_str().unwrap().replace('/', "&#x2f;");
-    assert!(html.contains(&dest_escaped), "待生效目录路径应展示：{html}");
-    assert!(html.contains("重启应用后启用"), "应提示重启生效：{html}");
+    assert!(
+        html.contains(&dest_escaped),
+        "配置的数据目录（待生效）路径应展示：{html}"
+    );
+    assert!(
+        html.contains("当前使用"),
+        "待生效时应注记仍在使用的旧目录：{html}"
+    );
+    assert!(html.contains("重启应用后切换"), "应提示重启切换：{html}");
     // 指针已写锚点库，启动解析定位新目录
     assert_eq!(
         AppState::resolve_start_dir(&dir),

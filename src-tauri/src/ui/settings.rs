@@ -49,7 +49,11 @@ pub(super) struct SettingsCtx {
     /// 收件同步 tab：收件进行中，重新拉取被拒绝（C5）
     refetch_busy: bool,
     // 存储管理 tab
+    /// 配置的数据目录：迁移待生效时显示新目录（与向导页一致），否则当前目录
     data_dir: String,
+    /// data_dir_pending 时展示：重启前实际仍在使用的旧目录
+    data_dir_current: String,
+    data_dir_pending: bool,
     inline_max: String,
     db_size: String,
     db_pct: u32,
@@ -196,7 +200,18 @@ pub(super) fn settings_ctx(
                 "尚未收取过邮件".into()
             }
         },
-        data_dir: state.data_dir.display().to_string(),
+        data_dir: {
+            // 目录显示同步（用户反馈：向导设置的目录与设置页不一致）：
+            // 迁移待生效时显示目标目录（用户在向导里选的那个），否则当前目录
+            let pending = state.pending_data_dir().unwrap_or_default();
+            if pending.is_empty() {
+                state.data_dir.display().to_string()
+            } else {
+                pending
+            }
+        },
+        data_dir_current: state.data_dir.display().to_string(),
+        data_dir_pending: state.pending_data_dir().is_some(),
         inline_max: g(keys::INLINE_ATTACH_MAX_MB),
         db_size: human_bytes(db_bytes),
         db_pct,

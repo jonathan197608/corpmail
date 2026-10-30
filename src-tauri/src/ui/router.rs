@@ -271,6 +271,10 @@ struct FetchStatusCtx {
     /// M6 分批进度：已入库 / 应拉总数（running 且 total>0 时展示）
     done: usize,
     total: usize,
+    /// 刚完成（片段根节点 data-just-finished 标记）：app.js 原生 fetch
+    /// 看门狗据此兜底整页刷新——htmx 轮询链的触发器依赖元素换出后重建，
+    /// 任一环节断裂即永不刷新；标记同时随 HX-Refresh 头下发，双通道任一生效
+    just_finished: bool,
 }
 
 #[derive(Serialize)]
@@ -534,6 +538,7 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
         },
         done: s.fetch_done,
         total: s.fetch_total,
+        just_finished: s.just_finished,
     };
     let mut resp = render_html("fetch_status.html", &ctx);
     if consume && s.just_finished {
@@ -838,7 +843,11 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         recv_port: g(keys::RECV_PORT),
         recv_security: g(keys::RECV_SECURITY),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
-        data_dir: state.data_dir.display().to_string(),
+        // 目录预填与设置·存储页同源：迁移待生效时显示目标目录，否则当前目录
+        //（用户反馈：向导设置的目录与设置页显示不一致）
+        data_dir: state
+            .pending_data_dir()
+            .unwrap_or_else(|| state.data_dir.display().to_string()),
         cred_note: cred_storage_note(),
     };
     render_html("setup.html", &ctx)
