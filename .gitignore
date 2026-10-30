@@ -30,3 +30,5 @@ store-assets/msix/out/
 # 本地环境
 *.local
 .env
+# 工作区记忆与本地任务数据（WorkBuddy 管理，非源码）
+.workbuddy/
