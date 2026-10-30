@@ -1,6 +1,10 @@
-{# 收件状态片段（全局浮条 #fetch-status 容器 outerHTML 自替换；M4 §6.2）#}
-<div id="fetch-status" class="fetch-status fetch-status-global"
-    {% if running %} hx-get="/emails/fetch/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+{# 收件状态片段（侧栏 #fetch-status 容器 outerHTML 自替换；M4 §6.2）。
+   轮询节奏：收取中 every 2s（进度反馈）；空闲 every 8s（本地请求零成本）——
+   空闲态若无轮询，后台定时收取完成时 just_finished 无人消费，
+   HX-Refresh 永不触发，前端表现为"后台收到新邮件但界面不更新" #}
+<div id="fetch-status" class="fetch-status fetch-status-side"
+    {% if running %} hx-get="/emails/fetch/status" hx-trigger="every 2s" hx-swap="outerHTML"
+    {% else %} hx-get="/emails/fetch/status" hx-trigger="every 8s" hx-swap="outerHTML"{% endif %}>
     {% if running %}
     ⏳ 正在收取新邮件…{% if total > 0 %}（{{ done }}/{{ total }}）{% endif %}
     {% else %}

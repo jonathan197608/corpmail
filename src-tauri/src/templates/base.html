@@ -59,10 +59,6 @@
             <div id="pm-body" class="pm-body"></div>
         </div>
     </div>
-
-    {# 全局收件状态浮条（M6）：任意页面可见；页面加载拉一次，收件中自动每 2s 轮询 #}
-    <div id="fetch-status" class="fetch-status fetch-status-global"
-         hx-get="/emails/fetch/status" hx-trigger="load" hx-swap="outerHTML"></div>
 </body>
 
 </html>

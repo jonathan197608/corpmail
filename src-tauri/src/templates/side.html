@@ -10,6 +10,10 @@
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>
     <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">📤 已发送 <span class="cnt">{{ frame.sent }}</span></a>
     <a class="folder {% if frame.folder == 'draft' %}on{% endif %}" href="/?folder=draft">📝 草稿 <span class="cnt">{{ frame.draft }}</span></a>
+    {# 收件状态条（原全局浮条移入侧栏；空闲态每 8s 低频轮询——否则后台定时收取
+       完成时 just_finished 无人消费，前端永不刷新；收取中每 2s） #}
+    <div id="fetch-status" class="fetch-status fetch-status-side"
+         hx-get="/emails/fetch/status" hx-trigger="load" hx-swap="outerHTML"></div>
     <div class="side-foot">
         <div class="account">
             <span class="avatar">{{ frame.avatar }}</span>

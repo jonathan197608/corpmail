@@ -236,6 +236,8 @@ struct SetupCtx {
     first_fetch_days: String,
     /// 数据保存目录（当前值，供输入框回显；留空=默认）
     data_dir: String,
+    /// 凭据保管说明（按编译平台自适应：Windows 凭据管理器 / macOS 钥匙串）
+    cred_note: String,
 }
 
 /// 首启向导·完成页
@@ -510,9 +512,9 @@ fn fetch_start(state: &AppState) -> Resp {
 /// 刚完成时消费标记并回 HX-Refresh 整页刷新（列表/计数全新）
 fn fetch_status(state: &AppState, consume: bool) -> Resp {
     if !state.configured() {
-        // 未配置：浮条留空（.fetch-status:empty 隐藏），避免欢迎页出现"没有新邮件"
+        // 未配置：状态条留空（.fetch-status:empty 隐藏），避免欢迎页出现"没有新邮件"
         return Resp::html(
-            r#"<div id="fetch-status" class="fetch-status fetch-status-global"></div>"#.into(),
+            r#"<div id="fetch-status" class="fetch-status fetch-status-side"></div>"#.into(),
         );
     }
     let s = state.fetch_snapshot();
@@ -837,8 +839,20 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         recv_security: g(keys::RECV_SECURITY),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
         data_dir: state.data_dir.display().to_string(),
+        cred_note: cred_storage_note(),
     };
     render_html("setup.html", &ctx)
+}
+
+/// 凭据保管文案（编译期平台自适应；模板不再写死两个平台名）
+fn cred_storage_note() -> String {
+    if cfg!(target_os = "macos") {
+        "🔒 密码保存进 macOS 钥匙串，服务器与邮件数据保存在本机数据库。".into()
+    } else if cfg!(target_os = "windows") {
+        "🔒 密码保存进 Windows 凭据管理器，服务器与邮件数据保存在本机数据库。".into()
+    } else {
+        "🔒 密码保存进系统凭据保管，服务器与邮件数据保存在本机数据库。".into()
+    }
 }
 
 fn wizard_done(state: &AppState) -> Resp {
