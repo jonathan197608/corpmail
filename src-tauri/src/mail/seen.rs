@@ -25,9 +25,11 @@ const MAX_UIDS_PER_ROUND: usize = 500;
 /// 失败重试上限（连续失败达到即清标志放弃，避免永久重试）
 pub const MAX_ATTEMPTS: u32 = 5;
 
-/// 第 n 次失败后的退避时长（60s 起翻倍，上限 10 分钟）
-pub fn backoff(n: u32) -> Duration {
-    let secs = 60u64.saturating_mul(1u64 << n.min(4));
+/// 第 attempt 次失败后的退避时长（60s 起翻倍，上限 10 分钟；attempt 从 1 计）。
+/// 旧实现 `60 << n` 首次失败即 120s，与「60s 起」的文档语义不符
+pub fn backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    let secs = 60u64.saturating_mul(1u64 << shift);
     Duration::from_secs(secs.min(600))
 }
 

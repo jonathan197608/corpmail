@@ -152,13 +152,17 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
         let mut failures = 0u32;
         loop {
-            // 阻塞等待唤醒（空闲零开销；channel 关闭说明状态已销毁，线程退出）
-            if rx.recv().is_err() {
-                return;
+            // failures == 0：阻塞等待唤醒（空闲零开销；channel 关闭说明状态已销毁），
+            // 醒来后合并窗口把连点合成一批；failures > 0：上一轮失败且退避已睡完，
+            // 直接重试（旧实现睡完回 recv 阻塞——退避被架空成"等用户再点一封"，
+            // 瞬时网络抖动后必须等用户下一次点击才补得上）
+            if failures == 0 {
+                if rx.recv().is_err() {
+                    return;
+                }
+                std::thread::sleep(mail::seen::MERGE_WINDOW);
+                while rx.try_recv().is_ok() {}
             }
-            // 合并窗口：窗口内的后续点击一并带走（连点 N 封 = 1 次登录）
-            std::thread::sleep(mail::seen::MERGE_WINDOW);
-            while rx.try_recv().is_ok() {}
             let state = worker_handle.state::<state::AppState>();
             match mail::seen::flush(&state, &mail::RealFetcher) {
                 Ok(n) => {

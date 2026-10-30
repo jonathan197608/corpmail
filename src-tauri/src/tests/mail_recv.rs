@@ -462,3 +462,17 @@ fn store_incoming_persists_too_large_flag() {
     assert!(!get(&state, normal_id).unwrap().too_large);
     cleanup(&dir);
 }
+
+/// 空信头占位（服务器对超限邮件未返回 HEADER / 返回空）：
+/// 主题必须有可见兜底文案而非空串（mailparse 对空输入返回 Ok 空头，不可依赖 Err 分支）
+#[test]
+fn placeholder_mail_empty_header_gets_subject_fallback() {
+    let m = placeholder_mail(7, 8, false, None, &[], 60 * 1024 * 1024, 50 * 1024 * 1024);
+    assert!(
+        !m.subject.trim().is_empty(),
+        "空信头占位主题不得为空串：{:?}",
+        m.subject
+    );
+    assert!(m.too_large);
+    assert!(m.body_text.contains("60.0 MB"));
+}

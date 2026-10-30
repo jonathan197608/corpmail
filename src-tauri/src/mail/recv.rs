@@ -345,6 +345,12 @@ impl RealFetcher {
         if uids.is_empty() {
             return Ok(());
         }
+        // 有界探活（同 fetch_round/conncheck）：imap 无连接超时，而 seen worker 是
+        // 进程级单线程——连接黑洞（内网丢包不回 RST）会令 worker 永久挂起，
+        // 此后所有已读回写停摆直到重启。探活把"不可达"限定在 10s 内交调用方退避
+        if let Err(e) = crate::net::probe_tcp(host, port) {
+            return Err(format!("{e}；本轮回写未执行"));
+        }
         let client = imap::ClientBuilder::new(host, port)
             .mode(mode.imap_mode())
             .connect()
@@ -509,7 +515,9 @@ fn placeholder_mail(
     size: u64,
     max_mail_bytes: u64,
 ) -> IncomingMail {
-    let fields = mailparse::parse_mail(header)
+    // 注意 parse_mail(空输入) 返回 Ok(空头)（mailparse parse_headers 对空数据直接
+    // break），因此"服务器未返回信头"走不到下面的 unwrap_or 分支——空主题在此兜底
+    let mut fields = mailparse::parse_mail(header)
         .map(|m| header_fields(&m))
         .unwrap_or(HeaderFields {
             subject: "（邮件头无法解析）".into(),
@@ -518,6 +526,9 @@ fn placeholder_mail(
             to_addrs: String::new(),
             message_id: String::new(),
         });
+    if fields.subject.is_empty() {
+        fields.subject = "（未获取到邮件主题）".into();
+    }
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let body_text = if size > 0 {
         format!(

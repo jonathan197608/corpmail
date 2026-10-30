@@ -243,11 +243,13 @@ fn abandon_clears_all_pending() {
     cleanup(&dir);
 }
 
-/// 退避：60s 起翻倍，上限 10 分钟
+/// 退避：第 1 次失败 60s 起，翻倍到上限 10 分钟
 #[test]
 fn backoff_grows_and_caps() {
-    assert_eq!(backoff(1).as_secs(), 120);
-    assert_eq!(backoff(2).as_secs(), 240);
+    assert_eq!(backoff(1).as_secs(), 60, "首次失败 60s 起");
+    assert_eq!(backoff(2).as_secs(), 120);
+    assert_eq!(backoff(3).as_secs(), 240);
+    assert_eq!(backoff(4).as_secs(), 480);
     assert_eq!(backoff(5).as_secs(), 600, "上限 10 分钟");
     assert_eq!(backoff(99).as_secs(), 600);
 }

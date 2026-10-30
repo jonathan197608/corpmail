@@ -20,8 +20,10 @@ pub struct OutgoingMessage {
     pub attachments: Vec<super::SendAttachment>,
 }
 
-/// 发送参数总大小上限（字节）。企业 SMTP 普遍限制 20–50MB，超出时 lettre 只在
-/// 传输阶段被服务器拒绝（耗时且错误文案不可读）；提前阻断并给出可操作提示。
+/// 发送参数总大小上限（字节，按 **base64 编码后** 的线上体积计——附件以 4/3 膨胀
+/// 传输，只按原始字节计会让 50MB 附件实际发出 ≈67MB，检查形同虚设）。企业 SMTP
+/// 普遍限制 20–50MB，超出时 lettre 只在传输阶段被服务器拒绝（耗时且错误文案
+/// 不可读）；提前阻断并给出可操作提示。
 const MAX_OUTGOING_ATTACH_BYTES: u64 = 50 * 1024 * 1024;
 
 /// SMTP 发送注入点（生产 lettre SMTPS；单测注入假实现，避免网络依赖——与 ConnTester 同模式）
@@ -271,10 +273,14 @@ pub fn dispatch_one(
     // 界面仍显示"已发送"，属静默丢用户数据，代价远高于一次明确失败
     match crate::mail::outgoing_attachments(conn, attach_root, id) {
         Ok(list) => {
-            let total: u64 = list.iter().map(|a| a.bytes.len() as u64).sum();
+            // 编码后体积：MIME 附件 base64 传输，4/3 膨胀 + 分隔符开销（后者忽略）
+            let total: u64 = list
+                .iter()
+                .map(|a| (a.bytes.len() as u64).div_ceil(3) * 4)
+                .sum();
             if total > MAX_OUTGOING_ATTACH_BYTES {
                 fail_or_log(&format!(
-                    "附件总大小 {:.1} MB 超过 {} MB 上限（企业邮箱普遍限制 20–50 MB），请精简后重发",
+                    "附件编码后总大小 {:.1} MB 超过 {} MB 上限（企业邮箱普遍限制 20–50 MB），请精简后重发",
                     total as f64 / (1024.0 * 1024.0),
                     MAX_OUTGOING_ATTACH_BYTES / (1024 * 1024)
                 ));
