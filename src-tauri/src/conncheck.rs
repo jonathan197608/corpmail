@@ -106,10 +106,7 @@ pub fn imap_test(
         {
             Ok(c) => c,
             Err(e) => {
-                return TestOutcome::fail(
-                    ms(),
-                    format!("连接失败：{e}{}", mode.hint(port)),
-                );
+                return TestOutcome::fail(ms(), format!("连接失败：{e}{}", mode.hint(port)));
             }
         };
         let mut sess = match client.login(&account, &password) {

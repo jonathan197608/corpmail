@@ -477,3 +477,45 @@ fn attachment_file_names_never_collide() {
     }
     cleanup(&dir);
 }
+
+#[test]
+fn copy_attachments_duplicates_files_and_skips_detached() {
+    let (state, dir) = temp_state("attach-copy");
+    let src = save_draft(&state, &draft("转发源", "原文")).unwrap();
+    let a = dir.join("a.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    let b = dir.join("b.bin");
+    std::fs::write(&b, b"bravo").unwrap();
+    add_attachments(
+        &state,
+        src,
+        &[a.to_str().unwrap().into(), b.to_str().unwrap().into()],
+    )
+    .unwrap();
+    // 模拟清理器已删除 b 的落盘文件：detached 应从复制中跳过而非整体失败
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE attachments SET detached = 1 WHERE filename = 'b.bin'",
+            [],
+        )
+        .unwrap()
+    });
+
+    let dst = save_draft(&state, &draft("转发目标", "新文")).unwrap();
+    let (copied, skipped) = copy_attachments(&state, src, dst).unwrap();
+    assert_eq!((copied, skipped), (1, 1), "可读附件复制、detached 跳过");
+
+    // 目标邮件独立成行：文件重新落盘，字节与源一致
+    let d = get(&state, dst).unwrap();
+    assert_eq!(d.attach_cnt, 1);
+    assert_eq!(d.attachments[0].filename, "a.txt");
+    let out = dir.join("copied.txt");
+    save_attachment_to(&state, d.attachments[0].id, out.to_str().unwrap()).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"alpha");
+
+    // 源邮件附件不受影响（复制而非移动）
+    assert_eq!(get(&state, src).unwrap().attach_cnt, 2);
+    assert_eq!(get(&state, src).unwrap().attachments[0].filename, "a.txt");
+
+    cleanup(&dir);
+}

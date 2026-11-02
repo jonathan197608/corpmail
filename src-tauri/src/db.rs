@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -72,6 +72,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
     match from {
         1 => tx.execute_batch(MIGRATIONS[0]),
         2 => migrate_v3(tx),
+        3 => migrate_v4(tx),
         _ => Ok(()),
     }
 }
@@ -103,6 +104,21 @@ fn migrate_v3(tx: &Connection) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_seen_pending ON emails(seen_pending)
          WHERE seen_pending = 1",
+    )
+}
+
+/// v3 → v4：联系人库（姓名 + 邮件地址），自动采集收/发件地址，
+/// 撰写页按姓名或地址模糊匹配。addr 主键 NOCASE：大小写不敏感去重。
+/// name 索引支持按姓名检索（LIKE 前缀/包含仍走扫描，但 8 条 LIMIT 下可接受）。
+fn migrate_v4(tx: &Connection) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS contacts (
+           addr       TEXT PRIMARY KEY COLLATE NOCASE,
+           name       TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0,
+           hits       INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);",
     )
 }
 

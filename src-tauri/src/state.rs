@@ -38,6 +38,9 @@ pub mod keys {
     pub const LAST_SYNC_AT: &str = "last_sync_at";
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
     pub const LAST_UID: &str = "last_uid";
+    /// 发件箱（服务器已发送）独立游标：UIDVALIDITY 按邮箱独立，不可与收件箱共用
+    pub const LAST_UIDVALIDITY_SENT: &str = "last_uidvalidity_sent";
+    pub const LAST_UID_SENT: &str = "last_uid_sent";
 
     /// 自定义数据目录指针（存独立配置文件 corpmail.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
@@ -124,6 +127,8 @@ pub struct FetchState {
     /// 本轮拉取进度（M6 分批入库）：已入库 / 应拉总数；正在首拉前为 0/0
     pub fetch_done: usize,
     pub fetch_total: usize,
+    /// 当前同步阶段（"sent"=发件箱 / "inbox"=收件箱 / 空=空闲）
+    pub phase: String,
 }
 
 /// 收件轮看门狗上限（秒）：imap 无网络超时，挂起轮超过此时长由轮询链复位，
@@ -160,8 +165,12 @@ impl AppState {
     pub fn try_open_with_anchor(data_dir: &Path, anchor_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir)
             .map_err(|e| format!("数据目录无法创建（{}）：{e}", data_dir.display()))?;
-        let conn = crate::db::open(&data_dir.join("corpmail.db"))
+        let mut conn = crate::db::open(&data_dir.join("corpmail.db"))
             .map_err(|e| format!("数据库无法打开（{}）：{e}", data_dir.display()))?;
+        // 联系人库一次性回填（v4 升级/首启）：contacts 非空即跳过，失败不阻断启动
+        if let Err(err) = crate::mail::contacts::backfill(&mut conn) {
+            eprintln!("[contacts] 历史邮件回填失败（忽略）：{err}");
+        }
         Ok(Self {
             db: Mutex::new(conn),
             data_dir: data_dir.to_path_buf(),
@@ -178,6 +187,7 @@ impl AppState {
                 started_at: 0,
                 fetch_done: 0,
                 fetch_total: 0,
+                phase: String::new(),
             })),
             active_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -453,6 +463,10 @@ impl AppState {
             uidvalidity: g(keys::LAST_UIDVALIDITY).parse().unwrap_or(0),
             uid: g(keys::LAST_UID).parse().unwrap_or(0),
         };
+        let last_sent = crate::mail::LastCursor {
+            uidvalidity: g(keys::LAST_UIDVALIDITY_SENT).parse().unwrap_or(0),
+            uid: g(keys::LAST_UID_SENT).parse().unwrap_or(0),
+        };
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
         let active_rounds = std::sync::Arc::clone(&self.active_rounds);
         let db_path = self.data_dir.join("corpmail.db");
@@ -473,6 +487,7 @@ impl AppState {
                 password,
                 first_days,
                 last,
+                last_sent,
                 epoch,
             });
         });
@@ -502,6 +517,7 @@ impl AppState {
         s.last_error.clear();
         s.fetch_done = 0;
         s.fetch_total = 0;
+        s.phase.clear();
         Some(s.epoch)
     }
 
@@ -924,7 +940,7 @@ fn fetch_retry_delay(attempt: u32) -> u64 {
 
 /// 从轮次专用连接读当前游标（重试前调用）：上一轮尝试的批次已持久化，
 /// 重读游标即可从断点续传，无需重拉已入库邮件（入库侧另有去重兜底）
-fn read_fetch_cursor(conn: &Connection) -> crate::mail::LastCursor {
+fn read_fetch_cursor(conn: &Connection, uv_key: &str, uid_key: &str) -> crate::mail::LastCursor {
     let parse = |key: &str| -> u32 {
         crate::db::settings::get(conn, key)
             .ok()
@@ -933,8 +949,16 @@ fn read_fetch_cursor(conn: &Connection) -> crate::mail::LastCursor {
             .unwrap_or(0)
     };
     crate::mail::LastCursor {
-        uidvalidity: parse(keys::LAST_UIDVALIDITY),
-        uid: parse(keys::LAST_UID),
+        uidvalidity: parse(uv_key),
+        uid: parse(uid_key),
+    }
+}
+
+/// 同步目标 → 游标键对（收件箱沿用历史键，发件箱独立键）
+fn cursor_keys(dest: crate::mail::MailDest) -> (&'static str, &'static str) {
+    match dest {
+        crate::mail::MailDest::Inbox => (keys::LAST_UIDVALIDITY, keys::LAST_UID),
+        crate::mail::MailDest::Sent => (keys::LAST_UIDVALIDITY_SENT, keys::LAST_UID_SENT),
     }
 }
 
@@ -953,6 +977,8 @@ struct FetchJob {
     password: String,
     first_days: i64,
     last: crate::mail::LastCursor,
+    /// 发件箱游标（先于收件箱同步）
+    last_sent: crate::mail::LastCursor,
     /// 本轮代际（fetch_cas_begin 发放；finish 时的凭证）
     epoch: u64,
 }
@@ -967,6 +993,8 @@ struct FetchJob {
 /// 是断点不漏信的根基。
 fn persist_fetch_cursor(
     conn: &mut Connection,
+    uv_key: &str,
+    uid_key: &str,
     uidvalidity: u32,
     uid: u32,
     sync_at: bool,
@@ -974,18 +1002,18 @@ fn persist_fetch_cursor(
     let tx = conn
         .transaction()
         .map_err(|e| format!("游标事务开启失败：{e}"))?;
-    let cur_uv: u32 = crate::db::settings::get(&tx, keys::LAST_UIDVALIDITY)
+    let cur_uv: u32 = crate::db::settings::get(&tx, uv_key)
         .map_err(|e| format!("uidvalidity 读取失败：{e}"))?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let cur_uid: u32 = crate::db::settings::get(&tx, keys::LAST_UID)
+    let cur_uid: u32 = crate::db::settings::get(&tx, uid_key)
         .map_err(|e| format!("uid 读取失败：{e}"))?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    crate::db::settings::set(&tx, keys::LAST_UIDVALIDITY, &uidvalidity.to_string())
+    crate::db::settings::set(&tx, uv_key, &uidvalidity.to_string())
         .map_err(|e| format!("uidvalidity 写入失败：{e}"))?;
     if uid > 0 && (uidvalidity != cur_uv || uid > cur_uid) {
-        crate::db::settings::set(&tx, keys::LAST_UID, &uid.to_string())
+        crate::db::settings::set(&tx, uid_key, &uid.to_string())
             .map_err(|e| format!("uid 写入失败：{e}"))?;
     }
     if sync_at {
@@ -997,6 +1025,98 @@ fn persist_fetch_cursor(
         .map_err(|e| format!("last_sync_at 写入失败：{e}"))?;
     }
     tx.commit().map_err(|e| format!("游标提交失败：{e}"))
+}
+
+/// 单阶段同步参数（收件箱/发件箱共用；避免两套 on_batch 闭包漂移）
+struct FetchPhase<'a> {
+    conn: &'a mut Connection,
+    data_dir: &'a Path,
+    fetch_state: &'a std::sync::Arc<Mutex<FetchState>>,
+    epoch: u64,
+    host: &'a str,
+    port: u16,
+    security: crate::net::TlsMode,
+    account: &'a str,
+    password: &'a str,
+    dest: crate::mail::MailDest,
+    first_days: i64,
+    last: crate::mail::LastCursor,
+    max_mail_bytes: u64,
+    added: &'a mut usize,
+}
+
+/// 单阶段同步：设阶段标记 → 分批拉取入库 → 每批持久化对应邮箱游标。
+/// 发件箱不存在时返回 Ok(None)（跳过，不影响收件箱）。
+fn fetch_phase(p: FetchPhase<'_>) -> Result<Option<(u32, u32)>, String> {
+    let FetchPhase {
+        conn,
+        data_dir,
+        fetch_state,
+        epoch,
+        host,
+        port,
+        security,
+        account,
+        password,
+        dest,
+        first_days,
+        last,
+        max_mail_bytes,
+        added,
+    } = p;
+    let (uv_key, uid_key) = cursor_keys(dest);
+    {
+        let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.epoch == epoch {
+            s.phase = match dest {
+                crate::mail::MailDest::Inbox => "inbox",
+                crate::mail::MailDest::Sent => "sent",
+            }
+            .to_string();
+            s.fetch_done = 0;
+            s.fetch_total = 0;
+            s.started_at = crate::mail::now_epoch();
+        }
+    }
+    // 分批拉取：每批解析后立即入库并推进进度/游标；任一 panic 由上层 catch_unwind 兜住
+    let mut on_batch = |mails: &[crate::mail::IncomingMail],
+                        done: usize,
+                        total: usize,
+                        uidvalidity: u32,
+                        batch_max: u32|
+     -> Result<(), String> {
+        // C4：看门狗已复位/新一轮已开始 → 立即终止本轮（Err 中断后续批次下载）
+        {
+            let s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.epoch != epoch {
+                return Err("收件轮已中止".into());
+            }
+        }
+        *added += crate::mail::store_incoming_conn(conn, data_dir, mails, dest)?;
+        // 断点续传：每批成功入库后立即持久化本邮箱游标（DB 侧单调）；
+        // 入库失败提前返回，游标不推进，靠去重兜底
+        persist_fetch_cursor(conn, uv_key, uid_key, uidvalidity, batch_max, false)?;
+        let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.epoch == epoch {
+            s.fetch_done = done;
+            s.fetch_total = total;
+            // 进展即续命：大邮箱首拉远超看门狗 300s，批间进展说明轮次健康存活
+            s.started_at = crate::mail::now_epoch();
+        }
+        Ok(())
+    };
+    crate::mail::RealFetcher.fetch_batched(
+        host,
+        port,
+        security,
+        account,
+        password,
+        dest,
+        first_days,
+        last,
+        max_mail_bytes,
+        &mut on_batch,
+    )
 }
 
 fn fetch_round(job: FetchJob) {
@@ -1012,6 +1132,7 @@ fn fetch_round(job: FetchJob) {
         password,
         first_days,
         last,
+        last_sent,
         epoch,
     } = job;
     // finish 携带轮次凭证：epoch 失配（看门狗已复位/新一轮已开始）则仅记日志不写状态，
@@ -1026,123 +1147,123 @@ fn fetch_round(job: FetchJob) {
         s.new_count = new_count;
         s.last_error = error;
         s.just_finished = true;
+        s.phase.clear();
     };
     let Ok(mut conn) = crate::db::open(&db_path) else {
         finish(0, "本地数据库打开失败".into());
         return;
     };
-    // 自动重试（FETCH_ATTEMPTS）：大邮箱首拉的会话可能被服务器/防火墙中途
-    // 掐断，或遇瞬时网络抖动。游标已按批持久化，重试前重读游标即从断点续传；
-    // 看门狗已复位/新一轮已开始（epoch 失配）时不再重试——迟到结果会被
-    // finish 丢弃，重试只是空耗连接
     let mut added = 0usize;
-    let mut outcome: Result<(u32, u32), String> = Err(String::new());
+    let mut last_err = String::new();
+    let mut done = false;
     for attempt in 1..=FETCH_ATTEMPTS {
-        let last = if attempt == 1 {
-            last
+        let (cur_sent, cur_inbox) = if attempt == 1 {
+            (last_sent, last)
         } else {
-            read_fetch_cursor(&conn)
+            (
+                read_fetch_cursor(&conn, keys::LAST_UIDVALIDITY_SENT, keys::LAST_UID_SENT),
+                read_fetch_cursor(&conn, keys::LAST_UIDVALIDITY, keys::LAST_UID),
+            )
         };
         if attempt > 1 {
-            if let Err(prev) = &outcome {
-                eprintln!("[fetch] 自动重试 {attempt}/{FETCH_ATTEMPTS}（上次失败：{prev}）");
-            }
+            eprintln!("[fetch] 自动重试 {attempt}/{FETCH_ATTEMPTS}（上次失败：{last_err}）");
             std::thread::sleep(std::time::Duration::from_secs(fetch_retry_delay(
                 (attempt - 1) as u32,
             )));
         }
-        // 网络探活（P1-5）：imap 无连接超时接口，先做一次有界 TCP 连接，
-        // 把"根本不可达"（内网设备丢包/DNS 错误/端口不通）的尝试在 10s 内
-        // 结束。探活成功不代表协议可用，后续握手仍由 imap 完成。
-        // 探活失败与拉取失败同等对待：进重试循环，等退避后网络可能自愈
+        // 网络探活：把"根本不可达"在 10s 内结束
         if let Err(e) = crate::net::probe_tcp(&host, port) {
-            outcome = Err(format!("{e}；服务器不可达"));
+            last_err = format!("{e}；服务器不可达");
             continue;
         }
-        // 收件主体 catch_unwind（M5 验收反馈）：imap 3.0.0-alpha 解析、入库等任何 panic
-        // 不得中断线程——否则 running 永久卡 true，手动收取按钮 CAS 永远被拒，
-        // 用户表现为"无法刷新"。捕获后状态复位并把错误透出给 UI。
-        outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // 分批拉取（M6）：每批解析后立即入库并推进进度，边拉边显示；
-            // 入库与网络拉取同属关键路径，任一 panic 都必须复位状态。
-            let mut on_batch = |mails: &[crate::mail::IncomingMail],
-                                done: usize,
-                                total: usize,
-                                uidvalidity: u32,
-                                batch_max: u32|
-             -> Result<(), String> {
-                // C4：看门狗已复位/新一轮已开始 → 立即终止本轮（Err 会中断
-                // fetch_batched 后续批次下载），防止旧轮维续写库与游标
-                {
-                    let s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
-                    if s.epoch != epoch {
-                        return Err("收件轮已中止".into());
-                    }
-                }
-                added += crate::mail::store_incoming_conn(&mut conn, &data_dir, mails)?;
-                // 需求2 断点续传：每批成功入库后立即持久化游标到本批最大 UID。
-                // 崩溃/退出后重启，last.uid 已推进，下一轮增量续拉，不重不漏；
-                // 本批入库失败会提前 ? 返回，游标不推进，靠去重兜底。
-                // C4：单调性以 DB 侧现值为准，防旧轮与新轮并发回退。
-                persist_fetch_cursor(&mut conn, uidvalidity, batch_max, false)?;
-                let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
-                if s.epoch == epoch {
-                    s.fetch_done = done;
-                    s.fetch_total = total;
-                    // 进展即续命：大邮箱首拉远超看门狗 300s，有批间进展说明轮次
-                    // 健康存活，刷新看门狗起点——否则健康长轮被误杀（epoch+1），
-                    // 后续批次中止，用户表现为"只在失败（超时）时才刷新页面，
-                    // 部分更新从不触发"。真挂起轮无进展，仍会被正常复位
-                    s.started_at = crate::mail::now_epoch();
-                }
-                Ok(())
-            };
-            crate::mail::RealFetcher.fetch_batched(
-                &host,
+        // 阶段一：发件箱先同步（失败不阻断收件箱——发件箱命名/权限差异不该拖垮收件）
+        let sent_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fetch_phase(FetchPhase {
+                conn: &mut conn,
+                data_dir: &data_dir,
+                fetch_state: &fetch_state,
+                epoch,
+                host: &host,
                 port,
                 security,
-                &account,
-                &password,
+                account: &account,
+                password: &password,
+                dest: crate::mail::MailDest::Sent,
                 first_days,
-                last,
+                last: cur_sent,
                 max_mail_bytes,
-                &mut on_batch,
-            )
+                added: &mut added,
+            })
         }))
         .unwrap_or_else(|_| {
-            eprintln!("[fetch] 收件线程 panic（已捕获，状态复位）");
-            Err("收件内部异常终止，请重试收取".into())
+            eprintln!("[fetch] 发件箱同步 panic（已捕获）");
+            Err("发件箱同步内部异常".into())
         });
-        match outcome {
-            Ok(_) => break,
-            Err(ref e) => {
-                let aborted =
-                    fetch_state.lock().unwrap_or_else(|e| e.into_inner()).epoch != epoch;
-                if aborted {
-                    eprintln!("[fetch] 轮次已失效（看门狗复位/新一轮开始），停止重试：{e}");
-                    break;
-                }
+        let sent_err = match &sent_outcome {
+            Ok(_) => String::new(),
+            Err(e) => {
+                eprintln!("[fetch] 发件箱同步失败（继续收件箱）：{e}");
+                e.clone()
             }
+        };
+        // 阶段二：收件箱
+        let inbox_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fetch_phase(FetchPhase {
+                conn: &mut conn,
+                data_dir: &data_dir,
+                fetch_state: &fetch_state,
+                epoch,
+                host: &host,
+                port,
+                security,
+                account: &account,
+                password: &password,
+                dest: crate::mail::MailDest::Inbox,
+                first_days,
+                last: cur_inbox,
+                max_mail_bytes,
+                added: &mut added,
+            })
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("[fetch] 收件箱同步 panic（已捕获）");
+            Err("收件箱同步内部异常".into())
+        });
+        match inbox_outcome {
+            Ok(Some((uidvalidity, max_uid))) => {
+                // 收尾游标（与每批持久化共用同一 DB 侧单调实现）：写 last_sync_at
+                if let Err(err) = persist_fetch_cursor(
+                    &mut conn,
+                    keys::LAST_UIDVALIDITY,
+                    keys::LAST_UID,
+                    uidvalidity,
+                    max_uid,
+                    true,
+                ) {
+                    eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
+                }
+                eprintln!("[fetch] 完成：入库 {added} 封（发件箱+收件箱）");
+                let msg = if sent_err.is_empty() {
+                    String::new()
+                } else {
+                    format!("收件完成，但发件箱同步失败：{sent_err}")
+                };
+                finish(added as i64, msg);
+                done = true;
+                break;
+            }
+            Ok(None) => last_err = "收件箱不可用".into(),
+            Err(e) => last_err = e,
+        }
+        let aborted = fetch_state.lock().unwrap_or_else(|e| e.into_inner()).epoch != epoch;
+        if aborted {
+            eprintln!("[fetch] 轮次已失效（看门狗复位/新一轮开始），停止重试：{last_err}");
+            break;
         }
     }
-    match outcome {
-        Ok((uidvalidity, max_uid)) => {
-            // 收尾游标（与每批持久化共用同一 DB 侧单调实现，C4）：
-            // max_uid 覆盖解析失败/去重跳过的邮件；并写 last_sync_at。
-            // 失败仅记日志——本轮邮件已入库，下轮重拉去重兜底。
-            if let Err(err) = persist_fetch_cursor(&mut conn, uidvalidity, max_uid, true) {
-                eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
-            }
-            eprintln!(
-                "[fetch] 完成：命中游标 uid={}，入库 {added} 封（分批持久化）",
-                max_uid
-            );
-            finish(added as i64, String::new());
-        }
-        Err(e) => {
-            eprintln!("[fetch] 失败：{e}");
-            finish(0, e);
-        }
+    if !done {
+        eprintln!("[fetch] 失败：{last_err}");
+        finish(0, last_err);
     }
 }
 

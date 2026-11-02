@@ -80,6 +80,7 @@
                 {% if email.direction == 'in' %}
                 <a class="btn primary" href="/compose?reply_to={{ email.id }}">✎ 回复</a>
                 {% endif %}
+                <a class="btn" href="/compose?forward_from={{ email.id }}">↗ 转发</a>
                 <button type="button" class="btn danger"
                         hx-post="/emails/{{ email.id }}/delete"
                         hx-trigger="click throttle:500ms"

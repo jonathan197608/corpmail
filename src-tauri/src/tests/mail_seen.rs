@@ -63,10 +63,13 @@ impl MailFetcher for FakeFetcher {
         uidvalidity: u32,
         uids: &[u32],
     ) -> Result<(), String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((host.into(), port, account.into(), uidvalidity, uids.to_vec()));
+        self.calls.lock().unwrap().push((
+            host.into(),
+            port,
+            account.into(),
+            uidvalidity,
+            uids.to_vec(),
+        ));
         match &self.fail {
             Some(msg) => Err(msg.clone()),
             None => Ok(()),
@@ -95,6 +98,7 @@ fn incoming(uidvalidity: u32, uid: u32) -> IncomingMail {
         subject: format!("来件 {uid}"),
         from_addr: "boss@x.cn".into(),
         from_name: "领导".into(),
+        cc_addrs: String::new(),
         to_addrs: "demo@chinatelecom.cn".into(),
         body_text: "正文".into(),
         body_kind: "plain".into(),
@@ -304,8 +308,7 @@ fn malformed_remote_uid_rows_are_cleared_not_stuck() {
                 [],
             )
         })
-        .unwrap()
-        ;
+        .unwrap();
     let mails = vec![incoming(42, 7)];
     store_incoming(&state, &mails).unwrap();
     let valid_id: i64 = state.with_conn(|conn| {
@@ -318,11 +321,7 @@ fn malformed_remote_uid_rows_are_cleared_not_stuck() {
 
     let fetcher = FakeFetcher::ok();
     assert_eq!(flush(&state, &fetcher).unwrap(), 1, "只有正常行计入回写");
-    assert_eq!(
-        fetcher.calls().len(),
-        1,
-        "畸形行不得产生网络调用"
-    );
+    assert_eq!(fetcher.calls().len(), 1, "畸形行不得产生网络调用");
     assert_eq!(fetcher.calls()[0].4, vec![7]);
     let stuck: i64 = state.with_conn(|conn| {
         conn.query_row(

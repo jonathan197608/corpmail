@@ -58,7 +58,9 @@ fn plan_runs(uids: &[u32], sizes: &HashMap<u32, u32>, max_mail_bytes: u64) -> Ve
     let mut run_over: Option<bool> = None;
     let mut run_bytes = 0u64;
     for &uid in uids {
-        let over = sizes.get(&uid).is_some_and(|&s| u64::from(s) > max_mail_bytes);
+        let over = sizes
+            .get(&uid)
+            .is_some_and(|&s| u64::from(s) > max_mail_bytes);
         let size = sizes.get(&uid).copied().map(u64::from).unwrap_or(0);
         let switch = run_over != Some(over);
         let full = match run_over {
@@ -111,6 +113,8 @@ pub struct IncomingMail {
     pub from_addr: String,
     pub from_name: String,
     pub to_addrs: String,
+    /// 抄送地址（逗号分隔纯地址；联系人采集用）
+    pub cc_addrs: String,
     pub body_text: String,
     pub body_kind: String,
     pub attachments: Vec<IncomingAttach>,
@@ -123,6 +127,13 @@ pub struct IncomingMail {
 pub struct LastCursor {
     pub uidvalidity: u32,
     pub uid: u32,
+}
+
+/// 同步目标邮箱：收件箱 / 已发送（发件箱先同步，见 fetch_round）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailDest {
+    Inbox,
+    Sent,
 }
 
 /// 一轮收件结果（游标推进依据 = 搜索层 max_uid，解析失败/入库去重不阻塞游标）
@@ -239,6 +250,45 @@ fn resolve_uids<T: std::io::Read + std::io::Write>(
     Ok(uids)
 }
 
+/// 发现服务器的「已发送」邮箱（发件箱同步目标）。
+///
+/// 本 imap 版本未导出 LIST 的特殊用途属性（\Sent），按常见命名启发式：
+/// 优先全名精确匹配（Sent/Sent Items/Sent Messages/Sent Mail/已发送/已发送邮件/发件箱），
+/// 其次名称包含 "sent"（ASCII）或 "已发送"/"发件"。找不到返回 None（跳过该阶段）。
+fn find_sent_mailbox<T: std::io::Read + std::io::Write>(
+    sess: &mut imap::Session<T>,
+) -> Option<String> {
+    const EXACT: &[&str] = &[
+        "sent",
+        "sent items",
+        "sent messages",
+        "sent mail",
+        "已发送",
+        "已发送邮件",
+        "发件箱",
+    ];
+    let names = sess.list(None, Some("*")).ok()?;
+    let mut best: Option<(u8, String)> = None;
+    for n in names.iter() {
+        let name = n.name().to_string();
+        if name.eq_ignore_ascii_case("INBOX") {
+            continue;
+        }
+        let lower = name.to_lowercase();
+        let score = if EXACT.iter().any(|c| lower == *c) {
+            0
+        } else if lower.contains("sent") || name.contains("已发送") || name.contains("发件") {
+            1
+        } else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(s, _)| score < *s) {
+            best = Some((score, name));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 /// IMAP 序列集合（"1,2,3"）：UID STORE/FETCH 的 set 参数
 fn uid_set(uids: &[u32]) -> String {
     uids.iter()
@@ -285,11 +335,12 @@ impl RealFetcher {
         mode: TlsMode,
         account: &str,
         password: &str,
+        dest: MailDest,
         first_days: i64,
         last: LastCursor,
         max_mail_bytes: u64,
         mut on_batch: impl FnMut(&[IncomingMail], usize, usize, u32, u32) -> Result<(), String>,
-    ) -> Result<(u32, u32), String> {
+    ) -> Result<Option<(u32, u32)>, String> {
         let client = imap::ClientBuilder::new(host, port)
             .mode(mode.imap_mode())
             .connect()
@@ -297,9 +348,22 @@ impl RealFetcher {
         let mut sess = client
             .login(account, password)
             .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        // 目标邮箱：收件箱固定 INBOX；发件箱按名称启发式发现（特殊用途属性
+        // 未在当前 imap 版本导出，按常见命名匹配；找不到则跳过该阶段，不影响收件箱）
+        let mailbox_name = match dest {
+            MailDest::Inbox => "INBOX".to_string(),
+            MailDest::Sent => match find_sent_mailbox(&mut sess) {
+                Some(name) => name,
+                None => {
+                    eprintln!("[fetch] 未发现服务器「已发送」邮箱，跳过发件箱同步");
+                    let _ = sess.logout();
+                    return Ok(None);
+                }
+            },
+        };
         let mailbox = sess
-            .select("INBOX")
-            .map_err(|e| format!("无法打开收件箱：{e}"))?;
+            .select(&mailbox_name)
+            .map_err(|e| format!("无法打开邮箱「{mailbox_name}」：{e}"))?;
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
         let uids = resolve_uids(&mut sess, first_days, last, uidvalidity)?;
         // 大小预检（审计批 0+2）：超过单封上限的只拉信头，避免整封 + 附件 + gzip
@@ -319,15 +383,13 @@ impl RealFetcher {
             } else {
                 "(FLAGS INTERNALDATE BODY.PEEK[])"
             };
-            let fetches = sess
-                .uid_fetch(uid_set(&run.uids), query)
-                .map_err(|e| {
-                    format!(
-                        "拉取邮件（{} 封，uid 自 {} 起）失败：{e}",
-                        run.uids.len(),
-                        run.uids[0]
-                    )
-                })?;
+            let fetches = sess.uid_fetch(uid_set(&run.uids), query).map_err(|e| {
+                format!(
+                    "拉取邮件（{} 封，uid 自 {} 起）失败：{e}",
+                    run.uids.len(),
+                    run.uids[0]
+                )
+            })?;
             // 响应顺序由服务器决定：建 uid 索引，仍沿 run 的升序遍历
             let fetched: HashMap<u32, &imap::types::Fetch> = fetches
                 .iter()
@@ -408,7 +470,7 @@ impl RealFetcher {
         }
         let max_uid = uids.iter().copied().max().unwrap_or(0);
         let _ = sess.logout();
-        Ok((uidvalidity, max_uid))
+        Ok(Some((uidvalidity, max_uid)))
     }
 
     /// 批量已读回写核心：单次连接 + 单次 SELECT，UID 每 SEEN_CHUNK 一批 STORE。
@@ -445,7 +507,9 @@ impl RealFetcher {
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
         if mailbox.uid_validity.unwrap_or(0) != uidvalidity {
             let _ = sess.logout();
-            return Err(format!("{ERR_UIDVALIDITY_CHANGED}，跳过回写（下次收件自动对齐）"));
+            return Err(format!(
+                "{ERR_UIDVALIDITY_CHANGED}，跳过回写（下次收件自动对齐）"
+            ));
         }
         for chunk in uids.chunks(SEEN_CHUNK) {
             sess.uid_store(uid_set(chunk), "+FLAGS (\\Seen)")
@@ -474,22 +538,25 @@ impl MailFetcher for RealFetcher {
         let mut mails: Vec<IncomingMail> = Vec::new();
         let mut last_uv = 0u32;
         let mut last_max = 0u32;
-        let (uidvalidity, max_uid) = self.fetch_batched(
-            host,
-            port,
-            mode,
-            account,
-            password,
-            first_days,
-            last,
-            max_mail_bytes,
-            |batch, _done, _total, uv, batch_max| {
-                mails.extend_from_slice(batch);
-                last_uv = uv;
-                last_max = last_max.max(batch_max);
-                Ok(())
-            },
-        )?;
+        let (uidvalidity, max_uid) = self
+            .fetch_batched(
+                host,
+                port,
+                mode,
+                account,
+                password,
+                MailDest::Inbox,
+                first_days,
+                last,
+                max_mail_bytes,
+                |batch, _done, _total, uv, batch_max| {
+                    mails.extend_from_slice(batch);
+                    last_uv = uv;
+                    last_max = last_max.max(batch_max);
+                    Ok(())
+                },
+            )?
+            .ok_or_else(|| "收件箱不可用".to_string())?;
         Ok(FetchOutcome {
             uidvalidity: if last_uv == 0 { uidvalidity } else { last_uv },
             max_uid: max_uid.max(last_max),
@@ -531,6 +598,7 @@ struct HeaderFields {
     from_addr: String,
     from_name: String,
     to_addrs: String,
+    cc_addrs: String,
     message_id: String,
 }
 
@@ -559,29 +627,35 @@ fn header_fields(part: &mailparse::ParsedMail) -> HeaderFields {
             })
         })
         .unwrap_or_default();
-    let to_addrs = headers
-        .get_first_header("To")
-        .and_then(|h| mailparse::addrparse_header(h).ok())
-        .map(|list| {
-            let mut out: Vec<String> = Vec::new();
-            for a in list.iter() {
-                match a {
-                    mailparse::MailAddr::Single(s) => out.push(s.addr.clone()),
-                    mailparse::MailAddr::Group(g) => {
-                        for s in &g.addrs {
-                            out.push(s.addr.clone());
+    // To/Cc：addrparse 展开组地址，取纯地址逗号拼接（联系人采集与展示共用）
+    let addr_list = |key: &str| -> String {
+        headers
+            .get_first_header(key)
+            .and_then(|h| mailparse::addrparse_header(h).ok())
+            .map(|list| {
+                let mut out: Vec<String> = Vec::new();
+                for a in list.iter() {
+                    match a {
+                        mailparse::MailAddr::Single(s) => out.push(s.addr.clone()),
+                        mailparse::MailAddr::Group(g) => {
+                            for s in &g.addrs {
+                                out.push(s.addr.clone());
+                            }
                         }
                     }
                 }
-            }
-            out.join(",")
-        })
-        .unwrap_or_default();
+                out.join(",")
+            })
+            .unwrap_or_default()
+    };
+    let to_addrs = addr_list("To");
+    let cc_addrs = addr_list("Cc");
     HeaderFields {
         subject: header_value("Subject"),
         from_addr,
         from_name,
         to_addrs,
+        cc_addrs,
         message_id: header_value("Message-Id"),
     }
 }
@@ -606,6 +680,7 @@ fn placeholder_mail(
             from_addr: String::new(),
             from_name: String::new(),
             to_addrs: String::new(),
+            cc_addrs: String::new(),
             message_id: String::new(),
         });
     if fields.subject.is_empty() {
@@ -636,6 +711,7 @@ fn placeholder_mail(
         from_addr: fields.from_addr,
         from_name: fields.from_name,
         to_addrs: fields.to_addrs,
+        cc_addrs: fields.cc_addrs,
         body_text,
         body_kind: "plain".into(),
         attachments: Vec::new(),
@@ -665,6 +741,7 @@ fn parse_incoming(
         from_addr: fields.from_addr,
         from_name: fields.from_name,
         to_addrs: fields.to_addrs,
+        cc_addrs: fields.cc_addrs,
         body_text,
         body_kind: body_kind.to_string(),
         attachments,
@@ -886,7 +963,7 @@ fn walk_attachments(mail: &mailparse::ParsedMail, out: &mut Vec<IncomingAttach>)
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize, String> {
     let data_dir = state.data_dir.clone();
-    state.with_conn(|conn| store_incoming_conn(conn, &data_dir, mails))
+    state.with_conn(|conn| store_incoming_conn(conn, &data_dir, mails, MailDest::Inbox))
 }
 
 /// 收件入库核心（独立连接版：收件线程使用，不依赖 AppState）。
@@ -896,18 +973,29 @@ pub fn store_incoming_conn(
     conn: &mut rusqlite::Connection,
     data_dir: &Path,
     mails: &[IncomingMail],
+    dest: MailDest,
 ) -> Result<usize, String> {
     let root = attach_root_of(data_dir);
     let limit = inline_limit_conn(conn);
     let mut added = 0usize;
+    // 分目标形态：收件箱（in/inbox/received/未读跟随 \Seen）；
+    // 发件箱（out/sent/sent，恒已读）。remote_uid 加 "sent:" 前缀——
+    // UIDVALIDITY 按邮箱独立，两箱的 v/u 可能相撞，前缀防唯一索引冲突。
+    let (direction, folder, status, unread_of, remote_prefix) = match dest {
+        MailDest::Inbox => ("in", "inbox", "received", None, ""),
+        MailDest::Sent => ("out", "sent", "sent", Some(false), "sent:"),
+    };
     for m in mails {
-        let remote = format!("{}:{}", m.uidvalidity, m.uid);
-        // 去重：remote_uid 唯一索引 + message_id 双保险（为空串时不按 message_id 去重）
+        let remote = format!("{remote_prefix}{}:{}", m.uidvalidity, m.uid);
+        // 去重：remote_uid 唯一索引 + message_id 双保险（空串不按 message_id 去重）。
+        // message_id 限定同方向：自己发给自己的信会同时出现在 Sent 与 Inbox，
+        // 跨方向去重会吞掉其中一份。
         let dup: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM emails WHERE remote_uid = ?1)
-                     OR (?2 <> '' AND EXISTS(SELECT 1 FROM emails WHERE message_id = ?2))",
-                rusqlite::params![remote, m.message_id],
+                     OR (?2 <> '' AND EXISTS(
+                           SELECT 1 FROM emails WHERE message_id = ?2 AND direction = ?3))",
+                rusqlite::params![remote, m.message_id, direction],
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -918,20 +1006,26 @@ pub fn store_incoming_conn(
         let bt = tokenize(&m.body_text);
         let now = now_epoch();
         let attach_bytes: i64 = m.attachments.iter().map(|a| a.data.len() as i64).sum();
-        let unread = !m.seen;
+        let unread = unread_of.unwrap_or(!m.seen);
+        let ts = m.internal_date.unwrap_or(now);
+        let (received_at, sent_at) = match dest {
+            MailDest::Inbox => (Some(ts), None),
+            MailDest::Sent => (None, Some(ts)),
+        };
 
         let tx = conn.transaction().map_err(e)?;
         tx.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
-                                subject, body_text, body_kind, subject_tokens, body_tokens,
-                                attach_cnt, attach_bytes, unread, remote_uid, message_id,
-                                created_at, received_at, too_large)
-             VALUES ('in', 'inbox', 'received', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                     ?11, ?12, ?13, ?14, ?15, ?16)",
+                                cc_addrs, subject, body_text, body_kind, subject_tokens,
+                                body_tokens, attach_cnt, attach_bytes, unread, remote_uid,
+                                message_id, created_at, received_at, sent_at, too_large)
+             VALUES (?17, ?18, ?19, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?20, ?21, ?22)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
                 m.to_addrs,
+                m.cc_addrs,
                 m.subject,
                 m.body_text,
                 m.body_kind,
@@ -943,7 +1037,12 @@ pub fn store_incoming_conn(
                 remote,
                 m.message_id,
                 now,
-                m.internal_date.unwrap_or(now),
+                ts,
+                direction,
+                folder,
+                status,
+                received_at,
+                sent_at,
                 m.too_large,
             ],
         )
@@ -969,6 +1068,17 @@ pub fn store_incoming_conn(
             }
             sync_attach_stats(&tx, id)
         })();
+        let stored = stored.and_then(|()| {
+            // 联系人采集（v4）：From（带姓名）+ To + Cc，与邮件行同事务落库
+            super::contacts::upsert_conn(&tx, &m.from_addr, &m.from_name, now).map_err(e)?;
+            for (addr, name) in super::contacts::parse_addr_list(&m.to_addrs) {
+                super::contacts::upsert_conn(&tx, &addr, &name, now).map_err(e)?;
+            }
+            for (addr, name) in super::contacts::parse_addr_list(&m.cc_addrs) {
+                super::contacts::upsert_conn(&tx, &addr, &name, now).map_err(e)?;
+            }
+            Ok(())
+        });
         match stored {
             Ok(()) => {
                 tx.commit().map_err(e)?;

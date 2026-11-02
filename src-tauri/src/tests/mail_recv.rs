@@ -82,6 +82,7 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
         subject: subject.into(),
         from_addr: "boss@x.cn".into(),
         from_name: "部门领导".into(),
+        cc_addrs: String::new(),
         to_addrs: "demo@chinatelecom.cn".into(),
         body_text: "请查收本月激励清单。".into(),
         body_kind: "plain".into(),
@@ -175,13 +176,7 @@ fn mark_seen_local_and_delegates_to_fetcher() {
             calls[0].3,
             calls[0].4.clone()
         ),
-        (
-            "imap.test.cn",
-            993,
-            "demo@chinatelecom.cn",
-            42,
-            vec![7u32]
-        ),
+        ("imap.test.cn", 993, "demo@chinatelecom.cn", 42, vec![7u32]),
         "回写参数应来自设置与 remote_uid"
     );
     // 已读后再次调用：本地无变化、不再回写
@@ -442,9 +437,11 @@ fn store_incoming_persists_too_large_flag() {
     m.body_text = "（该邮件约 120.0 MB，超过本地单封收件上限 50 MB…）".into();
     assert_eq!(store_incoming(&state, &[m]).unwrap(), 1);
     let id: i64 = state.with_conn(|c| {
-        c.query_row("SELECT id FROM emails WHERE remote_uid = '42:11'", [], |r| {
-            r.get(0)
-        })
+        c.query_row(
+            "SELECT id FROM emails WHERE remote_uid = '42:11'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap()
     });
     let d = get(&state, id).unwrap();
@@ -454,9 +451,11 @@ fn store_incoming_persists_too_large_flag() {
     let normal = incoming(12, false, "正常邮件", "<n-12@x.cn>");
     store_incoming(&state, &[normal]).unwrap();
     let normal_id: i64 = state.with_conn(|c| {
-        c.query_row("SELECT id FROM emails WHERE remote_uid = '42:12'", [], |r| {
-            r.get(0)
-        })
+        c.query_row(
+            "SELECT id FROM emails WHERE remote_uid = '42:12'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap()
     });
     assert!(!get(&state, normal_id).unwrap().too_large);
@@ -550,10 +549,7 @@ fn plan_runs_merges_same_class_and_preserves_order() {
     assert_eq!(runs[1].uids.len(), 50);
 
     // 升序不变量：任意混合输入，拼接全部 run 的 uids == 输入（无重排、无丢失）
-    let uids: Vec<u32> = [3, 9, 9, 1, 1, 1, 2, 5]
-        .iter()
-        .map(|&x| x + 10)
-        .collect();
+    let uids: Vec<u32> = [3, 9, 9, 1, 1, 1, 2, 5].iter().map(|&x| x + 10).collect();
     let mut sizes = HashMap::new();
     for (i, u) in uids.iter().enumerate() {
         if i % 3 == 0 {
@@ -563,4 +559,104 @@ fn plan_runs_merges_same_class_and_preserves_order() {
     let runs = plan_runs(&uids, &sizes, max);
     let flattened: Vec<u32> = runs.iter().flat_map(|r| r.uids.iter().copied()).collect();
     assert_eq!(flattened, uids, "run 划分必须保序保量");
+}
+
+#[test]
+fn store_incoming_sent_uses_out_folder_and_prefixed_remote_uid() {
+    let (state, dir) = temp_state("m4-sent");
+    // 发件箱与收件箱的 UIDVALIDITY 独立，v/u 可能完全相同：
+    // 前缀 + 独立 folder/status 保证两箱并存不冲突
+    let inbox = incoming(1, false, "收件甲", "<a@x.cn>");
+    let sent = IncomingMail {
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: "peer@x.cn".into(),
+        ..incoming(1, true, "发件甲", "<b@x.cn>")
+    };
+    let added = state.with_conn(|conn| {
+        let mut n = store_incoming_conn(conn, &state.data_dir, &[inbox], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir, &[sent], MailDest::Sent)?;
+        Ok::<usize, String>(n)
+    });
+    assert_eq!(added.unwrap(), 2, "同 v/u 的收件与发件应各自入库");
+    let rows: Vec<(String, String, String, String, bool, bool)> = state.with_conn(|c| {
+        c.prepare(
+            "SELECT remote_uid, direction, folder, status, unread = 1,
+                    sent_at IS NOT NULL AND received_at IS NULL
+             FROM emails ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    });
+    assert_eq!(rows[0].0, "42:1", "收件 remote_uid 不带前缀");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[0].2.as_str(), rows[0].3.as_str()),
+        ("in", "inbox", "received")
+    );
+    assert!(rows[0].4, "\\Seen 缺失应未读");
+    assert!(!rows[0].5, "收件只写 received_at");
+    assert_eq!(rows[1].0, "sent:42:1", "发件 remote_uid 必须带 sent: 前缀");
+    assert_eq!(
+        (rows[1].1.as_str(), rows[1].2.as_str(), rows[1].3.as_str()),
+        ("out", "sent", "sent")
+    );
+    assert!(!rows[1].4, "发件箱恒已读");
+    assert!(rows[1].5, "发件只写 sent_at");
+    cleanup(&dir);
+}
+
+#[test]
+fn store_incoming_dedupes_message_id_within_direction_only() {
+    let (state, dir) = temp_state("m4-sent-dedup");
+    // 自己发给自己：同一 message_id 会同时落在 Sent 与 Inbox，跨方向不得互吞
+    let msg = "<self@chinatelecom.cn>";
+    let inbox = IncomingMail {
+        from_addr: "demo@chinatelecom.cn".into(),
+        to_addrs: "demo@chinatelecom.cn".into(),
+        ..incoming(7, false, "自留副本", msg)
+    };
+    let sent = IncomingMail {
+        from_addr: "demo@chinatelecom.cn".into(),
+        to_addrs: "demo@chinatelecom.cn".into(),
+        ..incoming(7, true, "自留副本", msg)
+    };
+    let added = state.with_conn(|conn| {
+        let mut n = store_incoming_conn(conn, &state.data_dir, &[inbox], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir, &[sent], MailDest::Sent)?;
+        // 同方向重复：应被去重（收件箱靠消息 id / 发件箱靠前缀 remote_uid）
+        let again_in = IncomingMail {
+            uid: 8,
+            ..incoming(8, false, "自留副本", msg)
+        };
+        let again_sent = IncomingMail {
+            uid: 9,
+            ..incoming(9, true, "自留副本", msg)
+        };
+        n += store_incoming_conn(conn, &state.data_dir, &[again_in], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir, &[again_sent], MailDest::Sent)?;
+        Ok::<usize, String>(n)
+    });
+    assert_eq!(added.unwrap(), 2, "跨方向各存一份，同方向重复被去重");
+    let dirs: Vec<String> = state.with_conn(|c| {
+        c.prepare("SELECT direction FROM emails ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    });
+    assert_eq!(dirs, vec!["in".to_string(), "out".to_string()]);
+    cleanup(&dir);
 }

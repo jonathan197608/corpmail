@@ -439,10 +439,7 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
     };
     // 单封收件上限：空/非法保持现值；合法值钳制 1..=200 MB
     // （0 会让所有邮件都成占位，巨值则等于关掉保护——收件峰值内存不可控）
-    let max_mail = match form
-        .get("max_mail_mb")
-        .map(|v| v.trim().parse::<u32>())
-    {
+    let max_mail = match form.get("max_mail_mb").map(|v| v.trim().parse::<u32>()) {
         Some(Ok(v)) => v
             .clamp(state::MAX_MAIL_MB_MIN, state::MAX_MAIL_MB_MAX)
             .to_string(),

@@ -2373,6 +2373,26 @@ fn dump_smoke_html() {
         "compose-draft.html",
         get_url(&format!("/compose?draft_id={d2}")),
     );
+    // M6 转发素材：带附件提示的转发撰写页（种子第二封 attach_cnt=1）
+    dump(
+        "compose-forward.html",
+        get_url(&format!("/compose?forward_from={}", inbox_id + 1)),
+    );
+    // M6 状态条素材：发件箱同步阶段（data-running=true 供按钮禁用联调）
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = true;
+        s.phase = "sent".into();
+        s.started_at = mail::now_epoch();
+        s.fetch_done = 12;
+        s.fetch_total = 48;
+    }
+    dump("fetch-status-running.html", get("/emails/fetch/status"));
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = false;
+        s.phase.clear();
+    }
 
     // M3 发送状态素材：sending 轮询态 / failed 重发态 / sent 终态 + 已发送列表
     let sending_id = d2 + 2;
@@ -2629,7 +2649,10 @@ fn settings_account_saves_security_mode() {
         },
     );
     let html = body(&pages);
-    assert!(html.contains("name=\"smtp_security\""), "账号页应有加密方式选择");
+    assert!(
+        html.contains("name=\"smtp_security\""),
+        "账号页应有加密方式选择"
+    );
     assert!(html.contains("name=\"recv_security\""));
     assert!(html.contains("value=\"587\""));
 
@@ -2690,10 +2713,7 @@ fn settings_sync_saves_max_mail_mb_with_clamp() {
     };
     let d = defaults();
     save("80");
-    assert_eq!(
-        state.get_or(keys::MAX_MAIL_MB, &d).as_deref(),
-        Some("80")
-    );
+    assert_eq!(state.get_or(keys::MAX_MAIL_MB, &d).as_deref(), Some("80"));
     save("0");
     assert_eq!(
         state.get_or(keys::MAX_MAIL_MB, &d).as_deref(),
@@ -2717,5 +2737,279 @@ fn settings_sync_saves_max_mail_mb_with_clamp() {
         },
     );
     assert!(body(&pane).contains("name=\"max_mail_mb\""));
+    cleanup(&dir);
+}
+
+#[test]
+fn forward_prefills_headers_body_and_attachment_hint() {
+    let (state, dir) = temp_state("m6-forward");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    cc_addrs, subject, body_text, subject_tokens, body_tokens,
+                                    unread, created_at, received_at)
+                 VALUES ('in', 'inbox', 'received', 'boss@x.cn', '部门领导',
+                         'demo@chinatelecom.cn', 'cc1@x.cn', '季度激励清单',
+                         '请核对后回复。', '季度 激励 清单', '请 核对 后 回复', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    // 附件：用真实的附件入库路径，保证 attach_cnt 与模板提示一致
+    let f = dir.join("清单.xlsx");
+    std::fs::write(&f, b"xlsx").unwrap();
+    mail::add_attachments(&state, 1, &[f.to_str().unwrap().into()]).unwrap();
+
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "forward_from=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("转发邮件"), "应进入转发态标题");
+    assert!(html.contains("Fwd: 季度激励清单"), "主题应加 Fwd: 前缀");
+    assert!(
+        html.contains("---------- 转发的邮件 ----------"),
+        "正文应含转发头"
+    );
+    assert!(
+        html.contains("部门领导 &lt;boss@x.cn&gt;"),
+        "应保留原发件人显示名"
+    );
+    assert!(html.contains("抄送：cc1@x.cn"), "有抄送时应出现在转发头");
+    assert!(html.contains("请核对后回复。"), "应引用原文");
+    assert!(
+        html.contains("name=\"forward_from\" value=\"1\""),
+        "转发来源应写入隐藏域"
+    );
+    assert!(
+        html.contains("将携带原邮件 1 个附件"),
+        "应提示保存后携带附件：{html}"
+    );
+    // 详情页入口：转发按钮指向带来源 id 的撰写页
+    let detail = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        detail.contains("href=\"/compose?forward_from=1\""),
+        "详情页应有转发入口"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn forward_save_copies_attachments_only_on_first_save() {
+    let (state, dir) = temp_state("m6-forward-save");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in', 'inbox', 'received', 'boss@x.cn', '领导', 'demo@chinatelecom.cn',
+                         '带附件来件', '正文', '带 附件 来件', '正文', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    for name in ["a.txt", "b.txt"] {
+        let p = dir.join(name);
+        std::fs::write(&p, name.as_bytes()).unwrap();
+        mail::add_attachments(&state, 1, &[p.to_str().unwrap().into()]).unwrap();
+    }
+
+    // 首次保存：forward_from 触发附件复制
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("forward_from", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "Fwd: 带附件来件"),
+                ("body_text", "转给你"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/compose?draft_id=")),
+        "存草稿应跳转编辑页：{:?}",
+        resp.extra_headers
+    );
+    let draft_id: i64 = state.with_conn(|c| {
+        c.query_row("SELECT id FROM emails WHERE folder = 'draft'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    let d = mail::get(&state, draft_id).unwrap();
+    assert_eq!(d.attachments.len(), 2, "首次保存应复制原邮件全部附件");
+
+    // 二次保存（带 draft_id）：页面回显的 keep_ids 会列出已复制附件（真实前端行为），
+    // 服务端按 keep 保留、且不再复制源附件
+    let keep: Vec<i64> = d.attachments.iter().map(|a| a.id).collect();
+    let keep_json = serde_json::to_string(&keep).unwrap();
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("draft_id", &draft_id.to_string()),
+                ("forward_from", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "Fwd: 带附件来件"),
+                ("body_text", "转给你（改）"),
+                ("keep_ids", keep_json.as_str()),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let d = mail::get(&state, draft_id).unwrap();
+    assert_eq!(d.attachments.len(), 2, "重存不得重复复制附件");
+    cleanup(&dir);
+}
+
+#[test]
+fn contacts_suggest_returns_json_for_name_and_addr() {
+    let (state, dir) = temp_state("m6-contacts");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            mail::contacts::upsert_conn(c, "boss@x.cn", "部门领导", 100).unwrap();
+            mail::contacts::upsert_conn(c, "peer@x.cn", "李四", 90).unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts/suggest", "q=%E9%83%A8%E9%97%A8", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let json = body(&resp);
+    assert!(json.contains("\"boss@x.cn\""), "按姓名应命中地址：{json}");
+    assert!(json.contains("\"部门领导\""), "应返回姓名：{json}");
+    assert!(!json.contains("peer@x.cn"), "不相关联系人不应出现");
+
+    // 未配置：空数组（前端无需特判）
+    let (state2, dir2) = temp_state("m6-contacts-empty");
+    let json = body(&route(
+        &state2,
+        &assets(),
+        &req_q("GET", "/contacts/suggest", "q=a", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert_eq!(json.trim(), "[]");
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn fetch_status_marks_running_and_phase_for_button_disable() {
+    let (state, dir) = temp_state("m6-status");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 发件箱阶段：data-running=true + 阶段文案 + 2s 快轮询
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = true;
+        s.phase = "sent".into();
+        s.started_at = mail::now_epoch();
+        s.fetch_done = 3;
+        s.fetch_total = 10;
+    }
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/fetch/status", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("data-running=\"true\""),
+        "运行中应下发禁用标记：{html}"
+    );
+    assert!(html.contains("正在同步已发送"), "发件箱阶段文案");
+    assert!(html.contains("（3/10）"), "应展示进度");
+    assert!(html.contains("every 2s"), "运行中 2s 轮询");
+
+    // 收件箱阶段文案
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.phase = "inbox".into();
+    }
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/fetch/status", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("正在收取新邮件"), "收件箱阶段文案");
+
+    // 空闲：不再禁用，10s 轮询
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = false;
+        s.phase.clear();
+        s.last_error.clear();
+    }
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/fetch/status", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("data-running=\"false\""), "空闲应解除禁用");
+    assert!(html.contains("every 10s"), "空闲 10s 轮询");
     cleanup(&dir);
 }

@@ -174,34 +174,117 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
 
-// ---------- 后台收取完成 → 整页自动刷新（看门狗，双通道兜底） ----------
-// 依赖链「htmx 轮询 → just_finished 消费 → HX-Refresh 头 → reload」中，
-// htmx 轮询元素靠响应自替换延续触发器，任一环节断裂（触发器未重建/请求未
-// 发出）都会让刷新永不发生。这里用两条独立通道兜底，服务端在消费 just_finished
-// 时同时下发 HX-Refresh 头与片段根节点 data-just-finished 标记：
-// 通道1 afterSwap：htmx 轮询响应换入的片段若带标记，立即整页刷新（不依赖响应头）；
-// 通道2 原生 fetch 每 10s 轮询：htmx 请求本身未发出时由此检测（fetch 对自定义
-//      协议可用——附件预览 mbxPreviewAttachment 已验证）
-document.body.addEventListener('htmx:afterSwap', () => {
-    const el = document.getElementById('fetch-status');
-    if (el && el.hasAttribute('data-just-finished')) location.reload();
-});
+// ---------- 收取状态：按钮禁用 + 完成后整页刷新（单一通道） ----------
+// 更新逻辑（需求二.2 简化）：状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；
+// 后台收取结束时服务端下发一次 HX-Refresh 整页刷新。旧的 afterSwap 通道与
+// 原生 fetch 10s 看门狗已删除（三通道去重为一）。
+// data-running 标记由状态片段下发：收取中（含后台定时收取）禁用「收取新邮件」按钮。
+function mbxSyncFetchButton() {
+    const status = document.getElementById('fetch-status');
+    const btn = document.getElementById('fetch-btn');
+    if (!status || !btn) return;
+    btn.disabled = status.getAttribute('data-running') === 'true';
+}
+document.body.addEventListener('htmx:afterSwap', mbxSyncFetchButton);
+document.addEventListener('DOMContentLoaded', mbxSyncFetchButton);
 
-(function fetchRefreshWatchdog() {
-    if (!document.getElementById('fetch-status')) return; // 欢迎/向导页无状态条，不启动
-    const TICK_MS = 10000;
-    setTimeout(async function poll() {
-        try {
-            const r = await fetch('/emails/fetch/status', { cache: 'no-store' });
-            const t = await r.text();
-            if (r.headers.get('HX-Refresh') === 'true' || t.includes('data-just-finished')) {
-                location.reload();
-                return; // 刷新后本轮看门狗终止，新页面重新启动
-            }
-        } catch (e) { /* 本地协议异常：下轮再试 */ }
-        setTimeout(poll, TICK_MS);
-    }, TICK_MS);
-})();
+// ---------- 撰写页：收件人/抄送联系人建议（模糊匹配姓名或地址） ----------
+function mbxContactToken(inp) {
+    const v = inp.value;
+    const idx = Math.max(v.lastIndexOf(','), v.lastIndexOf(';'));
+    return v.slice(idx + 1);
+}
+
+function mbxInitContacts() {
+    document.querySelectorAll('input[name="to_addrs"], input[name="cc_addrs"]').forEach(inp => {
+        if (inp.dataset.mbxContacts === '1') return;
+        inp.dataset.mbxContacts = '1';
+        inp.setAttribute('autocomplete', 'off');
+        const host = inp.parentElement;
+        if (host) host.style.position = 'relative';
+        const box = document.createElement('div');
+        box.className = 'contacts-pop';
+        box.hidden = true;
+        (host || document.body).appendChild(box);
+        const state = { box, items: [], active: -1, timer: 0 };
+
+        inp.addEventListener('input', () => {
+            clearTimeout(state.timer);
+            state.timer = setTimeout(() => mbxContactQuery(inp, state), 200);
+        });
+        inp.addEventListener('keydown', ev => mbxContactKey(inp, state, ev));
+        inp.addEventListener('blur', () => setTimeout(() => { box.hidden = true; }, 150));
+        inp.addEventListener('focus', () => { if (state.items.length) box.hidden = false; });
+    });
+}
+
+async function mbxContactQuery(inp, state) {
+    const q = mbxContactToken(inp).trim();
+    if (!q) { state.box.hidden = true; state.items = []; return; }
+    try {
+        const r = await fetch('/contacts/suggest?q=' + encodeURIComponent(q), { cache: 'no-store' });
+        if (!r.ok) return;
+        state.items = await r.json();
+        // 默认高亮首项：输入姓名后直接回车即可选中（无需先按 ↓），
+        // 与「快速输入收件人」的目标一致；Esc/Ctrl 不影响输入
+        state.active = state.items.length ? 0 : -1;
+        if (!state.items.length) { state.box.hidden = true; return; }
+        state.box.innerHTML = state.items.map((c, i) => {
+            const name = c.name || c.addr;
+            const addr = c.name ? `<span class="ci-addr">${escapeHtml(c.addr)}</span>` : '';
+            return `<div class="contacts-item" data-i="${i}"><span class="ci-name">${escapeHtml(name)}</span>${addr}</div>`;
+        }).join('');
+        state.box.querySelectorAll('.contacts-item').forEach(el => {
+            el.addEventListener('mousedown', ev => {
+                ev.preventDefault();
+                mbxContactPick(inp, state, Number(el.dataset.i));
+            });
+        });
+        mbxContactMark(state);
+        state.box.hidden = false;
+    } catch (e) {
+        // 建议失败不打扰输入
+    }
+}
+
+function mbxContactPick(inp, state, i) {
+    const c = state.items[i];
+    if (!c) return;
+    const v = inp.value;
+    const idx = Math.max(v.lastIndexOf(','), v.lastIndexOf(';'));
+    const head = idx >= 0 ? v.slice(0, idx + 1) : '';
+    const token = c.name ? `${c.name} <${c.addr}>` : c.addr;
+    inp.value = head + (head ? ' ' : '') + token + ', ';
+    state.box.hidden = true;
+    state.items = [];
+    inp.dispatchEvent(new Event('input'));
+    inp.focus();
+}
+
+function mbxContactKey(inp, state, ev) {
+    if (state.box.hidden || !state.items.length) return;
+    if (ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        state.active = (state.active + 1) % state.items.length;
+        mbxContactMark(state);
+    } else if (ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        state.active = (state.active - 1 + state.items.length) % state.items.length;
+        mbxContactMark(state);
+    } else if (ev.key === 'Enter') {
+        if (state.active >= 0) { ev.preventDefault(); mbxContactPick(inp, state, state.active); }
+    } else if (ev.key === 'Escape') {
+        state.box.hidden = true;
+    }
+}
+
+function mbxContactMark(state) {
+    state.box.querySelectorAll('.contacts-item').forEach((el, i) => {
+        el.classList.toggle('on', i === state.active);
+    });
+}
+
+document.addEventListener('DOMContentLoaded', mbxInitContacts);
 
 // ---------- 设置页 tab 高亮（stab 自身不重渲染，点击时同步 .on） ----------
 document.addEventListener("click", function (e) {

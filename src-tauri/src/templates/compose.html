@@ -5,17 +5,19 @@
     <main class="main">
         <div class="topbar">
             <a class="back" href="/?folder=draft">‹ 返回列表</a>
-            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to %}回复邮件{% else %}撰写新邮件{% endif %}</h1>
+            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to %}回复邮件{% elif forward_from %}转发邮件{% else %}撰写新邮件{% endif %}</h1>
         </div>
 
         <div class="card compose-card">
             {% if saved %}<div class="compose-note ok">✓ 草稿已保存</div>{% endif %}
             {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个 0 字节文件（未附加）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
+            {% if forward_attach_cnt > 0 %}<div class="compose-note">📎 将携带原邮件 {{ forward_attach_cnt }} 个附件（保存后生效）</div>{% endif %}
 
             <form hx-post="/compose/draft" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button[type=submit]">
                 <input type="hidden" name="draft_id" value="{{ draft_id }}">
                 <input type="hidden" name="in_reply_to" value="{{ in_reply_to }}">
+                <input type="hidden" name="forward_from" value="{{ forward_from }}">
                 <input type="hidden" name="keep_ids" id="keep-ids"
                        value="{{ keep_ids_json }}">
                 <input type="hidden" name="attach_paths" id="attach-paths" value="[]">

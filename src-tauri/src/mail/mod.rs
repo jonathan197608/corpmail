@@ -10,12 +10,14 @@
 //!
 //! 子模块：`send`（SMTP 发送队列状态机）、`recv`（IMAP 收件与 MIME 解析入库）。
 
+pub mod contacts;
 mod recv;
 pub(crate) mod seen;
 mod send;
 
 pub use recv::{
-    IncomingMail, LastCursor, MailFetcher, RealFetcher, seen_params_of, store_incoming_conn,
+    IncomingMail, LastCursor, MailDest, MailFetcher, RealFetcher, seen_params_of,
+    store_incoming_conn,
 };
 // 仅单测使用的入口：生产收件走 fetch_batched + store_incoming_conn（避免为测试放宽生产可见性）
 #[cfg(test)]
@@ -1063,6 +1065,107 @@ pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Resul
     let (_, bytes) =
         attachment_bytes(state, attach_id).ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
     std::fs::write(dest, &bytes).map_err(|err| format!("另存失败：{err}"))
+}
+
+/// 复制源邮件的全部附件到目标邮件（转发用；附件独立成行、独立文件，互不影响）。
+///
+/// 读取源附件（inline BLOB / 独立文件）→ 解压 → 按目标邮件的上限规则重新入库。
+/// 返回复制数量；源附件已 detached（文件被清理）则跳过该条（转发不因一个附件整体失败，
+/// 但调用方应提示用户核对）。detached 数量通过 Ok 返回值中的第二个元素给调用方。
+pub fn copy_attachments(
+    state: &AppState,
+    from_id: i64,
+    to_id: i64,
+) -> Result<(usize, usize), String> {
+    let root = attach_root(state);
+    let limit = inline_limit(state);
+    let month = month_dir_of(state, to_id);
+    // 源附件快照：文件名/类型/存储/路径/数据（本连接内取完即释放锁）
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+        bool,
+    );
+    let rows: Vec<Row> = state
+        .with_conn(|conn| {
+            crate::db::collect_rows(
+                conn,
+                "SELECT filename, COALESCE(mime,'application/octet-stream'), storage,
+                    file_path, data, detached = 1
+             FROM attachments WHERE email_id = ?1 ORDER BY id",
+                &[&from_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+        })
+        .map_err(e)?;
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    for (filename, mime, storage, file_path, data, detached) in rows {
+        let gz = if detached {
+            skipped += 1;
+            continue;
+        } else if storage == "inline" {
+            match data {
+                Some(d) => d,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            match std::fs::read(root.join(file_path.unwrap_or_default())) {
+                Ok(gz) => gz,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        };
+        let Some(bytes) = gunzip(&gz) else {
+            skipped += 1;
+            continue;
+        };
+        state.with_conn(|conn| -> Result<(), String> {
+            let tx = conn.transaction().map_err(e)?;
+            let mut written: Vec<PathBuf> = Vec::new();
+            let res = insert_attachment(
+                &AttachCtx {
+                    tx: &tx,
+                    root: &root,
+                    month: &month,
+                    email_id: to_id,
+                    limit,
+                },
+                &filename,
+                &mime,
+                &bytes,
+                &mut written,
+            );
+            if let Err(err) = res {
+                drop(tx);
+                for f in &written {
+                    let _ = std::fs::remove_file(f);
+                }
+                return Err(err);
+            }
+            sync_attach_stats(&tx, to_id)?;
+            tx.commit().map_err(e)
+        })?;
+        copied += 1;
+    }
+    Ok((copied, skipped))
 }
 
 /// 出站附件载荷（发送路径用：解压后的原始字节，交 lettre 编码为 multipart）

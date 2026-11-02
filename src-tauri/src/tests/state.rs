@@ -550,7 +550,9 @@ fn persist_fetch_cursor_advances_monotonically_and_resets_on_uidvalidity_change(
             .unwrap()
     };
     let push = |state: &AppState, uv: u32, uid: u32, sync: bool| {
-        state.with_conn(|conn| persist_fetch_cursor(conn, uv, uid, sync))
+        state.with_conn(|conn| {
+            persist_fetch_cursor(conn, keys::LAST_UIDVALIDITY, keys::LAST_UID, uv, uid, sync)
+        })
     };
 
     // 1) 首拉后首个批次：uidvalidity + uid 落库；sync=false 不写 last_sync_at
@@ -742,8 +744,14 @@ fn max_mail_bytes_clamps_to_reasonable_range() {
     assert_eq!(max_mail_bytes_from("50"), 50 * 1024 * 1024);
     assert_eq!(max_mail_bytes_from(""), 50 * 1024 * 1024, "缺省 50MB");
     assert_eq!(max_mail_bytes_from("abc"), 50 * 1024 * 1024, "非法值兜底");
-    assert_eq!(max_mail_bytes_from("0"), MAX_MAIL_MB_MIN as u64 * 1024 * 1024);
-    assert_eq!(max_mail_bytes_from("9999"), MAX_MAIL_MB_MAX as u64 * 1024 * 1024);
+    assert_eq!(
+        max_mail_bytes_from("0"),
+        MAX_MAIL_MB_MIN as u64 * 1024 * 1024
+    );
+    assert_eq!(
+        max_mail_bytes_from("9999"),
+        MAX_MAIL_MB_MAX as u64 * 1024 * 1024
+    );
     assert_eq!(max_mail_bytes_from(" 1 "), 1024 * 1024);
 }
 
@@ -769,14 +777,22 @@ fn read_fetch_cursor_reads_persisted_values() {
     let dir = temp_dir("read-cursor");
     let state = AppState::open(&dir);
     let mut conn = open(&state.data_dir.join("corpmail.db")).unwrap();
-    persist_fetch_cursor(&mut conn, 42, 1000, false).unwrap();
-    let cur = read_fetch_cursor(&conn);
+    persist_fetch_cursor(
+        &mut conn,
+        keys::LAST_UIDVALIDITY,
+        keys::LAST_UID,
+        42,
+        1000,
+        false,
+    )
+    .unwrap();
+    let cur = read_fetch_cursor(&conn, keys::LAST_UIDVALIDITY, keys::LAST_UID);
     assert_eq!((cur.uidvalidity, cur.uid), (42, 1000));
     // 未写游标：全 0，不影响增量判断
     let dir2 = temp_dir("read-cursor-empty");
     let state2 = AppState::open(&dir2);
     let conn2 = open(&state2.data_dir.join("corpmail.db")).unwrap();
-    let empty = read_fetch_cursor(&conn2);
+    let empty = read_fetch_cursor(&conn2, keys::LAST_UIDVALIDITY, keys::LAST_UID);
     assert_eq!((empty.uidvalidity, empty.uid), (0, 0));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);

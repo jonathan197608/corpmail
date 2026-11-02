@@ -122,6 +122,17 @@ impl Resp {
         }
     }
 
+    /// JSON 响应（联系人建议等前端 fetch 接口）
+    fn json(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json; charset=utf-8".into(),
+            cache_control: "no-store",
+            body: body.into_bytes(),
+            extra_headers: Vec::new(),
+        }
+    }
+
     /// htmx 整页跳转（htmx 读取 HX-Redirect 响应头后驱动 window.location）
     fn hx_redirect(url: &str) -> Self {
         let mut resp = Self::html(String::new());
@@ -218,6 +229,10 @@ struct ComposeCtx {
     error: String,
     /// 本次被跳过的 0 字节文件数（附件选择误选空文件时提示，不阻断整单保存）
     skipped: usize,
+    /// 转发来源邮件 id（0 = 非转发；首次保存时复制其附件到新草稿）
+    forward_from: i64,
+    /// 被转发邮件的附件数（页面提示"保存后携带"用）
+    forward_attach_cnt: i64,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -275,6 +290,8 @@ struct FetchStatusCtx {
     /// 看门狗据此兜底整页刷新——htmx 轮询链的触发器依赖元素换出后重建，
     /// 任一环节断裂即永不刷新；标记同时随 HX-Refresh 头下发，双通道任一生效
     just_finished: bool,
+    /// 当前同步阶段（sent=发件箱 / inbox=收件箱 / 空）
+    phase: String,
 }
 
 #[derive(Serialize)]
@@ -322,6 +339,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         }
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
+        ("GET", "/contacts/suggest") => Some(contacts_suggest(state, req)),
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
@@ -503,6 +521,23 @@ fn mark_read_and_sync_seen(state: &AppState, id: i64) {
     mail::mark_read(state, id);
 }
 
+/// 联系人建议（GET /contacts/suggest?q=）：撰写页收/抄送输入框模糊匹配。
+/// 返回 JSON 数组 [{name, addr}]，最多 8 条；未配置返回空数组。
+fn contacts_suggest(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return Resp::json("[]".into());
+    }
+    let q = req.query_param("q").unwrap_or_default();
+    let list = state
+        .with_conn(|conn| mail::contacts::suggest(conn, &q, 8))
+        .unwrap_or_default();
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|c| serde_json::json!({ "name": c.name, "addr": c.addr }))
+        .collect();
+    Resp::json(serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()))
+}
+
 /// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
 fn fetch_start(state: &AppState) -> Resp {
     if !state.configured() {
@@ -539,6 +574,7 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
         done: s.fetch_done,
         total: s.fetch_total,
         just_finished: s.just_finished,
+        phase: s.phase.clone(),
     };
     let mut resp = render_html("fetch_status.html", &ctx);
     if consume && s.just_finished {
@@ -574,6 +610,8 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         saved,
         error,
         skipped,
+        forward_from: 0,
+        forward_attach_cnt: 0,
     };
     if let Some(id) = req
         .query_param("draft_id")
@@ -610,6 +648,32 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             .collect::<Vec<_>>()
             .join("\n");
         ctx.body_text = format!("\n\n----- 原文 -----\n{quoted}\n");
+    } else if let Some(fid) = req
+        .query_param("forward_from")
+        .and_then(|v| v.parse::<i64>().ok())
+        && let Some(src) = mail::get(state, fid)
+    {
+        ctx.forward_from = fid;
+        ctx.forward_attach_cnt = src.attach_cnt;
+        ctx.subject = if src.subject.starts_with("Fwd:") {
+            src.subject.clone()
+        } else {
+            format!("Fwd: {}", src.subject)
+        };
+        let from_disp = if src.from_name.is_empty() {
+            src.from_addr.clone()
+        } else {
+            format!("{} <{}>", src.from_name, src.from_addr)
+        };
+        let cc_line = if src.cc_addrs.trim().is_empty() {
+            String::new()
+        } else {
+            format!("抄送：{}\n", src.cc_addrs)
+        };
+        ctx.body_text = format!(
+            "\n\n---------- 转发的邮件 ----------\n发件人：{from_disp}\n日期：{}\n收件人：{}\n{cc_line}主题：{}\n\n{}\n",
+            src.time_full, src.to_addrs, src.subject, src.body_text
+        );
     }
     render_html("compose.html", &ctx)
 }
@@ -656,9 +720,20 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, 
     };
     let keep_ids = form_json_i64s(&form, "keep_ids");
     let paths = form_json_strings(&form, "attach_paths");
+    let forward_from = form_i64(&form, "forward_from").unwrap_or(0);
     let id = mail::save_draft(state, &input).map_err(|e| (draft_id.unwrap_or(0), e))?;
+    // 顺序敏感：keep_ids 裁剪只针对本次保存前已存在的附件，必须排在转发复制之前。
+    // 否则首次保存转发时 keep_ids 为空，会把刚复制进来的附件全部删掉（附件永远带不过去）。
     mail::remove_attachments_except(state, id, &keep_ids)
         .map_err(|e| (id, format!("附件裁剪失败：{e}")))?;
+    // 转发：仅在首次保存（尚无 draft_id）时把原邮件附件复制到新草稿，
+    // 之后的重存由 keep_ids 机制保留（页面会带上已复制附件的 id），不会重复复制
+    if draft_id.is_none()
+        && forward_from > 0
+        && let Err(err) = mail::copy_attachments(state, forward_from, id)
+    {
+        return Err((id, format!("转发附件复制失败：{err}")));
+    }
     let mut skipped = 0usize;
     if !paths.is_empty() {
         let (_, skipped_names) = mail::add_attachments(state, id, &paths)
@@ -976,6 +1051,12 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         // 首拉立即触发：启动调度线程的 2s 首收跑在向导之前（未配置已被
         // start_fetch 静默忽略），不等这一单，下次收信要等满一个定时周期
         state.start_fetch();
+        // 首次同步：配置完成立即拉取（fetch_round 内部先发件箱、后收件箱）。
+        // 数据目录迁移已完成待重启时跳过——本轮会写入旧目录，重启后新库
+        // 由 sync_on_start 再拉一次，避免白拉
+        if state.pending_data_dir().is_none() {
+            state.start_fetch();
+        }
         return Resp::hx_redirect("/welcome/done");
     }
     let tests = vec![test_view("发信通道", &smtp), test_view("收信通道", &imap)];
@@ -1111,11 +1192,7 @@ fn port_or(form: &HashMap<String, String>, name: &str, fallback: u16) -> u16 {
 
 /// 加密方式字段：表单值优先（仅接受四个合法串），否则回落到已保存值。
 /// 返回规范化的配置串（auto|implicit|starttls|plain）
-pub(super) fn security_or(
-    form: &HashMap<String, String>,
-    state: &AppState,
-    key: &str,
-) -> String {
+pub(super) fn security_or(form: &HashMap<String, String>, state: &AppState, key: &str) -> String {
     let d = defaults();
     match form.get(key).map(|v| v.trim().to_ascii_lowercase()) {
         Some(v) if matches!(v.as_str(), "auto" | "implicit" | "starttls" | "plain") => v,

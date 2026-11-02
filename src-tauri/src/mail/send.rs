@@ -16,6 +16,8 @@ pub struct OutgoingMessage {
     pub cc_addrs: Vec<String>,
     pub subject: String,
     pub body_text: String,
+    /// 生成的 Message-ID 头（发送成功后回写本地已发送行，供发件箱同步去重）
+    pub message_id: String,
     /// 附件（原始字节；空 = 纯文本单段邮件）
     pub attachments: Vec<super::SendAttachment>,
 }
@@ -76,7 +78,9 @@ impl MailSender for RealSender {
         for c in &msg.cc_addrs {
             builder = builder.cc(build(c, "")?);
         }
-        let builder = builder.subject(msg.subject.clone());
+        let builder = builder
+            .message_id(Some(msg.message_id.clone()))
+            .subject(msg.subject.clone());
         // 正文 + 附件：无附件保持单段 text/plain（与历史行为逐字节一致）；
         // 有附件才升为 multipart/mixed，附件以原始文件名/类型逐段编码
         let message = if msg.attachments.is_empty() {
@@ -106,6 +110,21 @@ impl MailSender for RealSender {
             .map_err(|err| format!("发送失败：{err}{}", mode.hint(port)))
             .map(|_| ())
     }
+}
+
+/// 生成本封邮件的 Message-ID（<时间.纳秒@域名>）。
+/// 回写本地已发送行后，发件箱同步按 message_id 与服务端副本去重。
+fn new_message_id(from_addr: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let domain = from_addr
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim())
+        .filter(|d| !d.is_empty())
+        .unwrap_or("corpmail.local");
+    format!("<{}.{}@{}>", now_epoch(), nanos, domain)
 }
 
 /// 收件人/抄送串拆分（逗号或分号分隔，去空白）
@@ -229,15 +248,22 @@ pub fn dispatch_one(
          FROM emails WHERE id = ?1",
         [id],
         |r| {
-            Ok(OutgoingMessage {
-                from_addr: r.get(0)?,
-                from_name: r.get(1)?,
-                to_addrs: split_addrs(&r.get::<_, String>(2)?),
-                cc_addrs: split_addrs(&r.get::<_, String>(3)?),
-                subject: r.get(4)?,
-                body_text: r.get(5)?,
-                attachments: Vec::new(),
-            })
+            let to_raw: String = r.get(2)?;
+            let cc_raw: String = r.get(3)?;
+            Ok((
+                OutgoingMessage {
+                    from_addr: r.get(0)?,
+                    from_name: r.get(1)?,
+                    to_addrs: split_addrs(&to_raw),
+                    cc_addrs: split_addrs(&cc_raw),
+                    subject: r.get(4)?,
+                    body_text: r.get(5)?,
+                    message_id: String::new(),
+                    attachments: Vec::new(),
+                },
+                to_raw,
+                cc_raw,
+            ))
         },
     );
     // 读取失败（行被删/库异常）也必须把已抢占的 sending 落定：
@@ -248,13 +274,14 @@ pub fn dispatch_one(
             eprintln!("[send] 邮件 {id} 落定 failed 失败：{err}");
         }
     };
-    let mut msg = match row {
+    let (mut msg, to_raw, cc_raw) = match row {
         Ok(m) => m,
         Err(err) => {
             fail_or_log(&format!("读取待发邮件失败：{err}"));
             return Ok("failed");
         }
     };
+    msg.message_id = new_message_id(&msg.from_addr);
     if msg.to_addrs.is_empty() {
         fail_or_log("收件人为空");
         return Ok("failed");
@@ -293,6 +320,7 @@ pub fn dispatch_one(
             return Ok("failed");
         }
     }
+    let sent_message_id = msg.message_id.clone();
     match sender.send(
         &smtp.host,
         smtp.port,
@@ -304,6 +332,21 @@ pub fn dispatch_one(
         Ok(()) => {
             if let Err(err) = mark("sent", None) {
                 eprintln!("[send] 邮件 {id} 落定 sent 失败：{err}");
+            }
+            // 回写 Message-ID（发件箱同步按它与服务端副本去重）+ 联系人采集（To/Cc）
+            if let Err(err) = conn.execute(
+                "UPDATE emails SET message_id = ?2 WHERE id = ?1",
+                rusqlite::params![id, sent_message_id],
+            ) {
+                eprintln!("[send] 邮件 {id} 回写 Message-ID 失败：{err}");
+            }
+            let now = now_epoch();
+            for raw in [&to_raw, &cc_raw] {
+                for (addr, name) in super::contacts::parse_addr_list(raw) {
+                    if let Err(err) = super::contacts::upsert_conn(conn, &addr, &name, now) {
+                        eprintln!("[send] 联系人采集失败（{addr}）：{err}");
+                    }
+                }
             }
             Ok("sent")
         }

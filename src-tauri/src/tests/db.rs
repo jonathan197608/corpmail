@@ -128,7 +128,7 @@ fn migrate_v1_to_v2_adds_index_and_narrow_trigger() {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 3, "新库应一步建到当前版本");
+    assert_eq!(v, SCHEMA_VERSION, "新库应一步建到当前版本");
     let idx: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_attach_email'",
@@ -236,7 +236,7 @@ fn migrate_v2_to_v3_adds_receive_columns() {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 3);
+    assert_eq!(v, SCHEMA_VERSION);
     let (too_large, pending): (i64, i64) = conn
         .query_row("SELECT too_large, seen_pending FROM emails", [], |r| {
             Ok((r.get(0)?, r.get(1)?))

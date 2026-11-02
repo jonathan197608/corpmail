@@ -111,8 +111,11 @@ fn clear_pending(state: &AppState, ids: &[i64]) {
 /// 放弃全部待回写（重试上限后用；下次点击已读会重新置标志，不影响本地语义）
 pub fn abandon(state: &AppState) {
     let n = state.with_conn(|conn| {
-        conn.execute("UPDATE emails SET seen_pending = 0 WHERE seen_pending = 1", [])
-            .unwrap_or(0)
+        conn.execute(
+            "UPDATE emails SET seen_pending = 0 WHERE seen_pending = 1",
+            [],
+        )
+        .unwrap_or(0)
     });
     if n > 0 {
         eprintln!("[seen] 回写连续失败达上限，放弃 {n} 封的服务器已读同步（本地已读不受影响）");

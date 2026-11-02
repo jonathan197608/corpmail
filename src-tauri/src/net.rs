@@ -157,7 +157,11 @@ mod tests {
         assert_eq!(TlsMode::resolve(465, "starttls"), TlsMode::StartTls);
         assert_eq!(TlsMode::resolve(587, "implicit"), TlsMode::Implicit);
         assert_eq!(TlsMode::resolve(993, " Plain "), TlsMode::Plain);
-        assert_eq!(TlsMode::resolve(465, "bogus"), TlsMode::Implicit, "未知值回落端口推断");
+        assert_eq!(
+            TlsMode::resolve(465, "bogus"),
+            TlsMode::Implicit,
+            "未知值回落端口推断"
+        );
         assert_eq!(TlsMode::parse("SSL"), Some(TlsMode::Implicit));
         assert_eq!(TlsMode::parse("auto"), None);
     }
