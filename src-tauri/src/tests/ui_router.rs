@@ -1860,13 +1860,14 @@ fn wizard_save_with_custom_domain() {
 }
 
 #[test]
-fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
-    // 需求：首次配置向导新增「首次拉取范围」与「数据保存目录」两项配置
-    let (state, dir) = temp_state("wiz-range-dir");
-    let target = std::env::temp_dir().join(format!("mbx-wiz-mig-{}", std::process::id()));
+fn wizard_save_first_run_custom_dir_switches_immediately() {
+    // 需求：首设向导选非默认目录 → 不走迁移（空库无数据可迁），会话内直切立即生效。
+    // 覆盖：范围落新库、done 页“已设置（无需重启）”文案、旧默认目录空库清理、
+    // 重复提交幂等。
+    let (state, dir) = temp_state("wiz-direct");
+    let target = std::env::temp_dir().join(format!("mbx-wiz-direct-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target);
 
-    // 1) 合法范围 7 + 指定新目录 → 保存成功、范围落库、done 页提示待生效目录
     let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
     pairs.push(("first_fetch_days", "7"));
     pairs.push(("data_dir", target.to_str().unwrap()));
@@ -1883,15 +1884,22 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
         resp.extra_headers
             .iter()
             .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
-        "含新增配置项的向导保存应跳转完成页"
+        "含自定义目录的向导保存应跳转完成页"
     );
-    assert!(state.configured(), "应已落库");
-    let d = defaults();
+    assert!(state.configured(), "配置应已落库（新目录的库）");
     assert_eq!(
-        state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(),
-        Some("7"),
-        "向导应保存所选首拉范围"
+        state.data_dir(),
+        target,
+        "首设空库直切应会话内立即切换数据目录"
     );
+    assert!(target.join("corpmail.db").exists(), "新目录应有数据库");
+    assert!(state.pending_data_dir().is_none(), "直切后不应有待重启目录");
+    // 旧默认目录（== 锚点）的启动空库应被清理，避免存储页误展示“迁移备份”
+    assert!(
+        !dir.join("corpmail.db").exists(),
+        "旧默认目录的空库文件应被清理"
+    );
+
     let resp = route(
         &state,
         &assets(),
@@ -1901,28 +1909,33 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
             imap_ok: true,
         },
     );
+    let done = body(&resp);
     assert!(
-        body(&resp).contains("数据目录已迁移"),
-        "done 页应提示数据目录已迁移待重启生效"
+        done.contains("数据目录已设置为") && done.contains("无需重启"),
+        "done 页应提示直切生效：{done}"
     );
-    assert!(target.join("corpmail.db").exists(), "目标目录应产生快照库");
+    assert!(
+        !done.contains("重启应用后生效"),
+        "首设直切不应出现迁移的重启提示：{done}"
+    );
 
-    // 1b) C2 回归——重启视角必须保留向导保存的首拉范围：
-    //     first_fetch_days 存 DB（非 corpmail.toml 键），旧实现"先迁移后保存"
-    //     时 VACUUM 快照不含该值，重启后回退默认 30 天
+    // 重启视角：指针（锚点 corpmail.toml）→ 新目录，配置与首拉范围都在新库
     {
         let state3 = AppState::open_with_anchor(&target, &dir);
+        assert!(
+            state3.configured(),
+            "重启视角账号配置完好（新库 + 锚点 toml）"
+        );
         assert_eq!(
             state3
                 .get_or(keys::FIRST_FETCH_DAYS, &defaults())
                 .as_deref(),
             Some("7"),
-            "重启视角（新目录库）应保留向导保存的首拉范围，不得回退默认 30"
+            "重启视角应保留向导保存的首拉范围"
         );
-        assert!(state3.configured(), "重启视角账号配置完好（锚点 toml）");
     }
 
-    // 1c) C6——迁移已完成待重启，重跑向导同目录：幂等跳过重复迁移，正常跳转
+    // 重复提交同目录：已切换（want == cur）→ 幂等跳过，不再直切/迁移
     let resp_retry = route(
         &state,
         &assets(),
@@ -1937,17 +1950,15 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
             .extra_headers
             .iter()
             .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
-        "已迁移待重启状态重提向导应幂等跳过迁移并正常跳转"
+        "重复提交同目录应幂等跳过并正常跳转"
     );
 
-    // 2) 非法范围回落默认 30；未指定目录则沿用当前目录、done 页无迁移提示
-    let (state2, dir2) = temp_state("wiz-range2");
-    let mut pairs2: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
-    pairs2.push(("first_fetch_days", "x"));
+    // 未指定目录的新库向导：无目录提示
+    let (state2, dir2) = temp_state("wiz-direct2");
     let resp2 = route(
         &state2,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&pairs2)),
+        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -1958,14 +1969,7 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
             .extra_headers
             .iter()
             .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
-        "非法范围应仍可保存（回落默认）"
-    );
-    assert_eq!(
-        state2
-            .get_or(keys::FIRST_FETCH_DAYS, &defaults())
-            .as_deref(),
-        Some("30"),
-        "非法范围应回落默认 30"
+        "默认目录保存应成功"
     );
     let resp2 = route(
         &state2,
@@ -1977,8 +1981,8 @@ fn wizard_save_persists_first_fetch_range_and_migrates_data_dir() {
         },
     );
     assert!(
-        !body(&resp2).contains("数据目录已迁移"),
-        "未指定目录时不应出现迁移提示"
+        !body(&resp2).contains("数据目录已设置"),
+        "未指定目录时不应出现目录提示"
     );
     state.clear_password("unit.router@chinatelecom.cn");
     state2.clear_password("unit.router@chinatelecom.cn");
@@ -2463,6 +2467,37 @@ fn dump_smoke_html() {
         .unwrap();
     }
     dump("email-attachments.html", get(&format!("/emails/{d1}")));
+
+    // 首设直切素材：全新状态真实走一遍向导（含自定义目录）。
+    // 验证点：done 页“已设置（无需重启）”、存储页当前目录 = 新目录且无“待生效/备份”
+    {
+        let fresh = root.join("first-run");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let st = AppState::open_with_anchor(&fresh, &fresh);
+        let target = root.join("first-run-target");
+        let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+        pairs.push(("data_dir", target.to_str().unwrap()));
+        let resp = route(
+            &st,
+            &a,
+            &req("POST", "/welcome/setup/save", &form(&pairs)),
+            &t,
+        );
+        assert!(
+            resp.extra_headers
+                .iter()
+                .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+            "冒烟：首设直切向导应保存成功"
+        );
+        dump(
+            "done-switched.html",
+            body(&route(&st, &a, &req("GET", "/welcome/done", b""), &t)),
+        );
+        dump(
+            "storage-switched.html",
+            body(&route(&st, &a, &req("GET", "/settings/storage", b""), &t)),
+        );
+    }
 
     dump("settings-account.html", get("/settings"));
     dump("settings-sync.html", get("/settings/sync"));
@@ -3060,8 +3095,21 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 
-    // 数据目录迁移待生效：跳过首拉（否则本轮会写进旧目录，重启后白拉）
+    // 库非空（历史数据）+ 未配置 → 不满足“空库直切”条件，走迁移路径：
+    // 迁移待生效期间跳过首拉（否则本轮会写进旧目录，重启后白拉）
     let (state, dir) = temp_state("wiz-first-fetch-pending");
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','old@x.cn','demo@chinatelecom.cn',
+                         '历史邮件','旧正文','历史 邮件','旧 正文',0,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    assert!(!state.store_is_empty(), "前置：库非空才走迁移分支");
     state
         .active_rounds
         .store(2, std::sync::atomic::Ordering::SeqCst);

@@ -574,8 +574,8 @@ fn store_incoming_sent_uses_out_folder_and_prefixed_remote_uid() {
         ..incoming(1, true, "发件甲", "<b@x.cn>")
     };
     let added = state.with_conn(|conn| {
-        let mut n = store_incoming_conn(conn, &state.data_dir, &[inbox], MailDest::Inbox)?;
-        n += store_incoming_conn(conn, &state.data_dir, &[sent], MailDest::Sent)?;
+        let mut n = store_incoming_conn(conn, &state.data_dir(), &[inbox], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir(), &[sent], MailDest::Sent)?;
         Ok::<usize, String>(n)
     });
     assert_eq!(added.unwrap(), 2, "同 v/u 的收件与发件应各自入库");
@@ -633,8 +633,8 @@ fn store_incoming_dedupes_message_id_within_direction_only() {
         ..incoming(7, true, "自留副本", msg)
     };
     let added = state.with_conn(|conn| {
-        let mut n = store_incoming_conn(conn, &state.data_dir, &[inbox], MailDest::Inbox)?;
-        n += store_incoming_conn(conn, &state.data_dir, &[sent], MailDest::Sent)?;
+        let mut n = store_incoming_conn(conn, &state.data_dir(), &[inbox], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir(), &[sent], MailDest::Sent)?;
         // 同方向重复：应被去重（收件箱靠消息 id / 发件箱靠前缀 remote_uid）
         let again_in = IncomingMail {
             uid: 8,
@@ -644,8 +644,8 @@ fn store_incoming_dedupes_message_id_within_direction_only() {
             uid: 9,
             ..incoming(9, true, "自留副本", msg)
         };
-        n += store_incoming_conn(conn, &state.data_dir, &[again_in], MailDest::Inbox)?;
-        n += store_incoming_conn(conn, &state.data_dir, &[again_sent], MailDest::Sent)?;
+        n += store_incoming_conn(conn, &state.data_dir(), &[again_in], MailDest::Inbox)?;
+        n += store_incoming_conn(conn, &state.data_dir(), &[again_sent], MailDest::Sent)?;
         Ok::<usize, String>(n)
     });
     assert_eq!(added.unwrap(), 2, "跨方向各存一份，同方向重复被去重");

@@ -776,7 +776,7 @@ fn notify_seen_delivers_when_channel_installed() {
 fn read_fetch_cursor_reads_persisted_values() {
     let dir = temp_dir("read-cursor");
     let state = AppState::open(&dir);
-    let mut conn = open(&state.data_dir.join("corpmail.db")).unwrap();
+    let mut conn = open(&state.data_dir().join("corpmail.db")).unwrap();
     persist_fetch_cursor(
         &mut conn,
         keys::LAST_UIDVALIDITY,
@@ -791,7 +791,7 @@ fn read_fetch_cursor_reads_persisted_values() {
     // 未写游标：全 0，不影响增量判断
     let dir2 = temp_dir("read-cursor-empty");
     let state2 = AppState::open(&dir2);
-    let conn2 = open(&state2.data_dir.join("corpmail.db")).unwrap();
+    let conn2 = open(&state2.data_dir().join("corpmail.db")).unwrap();
     let empty = read_fetch_cursor(&conn2, keys::LAST_UIDVALIDITY, keys::LAST_UID);
     assert_eq!((empty.uidvalidity, empty.uid), (0, 0));
     let _ = std::fs::remove_dir_all(&dir);
@@ -803,4 +803,133 @@ fn read_fetch_cursor_reads_persisted_values() {
 fn fetch_retry_delay_grows_linearly() {
     assert_eq!(fetch_retry_delay(1), 15);
     assert_eq!(fetch_retry_delay(2), 30);
+}
+
+#[test]
+fn switch_data_dir_first_run_swaps_in_place_without_restart() {
+    // 需求回归：首设向导选非默认目录不得走迁移——空库直切，会话内立即生效。
+    let anchor = temp_dir("switch-anchor");
+    let state = AppState::open_with_anchor(&anchor, &anchor);
+    assert!(state.store_is_empty(), "新库应为空");
+    let target = std::env::temp_dir().join(format!("mbx-switch-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+
+    let msg = state
+        .switch_data_dir_first_run(target.to_str().unwrap())
+        .unwrap();
+    assert!(msg.contains("已设置"), "成功信息应说明已设置：{msg}");
+    // 会话内切换：路径、库、指针全部就位，无"待重启"状态
+    assert_eq!(state.data_dir(), target);
+    assert!(target.join("corpmail.db").exists());
+    assert!(state.pending_data_dir().is_none());
+    assert_eq!(
+        load(&anchor).get(keys::DATA_DIR).map(String::as_str),
+        Some(target.to_str().unwrap()),
+        "锚点 corpmail.toml 指针应指向新目录"
+    );
+    // 旧默认目录（== 锚点）的启动空库应被清理
+    assert!(!anchor.join("corpmail.db").exists());
+
+    // 后续配置写入新库（这正是"直切先于落库"的意义）
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::FIRST_FETCH_DAYS, "90"),
+        ])
+        .unwrap();
+    assert!(state.configured());
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &defaults()).as_deref(),
+        Some("90")
+    );
+    // 重启视角：从锚点解析指针 → 新目录，配置完好
+    let reopened = AppState::open_with_anchor(&AppState::resolve_start_dir(&anchor), &anchor);
+    assert_eq!(reopened.data_dir(), target);
+    assert!(reopened.configured());
+    assert_eq!(
+        reopened
+            .get_or(keys::FIRST_FETCH_DAYS, &defaults())
+            .as_deref(),
+        Some("90")
+    );
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&anchor);
+}
+
+#[test]
+fn switch_data_dir_first_run_refuses_nonempty_store_and_bad_targets() {
+    // 安全阀：库里有任何用户痕迹都拒绝直切（宁可走迁移），防误切丢数据
+    let anchor = temp_dir("switch-guard");
+    let state = AppState::open_with_anchor(&anchor, &anchor);
+    save_draft(
+        &state,
+        &crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "测试用户".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            subject: "草稿".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+        },
+    )
+    .unwrap();
+    let target = std::env::temp_dir().join(format!("mbx-switch-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    let err = state
+        .switch_data_dir_first_run(target.to_str().unwrap())
+        .unwrap_err();
+    assert!(err.contains("非空"), "非空库应拒绝直切：{err}");
+    assert_eq!(state.data_dir(), anchor, "拒绝后路径不得变化");
+    assert!(
+        !target.join("corpmail.db").exists(),
+        "拒绝时不得在新目录建库"
+    );
+    let _ = std::fs::remove_dir_all(&target);
+
+    // 目标非法：相对路径 / 与当前目录互相嵌套 / 已有库文件。
+    // 校验分支须在"空库"上验证——非空安全阀先于路径校验，测不到后面
+    let anchor2 = temp_dir("switch-guard2");
+    let state = AppState::open_with_anchor(&anchor2, &anchor2);
+    assert!(state.switch_data_dir_first_run("relative/dir").is_err());
+    let err = state
+        .switch_data_dir_first_run(anchor2.join("sub").to_str().unwrap())
+        .unwrap_err();
+    assert!(
+        err.contains("嵌套") || err.contains("位于"),
+        "嵌套目录应拒绝：{err}"
+    );
+
+    let occupied = temp_dir("switch-occupied");
+    open(&occupied.join("corpmail.db")).unwrap();
+    let err = state
+        .switch_data_dir_first_run(occupied.to_str().unwrap())
+        .unwrap_err();
+    assert!(err.contains("corpmail.db"), "已有库文件的目标应拒绝：{err}");
+    let _ = std::fs::remove_dir_all(&occupied);
+    let _ = std::fs::remove_dir_all(&anchor2);
+    let _ = std::fs::remove_dir_all(&anchor);
+}
+
+#[test]
+fn rebind_send_worker_rebuilds_on_new_dir() {
+    // 发送 worker 持有旧库连接与旧附件根；直切后必须重绑到新目录，
+    // 否则发送线程会把待发邮件读旧库、附件读旧目录
+    let anchor = temp_dir("rebind-anchor");
+    let state = AppState::open_with_anchor(&anchor, &anchor);
+    state.start_send_worker(); // 模拟 lib.rs 装配（旧 worker 绑旧目录）
+    let target = std::env::temp_dir().join(format!("mbx-rebind-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    state
+        .switch_data_dir_first_run(target.to_str().unwrap())
+        .unwrap();
+    let bound = state
+        .send_tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    assert!(bound, "直切后发送 worker 应已在新目录重建");
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&anchor);
 }

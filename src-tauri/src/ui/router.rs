@@ -281,6 +281,8 @@ struct DoneCtx {
     recv_port: String,
     /// 若向导中迁移了数据目录：待重启生效的目录（done 页提示）
     pending_dir: Option<String>,
+    /// 首设直切（或已生效的）自定义数据目录：无重启，done 页展示当前目录
+    dir_changed: Option<String>,
 }
 
 /// 连接测试结果片段
@@ -966,7 +968,7 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         //（用户反馈：向导设置的目录与设置页显示不一致）
         data_dir: state
             .pending_data_dir()
-            .unwrap_or_else(|| state.data_dir.display().to_string()),
+            .unwrap_or_else(|| state.data_dir().display().to_string()),
         cred_note: cred_storage_note(),
     };
     render_html("setup.html", &ctx)
@@ -998,6 +1000,8 @@ fn wizard_done(state: &AppState) -> Resp {
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
         pending_dir: state.pending_data_dir(),
+        dir_changed: (state.data_dir() != state.anchor_dir().to_path_buf())
+            .then(|| state.data_dir().display().to_string()),
     };
     render_html("done.html", &ctx)
 }
@@ -1048,6 +1052,22 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
             (keys::RECV_SECURITY, recv_security.as_str()),
             (keys::FIRST_FETCH_DAYS, first_fetch.as_str()),
         ];
+        // 首设空库直切：未配置且库无任何数据时，自定义目录不走迁移——
+        // 迁移的快照/复制/重启对空库全是无谓成本，直切在会话内立即生效。
+        // 必须排在 set_batch 之前：配置随后写入的才是新库（与迁移路径
+        // "先保存后快照"互补，空库没有可快照的内容）。
+        let first_run_fresh = !state.configured() && state.store_is_empty();
+        let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
+        if first_run_fresh
+            && !data_dir_input.is_empty()
+            && let Err(e) = state.switch_data_dir_first_run(&data_dir_input)
+        {
+            return test_fragment(
+                Vec::new(),
+                &format!("数据目录设置失败：{e}（可清空目录后重新提交）"),
+                false,
+            );
+        }
         // C2/C6：配置与密码先落库，迁移最后执行——
         // C2：first_fetch_days 存 DB（非 corpmail.toml 键），若迁移在前，快照发生于
         //     落库之前，重启后新目录丢首拉范围回退默认 30；先保存再迁移，VACUUM
@@ -1055,17 +1075,18 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         // C6：迁移最后执行，失败时账号配置已完整保存（无半保存态），指针未推进，
         //     目标残留已被 move_data_dir 清理，可清空目录字段重提或稍后在
         //     设置→存储管理 重试更换位置
+        // （首设直切路径：以下落库写入的就是新目录的库）
         if let Err(e) = state.set_batch(&pairs) {
             return test_fragment(Vec::new(), &format!("保存失败：{e}"), false);
         }
         if let Err(e) = state.store_password(&account, &password) {
             return test_fragment(Vec::new(), &format!("密码保存失败：{e}"), false);
         }
-        // 数据保存目录：非空且不同于当前时迁移；已是"迁移完成待重启"状态则跳过
-        let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
-        if !data_dir_input.is_empty() {
+        // 数据保存目录（非首设路径）：非空且不同于当前时迁移；
+        // 已是"迁移完成待重启"或"首设已直切"状态则跳过
+        if !first_run_fresh && !data_dir_input.is_empty() {
             let cur = state
-                .data_dir
+                .data_dir()
                 .to_string_lossy()
                 .trim_end_matches(['/', '\\'])
                 .to_string();
@@ -1073,14 +1094,14 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                 .trim()
                 .trim_end_matches(['/', '\\'])
                 .to_string();
-            // 指针已指向 want 且快照已存在 = 该目录已迁移、等重启生效 → 幂等跳过
-            let already_pending = state
+            // 指针已指向 want 且库文件已存在 = 迁移待重启或直切已完成 → 幂等跳过
+            let already_settled = state
                 .get(keys::DATA_DIR)
                 .flatten()
                 .is_some_and(|p| p.trim_end_matches(['/', '\\']) == want)
                 && std::path::Path::new(&want).join("corpmail.db").is_file();
             if want != cur
-                && !already_pending
+                && !already_settled
                 && let Err(e) = state.move_data_dir(&data_dir_input)
             {
                 return test_fragment(

@@ -205,12 +205,12 @@ pub(super) fn settings_ctx(
             // 迁移待生效时显示目标目录（用户在向导里选的那个），否则当前目录
             let pending = state.pending_data_dir().unwrap_or_default();
             if pending.is_empty() {
-                state.data_dir.display().to_string()
+                state.data_dir().display().to_string()
             } else {
                 pending
             }
         },
-        data_dir_current: state.data_dir.display().to_string(),
+        data_dir_current: state.data_dir().display().to_string(),
         data_dir_pending: state.pending_data_dir().is_some(),
         inline_max: g(keys::INLINE_ATTACH_MAX_MB),
         db_size: human_bytes(db_bytes),

@@ -34,7 +34,7 @@ fn insert_email(state: &AppState, folder: &str, direction: &str, status: &str, t
 
 /// 插一条独立文件附件并落盘真实文件
 fn insert_file_attachment(state: &AppState, email_id: i64, rel: &str, bytes: &[u8]) {
-    let path = state.data_dir.join("attachments").join(rel);
+    let path = state.data_dir().join("attachments").join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, bytes).unwrap();
     state
@@ -78,12 +78,12 @@ fn email_count(state: &AppState) -> i64 {
 }
 
 fn attach_file_exists(state: &AppState, rel: &str) -> bool {
-    state.data_dir.join("attachments").join(rel).exists()
+    state.data_dir().join("attachments").join(rel).exists()
 }
 
 /// 把文件 mtime 拨回 2 小时前（过孤儿宽限期）
 fn age_file(state: &AppState, rel: &str) {
-    let path = state.data_dir.join("attachments").join(rel);
+    let path = state.data_dir().join("attachments").join(rel);
     let f = std::fs::File::options().write(true).open(&path).unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * ORPHAN_GRACE_SECS);
     f.set_modified(old).unwrap();

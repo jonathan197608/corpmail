@@ -962,7 +962,7 @@ fn walk_attachments(mail: &mailparse::ParsedMail, out: &mut Vec<IncomingAttach>)
 /// （生产走收件线程的 conn 版；本 AppState 薄壳服务于单测与同步调用）
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize, String> {
-    let data_dir = state.data_dir.clone();
+    let data_dir = state.data_dir();
     state.with_conn(|conn| store_incoming_conn(conn, &data_dir, mails, MailDest::Inbox))
 }
 

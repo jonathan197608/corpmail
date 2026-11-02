@@ -96,7 +96,7 @@ fn backfill_extracts_from_historical_emails_once() {
         })
         .unwrap();
     // 回填（独立连接，与启动路径一致）
-    let mut conn = crate::db::open(&state.data_dir.join("corpmail.db")).unwrap();
+    let mut conn = crate::db::open(&state.data_dir().join("corpmail.db")).unwrap();
     backfill(&mut conn).unwrap();
     let addrs: Vec<String> =
         crate::db::collect_rows(&conn, "SELECT addr FROM contacts ORDER BY addr", &[], |r| {

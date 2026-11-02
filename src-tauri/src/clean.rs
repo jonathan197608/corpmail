@@ -221,7 +221,7 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
 pub fn estimate(state: &AppState) -> Estimate {
     let p = policy(state);
     let now = now_epoch();
-    let root = state.data_dir.join("attachments");
+    let root = state.data_dir().join("attachments");
     let mut est = Estimate::default();
     let res = state.with_conn(|conn| {
         let targets = detach_targets(conn, p.clean_sent_bulk_days.map(|d| cutoff(now, d)))?;
@@ -263,7 +263,7 @@ pub fn estimate(state: &AppState) -> Estimate {
 pub fn run(state: &AppState) -> Result<CleanReport, String> {
     let p = policy(state);
     let now = now_epoch();
-    let root = state.data_dir.join("attachments");
+    let root = state.data_dir().join("attachments");
     let mut report = CleanReport::default();
     // 步骤 1/2 的 DB 变更单事务提交；待删文件先记录，提交后统一执行
     let mut pending_files: Vec<String> = Vec::new();

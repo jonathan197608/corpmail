@@ -90,8 +90,10 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
 #[derive(Debug)]
 pub struct AppState {
     db: Mutex<Connection>,
-    /// 应用数据目录（库/附件根；设置·存储页展示）
-    pub data_dir: PathBuf,
+    /// 应用数据目录（库/附件根；设置·存储页展示）。
+    /// 首设向导选自定义目录时可会话内直切（见 switch_data_dir_first_run）；
+    /// 后台线程（收件调度/清理器）并发读 → RwLock，读方一律走 data_dir()
+    data_dir: std::sync::RwLock<PathBuf>,
     /// 锚点目录（系统默认应用数据目录）：独立配置文件 corpmail.toml 在此，
     /// 不随数据目录迁移、不被备份删除影响（resolve_start_dir 亦从此定位）
     anchor_dir: PathBuf,
@@ -173,7 +175,7 @@ impl AppState {
         }
         Ok(Self {
             db: Mutex::new(conn),
-            data_dir: data_dir.to_path_buf(),
+            data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
             anchor_dir: anchor_dir.to_path_buf(),
             config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
             send_tx: Mutex::new(None),
@@ -225,41 +227,8 @@ impl AppState {
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
     /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
     pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
-        // 去尾部斜杠保留根目录："/" 与 Windows "C:\\" 不得被清成非绝对路径
-        let raw = dest.trim();
-        let trimmed = raw.trim_end_matches(['/', '\\']);
-        let dest_str = if trimmed.is_empty() {
-            raw.to_string()
-        } else if trimmed.len() == 2 && trimmed.ends_with(':') {
-            format!("{trimmed}\\")
-        } else {
-            trimmed.to_string()
-        };
-        let dest_path = PathBuf::from(dest_str);
-        if !dest_path.is_absolute() {
-            return Err("请选择绝对路径目录".into());
-        }
-        let cur = &self.data_dir;
-        if dest_path == *cur {
-            return Err("目标目录与当前数据目录相同".into());
-        }
-        if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
-            return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
-        }
-        if dest_path.join("corpmail.db").exists() {
-            return Err("目标目录已存在 corpmail.db，请选择空目录".into());
-        }
-        // 目标已有 attachments/ 时拒绝：复制是合并语义，一旦后续步骤失败，
-        // 回滚无法区分"本次写入"与"用户原有文件"，只能整目录删除 → 误删用户数据
-        if dest_path.join("attachments").exists() {
-            return Err("目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into());
-        }
-        std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
-        // 写入探针：目标可写
-        let probe = dest_path.join(".corpmail-write-probe");
-        std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
-        let _ = std::fs::remove_file(&probe);
-
+        let cur = self.data_dir();
+        let dest_path = validate_data_dir(&cur, dest)?;
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
         let new_db = dest_path.join("corpmail.db");
         self.with_conn(|conn| {
@@ -320,10 +289,101 @@ impl AppState {
         ))
     }
 
+    /// 首设专用：空库直切数据目录（会话内立即生效，不迁移、不重启）。
+    ///
+    /// 与 move_data_dir 的分工：迁移服务"已用了一段时间、库里有数据"的场景
+    /// （快照 + 重启生效）；首设向导选自定义目录时库里只有空 schema，
+    /// 快照/复制/重启全是无谓成本——直接在新目录建库、换连接、写指针。
+    /// 安全阀：库内有任何用户痕迹（邮件或配置行）都拒绝，宁可走迁移；
+    /// 调用方（向导）以 `!configured && store_is_empty()` 判定走本路径。
+    pub fn switch_data_dir_first_run(&self, dest: &str) -> Result<String, String> {
+        let cur = self.data_dir();
+        if !self.store_is_empty() {
+            return Err("当前数据库非空，不能直接切换目录（请在 设置 → 存储管理 中迁移）".into());
+        }
+        let dest_path = validate_data_dir(&cur, dest)?;
+        // 新库（schema 幂等迁移到最新版本；空库联系人回填为 no-op）
+        let mut new_conn = crate::db::open(&dest_path.join("corpmail.db"))
+            .map_err(|e| format!("新目录数据库创建失败：{e}"))?;
+        if let Err(err) = crate::mail::contacts::backfill(&mut new_conn) {
+            eprintln!("[contacts] 新目录历史回填失败（忽略）：{err}");
+        }
+        // 指针先行：写失败则删掉刚建的新库文件回滚（此时尚未换连接，旧库仍在用）
+        {
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            cfg.insert(
+                keys::DATA_DIR.to_string(),
+                dest_path.to_string_lossy().into_owned(),
+            );
+            let snapshot = cfg.clone();
+            if let Err(e) = crate::conf::save(&self.anchor_dir, &snapshot) {
+                cfg.remove(keys::DATA_DIR); // 镜像必须反映文件内容
+                let _ = std::fs::remove_file(dest_path.join("corpmail.db"));
+                return Err(format!("配置文件写入失败：{e}"));
+            }
+        }
+        // 换库 → 换目录：先替换连接（旧连接 drop、文件句柄关闭），
+        // 再改路径。此后 set_batch/收件/附件全部落新目录，无需重启。
+        {
+            let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            *db = new_conn;
+        }
+        *self.data_dir.write().unwrap_or_else(|e| e.into_inner()) = dest_path.clone();
+        // 发送 worker 重绑：旧 worker 持有旧库连接与旧附件根，不重绑会写错库
+        self.rebind_send_worker();
+        // 旧目录残留清理：仅当旧目录 == 锚点（默认目录）且库为空（本函数前置
+        // 已保证）时，删掉启动时新建的空库文件——否则存储页会把它当
+        // "迁移备份"展示，误导用户。非默认旧目录（异常历史）不动用户文件。
+        if cur == self.anchor_dir {
+            for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+                let _ = std::fs::remove_file(cur.join(f));
+            }
+        }
+        Ok(format!("数据目录已设置为 {}", dest_path.display()))
+    }
+
+    /// 库内是否无任何用户数据（emails 与 settings 均为 0 行）。
+    /// 首设"空库直切"的前置判定；计数失败按非空处理（宁可走安全的迁移流程）
+    pub fn store_is_empty(&self) -> bool {
+        self.with_conn(|c| {
+            let mails: i64 = c
+                .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap_or(1);
+            let settings: i64 = c
+                .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
+                .unwrap_or(1);
+            mails == 0 && settings == 0
+        })
+    }
+
+    /// 数据目录切换后重建发送 worker：旧 worker 持旧库连接 + 旧附件根，
+    /// 继续用会把待发邮件读旧库/附件读旧目录。取走旧通道（sender 全部
+    /// drop → worker 下一轮 recv 得 Err 自行退出）后按新目录重启。
+    pub fn rebind_send_worker(&self) {
+        {
+            let mut guard = self.send_tx.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
+        self.start_send_worker();
+    }
+
+    /// 当前数据目录快照（首设直切后会话内变化；读方一律经此取，不直接碰字段）
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 锚点目录（corpmail.toml 与凭据回退密钥所在；完成页展示目录提示用）
+    pub fn anchor_dir(&self) -> &Path {
+        &self.anchor_dir
+    }
+
     /// 迁移备份统计：锚点（默认安装目录）中的 corpmail.db[-wal/-shm] + attachments/。
     /// 仅当已迁移（data_dir != anchor）且锚点存在备份文件时为 Some
     pub fn old_backup_stats(&self) -> Option<(u64, u64)> {
-        if self.data_dir == self.anchor_dir {
+        if self.data_dir() == self.anchor_dir {
             return None;
         }
         let mut bytes = 0u64;
@@ -353,10 +413,10 @@ impl AppState {
         if self.pending_data_dir().is_some() {
             return Err("数据目录迁移尚未重启生效，请先重启应用再删除旧目录备份".into());
         }
-        if self.data_dir == self.anchor_dir {
+        if self.data_dir() == self.anchor_dir {
             return Err("当前使用默认数据目录，无迁移备份".into());
         }
-        if !self.data_dir.join("corpmail.db").is_file() {
+        if !self.data_dir().join("corpmail.db").is_file() {
             return Err("当前数据目录缺少数据库文件，拒绝删除备份".into());
         }
         if self.old_backup_stats().is_none() {
@@ -469,8 +529,9 @@ impl AppState {
         };
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
         let active_rounds = std::sync::Arc::clone(&self.active_rounds);
-        let db_path = self.data_dir.join("corpmail.db");
-        let data_dir = self.data_dir.clone();
+        let cur_dir = self.data_dir();
+        let db_path = cur_dir.join("corpmail.db");
+        let data_dir = cur_dir;
         active_rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
             // RAII：任何退出路径（含 panic 越过 fetch_round 内部 catch_unwind）都归还名额
@@ -545,12 +606,13 @@ impl AppState {
         if guard.is_some() {
             return;
         }
-        let Ok(conn) = crate::db::open(&self.data_dir.join("corpmail.db")) else {
+        let dir = self.data_dir();
+        let Ok(conn) = crate::db::open(&dir.join("corpmail.db")) else {
             return;
         };
         let config_arc = std::sync::Arc::clone(&self.config);
         // 附件根目录：worker 线程独立取路径（不持 AppState；附件随信发送时读盘解压）
-        let attach_root = self.data_dir.join("attachments");
+        let attach_root = dir.join("attachments");
         // 凭据回退密钥（锚点目录；库外文件，见 secrets::KEY_FILE）
         let key_file = self.key_file();
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
@@ -756,7 +818,7 @@ impl AppState {
     pub fn db_size_bytes(&self) -> u64 {
         ["corpmail.db", "corpmail.db-wal"]
             .iter()
-            .filter_map(|f| std::fs::metadata(self.data_dir.join(f)).ok())
+            .filter_map(|f| std::fs::metadata(self.data_dir().join(f)).ok())
             .map(|m| m.len())
             .sum()
     }
@@ -845,13 +907,50 @@ impl AppState {
             _ => return None,
         };
         let pending = PathBuf::from(&over);
-        (pending != self.data_dir && pending.join("corpmail.db").is_file()).then_some(over)
+        (pending != self.data_dir() && pending.join("corpmail.db").is_file()).then_some(over)
     }
 
     /// 数据目录下的独立附件占用（目录不存在 → 0）：(字节, 文件数)
     pub fn attachments_stats(&self) -> (u64, u64) {
-        dir_stats(&self.data_dir.join("attachments"))
+        dir_stats(&self.data_dir().join("attachments"))
     }
+}
+
+/// 数据目录目标校验（迁移与首设直切共用）：绝对路径、不与当前目录互相嵌套、
+/// 目标须为空（无 corpmail.db / attachments——避免与既有文件混同导致回滚无法
+/// 区分"本次写入"与"用户原有文件"）、可创建可写。通过返回归一化后的目标路径。
+fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
+    // 去尾部斜杠保留根目录：Windows "C:" 盘符根（带反斜杠）不得被清成非绝对路径
+    let raw = dest.trim();
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    let dest_str = if trimmed.is_empty() {
+        raw.to_string()
+    } else if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{trimmed}\\")
+    } else {
+        trimmed.to_string()
+    };
+    let dest_path = PathBuf::from(dest_str);
+    if !dest_path.is_absolute() {
+        return Err("请选择绝对路径目录".into());
+    }
+    if dest_path == cur {
+        return Err("目标目录与当前数据目录相同".into());
+    }
+    if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
+        return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
+    }
+    if dest_path.join("corpmail.db").exists() {
+        return Err("目标目录已存在 corpmail.db，请选择空目录".into());
+    }
+    if dest_path.join("attachments").exists() {
+        return Err("目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into());
+    }
+    std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
+    let probe = dest_path.join(".corpmail-write-probe");
+    std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(dest_path)
 }
 
 /// 目录递归统计：(字节, 文件数)；目录不存在 → (0, 0)（附件占用与迁移备份共用）

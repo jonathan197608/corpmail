@@ -843,7 +843,7 @@ pub fn prune_empty_dirs(root: &Path) {
 }
 
 fn attach_root(state: &AppState) -> PathBuf {
-    state.data_dir.join("attachments")
+    state.data_dir().join("attachments")
 }
 
 /// 附件根目录（独立连接版）
