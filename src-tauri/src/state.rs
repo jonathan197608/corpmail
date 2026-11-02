@@ -1251,6 +1251,49 @@ where
     })
 }
 
+/// 执行单个同步阶段（收件箱/发件箱共用）：装配 FetchPhase 并加 panic 保护。
+/// 两阶段仅 dest/last 不同，集中于此避免调用处重复整套参数装配。
+#[allow(clippy::too_many_arguments)]
+fn sync_phase(
+    conn: &mut Connection,
+    data_dir: &Path,
+    fetch_state: &std::sync::Arc<Mutex<FetchState>>,
+    epoch: u64,
+    host: &str,
+    port: u16,
+    security: crate::net::TlsMode,
+    account: &str,
+    password: &str,
+    first_days: i64,
+    max_mail_bytes: u64,
+    dest: crate::mail::MailDest,
+    last: crate::mail::LastCursor,
+    added: &mut usize,
+) -> Result<Option<(u32, u32)>, String> {
+    let label = match dest {
+        crate::mail::MailDest::Sent => "发件箱",
+        crate::mail::MailDest::Inbox => "收件箱",
+    };
+    guarded_phase(label, || {
+        fetch_phase(FetchPhase {
+            conn,
+            data_dir,
+            fetch_state,
+            epoch,
+            host,
+            port,
+            security,
+            account,
+            password,
+            dest,
+            first_days,
+            last,
+            max_mail_bytes,
+            added,
+        })
+    })
+}
+
 fn fetch_round(job: FetchJob) {
     let FetchJob {
         fetch_state,
@@ -1309,24 +1352,22 @@ fn fetch_round(job: FetchJob) {
             continue;
         }
         // 阶段一：发件箱先同步（失败不阻断收件箱——发件箱命名/权限差异不该拖垮收件）
-        let sent_outcome = guarded_phase("发件箱", || {
-            fetch_phase(FetchPhase {
-                conn: &mut conn,
-                data_dir: &data_dir,
-                fetch_state: &fetch_state,
-                epoch,
-                host: &host,
-                port,
-                security,
-                account: &account,
-                password: &password,
-                dest: crate::mail::MailDest::Sent,
-                first_days,
-                last: cur_sent,
-                max_mail_bytes,
-                added: &mut added,
-            })
-        });
+        let sent_outcome = sync_phase(
+            &mut conn,
+            &data_dir,
+            &fetch_state,
+            epoch,
+            &host,
+            port,
+            security,
+            &account,
+            &password,
+            first_days,
+            max_mail_bytes,
+            crate::mail::MailDest::Sent,
+            cur_sent,
+            &mut added,
+        );
         let sent_err = match &sent_outcome {
             // 未发现发件箱（中文服务器的 mUTF-7 名称、命名不规范等）也要可见：
             // 静默跳过会让用户以为已同步（webmail 有已发送、本地永远空）
@@ -1338,24 +1379,22 @@ fn fetch_round(job: FetchJob) {
             }
         };
         // 阶段二：收件箱
-        let inbox_outcome = guarded_phase("收件箱", || {
-            fetch_phase(FetchPhase {
-                conn: &mut conn,
-                data_dir: &data_dir,
-                fetch_state: &fetch_state,
-                epoch,
-                host: &host,
-                port,
-                security,
-                account: &account,
-                password: &password,
-                dest: crate::mail::MailDest::Inbox,
-                first_days,
-                last: cur_inbox,
-                max_mail_bytes,
-                added: &mut added,
-            })
-        });
+        let inbox_outcome = sync_phase(
+            &mut conn,
+            &data_dir,
+            &fetch_state,
+            epoch,
+            &host,
+            port,
+            security,
+            &account,
+            &password,
+            first_days,
+            max_mail_bytes,
+            crate::mail::MailDest::Inbox,
+            cur_inbox,
+            &mut added,
+        );
         match inbox_outcome {
             Ok(Some((uidvalidity, max_uid))) => {
                 // 收尾游标（与每批持久化共用同一 DB 侧单调实现）：写 last_sync_at

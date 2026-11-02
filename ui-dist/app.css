@@ -1619,6 +1619,31 @@ body {
     min-height: 120px;
 }
 
+/* HTML 邮件正文（服务端已做白名单净化）：保留原版式，同时约束宽度防撑破容器 */
+.md-html {
+    white-space: normal;
+}
+.md-html img {
+    max-width: 100%;
+    height: auto;
+}
+.md-html table {
+    border-collapse: collapse;
+    max-width: 100%;
+}
+.md-html td,
+.md-html th {
+    padding: 2px 6px;
+}
+.md-html a {
+    color: var(--accent);
+}
+.md-html pre,
+.md-html code {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .md-attach {
     border-top: 1px solid var(--line-soft);
     padding-top: 12px;

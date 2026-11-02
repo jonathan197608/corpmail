@@ -4,6 +4,18 @@
 use super::*;
 use crate::state::AppState;
 
+#[test]
+fn sanitize_html_removes_xss_vectors() {
+    let raw = r#"<p style="color:red">hi<script>alert(1)</script><img src="x" onerror="alert(1)"><a href="javascript:alert(1)">link</a></p>"#;
+    let out = sanitize_html(raw);
+    let lower = out.to_lowercase();
+    assert!(!lower.contains("<script"), "应移除 script：{out}");
+    assert!(!lower.contains("onerror"), "应移除事件属性：{out}");
+    assert!(!lower.contains("javascript:"), "应移除危险 URL：{out}");
+    assert!(out.contains("hi"), "正文内容应保留：{out}");
+    assert!(out.contains("color:red"), "内联样式应保留：{out}");
+}
+
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
     let dir = std::env::temp_dir().join(format!("corpmail-m2-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

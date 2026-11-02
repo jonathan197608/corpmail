@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -73,6 +73,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         1 => tx.execute_batch(MIGRATIONS[0]),
         2 => migrate_v3(tx),
         3 => migrate_v4(tx),
+        4 => migrate_v5(tx),
         _ => Ok(()),
     }
 }
@@ -81,23 +82,12 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
 /// 加列用"先查 table_info 再 ALTER"（SQLite 不支持 ADD COLUMN IF NOT EXISTS）：
 /// 事务已能保证原子性，这里再兜一层——历史上出现过进程被杀后残留半迁移库。
 fn migrate_v3(tx: &Connection) -> rusqlite::Result<()> {
-    let has_column = |name: &str| -> rusqlite::Result<bool> {
-        let mut stmt = tx.prepare("PRAGMA table_info(emails)")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let col: String = row.get(1)?;
-            if col == name {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
     // too_large：1 = 邮件超过单封上限，只拉了信头（正文为占位说明）
-    if !has_column("too_large")? {
+    if !emails_has_column(tx, "too_large")? {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0")?;
     }
     // seen_pending：1 = 本地已读但服务器 \Seen 尚未回写成功（worker 消费）
-    if !has_column("seen_pending")? {
+    if !emails_has_column(tx, "seen_pending")? {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0")?;
     }
     // 部分索引：worker 每轮只扫待回写行，不为历史邮件做全表扫
@@ -105,6 +95,28 @@ fn migrate_v3(tx: &Connection) -> rusqlite::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_seen_pending ON emails(seen_pending)
          WHERE seen_pending = 1",
     )
+}
+
+/// emails 表是否已有指定列（SQLite 无 ADD COLUMN IF NOT EXISTS，回退到先查后加）
+fn emails_has_column(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let mut stmt = tx.prepare("PRAGMA table_info(emails)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let col: String = row.get(1)?;
+        if col == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v4 → v5：详情页 HTML 正文渲染。存**净化后的** HTML（纯文本仍存 body_text，
+/// 供检索/列表预览/转发引用）；为空表示该邮件无 HTML 版式。
+fn migrate_v5(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "body_html")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN body_html TEXT")?;
+    }
+    Ok(())
 }
 
 /// v3 → v4：联系人库（姓名 + 邮件地址），自动采集收/发件地址，

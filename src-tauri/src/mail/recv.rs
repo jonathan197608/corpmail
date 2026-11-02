@@ -10,7 +10,8 @@
 
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
-    mark_read, month_dir_conn, now_epoch, safe_filename, sync_attach_stats, tokenize, zoned_of,
+    mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, sync_attach_stats,
+    tokenize, zoned_of,
 };
 use crate::net::TlsMode;
 use rusqlite::OptionalExtension;
@@ -116,6 +117,8 @@ pub struct IncomingMail {
     pub cc_addrs: String,
     pub body_text: String,
     pub body_kind: String,
+    /// 净化后的 HTML 正文（None = 无 HTML 版式，详情页回退纯文本）
+    pub body_html: Option<String>,
     pub attachments: Vec<IncomingAttach>,
     /// 超过单封上限：只拉了信头，正文/附件未下载（正文为占位说明）
     pub too_large: bool,
@@ -439,6 +442,23 @@ fn prefetch_sizes<T: std::io::Read + std::io::Write>(
     out
 }
 
+/// 建立 IMAP 连接并登录（收件拉取与已读回写共用，避免连接/登录参数漂移）。
+fn connect_login(
+    host: &str,
+    port: u16,
+    mode: TlsMode,
+    account: &str,
+    password: &str,
+) -> Result<imap::Session<imap::Connection>, String> {
+    let client = imap::ClientBuilder::new(host, port)
+        .mode(mode.imap_mode())
+        .connect()
+        .map_err(|e| format!("连接失败：{e}{}", mode.hint(port)))?;
+    client
+        .login(account, password)
+        .map_err(|(e, _)| format!("登录失败：{e}"))
+}
+
 impl RealFetcher {
     /// 分批拉取（M6）：单会话内把 uids 按 BATCH 切块，逐批 uid_fetch → 解析 → 回调。
     /// on_batch 回调参数：已解析邮件、累计处理数、总数、uidvalidity、本批最大 UID。
@@ -457,13 +477,7 @@ impl RealFetcher {
         max_mail_bytes: u64,
         mut on_batch: impl FnMut(&[IncomingMail], usize, usize, u32, u32) -> Result<(), String>,
     ) -> Result<Option<(u32, u32)>, String> {
-        let client = imap::ClientBuilder::new(host, port)
-            .mode(mode.imap_mode())
-            .connect()
-            .map_err(|e| format!("连接失败：{e}{}", mode.hint(port)))?;
-        let mut sess = client
-            .login(account, password)
-            .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        let mut sess = connect_login(host, port, mode, account, password)?;
         // 目标邮箱：收件箱固定 INBOX；发件箱按名称启发式发现（特殊用途属性
         // 未在当前 imap 版本导出，按常见命名匹配；找不到则跳过该阶段，不影响收件箱）
         let mailbox_name = match dest {
@@ -611,13 +625,7 @@ impl RealFetcher {
         if let Err(e) = crate::net::probe_tcp(host, port) {
             return Err(format!("{e}；本轮回写未执行"));
         }
-        let client = imap::ClientBuilder::new(host, port)
-            .mode(mode.imap_mode())
-            .connect()
-            .map_err(|e| format!("连接失败：{e}{}", mode.hint(port)))?;
-        let mut sess = client
-            .login(account, password)
-            .map_err(|(e, _)| format!("登录失败：{e}"))?;
+        let mut sess = connect_login(host, port, mode, account, password)?;
         let mailbox = sess
             .select("INBOX")
             .map_err(|e| format!("无法打开收件箱：{e}"))?;
@@ -830,6 +838,7 @@ fn placeholder_mail(
         cc_addrs: fields.cc_addrs,
         body_text,
         body_kind: "plain".into(),
+        body_html: None,
         attachments: Vec::new(),
         too_large: true,
     }
@@ -845,7 +854,10 @@ fn parse_incoming(
 ) -> Option<IncomingMail> {
     let mail = mailparse::parse_mail(raw).ok()?;
     let fields = header_fields(&mail);
-    let (body_text, body_kind) = extract_body(&mail);
+    let (body_text, html_raw) = extract_body(&mail);
+    let body_html = html_raw
+        .map(|h| sanitize_html(&h))
+        .filter(|h| !h.trim().is_empty());
     let attachments = collect_attachments(&mail);
     Some(IncomingMail {
         uidvalidity,
@@ -859,7 +871,8 @@ fn parse_incoming(
         to_addrs: fields.to_addrs,
         cc_addrs: fields.cc_addrs,
         body_text,
-        body_kind: body_kind.to_string(),
+        body_kind: if body_html.is_some() { "html" } else { "plain" }.to_string(),
+        body_html,
         attachments,
         too_large: false,
     })
@@ -967,16 +980,17 @@ fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
     fix_gbk_fallback(part, &decoded)
 }
 
-/// 正文抽取（§6.1）：multipart 递归，text/plain 优先；仅 text/html 时剥标签存纯文本；
-/// 编码修复（M5）：mis-declared charset 修复 + GBK 兜底
-fn extract_body(mail: &mailparse::ParsedMail) -> (String, &'static str) {
-    if let Some(p) = find_inline_part(mail, "text/plain") {
-        return (body_text_repaired(p), "plain");
-    }
-    if let Some(p) = find_inline_part(mail, "text/html") {
-        return (strip_html(&body_text_repaired(p)), "html");
-    }
-    (String::new(), "plain")
+/// 正文抽取（§6.1）：返回（纯文本, 原始 HTML）。
+/// - 纯文本优先 text/plain；仅有 HTML 时剥标签得到纯文本（检索/预览/转发用）
+/// - 原始 HTML 另存一份，供 parse_incoming 净化后入库渲染（保留原版式）
+fn extract_body(mail: &mailparse::ParsedMail) -> (String, Option<String>) {
+    let plain = find_inline_part(mail, "text/plain").map(body_text_repaired);
+    let html = find_inline_part(mail, "text/html").map(body_text_repaired);
+    let plain_text = match &plain {
+        Some(t) => t.clone(),
+        None => html.as_deref().map(strip_html).unwrap_or_default(),
+    };
+    (plain_text, html)
 }
 
 fn find_inline_part<'a>(
@@ -1134,9 +1148,10 @@ pub fn store_incoming_conn(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                 cc_addrs, subject, body_text, body_kind, subject_tokens,
                                 body_tokens, attach_cnt, attach_bytes, unread, remote_uid,
-                                message_id, created_at, received_at, sent_at, too_large)
+                                message_id, created_at, received_at, sent_at, too_large,
+                                body_html)
              VALUES (?17, ?18, ?19, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?20, ?21, ?22)",
+                     ?13, ?14, ?15, ?20, ?21, ?22, ?23)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
@@ -1160,6 +1175,7 @@ pub fn store_incoming_conn(
                 received_at,
                 sent_at,
                 m.too_large,
+                m.body_html,
             ],
         )
         .map_err(e)?;

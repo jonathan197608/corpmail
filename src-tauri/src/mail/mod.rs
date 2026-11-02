@@ -139,6 +139,24 @@ pub fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// 邮件 HTML 正文净化（XSS 防护）：白名单过滤，移除 script/iframe/object/embed/form、
+/// `on*` 事件属性、`javascript:` 等危险 URL；保留常规排版标签、表格与内联样式。
+/// 用于收件入库前净化——库内不存可执行内容，详情页可直接安全输出。
+pub fn sanitize_html(raw: &str) -> String {
+    static SANITIZER: std::sync::LazyLock<ammonia::Builder<'static>> =
+        std::sync::LazyLock::new(|| {
+            let mut b = ammonia::Builder::default();
+            // 邮件常见但默认白名单外的排版标签/属性
+            b.add_tags(["font", "center", "colgroup", "col", "strike"]);
+            b.add_generic_attributes([
+                "style", "align", "valign", "width", "height", "bgcolor", "color",
+            ]);
+            b.link_rel(Some("noopener noreferrer"));
+            b
+        });
+    SANITIZER.clean(raw).to_string()
+}
+
 fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(bytes)?;
@@ -679,6 +697,8 @@ pub struct EmailDetail {
     pub to_addrs: String,
     pub cc_addrs: String,
     pub body_text: String,
+    /// 净化后的 HTML 正文（空串 = 无 HTML 版式，详情页回退纯文本）
+    pub body_html: String,
     pub attach_cnt: i64,
     pub attach_bytes: i64,
     pub unread: bool,
@@ -696,8 +716,9 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
         let row = conn
             .query_row(
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
-                        cc_addrs, body_text, attach_cnt, attach_bytes, unread, in_reply_to,
-                        COALESCE(error, ''), COALESCE(received_at, sent_at, created_at), too_large
+                        cc_addrs, body_text, COALESCE(body_html, ''), attach_cnt, attach_bytes,
+                        unread, in_reply_to, COALESCE(error, ''),
+                        COALESCE(received_at, sent_at, created_at), too_large
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -712,13 +733,14 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         to_addrs: r.get(6)?,
                         cc_addrs: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                         body_text: r.get(8)?,
-                        attach_cnt: r.get(9)?,
-                        attach_bytes: r.get(10)?,
-                        unread: r.get::<_, i64>(11)? == 1,
-                        in_reply_to: r.get(12)?,
-                        error: r.get(13)?,
-                        time_full: time_full(r.get(14)?),
-                        too_large: r.get::<_, i64>(15)? == 1,
+                        body_html: r.get(9)?,
+                        attach_cnt: r.get(10)?,
+                        attach_bytes: r.get(11)?,
+                        unread: r.get::<_, i64>(12)? == 1,
+                        in_reply_to: r.get(13)?,
+                        error: r.get(14)?,
+                        time_full: time_full(r.get(15)?),
+                        too_large: r.get::<_, i64>(16)? == 1,
                         attachments: Vec::new(),
                     })
                 },
@@ -1145,6 +1167,27 @@ pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Resul
 /// 读取源附件（inline BLOB / 独立文件）→ 解压 → 按目标邮件的上限规则重新入库。
 /// 返回复制数量；源附件已 detached（文件被清理）则跳过该条（转发不因一个附件整体失败，
 /// 但调用方应提示用户核对）。detached 数量通过 Ok 返回值中的第二个元素给调用方。
+/// 附件读取行：(filename, mime, storage, file_path, data, detached)
+type AttachRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    bool,
+);
+
+fn attach_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
 pub fn copy_attachments(
     state: &AppState,
     from_id: i64,
@@ -1154,15 +1197,7 @@ pub fn copy_attachments(
     let limit = inline_limit(state);
     let month = month_dir_of(state, to_id);
     // 源附件快照：文件名/类型/存储/路径/数据（本连接内取完即释放锁）
-    type Row = (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<Vec<u8>>,
-        bool,
-    );
-    let rows: Vec<Row> = state
+    let rows: Vec<AttachRow> = state
         .with_conn(|conn| {
             crate::db::collect_rows(
                 conn,
@@ -1170,16 +1205,7 @@ pub fn copy_attachments(
                     file_path, data, detached = 1
              FROM attachments WHERE email_id = ?1 ORDER BY id",
                 &[&from_id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
+                attach_row_from,
             )
         })
         .map_err(e)?;
@@ -1249,16 +1275,6 @@ pub struct SendAttachment {
     pub bytes: Vec<u8>,
 }
 
-/// 出站附件读取行：(filename, mime, storage, file_path, data, detached)
-type AttachSendRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<Vec<u8>>,
-    bool,
-);
-
 /// 读取待发邮件的全部附件（发送前置校验，独立连接版）。
 ///
 /// 语义：任何一个附件不可用即整体报错——**绝不"少发一个附件"静默成功**，
@@ -1269,22 +1285,13 @@ pub fn outgoing_attachments(
     root: &Path,
     email_id: i64,
 ) -> Result<Vec<SendAttachment>, String> {
-    let rows: Vec<AttachSendRow> = crate::db::collect_rows(
+    let rows: Vec<AttachRow> = crate::db::collect_rows(
         conn,
         "SELECT filename, COALESCE(mime,'application/octet-stream'), storage,
                 file_path, data, detached = 1
          FROM attachments WHERE email_id = ?1 ORDER BY id",
         &[&email_id],
-        |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        },
+        attach_row_from,
     )
     .map_err(|err| format!("读取附件清单失败：{err}"))?;
     let mut out = Vec::with_capacity(rows.len());

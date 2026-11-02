@@ -2392,6 +2392,17 @@ fn dump_smoke_html() {
         let id = d2 + 1 + i as i64;
         if i == 0 {
             inbox_first_id = id;
+            // HTML 正文冒烟样例：表格/内联样式应渲染保留，script 与 javascript: 链接
+            // 应被净化移除——供浏览器目视核对 HTML 渲染与 XSS 防护
+            let sample = r#"<div style="font-family:sans-serif"><h2 style="color:#0057c2">配案清单（HTML 版）</h2><p>各位领导：</p><table border="1" cellpadding="6" style="border-collapse:collapse"><tr><th>客户</th><th>速率</th></tr><tr><td>示例客户 A</td><td>200M</td></tr></table><p><a href="javascript:alert(1)">危险链接</a><script>alert('xss')</script></p></div>"#;
+            let safe = mail::sanitize_html(sample);
+            state.with_conn(|c| {
+                c.execute(
+                    "UPDATE emails SET body_html = ?1, body_kind = 'html' WHERE id = ?2",
+                    rusqlite::params![safe, id],
+                )
+                .unwrap();
+            });
         }
     }
     let inbox_id = inbox_first_id;

@@ -102,6 +102,7 @@ fn incoming(uidvalidity: u32, uid: u32) -> IncomingMail {
         to_addrs: "demo@chinatelecom.cn".into(),
         body_text: "正文".into(),
         body_kind: "plain".into(),
+        body_html: None,
         attachments: Vec::new(),
         too_large: false,
     }

@@ -87,6 +87,7 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
         to_addrs: "demo@chinatelecom.cn".into(),
         body_text: "请查收本月激励清单。".into(),
         body_kind: "plain".into(),
+        body_html: None,
         attachments: Vec::new(),
         too_large: false,
     }
@@ -328,13 +329,18 @@ fn extract_body_prefers_plain_and_falls_back_to_html() {
     assert_eq!(extract_body(&mail).0, "plain content");
     let html_mime = b"Content-Type: text/html\r\n\r\n<h1>heading</h1>";
     let mail = mailparse::parse_mail(html_mime).unwrap();
-    let (body, kind) = extract_body(&mail);
-    assert_eq!((body.as_str(), kind), ("heading", "html"));
+    let (body, html) = extract_body(&mail);
+    assert_eq!(body, "heading");
+    assert_eq!(html.as_deref(), Some("<h1>heading</h1>"));
     // multipart/alternative：plain 优先
     let mp = b"Content-Type: multipart/alternative; boundary=BOUND\r\n\r\n--BOUND\r\nContent-Type: text/html\r\n\r\n<html>hi</html>\r\n--BOUND\r\nContent-Type: text/plain\r\n\r\nhi plain\r\n--BOUND--\r\n";
     let mail = mailparse::parse_mail(mp).unwrap();
-    let (body, kind) = extract_body(&mail);
-    assert_eq!((body.trim(), kind), ("hi plain", "plain"));
+    let (body, html) = extract_body(&mail);
+    assert_eq!(body.trim(), "hi plain");
+    assert!(
+        html.as_deref().unwrap_or("").contains("<html>hi</html>"),
+        "HTML 原文应保留（可净化渲染）：{html:?}"
+    );
     // 附件识别
     let att = b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody here\r\n--B\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"data.bin\"\r\n\r\nBINARY\r\n--B--\r\n";
     let mail = mailparse::parse_mail(att).unwrap();
