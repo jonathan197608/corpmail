@@ -2,7 +2,7 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
-use crate::mail::{DraftInput, add_attachments, save_draft};
+use crate::mail::{DraftInput, add_attachments, get, save_draft, save_draft_with_html};
 use crate::state::AppState;
 use std::path::PathBuf;
 
@@ -45,6 +45,41 @@ fn draft(subject: &str, body: &str) -> DraftInput {
         body_text: body.into(),
         in_reply_to: None,
     }
+}
+
+#[test]
+fn save_draft_with_html_stores_sanitized_html_and_plain_text() {
+    let (state, dir) = temp_state("html-draft");
+    let input = DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: "peer@x.cn".into(),
+        cc_addrs: String::new(),
+        subject: "HTML 正文".into(),
+        body_text: "你好".into(),
+        in_reply_to: None,
+    };
+    let id = save_draft_with_html(
+        &state,
+        &input,
+        r#"<p style="color:red">你好<script>alert(1)</script><a href="javascript:alert(1)">x</a></p>"#,
+    )
+    .unwrap();
+    let d = get(&state, id).expect("草稿应可读");
+    assert!(d.body_html.contains("color:red"), "内联样式应保留");
+    assert!(!d.body_html.contains("<script"), "script 应被净化");
+    assert!(!d.body_html.contains("javascript:"), "危险 URL 应被净化");
+    assert_eq!(d.body_text, "你好", "纯文本版用于检索/预览");
+    let kind: String = state
+        .with_conn(|c| {
+            c.query_row("SELECT body_kind FROM emails WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+        })
+        .unwrap();
+    assert_eq!(kind, "html", "body_kind 应标记为 html");
+    cleanup(&dir);
 }
 
 struct FakeSender {
@@ -167,6 +202,51 @@ fn dispatch_success_transitions_to_sent() {
         vec!["peer@x.cn".to_string(), "ops@x.cn".to_string()]
     );
     assert_eq!(msg.body_text, "请查收汇总表。");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+#[test]
+fn dispatch_reads_html_body_for_sending() {
+    let (state, dir) = temp_state("m3-html-dispatch");
+    state
+        .set_batch(&[(keys::SMTP_HOST, "smtp.test.cn")])
+        .unwrap();
+    state
+        .store_password("demo@chinatelecom.cn", "pw-m3")
+        .unwrap();
+    let input = DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: "peer@x.cn".into(),
+        cc_addrs: String::new(),
+        subject: "HTML 发送".into(),
+        body_text: "你好".into(),
+        in_reply_to: None,
+    };
+    let id = save_draft_with_html(&state, &input, "<p>你好</p>").unwrap();
+    assert!(enqueue_draft(&state, id));
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let result = state.with_conn(|c| {
+        dispatch_one(
+            c,
+            &sender,
+            id,
+            &smtp,
+            &dir.join("attachments"),
+            &state.key_file(),
+        )
+    });
+    assert_eq!(result.unwrap(), "sent");
+    let seen = sender.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].3.body_html.as_deref(),
+        Some("<p>你好</p>"),
+        "发送应携带净化后的 HTML 正文"
+    );
+    assert_eq!(seen[0].3.body_text, "你好");
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
 }

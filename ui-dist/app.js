@@ -348,3 +348,19 @@ document.addEventListener("click", function (e) {
     document.querySelectorAll(".settings-tabs .stab").forEach(function (s) { s.classList.remove("on"); });
     stab.classList.add("on");
 });
+
+// ---------- 撰写页：正文模式切换（纯文本 / HTML） ----------
+// 两个 textarea 都在表单内，按模式显隐；提交时服务端按 body_mode 取用对应字段
+function mbxSyncBodyMode() {
+    const mode = document.querySelector('input[name="body_mode"]:checked');
+    if (!mode) return;
+    const isHtml = mode.value === 'html';
+    const plain = document.getElementById('body-text');
+    const html = document.getElementById('body-html');
+    if (plain) plain.hidden = isHtml;
+    if (html) html.hidden = !isHtml;
+}
+document.body.addEventListener('change', ev => {
+    if (ev.target && ev.target.name === 'body_mode') mbxSyncBodyMode();
+});
+document.addEventListener('DOMContentLoaded', mbxSyncBodyMode);

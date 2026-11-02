@@ -36,12 +36,12 @@
                = 发件人+收件人+抄送（见 reply_all_recipients） #}
             <div class="md-actions md-actions-top">
                 {% if email.direction == 'in' %}
-                <a class="btn primary" href="/compose?reply_to={{ email.id }}">✎ 回复</a>
-                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}">✎ 回复全部</a>
+                <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复</a>
+                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复全部</a>
                 {% endif %}
-                <a class="btn" href="/compose?forward_from={{ email.id }}">↗ 转发</a>
+                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↗ 转发</a>
                 <button type="button" class="btn danger"
-                        hx-post="/emails/{{ email.id }}/delete"
+                        hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                         hx-trigger="click throttle:500ms"
                         hx-disabled-elt="this"
                         hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑 删除</button>

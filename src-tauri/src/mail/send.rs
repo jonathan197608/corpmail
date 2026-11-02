@@ -16,6 +16,8 @@ pub struct OutgoingMessage {
     pub cc_addrs: Vec<String>,
     pub subject: String,
     pub body_text: String,
+    /// HTML 正文（净化后；Some = 以 text/html 发送，纯文本作为 alternative 回退）
+    pub body_html: Option<String>,
     /// 生成的 Message-ID 头（发送成功后回写本地已发送行，供发件箱同步去重）
     pub message_id: String,
     /// 附件（原始字节；空 = 纯文本单段邮件）
@@ -70,24 +72,39 @@ impl MailSender for RealSender {
         let builder = builder
             .message_id(Some(msg.message_id.clone()))
             .subject(msg.subject.clone());
-        // 正文 + 附件：无附件保持单段 text/plain（与历史行为逐字节一致）；
-        // 有附件才升为 multipart/mixed，附件以原始文件名/类型逐段编码
-        let message = if msg.attachments.is_empty() {
+        // 正文 + 附件：
+        // - 纯文本无附件：保持历史单段 text/plain（逐字节一致）
+        // - HTML 正文：multipart/alternative（纯文本回退 + text/html）
+        // - 有附件：再包一层 multipart/mixed，附件逐段编码
+        let message = if msg.body_html.is_none() && msg.attachments.is_empty() {
             builder.body(msg.body_text)
         } else {
-            let text = SinglePart::builder()
+            let plain = SinglePart::builder()
                 .header(ContentType::TEXT_PLAIN)
-                .body(msg.body_text);
-            let mut mp = MultiPart::mixed().singlepart(text);
-            for a in msg.attachments {
-                // 附件类型来自库内记录（收件时从 MIME 头取得 / 本地按扩展名推断）；
-                // 非法 MIME 回退 octet-stream，绝不因类型串异常放弃整封邮件
-                let ct = ContentType::parse(&a.mime).unwrap_or_else(|_| {
-                    ContentType::parse("application/octet-stream")
-                        .unwrap_or(ContentType::TEXT_PLAIN)
-                });
-                mp = mp.singlepart(Attachment::new(a.filename).body(a.bytes, ct));
-            }
+                .body(msg.body_text.clone());
+            let text_html = match msg.body_html.as_deref() {
+                Some(html) => MultiPart::alternative().singlepart(plain).singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html.to_string()),
+                ),
+                None => MultiPart::mixed().singlepart(plain),
+            };
+            let mp = if msg.attachments.is_empty() {
+                text_html
+            } else {
+                let mut mixed = MultiPart::mixed().multipart(text_html);
+                for a in msg.attachments {
+                    // 附件类型来自库内记录（收件时从 MIME 头取得 / 本地按扩展名推断）；
+                    // 非法 MIME 回退 octet-stream，绝不因类型串异常放弃整封邮件
+                    let ct = ContentType::parse(&a.mime).unwrap_or_else(|_| {
+                        ContentType::parse("application/octet-stream")
+                            .unwrap_or(ContentType::TEXT_PLAIN)
+                    });
+                    mixed = mixed.singlepart(Attachment::new(a.filename).body(a.bytes, ct));
+                }
+                mixed
+            };
             builder.multipart(mp)
         }
         .map_err(|err| format!("构建邮件失败：{err}"))?;
@@ -257,12 +274,13 @@ pub fn dispatch_one(
     };
     let row = conn.query_row(
         "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''),
-                subject, body_text
+                subject, body_text, COALESCE(body_html,'')
          FROM emails WHERE id = ?1",
         [id],
         |r| {
             let to_raw: String = r.get(2)?;
             let cc_raw: String = r.get(3)?;
+            let body_html: String = r.get(6)?;
             Ok((
                 OutgoingMessage {
                     from_addr: r.get(0)?,
@@ -271,6 +289,11 @@ pub fn dispatch_one(
                     cc_addrs: split_addrs(&cc_raw),
                     subject: r.get(4)?,
                     body_text: r.get(5)?,
+                    body_html: if body_html.trim().is_empty() {
+                        None
+                    } else {
+                        Some(body_html)
+                    },
                     message_id: String::new(),
                     attachments: Vec::new(),
                 },

@@ -1769,6 +1769,23 @@ body {
     background: #fff;
 }
 
+/* 正文模式切换（纯文本 / HTML）与 HTML 源码编辑区 */
+.body-mode {
+    margin-left: 10px;
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--muted);
+}
+.body-mode .mode-opt {
+    margin-left: 10px;
+    cursor: pointer;
+}
+.compose-card textarea.html-edit {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+}
+
 .compose-note {
     border-radius: 9px;
     padding: 8px 12px;

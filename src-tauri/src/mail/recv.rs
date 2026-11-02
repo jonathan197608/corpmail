@@ -10,8 +10,8 @@
 
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
-    mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, sync_attach_stats,
-    tokenize, zoned_of,
+    mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, strip_html,
+    sync_attach_stats, tokenize, zoned_of,
 };
 use crate::net::TlsMode;
 use rusqlite::OptionalExtension;
@@ -1008,52 +1008,6 @@ fn find_inline_part<'a>(
         }
     }
     None
-}
-
-/// HTML 剥标签（无 regex 依赖的手工实现）+ 基础实体解码。
-/// 索引扫描而非吞并式迭代：未闭合 `<` 不应吞掉后文（畸形 HTML 常见）
-fn strip_html(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut i = 0;
-    while i < html.len() {
-        match html.as_bytes()[i] {
-            b'<' => match html[i..].find('>') {
-                Some(rel) => i += rel + 1, // 整段标签丢弃
-                None => {
-                    // 未闭合：保留 '<' 与后文（不解析）
-                    out.push_str(&html[i..]);
-                    break;
-                }
-            },
-            b'&' => {
-                // 实体：扫描到 ';'（最多 8 字符）；未闭合则原样输出
-                let rest = &html[i + 1..];
-                match rest.find(';').filter(|pos| *pos <= 8) {
-                    Some(pos) => {
-                        match &rest[..pos] {
-                            "nbsp" => out.push(' '),
-                            "lt" => out.push('<'),
-                            "gt" => out.push('>'),
-                            "amp" => out.push('&'),
-                            "quot" => out.push('"'),
-                            other => out.push_str(other),
-                        }
-                        i += 1 + pos + 1;
-                    }
-                    None => {
-                        out.push('&');
-                        i += 1;
-                    }
-                }
-            }
-            _ => {
-                let ch = html[i..].chars().next().unwrap_or(' ');
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    out
 }
 
 /// 附件收集（§6.1：Content-Disposition attachment 或带 filename 的 part）

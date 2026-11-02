@@ -740,8 +740,8 @@ fn detail_marks_read_and_delete_redirects() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/?folder=inbox"),
-        "删除应整页回列表：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
+        "删除应整页回列表（inbox 无上下文 → 根路径）：{:?}",
         resp.extra_headers
     );
     // 二次访问 404
@@ -755,6 +755,50 @@ fn detail_marks_read_and_delete_redirects() {
         },
     );
     assert_eq!(resp.status, 404, "删除后详情应 404");
+    cleanup(&dir);
+}
+
+#[test]
+fn delete_redirects_back_with_list_context() {
+    let (state, dir) = temp_state("m2-delete-back");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in', 'inbox', 'received', 'a@x.cn', '', 'demo@chinatelecom.cn',
+                         '来件主题', '来件正文。', '来件 主题', '来件 正文', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q(
+            "POST",
+            "/emails/1/delete",
+            "unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+            b"",
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        loc, "/?unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+        "删除应保持列表过滤与翻页：{loc}"
+    );
     cleanup(&dir);
 }
 
@@ -2412,6 +2456,13 @@ fn dump_smoke_html() {
     dump("main-draft.html", get_url("/?folder=draft"));
     dump("main-all.html", get_url("/?folder=all"));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
+    // 带列表上下文（未读筛选 + 检索 + 第 2 页）：验证返回/回复/删除链接保持状态
+    dump(
+        "email-inbox-filtered.html",
+        get_url(&format!(
+            "/emails/{inbox_id}?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2"
+        )),
+    );
     dump("email-draft.html", get(&format!("/emails/{d1}")));
     dump("compose.html", get("/compose"));
     dump(

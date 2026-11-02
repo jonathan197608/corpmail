@@ -157,6 +157,52 @@ pub fn sanitize_html(raw: &str) -> String {
     SANITIZER.clean(raw).to_string()
 }
 
+/// HTML 剥标签为纯文本（基础实体解码）：用于 HTML 正文的检索/列表预览/转发引用。
+/// 索引扫描而非吞并式迭代：未闭合 `<` 不应吞掉后文（畸形 HTML 常见）。
+pub fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        match html.as_bytes()[i] {
+            b'<' => match html[i..].find('>') {
+                Some(rel) => i += rel + 1, // 整段标签丢弃
+                None => {
+                    // 未闭合：保留 '<' 与后文（不解析）
+                    out.push_str(&html[i..]);
+                    break;
+                }
+            },
+            b'&' => {
+                // 实体：扫描到 ';'（最多 8 字符）；未闭合则原样输出
+                let rest = &html[i + 1..];
+                match rest.find(';').filter(|pos| *pos <= 8) {
+                    Some(pos) => {
+                        match &rest[..pos] {
+                            "nbsp" => out.push(' '),
+                            "lt" => out.push('<'),
+                            "gt" => out.push('>'),
+                            "amp" => out.push('&'),
+                            "quot" => out.push('"'),
+                            other => out.push_str(other),
+                        }
+                        i += 1 + pos + 1;
+                    }
+                    None => {
+                        out.push('&');
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                let ch = html[i..].chars().next().unwrap_or(' ');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(bytes)?;
@@ -254,9 +300,33 @@ pub struct DraftInput {
 /// 覆盖要求目标行存在且 folder='draft'；更新走 emails_au 触发器同步 FTS。
 /// 幂等：同入参重复提交覆盖同一行，结果一致。
 pub fn save_draft(state: &AppState, input: &DraftInput) -> Result<i64, String> {
+    save_draft_impl(state, input, None)
+}
+
+/// 带 HTML 正文保存草稿（撰写页 HTML 模式）：入库前净化，`body_text` 由调用方
+/// 提供纯文本版（检索/预览/转发引用）。净化后为空则按纯文本处理。
+pub fn save_draft_with_html(
+    state: &AppState,
+    input: &DraftInput,
+    html: &str,
+) -> Result<i64, String> {
+    let clean = sanitize_html(html);
+    if clean.trim().is_empty() {
+        save_draft_impl(state, input, None)
+    } else {
+        save_draft_impl(state, input, Some(&clean))
+    }
+}
+
+fn save_draft_impl(
+    state: &AppState,
+    input: &DraftInput,
+    body_html: Option<&str>,
+) -> Result<i64, String> {
     let st = tokenize(&input.subject);
     let bt = tokenize(&input.body_text);
     let now = now_epoch();
+    let body_kind = if body_html.is_some() { "html" } else { "plain" };
     state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         if let Some(id) = input.id {
@@ -274,7 +344,7 @@ pub fn save_draft(state: &AppState, input: &DraftInput) -> Result<i64, String> {
             tx.execute(
                 "UPDATE emails SET from_addr=?2, from_name=?3, to_addrs=?4, cc_addrs=?5,
                         subject=?6, body_text=?7, subject_tokens=?8, body_tokens=?9,
-                        in_reply_to=?10
+                        in_reply_to=?10, body_kind=?11, body_html=?12
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -287,6 +357,8 @@ pub fn save_draft(state: &AppState, input: &DraftInput) -> Result<i64, String> {
                     st,
                     bt,
                     input.in_reply_to,
+                    body_kind,
+                    body_html,
                 ],
             )
             .map_err(e)?;
@@ -296,8 +368,8 @@ pub fn save_draft(state: &AppState, input: &DraftInput) -> Result<i64, String> {
             tx.execute(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     cc_addrs, subject, body_text, subject_tokens, body_tokens,
-                                    unread, created_at, in_reply_to)
-                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10)",
+                                    unread, created_at, in_reply_to, body_kind, body_html)
+                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     input.from_addr,
                     input.from_name,
@@ -309,6 +381,8 @@ pub fn save_draft(state: &AppState, input: &DraftInput) -> Result<i64, String> {
                     bt,
                     now,
                     input.in_reply_to,
+                    body_kind,
+                    body_html,
                 ],
             )
             .map_err(e)?;

@@ -238,7 +238,14 @@ fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                 }
             }
             if interval > 0 {
-                handle.state::<state::AppState>().start_fetch();
+                let st = handle.state::<state::AppState>();
+                // 后台更新进行中：本次定时触发直接忽略（不排队、不叠加线程）。
+                // start_fetch 内部 CAS 亦兜底，这里提前短路主要是语义明确 + 少一次调用
+                if st.fetch_snapshot().running {
+                    eprintln!("[fetch] 定时触发时已有收件进行中，忽略本次");
+                } else {
+                    st.start_fetch();
+                }
             }
         }
     });

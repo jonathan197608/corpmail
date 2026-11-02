@@ -718,6 +718,25 @@ fn start_fetch_skips_when_unconfigured() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 运行中重复触发（定时/页面重复请求）应被忽略：不开启新轮、不改变代际
+#[test]
+fn start_fetch_ignored_while_running() {
+    let dir = temp_dir("fetch-ignore");
+    let state = AppState::open(&dir);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    {
+        let mut s = state.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.running = true;
+        s.epoch = 7;
+    }
+    state.start_fetch();
+    let s = state.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(s.running, "运行中应保持运行");
+    assert_eq!(s.epoch, 7, "运行中重复触发不得开启新轮（epoch 不变）");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 挂起轮达到上限：拒绝开新轮并说明原因（不再叠加线程/TcpStream/连接）
 #[test]
 fn fetch_refuses_new_round_at_hang_cap() {

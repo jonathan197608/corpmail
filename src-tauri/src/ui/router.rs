@@ -223,6 +223,9 @@ struct EmailCtx {
     email: mail::EmailDetail,
     /// 「返回列表」链接：还原进入详情前的过滤状态（未读/外部/搜索/页码）
     back_href: String,
+    /// 同一列表上下文的查询串（不含 `?`）：回复/转发/删除操作携带，
+    /// 使撰写页返回与删除回跳同样保持原过滤与翻页
+    list_query: String,
     /// 发件人是否外部（详情页发件人旁「外部」标记）
     from_external: bool,
     /// 收件人/抄送按地址拆开，外部地址逐个标注
@@ -244,9 +247,15 @@ struct ComposeCtx {
     cc_addrs: String,
     subject: String,
     body_text: String,
+    /// HTML 编辑模式的正文源码（草稿回填用；仅 body_mode=="html" 时提交）
+    body_html: String,
+    /// 正文模式：plain | html
+    body_mode: String,
     attachments: Vec<AttachView>,
     /// 已入库附件 id 的 JSON 数组（keep_ids 隐藏域初值；JS 维护移除）
     keep_ids_json: String,
+    /// 「返回列表」链接：保持来源列表的过滤/翻页（无来源时回默认列表）
+    back_href: String,
     saved: bool,
     error: String,
     /// 本次被跳过的 0 字节文件数（附件选择误选空文件时提示，不阻断整单保存）
@@ -559,12 +568,14 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let to_chips = addr_chips(&email.to_addrs, &domain);
     let cc_chips = addr_chips(&email.cc_addrs, &domain);
     let back_href = detail_back_href(req, &folder);
+    let list_query = list_query_of(req, &folder);
     Some(render_html(
         "email.html",
         &EmailCtx {
             frame: frame_ctx(state, &folder),
             email,
             back_href,
+            list_query,
             from_external,
             to_chips,
             cc_chips,
@@ -581,12 +592,19 @@ fn email_delete(state: &AppState, req: &Req) -> Resp {
     let folder = mail::get(state, id)
         .map(|d| d.folder)
         .unwrap_or_else(|| "inbox".into());
+    // 删除后回列表 / 失败回详情：均携带进入前的列表上下文（过滤+翻页）
+    let back_href = detail_back_href(req, &folder);
+    let list_query = list_query_of(req, &folder);
     match mail::delete(state, id) {
-        Ok(_) => Resp::hx_redirect(&format!("/?folder={folder}")),
-        Err(e) => Resp::hx_redirect(&format!(
-            "/emails/{id}?error={}",
-            urlencode(&format!("删除失败：{e}"))
-        )),
+        Ok(_) => Resp::hx_redirect(&back_href),
+        Err(e) => {
+            let mut q = list_query;
+            if !q.is_empty() {
+                q.push('&');
+            }
+            q.push_str(&format!("error={}", urlencode(&format!("删除失败：{e}"))));
+            Resp::hx_redirect(&format!("/emails/{id}?{q}"))
+        }
     }
 }
 
@@ -629,7 +647,11 @@ fn fetch_start(state: &AppState) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
     }
-    state.start_fetch();
+    // 后台更新进行中：页面重复触发直接忽略（不排队、不叠加），仅回当前状态；
+    // start_fetch 内部 CAS 亦兜底（多请求竞态时仅首个生效）
+    if !state.fetch_snapshot().running {
+        state.start_fetch();
+    }
     fetch_status(state, false)
 }
 
@@ -722,8 +744,19 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         cc_addrs: String::new(),
         subject: String::new(),
         body_text: String::new(),
+        body_html: String::new(),
+        body_mode: "plain".into(),
         attachments: Vec::new(),
         keep_ids_json: "[]".into(),
+        // 草稿编辑回草稿箱，其余回来源列表（回复/转发链接携带 list_query）
+        back_href: detail_back_href(
+            req,
+            if req.query_param("draft_id").is_some() {
+                "draft"
+            } else {
+                "inbox"
+            },
+        ),
         saved,
         error,
         skipped,
@@ -741,6 +774,12 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.cc_addrs = draft.cc_addrs;
             ctx.subject = draft.subject;
             ctx.body_text = draft.body_text;
+            ctx.body_html = draft.body_html;
+            ctx.body_mode = if ctx.body_html.trim().is_empty() {
+                "plain".into()
+            } else {
+                "html".into()
+            };
             ctx.attachments = draft.attachments;
             ctx.keep_ids_json =
                 serde_json::to_string(&ctx.attachments.iter().map(|a| a.id).collect::<Vec<_>>())
@@ -846,6 +885,14 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, 
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let draft_id = form_i64(&form, "draft_id");
+    // 正文模式：html 模式下按 body_html 源码生成纯文本版（检索/预览）并净化入库
+    let body_mode = form.get("body_mode").map(String::as_str).unwrap_or("plain");
+    let (body_text, html_raw) = if body_mode == "html" {
+        let raw = form.get("body_html").cloned().unwrap_or_default();
+        (mail::strip_html(&raw), Some(raw))
+    } else {
+        (form.get("body_text").cloned().unwrap_or_default(), None)
+    };
     let input = mail::DraftInput {
         id: draft_id,
         from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
@@ -853,13 +900,17 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, 
         to_addrs: trimmed_field(&form, "to_addrs").unwrap_or_default(),
         cc_addrs: trimmed_field(&form, "cc_addrs").unwrap_or_default(),
         subject: form.get("subject").cloned().unwrap_or_default(),
-        body_text: form.get("body_text").cloned().unwrap_or_default(),
+        body_text,
         in_reply_to: form_i64(&form, "in_reply_to"),
     };
     let keep_ids = form_json_i64s(&form, "keep_ids");
     let paths = form_json_strings(&form, "attach_paths");
     let forward_from = form_i64(&form, "forward_from").unwrap_or(0);
-    let id = mail::save_draft(state, &input).map_err(|e| (draft_id.unwrap_or(0), e))?;
+    let id = match html_raw {
+        Some(html) => mail::save_draft_with_html(state, &input, &html),
+        None => mail::save_draft(state, &input),
+    }
+    .map_err(|e| (draft_id.unwrap_or(0), e))?;
     // 顺序敏感：keep_ids 裁剪只针对本次保存前已存在的附件，必须排在转发复制之前。
     // 否则首次保存转发时 keep_ids 为空，会把刚复制进来的附件全部删掉（附件永远带不过去）。
     mail::remove_attachments_except(state, id, &keep_ids)
@@ -1259,7 +1310,10 @@ pub(super) fn frame_of(
 /// 参数来自列表行链接（见 MainCtx.list_query）；未携带时按邮件所在 folder。
 /// 全部走白名单/夹取：q 需 urlencode（用户输入），folder 只放行已知值，
 /// 页码夹取到 1..=10 万防畸形查询串撑爆。
-fn detail_back_href(req: &Req, fallback_folder: &str) -> String {
+/// 还原进入前的列表过滤状态为查询串（folder/unread/external/q/page）。
+/// 全部走白名单/夹取：q 需 urlencode（用户输入），folder 只放行已知值，
+/// 页码夹取到 1..=10 万防畸形查询串撑爆。
+fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let folder = match req.query_param("folder").as_deref() {
         Some("all") | Some("sent") | Some("draft") | Some("inbox") => {
             req.query_param("folder").unwrap()
@@ -1287,10 +1341,17 @@ fn detail_back_href(req: &Req, fallback_folder: &str) -> String {
     if page > 1 {
         qs.push(format!("page={page}"));
     }
+    qs.join("&")
+}
+
+/// 详情页「返回列表」链接：原样还原进入前的过滤状态。
+/// 参数来自列表行链接（见 MainCtx.list_query）；未携带时按邮件所在 folder。
+fn detail_back_href(req: &Req, fallback_folder: &str) -> String {
+    let qs = list_query_of(req, fallback_folder);
     if qs.is_empty() {
         "/".to_string()
     } else {
-        format!("/?{}", qs.join("&"))
+        format!("/?{qs}")
     }
 }
 
