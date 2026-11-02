@@ -36,11 +36,18 @@
                 <div class="md-row">
                     <span class="k">发件人</span>
                     <b class="md-addr">{% if email.from_name %}{{ email.from_name }} &lt;{{ email.from_addr }}&gt;{% else %}{{ email.from_addr }}{% endif %}</b>
+                    {% if from_external %}<span class="ext-badge" title="发件人为外部邮箱域名">外部</span>{% endif %}
                     <span class="md-time">{{ email.time_full }}</span>
                 </div>
-                <div class="md-row"><span class="k">收件人</span><span class="md-addr">{{ email.to_addrs }}</span></div>
-                {% if email.cc_addrs %}
-                <div class="md-row"><span class="k">抄送</span><span class="md-addr">{{ email.cc_addrs }}</span></div>
+                {% if to_chips %}
+                <div class="md-row"><span class="k">收件人</span><span class="md-addr">
+                    {% for c in to_chips %}<span class="md-addr-item{% if c.external %} ext{% endif %}">{{ c.text }}{% if c.external %}<span class="ext-badge">外部</span>{% endif %}</span>{{ ", " if not loop.last else "" }}{% endfor %}
+                </span></div>
+                {% endif %}
+                {% if cc_chips %}
+                <div class="md-row"><span class="k">抄送</span><span class="md-addr">
+                    {% for c in cc_chips %}<span class="md-addr-item{% if c.external %} ext{% endif %}">{{ c.text }}{% if c.external %}<span class="ext-badge">外部</span>{% endif %}</span>{{ ", " if not loop.last else "" }}{% endfor %}
+                </span></div>
                 {% endif %}
                 {% if email.status == 'failed' and email.error %}
                 <div class="md-row"><span class="k">失败原因</span><span class="md-error">{{ email.error }}</span></div>

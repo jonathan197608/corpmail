@@ -170,6 +170,13 @@ impl Resp {
 
 // ---------- 模板上下文 ----------
 
+/// 收件人地址片段（详情页按地址逐个标注“外部”）
+#[derive(Serialize)]
+struct AddrChip {
+    text: String,
+    external: bool,
+}
+
 /// 侧栏（主界面/设置页共用）
 #[derive(Serialize)]
 pub(super) struct FrameCtx {
@@ -191,13 +198,16 @@ struct MainCtx {
     folder: String,
     folder_label: String,
     unread_only: bool,
+    /// 只看外部发件人
+    external_only: bool,
+    /// 未读/外部开关链接（各自取反、保留另一个筛选与检索词）
+    unread_href: String,
+    external_href: String,
     page: i64,
     pages: i64,
     total: i64,
-    /// 分页链接前缀（含 folder/unread/q 参数；模板拼 page=N）
+    /// 分页链接前缀（含 folder/unread/external/q 参数；模板拼 page=N）
     page_base: String,
-    /// 未读开关基址（仅 folder/q，无 unread：开启/恢复链接共用，防恢复链接自带 unread）
-    plain_base: String,
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
     items: Vec<EmailSummary>,
@@ -208,6 +218,11 @@ struct MainCtx {
 struct EmailCtx {
     frame: FrameCtx,
     email: mail::EmailDetail,
+    /// 发件人是否外部（详情页发件人旁「外部」标记）
+    from_external: bool,
+    /// 收件人/抄送按地址拆开，外部地址逐个标注
+    to_chips: Vec<AddrChip>,
+    cc_chips: Vec<AddrChip>,
     /// 页面轻提示（error query 回显，如重发被拒）
     notice: String,
 }
@@ -414,11 +429,20 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         .unwrap_or(1)
         .max(1);
     let unread_only = req.query_param("unread").map(|v| v == "1").unwrap_or(false);
+    let external_only = req
+        .query_param("external")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let q_input = req.query_param("q").unwrap_or_default().trim().to_string();
+    // 内部域取账号域名（默认 chinatelecom.cn）：判定外部发件人的唯一口径
+    let d = defaults();
+    let internal_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let q = mail::ListQuery {
         folder: folder.clone(),
         page,
         unread_only,
+        external_only,
+        internal_domain,
     };
     // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词/检索异常回退普通列表
     let (items, total) = if q_input.is_empty() {
@@ -430,30 +454,42 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
     };
     let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
-    // plain_base：folder+q 基址（无 unread）——未读开关开启/恢复链接共用，
-    // 恢复链接不得复用含 unread 的 page_base（否则永远跳不回全部）
-    let mut plain_base = if folder == "inbox" {
+    // 基址 = folder + q（不含筛选）：两个开关各自"取反自己、保留对方"，
+    // 否则开关一次会丢掉另一个筛选（多筛选项并存时的常见坑）
+    let mut base = if folder == "inbox" {
         "/?".to_string()
     } else {
         format!("/?folder={folder}&")
     };
     if !q_input.is_empty() {
-        plain_base = format!("{plain_base}q={}&", urlencode(&q_input));
+        base = format!("{base}q={}&", urlencode(&q_input));
     }
-    let mut page_base = plain_base.clone();
-    if unread_only {
-        page_base = format!("{page_base}unread=1&");
-    }
+    let unread_part = if unread_only { "unread=1&" } else { "" };
+    let external_part = if external_only { "external=1&" } else { "" };
+    let page_base = format!("{base}{unread_part}{external_part}");
+    let unread_href = if unread_only {
+        // 取消未读筛选：保留外部筛选，回到当前页
+        format!("{base}{external_part}page={page}")
+    } else {
+        format!("{base}unread=1&{external_part}page=1")
+    };
+    let external_href = if external_only {
+        format!("{base}{unread_part}page={page}")
+    } else {
+        format!("{base}external=1&{unread_part}page=1")
+    };
     let ctx = MainCtx {
         frame: frame_ctx(state, &folder),
         folder: folder.clone(),
         folder_label: folder_label(&folder).into(),
         unread_only,
+        external_only,
+        unread_href,
+        external_href,
         page,
         pages,
         total,
         page_base,
-        plain_base,
         q: q_input,
         items,
     };
@@ -477,11 +513,19 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let folder = email.folder.clone();
     // query_param 已做百分号解码，勿再 urldecode（二次解码会破坏含 %/+ 的错误文案）
     let notice = req.query_param("error").unwrap_or_default();
+    let d = defaults();
+    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
+    let from_external = mail::is_external_addr(&email.from_addr, &domain);
+    let to_chips = addr_chips(&email.to_addrs, &domain);
+    let cc_chips = addr_chips(&email.cc_addrs, &domain);
     Some(render_html(
         "email.html",
         &EmailCtx {
             frame: frame_ctx(state, &folder),
             email,
+            from_external,
+            to_chips,
+            cc_chips,
             notice,
         },
     ))
@@ -1096,6 +1140,21 @@ pub(super) fn frame_of(
         draft: counts["draft"],
         folder: folder.into(),
     }
+}
+
+/// 地址串拆成展示片段（详情页收件人/抄送逐个标注外部）
+fn addr_chips(raw: &str, domain: &str) -> Vec<AddrChip> {
+    mail::contacts::parse_addr_list(raw)
+        .into_iter()
+        .map(|(addr, name)| AddrChip {
+            text: if name.is_empty() {
+                addr.clone()
+            } else {
+                format!("{name} <{addr}>")
+            },
+            external: mail::is_external_addr(&addr, domain),
+        })
+        .collect()
 }
 
 fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {

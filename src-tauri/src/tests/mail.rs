@@ -141,6 +141,8 @@ fn search_ranks_matches_and_highlights_subject() {
         folder: "all".into(),
         page: 1,
         unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
     };
     let (items, total) = search(&state, "激励", &q).unwrap().unwrap();
     assert_eq!(total, 1);
@@ -165,6 +167,8 @@ fn search_ranks_matches_and_highlights_subject() {
         folder: "inbox".into(),
         page: 1,
         unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
     };
     let inbox_result = search(&state, "激励", &q_inbox).unwrap().unwrap();
     assert_eq!(inbox_result.1, 0, "inbox 无邮件");
@@ -232,6 +236,8 @@ fn list_filters_folder_and_pages() {
             folder: "draft".into(),
             page: 1,
             unread_only: false,
+            external_only: false,
+            internal_domain: "chinatelecom.cn".into(),
         },
     )
     .unwrap();
@@ -242,6 +248,8 @@ fn list_filters_folder_and_pages() {
             folder: "inbox".into(),
             page: 1,
             unread_only: false,
+            external_only: false,
+            internal_domain: "chinatelecom.cn".into(),
         },
     )
     .unwrap();
@@ -252,6 +260,8 @@ fn list_filters_folder_and_pages() {
             folder: "all".into(),
             page: 1,
             unread_only: true,
+            external_only: false,
+            internal_domain: "chinatelecom.cn".into(),
         },
     )
     .unwrap();
@@ -263,6 +273,8 @@ fn list_filters_folder_and_pages() {
             folder: "draft".into(),
             page: 1,
             unread_only: false,
+            external_only: false,
+            internal_domain: "chinatelecom.cn".into(),
         },
     )
     .unwrap();

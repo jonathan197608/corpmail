@@ -279,11 +279,13 @@ fn unread_toggle_restores_full_list() {
     };
     // 未开态：开关进入链接带 unread=1
     let plain = body(&route(&state, &assets(), &req("GET", "/", b""), &tester));
+    // URL 作为变量输出时 minijinja 会转义 & → &amp;（浏览器解析无差异）
     assert!(
-        plain.contains("unread=1&page=1"),
+        plain.contains("unread=1&amp;page=1"),
         "未开态开关链接应带 unread=1：{plain}"
     );
     assert!(plain.contains("只看未读"));
+    assert!(plain.contains("只看外部"), "应同时提供外部筛选按钮");
     // 开启态：开关为恢复链接（不带 unread 参数）+ 明确文字
     let unread = body(&route(
         &state,
@@ -295,12 +297,13 @@ fn unread_toggle_restores_full_list() {
     // 恢复链接不带 unread 参数（minijinja 按规范将 / 转义为 &#x2f;，浏览器解码后
     // 即 /?page=1；断言按渲染原文精确匹配）
     assert!(
-        unread.contains(r#"href="&#x2f;?page=1""#),
+        unread.contains(r#"class="unread-toggle on" href="&#x2f;?page=1""#),
         "恢复链接不得再携带 unread 参数：{unread}"
     );
+    // 外部筛选按钮须保留未读筛选（两个开关互不吞掉对方）
     assert!(
-        !unread.contains("unread=1"),
-        "开启态整页不应再出现 unread=1 链接：{unread}"
+        unread.contains("external=1&amp;unread=1&amp;page=1"),
+        "外部按钮应保留未读筛选：{unread}"
     );
     // 恢复链接可达且回到全部
     let restored = body(&route(
@@ -2433,6 +2436,12 @@ fn dump_smoke_html() {
     dump("email-failed.html", get(&format!("/emails/{failed_id}")));
     dump("email-sent.html", get(&format!("/emails/{sent_id}")));
     dump("main-sent.html", get_url("/?folder=sent"));
+    // 外部发件人素材：外部筛选视图 + 外部来信详情（种子第 5 封为合作方域）
+    dump("main-external.html", get_url("/?external=1"));
+    dump(
+        "email-external.html",
+        get(&format!("/emails/{}", inbox_id + 4)),
+    );
 
     // M5 附件预览素材：给草稿 d1 加三类附件（png/txt/zip）→ 详情页统一预览按钮
     {

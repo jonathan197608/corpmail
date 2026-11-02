@@ -249,13 +249,13 @@ body {
 
 .gear {
     margin-left: auto;
-    width: 28px;
-    height: 28px;
+    width: 34px;
+    height: 34px;
     border: none;
-    border-radius: 8px;
+    border-radius: 9px;
     background: transparent;
     color: var(--muted);
-    font-size: 15px;
+    font-size: 19px;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -1399,6 +1399,20 @@ body {
     pointer-events: none;
 }
 
+/* 外部发件人标记：列表行内醒目标签（区分内部/外部域名邮件） */
+.mr-ext {
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 1.5;
+    color: #a63b0a;
+    background: #fdece0;
+    border: 1px solid #f2c9a8;
+    border-radius: 5px;
+    padding: 0 6px;
+    white-space: nowrap;
+    flex: none;
+}
+
 .mr-flag {
     font-size: 11px;
     color: #8a6d1a;
@@ -1470,6 +1484,12 @@ body {
     border-color: var(--accent);
 }
 
+.ext-toggle.on {
+    color: #a63b0a;
+    background: #fdf1e6;
+    border-color: #e5a877;
+}
+
 .back {
     font-size: 13px;
     color: var(--muted);
@@ -1523,6 +1543,26 @@ body {
 .md-addr {
     color: var(--ink-soft);
     word-break: break-all;
+}
+
+/* 详情页：地址逐个展示，外部地址带醒目标记 */
+.md-addr-item.ext {
+    color: #a63b0a;
+}
+
+.ext-badge {
+    display: inline-block;
+    margin-left: 5px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.5;
+    color: #a63b0a;
+    background: #fdece0;
+    border: 1px solid #f2c9a8;
+    border-radius: 5px;
+    padding: 0 5px;
+    vertical-align: 1px;
+    white-space: nowrap;
 }
 
 .md-time {

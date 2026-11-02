@@ -11,6 +11,8 @@
             </div>
             <div class="mr-main">
                 <div class="mr-top">
+                    {# 外部发件人：醒目标记（按域名后缀判定，见 mail::is_external_addr） #}
+                    {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
                     <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
                     {% if m.preview_tip %}<span class="mr-tip" aria-hidden="true">{{ m.preview_tip }}</span>{% endif %}
                     {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
@@ -40,6 +42,10 @@
             <div class="empty-mark">✅</div>
             <h2>没有未读邮件</h2>
             <p>太好了，收件箱已全部读完。</p>
+            {% elif external_only %}
+            <div class="empty-mark">🏠</div>
+            <h2>没有外部邮件</h2>
+            <p>当前邮箱收到的都是内部同事来信。</p>
             {% else %}
             <div class="empty-mark">📭</div>
             <h2>这里还没有邮件</h2>

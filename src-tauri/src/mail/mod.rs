@@ -308,6 +308,59 @@ pub struct ListQuery {
     pub folder: String,
     pub page: i64,
     pub unread_only: bool,
+    /// 只看外部发件人（收件箱「外部」筛选按钮）
+    pub external_only: bool,
+    /// 账号内部域（如 chinatelecom.cn；用于判定外部发件人，空 = 无内部域）
+    pub internal_domain: String,
+}
+
+/// 外部发件人判定：域名与内部域相同或为其子域时为内部。
+/// 无 @ 的串（本地草稿等）不算外部；空内部域时所有带地址的来信均为外部。
+/// 与 `external_sql` 保持同一口径（单测对照两者）。
+pub fn is_external_addr(addr: &str, internal_domain: &str) -> bool {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return false;
+    }
+    let Some((_, dom)) = addr.rsplit_once('@') else {
+        return false;
+    };
+    let dom = dom.trim().to_ascii_lowercase();
+    if dom.is_empty() {
+        return false;
+    }
+    let internal = internal_domain
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    if internal.is_empty() {
+        return true;
+    }
+    !(dom == internal || dom.ends_with(&format!(".{internal}")))
+}
+
+/// 外部发件人 SQL 表达式（与 `is_external_addr` 同口径；供列表过滤与行标记复用，
+/// 避免"筛出来的"和"标出来的"不一致）。alias 为空或 "e."。
+/// 绑定参数：:dom = 内部域（大小写不敏感）。
+fn external_sql(alias: &str) -> String {
+    let a = alias;
+    // :dom 归一化：配置默认值形如 "@chinatelecom.cn"（含前导 @），
+    // 直接拼 '%@' || :dom 会得到 '%@@chinatelecom.cn' 永不命中——
+    // 必须去掉前导 @ 与空白后再比后缀，否则全部来信被误标外部。
+    let dom = "lower(ltrim(trim(:dom), '@'))";
+    format!(
+        "({a}from_addr <> '' AND NOT (lower({a}from_addr) LIKE '%@' || {dom} \
+         OR lower({a}from_addr) LIKE '%.' || {dom}))"
+    )
+}
+
+/// 外部标记 SQL 列（空内部域时所有带地址来信都算外部）
+fn external_col(alias: &str, domain: &str) -> String {
+    if domain.trim().trim_start_matches('@').trim().is_empty() {
+        format!("({alias}from_addr <> '')")
+    } else {
+        external_sql(alias)
+    }
 }
 
 /// 列表行（邮件摘要）
@@ -322,6 +375,8 @@ pub struct EmailSummary {
     pub body_preview: String,
     pub attach_cnt: i64,
     pub unread: bool,
+    /// 外部发件人（列表「外部」标记；口径见 is_external_addr）
+    pub from_external: bool,
     pub time_label: String,
     /// 标题安全 HTML：列表为转义原文，检索命中时为 <mark> 高亮版（模板 |safe 输出）
     pub subject_html: String,
@@ -346,7 +401,11 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         format!(" AND folder = '{folder}'")
     };
     let unread_sql = if q.unread_only { " AND unread = 1" } else { "" };
-    let where_sql = format!("WHERE 1=1{folder_sql}{unread_sql}");
+    let domain = q.internal_domain.trim();
+    let ext_col = external_col("", domain);
+    let ext_filter = if q.external_only { 1 } else { 0 };
+    // :extf = 0 时整段条件恒真：无需为"是否过滤"拼两套 SQL
+    let where_sql = format!("WHERE 1=1{folder_sql}{unread_sql} AND (:extf = 0 OR {ext_col})");
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
     let offset = (page - 1).saturating_mul(PAGE_SIZE);
@@ -354,7 +413,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         let total: i64 = conn
             .query_row(
                 &format!("SELECT count(*) FROM emails {where_sql}"),
-                [],
+                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain },
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -362,16 +421,20 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
             .prepare(&format!(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
-                        COALESCE(received_at, sent_at, created_at) AS t
+                        COALESCE(received_at, sent_at, created_at) AS t,
+                        {ext_col} AS from_external
                  FROM emails {where_sql}
                  ORDER BY t DESC, id DESC
-                 LIMIT ?1 OFFSET ?2"
+                 LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;
         let rows = stmt
-            .query_map(rusqlite::params![PAGE_SIZE, offset], |r| {
-                summary_from_row(r, None)
-            })
+            .query_map(
+                rusqlite::named_params! {
+                    ":extf": ext_filter, ":dom": domain, ":lim": PAGE_SIZE, ":off": offset
+                },
+                |r| summary_from_row(r, None),
+            )
             .map_err(e)?;
         let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         Ok((items, total))
@@ -403,6 +466,7 @@ fn summary_from_row(
         preview_tip: preview_tip(&body),
         attach_cnt: r.get(8)?,
         unread: r.get::<_, i64>(9)? == 1,
+        from_external: r.get::<_, i64>(11)? == 1,
         time_label: time_label(r.get(10)?),
         subject_html,
     })
@@ -492,6 +556,10 @@ pub fn search(
     } else {
         ""
     };
+    let domain = q.internal_domain.trim();
+    let ext_col = external_col("e.", domain);
+    let ext_filter = if q.external_only { 1 } else { 0 };
+    let ext_sql = format!(" AND (:extf = 0 OR {ext_col})");
     let page = q.page.max(1);
     let offset = (page - 1).saturating_mul(PAGE_SIZE);
     let words = tokenize_words(input);
@@ -501,9 +569,9 @@ pub fn search(
                 &format!(
                     "SELECT count(*)
                      FROM email_fts JOIN emails e ON e.id = email_fts.rowid
-                     WHERE email_fts MATCH ?1{folder_sql}{unread_sql}"
+                     WHERE email_fts MATCH :match{folder_sql}{unread_sql}{ext_sql}"
                 ),
-                rusqlite::params![match_expr],
+                rusqlite::named_params! { ":match": match_expr, ":extf": ext_filter, ":dom": domain },
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -511,17 +579,22 @@ pub fn search(
             .prepare(&format!(
                 "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                         e.to_addrs, e.body_text, e.attach_cnt, e.unread,
-                        COALESCE(e.received_at, e.sent_at, e.created_at) AS t
+                        COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
+                        {ext_col} AS from_external
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
-                 WHERE email_fts MATCH ?1{folder_sql}{unread_sql}
+                 WHERE email_fts MATCH :match{folder_sql}{unread_sql}{ext_sql}
                  ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
-                 LIMIT ?2 OFFSET ?3"
+                 LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;
         let rows = stmt
-            .query_map(rusqlite::params![match_expr, PAGE_SIZE, offset], |r| {
-                summary_from_row(r, Some(&words))
-            })
+            .query_map(
+                rusqlite::named_params! {
+                    ":match": match_expr, ":extf": ext_filter, ":dom": domain,
+                    ":lim": PAGE_SIZE, ":off": offset
+                },
+                |r| summary_from_row(r, Some(&words)),
+            )
             .map_err(e)?;
         let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         Ok(Some((items, total)))
