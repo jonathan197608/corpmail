@@ -4,6 +4,7 @@
 use super::*;
 use crate::mail::{get, save_draft};
 use crate::state::AppState;
+use crate::state::keys;
 use std::path::PathBuf;
 
 /// 假收件器：记录批量回写调用参数（fetch 路径由真实 fetcher 单独覆盖，不测网络）

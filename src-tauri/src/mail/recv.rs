@@ -13,7 +13,6 @@ use super::{
     mark_read, month_dir_conn, now_epoch, safe_filename, sync_attach_stats, tokenize, zoned_of,
 };
 use crate::net::TlsMode;
-use crate::state::{defaults, full_address, keys};
 use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -134,6 +133,16 @@ pub struct LastCursor {
 pub enum MailDest {
     Inbox,
     Sent,
+}
+
+impl MailDest {
+    /// 状态片段展示用的阶段标识（收件箱/发件箱同步进度文案）
+    pub fn phase_str(self) -> &'static str {
+        match self {
+            MailDest::Inbox => "inbox",
+            MailDest::Sent => "sent",
+        }
+    }
 }
 
 /// 一轮收件结果（游标推进依据 = 搜索层 max_uid，解析失败/入库去重不阻塞游标）
@@ -1253,29 +1262,13 @@ pub fn seen_params_of(state: &AppState, id: i64) -> Option<SeenParams> {
     let (v, u) = remote.split_once(':')?;
     let uidvalidity = v.parse().ok()?;
     let uid = u.parse().ok()?;
-    let d = defaults();
-    let host = state.get_or(keys::RECV_HOST, &d).unwrap_or_default();
-    let port: u16 = state
-        .get_or(keys::RECV_PORT, &d)
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(993);
-    let security = TlsMode::resolve(
-        port,
-        &state.get_or(keys::RECV_SECURITY, &d).unwrap_or_default(),
-    );
-    let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
-    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
-    let account = full_address(&prefix, &domain);
-    let password = match state.retrieve_password(&account) {
-        crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
-        crate::secrets::GetResult::Missing => return None,
-    };
+    let p = state.imap_params()?;
     Some(SeenParams {
-        host,
-        port,
-        security,
-        account,
-        password,
+        host: p.host,
+        port: p.port,
+        security: p.security,
+        account: p.account,
+        password: p.password,
         uidvalidity,
         uid,
     })

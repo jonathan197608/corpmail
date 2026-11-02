@@ -152,6 +152,19 @@ pub fn full_address(prefix: &str, domain: &str) -> String {
     }
 }
 
+/// 收件（IMAP）连接参数快照。
+///
+/// `start_fetch`（收件轮次）与 `seen_params_of`（已读回写）共用同一装配口径，
+/// 避免两处各按一遍读取顺序拼 host/port/加密/账号/密码而漂移。
+#[derive(Clone)]
+pub struct ImapParams {
+    pub host: String,
+    pub port: u16,
+    pub security: crate::net::TlsMode,
+    pub account: String,
+    pub password: String,
+}
+
 impl AppState {
     /// 打开/初始化数据库（schema 幂等迁移在 db::open 内完成；锚点=数据目录本身，
     /// 适用于测试与未启用自定义目录的场景）
@@ -481,6 +494,29 @@ impl AppState {
     ///
     /// 参数快照与状态 CAS 在调用线程完成后，网络拉取与入库交由独立线程执行
     /// （独立连接，同发送 worker 模式；完成后更新游标/last_sync_at 并置 just_finished）。
+    /// 装配收件连接参数（host/端口/加密方式/账号/密码）。
+    /// 收件轮次与「已读回写」共用同一实现；密码缺失返回 None（由调用方决定提示或跳过）。
+    pub fn imap_params(&self) -> Option<ImapParams> {
+        let d = defaults();
+        let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
+        let port: u16 = g(keys::RECV_PORT).parse().unwrap_or(993);
+        let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
+        let password = self.retrieve_password(&account).into_password()?;
+        Some(ImapParams {
+            host: g(keys::RECV_HOST),
+            port,
+            security: crate::net::TlsMode::resolve(port, &g(keys::RECV_SECURITY)),
+            account,
+            password,
+        })
+    }
+
+    /// 读取指定邮箱的本地增量游标（启动快照与重试续拉共用）。
+    pub fn last_cursor(&self, dest: crate::mail::MailDest) -> crate::mail::LastCursor {
+        let (uv_key, uid_key) = cursor_keys(dest);
+        self.with_conn(|conn| read_fetch_cursor(conn, uv_key, uid_key))
+    }
+
     pub fn start_fetch(&self) {
         // 挂起轮上限（审计 P1-5）：看门狗只复位 UI 状态，挂起线程仍在跑。
         // 达到上限即拒绝新轮并给出明确原因，而不是继续叠加线程
@@ -502,31 +538,17 @@ impl AppState {
         let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
         };
+        let Some(conn_params) = self.imap_params() else {
+            self.fetch_end(epoch, 0, "凭据缺失，请先在设置中保存密码");
+            return;
+        };
         let d = defaults();
         let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
-        let host = g(keys::RECV_HOST);
-        let port: u16 = g(keys::RECV_PORT).parse().unwrap_or(993);
-        let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
-        let password = match self.retrieve_password(&account) {
-            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,
-            crate::secrets::GetResult::Missing => {
-                self.fetch_end(epoch, 0, "凭据缺失，请先在设置中保存密码");
-                return;
-            }
-        };
         let first_days = first_fetch_days_from_raw(&g(keys::FIRST_FETCH_DAYS));
-        // 加密方式：端口推断 + 显式覆盖（465/993 隐式 TLS，其余 STARTTLS）
-        let security = crate::net::TlsMode::resolve(port, &g(keys::RECV_SECURITY));
         // 单封上限：超出只拉信头存占位（防止整封 + 附件 + gzip 副本同时驻留内存）
         let max_mail_bytes = max_mail_bytes_from(&g(keys::MAX_MAIL_MB));
-        let last = crate::mail::LastCursor {
-            uidvalidity: g(keys::LAST_UIDVALIDITY).parse().unwrap_or(0),
-            uid: g(keys::LAST_UID).parse().unwrap_or(0),
-        };
-        let last_sent = crate::mail::LastCursor {
-            uidvalidity: g(keys::LAST_UIDVALIDITY_SENT).parse().unwrap_or(0),
-            uid: g(keys::LAST_UID_SENT).parse().unwrap_or(0),
-        };
+        let last = self.last_cursor(crate::mail::MailDest::Inbox);
+        let last_sent = self.last_cursor(crate::mail::MailDest::Sent);
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
         let active_rounds = std::sync::Arc::clone(&self.active_rounds);
         let cur_dir = self.data_dir();
@@ -540,12 +562,12 @@ impl AppState {
                 fetch_state,
                 db_path,
                 data_dir,
-                host,
-                port,
-                security,
+                host: conn_params.host,
+                port: conn_params.port,
+                security: conn_params.security,
                 max_mail_bytes,
-                account,
-                password,
+                account: conn_params.account,
+                password: conn_params.password,
                 first_days,
                 last,
                 last_sent,
@@ -1170,11 +1192,7 @@ fn fetch_phase(p: FetchPhase<'_>) -> Result<Option<(u32, u32)>, String> {
     {
         let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.epoch == epoch {
-            s.phase = match dest {
-                crate::mail::MailDest::Inbox => "inbox",
-                crate::mail::MailDest::Sent => "sent",
-            }
-            .to_string();
+            s.phase = dest.phase_str().to_string();
             s.fetch_done = 0;
             s.fetch_total = 0;
             s.started_at = crate::mail::now_epoch();
@@ -1219,6 +1237,18 @@ fn fetch_phase(p: FetchPhase<'_>) -> Result<Option<(u32, u32)>, String> {
         max_mail_bytes,
         &mut on_batch,
     )
+}
+
+/// 执行单个同步阶段并捕获 panic：任一阶段的 panic 不得拖垮整轮
+/// （发件箱异常也不阻断收件箱）。两个阶段共用同一包装，避免各写一遍。
+fn guarded_phase<F>(label: &str, f: F) -> Result<Option<(u32, u32)>, String>
+where
+    F: FnOnce() -> Result<Option<(u32, u32)>, String>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        eprintln!("[fetch] {label}同步 panic（已捕获）");
+        Err(format!("{label}同步内部异常"))
+    })
 }
 
 fn fetch_round(job: FetchJob) {
@@ -1279,7 +1309,7 @@ fn fetch_round(job: FetchJob) {
             continue;
         }
         // 阶段一：发件箱先同步（失败不阻断收件箱——发件箱命名/权限差异不该拖垮收件）
-        let sent_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let sent_outcome = guarded_phase("发件箱", || {
             fetch_phase(FetchPhase {
                 conn: &mut conn,
                 data_dir: &data_dir,
@@ -1296,10 +1326,6 @@ fn fetch_round(job: FetchJob) {
                 max_mail_bytes,
                 added: &mut added,
             })
-        }))
-        .unwrap_or_else(|_| {
-            eprintln!("[fetch] 发件箱同步 panic（已捕获）");
-            Err("发件箱同步内部异常".into())
         });
         let sent_err = match &sent_outcome {
             // 未发现发件箱（中文服务器的 mUTF-7 名称、命名不规范等）也要可见：
@@ -1312,7 +1338,7 @@ fn fetch_round(job: FetchJob) {
             }
         };
         // 阶段二：收件箱
-        let inbox_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let inbox_outcome = guarded_phase("收件箱", || {
             fetch_phase(FetchPhase {
                 conn: &mut conn,
                 data_dir: &data_dir,
@@ -1329,10 +1355,6 @@ fn fetch_round(job: FetchJob) {
                 max_mail_bytes,
                 added: &mut added,
             })
-        }))
-        .unwrap_or_else(|_| {
-            eprintln!("[fetch] 收件箱同步 panic（已捕获）");
-            Err("收件箱同步内部异常".into())
         });
         match inbox_outcome {
             Ok(Some((uidvalidity, max_uid))) => {

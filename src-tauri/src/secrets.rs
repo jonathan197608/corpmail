@@ -32,6 +32,19 @@ pub enum GetResult {
     Missing,
 }
 
+impl GetResult {
+    /// 取出密码明文；无记录返回 None。
+    ///
+    /// 收件/发信/已读回写多处都需要"命中即取明文、缺失即跳过"，统一收口，
+    /// 避免各调用方重复写 `Keychain(p)|Keyfile(p)=>p` 的 match 样板。
+    pub fn into_password(self) -> Option<String> {
+        match self {
+            GetResult::Keychain(p) | GetResult::Keyfile(p) => Some(p),
+            GetResult::Missing => None,
+        }
+    }
+}
+
 // ---------- 进程内密码缓存 ----------
 //
 // macOS 每次读 keychain 都要校验调用方代码签名：条目 ACL 记录的是创建时进程的
