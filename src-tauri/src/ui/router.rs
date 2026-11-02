@@ -1048,10 +1048,9 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                 );
             }
         }
-        // 首拉立即触发：启动调度线程的 2s 首收跑在向导之前（未配置已被
-        // start_fetch 静默忽略），不等这一单，下次收信要等满一个定时周期
-        state.start_fetch();
-        // 首次同步：配置完成立即拉取（fetch_round 内部先发件箱、后收件箱）。
+        // 首次同步：配置完成立即拉取（fetch_round 内部先发件箱、后收件箱），
+        // 不必等下一个定时周期。启动调度线程的 2s 首收跑在向导之前，
+        // 那时未配置已被 start_fetch 静默忽略。
         // 数据目录迁移已完成待重启时跳过——本轮会写入旧目录，重启后新库
         // 由 sync_on_start 再拉一次，避免白拉
         if state.pending_data_dir().is_none() {

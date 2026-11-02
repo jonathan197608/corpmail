@@ -3013,3 +3013,73 @@ fn fetch_status_marks_running_and_phase_for_button_disable() {
     assert!(html.contains("every 10s"), "空闲 10s 轮询");
     cleanup(&dir);
 }
+
+#[test]
+fn wizard_save_triggers_first_fetch_unless_migration_pending() {
+    // 需求：向导保存配置后立即触发首拉（先发件箱后收件箱），不必等定时周期。
+    // 白盒测法：占满并发轮名额，start_fetch 走同步拒绝分支并写入确定错误，
+    // 从而判断"是否被触发"，避免真实网络线程让断言不确定。
+    let (state, dir) = temp_state("wiz-first-fetch");
+    state
+        .active_rounds
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "向导保存应成功"
+    );
+    let err = state
+        .fetch_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last_error
+        .clone();
+    assert!(
+        err.contains("已有 2 轮"),
+        "保存成功应触发首拉（名额占满时留下明确拒绝原因）：{err}"
+    );
+    state.clear_password("unit.router@chinatelecom.cn");
+    cleanup(&dir);
+
+    // 数据目录迁移待生效：跳过首拉（否则本轮会写进旧目录，重启后白拉）
+    let (state, dir) = temp_state("wiz-first-fetch-pending");
+    state
+        .active_rounds
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let target = std::env::temp_dir().join(format!("mbx-wiz-first-fetch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let err = state
+        .fetch_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last_error
+        .clone();
+    assert!(
+        err.is_empty(),
+        "迁移待生效时不得触发首拉，避免写旧目录：{err}"
+    );
+    state.clear_password("unit.router@chinatelecom.cn");
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
