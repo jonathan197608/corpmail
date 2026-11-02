@@ -660,3 +660,28 @@ fn store_incoming_dedupes_message_id_within_direction_only() {
     assert_eq!(dirs, vec!["in".to_string(), "out".to_string()]);
     cleanup(&dir);
 }
+
+#[test]
+fn decode_mutf7_handles_rfc3501_mailbox_names() {
+    // 回归（发件箱同步拉不到）：中文服务器的 LIST 返回 modified UTF-7 名称，
+    // 旧实现直接在原始串上找「已发送」永远匹配不上，发件箱被静默跳过
+    assert_eq!(decode_mutf7("INBOX"), "INBOX");
+    assert_eq!(decode_mutf7("Sent Items"), "Sent Items");
+    // 「已发送」的 mUTF-7 编码（RFC 3501 §5.1.3 字母表：, 代替 /）
+    assert_eq!(decode_mutf7("&XfJT0ZAB-"), "已发送");
+    // 维基已知样例：日本語
+    assert_eq!(decode_mutf7("&ZeVnLIqe-"), "日本語");
+    // 增补平面字符（代理对）：U+20BB9 → UTF-16 D842 DFB9（32 bit）→
+    // 6bit 分组 110110|000100|001011|011111|101110|01+0000 → 2ELfuQ（末组补零）
+    assert_eq!(decode_mutf7("&2ELfuQ-"), "\u{20BB9}");
+    // &- 转义 = 字面 &
+    assert_eq!(decode_mutf7("A&-B"), "A&B");
+    // 纯 ASCII 混合
+    assert_eq!(
+        decode_mutf7("Prefix.&XfJT0ZAB-.Suffix"),
+        "Prefix.已发送.Suffix"
+    );
+    // 非法输入：无结束符的段原样保留，绝不 panic/吞串
+    assert_eq!(decode_mutf7("&XfJT0ZAB"), "&XfJT0ZAB");
+    assert_eq!(decode_mutf7("尾随&"), "尾随&");
+}

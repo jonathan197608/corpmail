@@ -203,6 +203,9 @@ struct MainCtx {
     /// 未读/外部开关链接（各自取反、保留另一个筛选与检索词）
     unread_href: String,
     external_href: String,
+    /// 当前列表完整查询串（folder/unread/external/q/page）：详情页链接携带，
+    /// 「返回列表」按原样还原过滤状态
+    list_query: String,
     page: i64,
     pages: i64,
     total: i64,
@@ -218,6 +221,8 @@ struct MainCtx {
 struct EmailCtx {
     frame: FrameCtx,
     email: mail::EmailDetail,
+    /// 「返回列表」链接：还原进入详情前的过滤状态（未读/外部/搜索/页码）
+    back_href: String,
     /// 发件人是否外部（详情页发件人旁「外部」标记）
     from_external: bool,
     /// 收件人/抄送按地址拆开，外部地址逐个标注
@@ -233,6 +238,8 @@ struct ComposeCtx {
     frame: FrameCtx,
     draft_id: i64,
     in_reply_to: i64,
+    /// 回复全部（标题区分；预填收件人=发件人+收件人+抄送，去掉自己）
+    reply_all: bool,
     to_addrs: String,
     cc_addrs: String,
     subject: String,
@@ -357,6 +364,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
         ("GET", "/contacts/suggest") => Some(contacts_suggest(state, req)),
+        ("GET", "/side/frame") => Some(side_frame(state, req)),
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
@@ -480,6 +488,35 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     } else {
         format!("{base}external=1&{unread_part}page=1")
     };
+    // 列表完整查询串（详情往返携带；folder=inbox 且无筛选时为空 → 链接保持简洁）
+    let mut list_query = String::new();
+    if folder != "inbox" {
+        list_query.push_str(&format!("folder={folder}"));
+    }
+    if unread_only {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str("unread=1");
+    }
+    if external_only {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str("external=1");
+    }
+    if !q_input.is_empty() {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("q={}", urlencode(&q_input)));
+    }
+    if page > 1 {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("page={page}"));
+    }
     let ctx = MainCtx {
         frame: frame_ctx(state, &folder),
         folder: folder.clone(),
@@ -488,6 +525,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         external_only,
         unread_href,
         external_href,
+        list_query,
         page,
         pages,
         total,
@@ -520,11 +558,13 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let from_external = mail::is_external_addr(&email.from_addr, &domain);
     let to_chips = addr_chips(&email.to_addrs, &domain);
     let cc_chips = addr_chips(&email.cc_addrs, &domain);
+    let back_href = detail_back_href(req, &folder);
     Some(render_html(
         "email.html",
         &EmailCtx {
             frame: frame_ctx(state, &folder),
             email,
+            back_href,
             from_external,
             to_chips,
             cc_chips,
@@ -625,10 +665,40 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
     let mut resp = render_html("fetch_status.html", &ctx);
     if consume && s.just_finished {
         state.clear_fetch_finish();
+        // 完成通知改为 HX-Trigger 事件：app.js 收到后按当前页面做局部刷新。
+        // 不再下发 HX-Refresh（location.reload）——Tauri 自定义协议下整页
+        // reload 行为不稳定，且会丢失正在撰写的草稿与阅读位置。
         resp.extra_headers
-            .push(("HX-Refresh".into(), "true".into()));
+            .push(("HX-Trigger".into(), "{\"mbx:fetchDone\":true}".into()));
     }
     resp
+}
+
+/// 侧栏片段（GET /side/frame?folder=）：收取完成局部刷新计数/高亮用，
+/// 渲染 side.html 单片段（无 base 布局），可直接 outerHTML 换入 aside.side
+fn side_frame(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return Resp::html(r#"<aside class="side"></aside>"#.into());
+    }
+    let folder = match req.query_param("folder").as_deref() {
+        Some("all") | Some("sent") | Some("draft") | Some("inbox") => {
+            req.query_param("folder").unwrap()
+        }
+        _ => "inbox".to_string(),
+    };
+    // side.html 经 include 共用，字段都挂在 frame.* 下——独立渲染须同名包一层
+    render_html(
+        "side.html",
+        &SideFrameCtx {
+            frame: frame_ctx(state, &folder),
+        },
+    )
+}
+
+/// side.html 独立渲染包装（对齐 include 时的变量名 frame）
+#[derive(Serialize)]
+struct SideFrameCtx {
+    frame: FrameCtx,
 }
 
 /// 撰写页（GET /compose：空表单 / ?reply_to=N 回复预填 / ?draft_id=M 草稿编辑）
@@ -647,6 +717,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         frame: frame_ctx(state, "draft"),
         draft_id: 0,
         in_reply_to: 0,
+        reply_all: false,
         to_addrs: String::new(),
         cc_addrs: String::new(),
         subject: String::new(),
@@ -682,6 +753,27 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
     {
         ctx.in_reply_to = rid;
         ctx.to_addrs = src.from_addr.clone();
+        ctx.subject = if src.subject.starts_with("Re:") {
+            src.subject.clone()
+        } else {
+            format!("Re: {}", src.subject)
+        };
+        let quoted = src
+            .body_text
+            .lines()
+            .map(|l| format!("· {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.body_text = format!("\n\n----- 原文 -----\n{quoted}\n");
+    } else if let Some(rid) = req
+        .query_param("reply_all_to")
+        .and_then(|v| v.parse::<i64>().ok())
+        && let Some(src) = mail::get(state, rid)
+    {
+        // 回复全部：收件人 = 原发件人 + 原收件人 + 原抄送（去自己、去重、保序）
+        ctx.in_reply_to = rid;
+        ctx.reply_all = true;
+        ctx.to_addrs = reply_all_recipients(state, &src);
         ctx.subject = if src.subject.starts_with("Re:") {
             src.subject.clone()
         } else {
@@ -1161,6 +1253,78 @@ pub(super) fn frame_of(
         draft: counts["draft"],
         folder: folder.into(),
     }
+}
+
+/// 详情页「返回列表」链接：原样还原进入前的过滤状态。
+/// 参数来自列表行链接（见 MainCtx.list_query）；未携带时按邮件所在 folder。
+/// 全部走白名单/夹取：q 需 urlencode（用户输入），folder 只放行已知值，
+/// 页码夹取到 1..=10 万防畸形查询串撑爆。
+fn detail_back_href(req: &Req, fallback_folder: &str) -> String {
+    let folder = match req.query_param("folder").as_deref() {
+        Some("all") | Some("sent") | Some("draft") | Some("inbox") => {
+            req.query_param("folder").unwrap()
+        }
+        _ => fallback_folder.to_string(),
+    };
+    let mut qs: Vec<String> = Vec::new();
+    if folder != "inbox" {
+        qs.push(format!("folder={folder}"));
+    }
+    if req.query_param("unread").as_deref() == Some("1") {
+        qs.push("unread=1".into());
+    }
+    if req.query_param("external").as_deref() == Some("1") {
+        qs.push("external=1".into());
+    }
+    if let Some(q) = req.query_param("q").filter(|v| !v.trim().is_empty()) {
+        qs.push(format!("q={}", urlencode(&q)));
+    }
+    let page = req
+        .query_param("page")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100_000);
+    if page > 1 {
+        qs.push(format!("page={page}"));
+    }
+    if qs.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", qs.join("&"))
+    }
+}
+
+/// 回复全部的收件人串：发件人 + 收件人 + 抄送，去掉自己（大小写不敏感）、
+/// 去重保序；有姓名按 "Name <addr>" 回填（联系人库识别更友好）
+fn reply_all_recipients(state: &AppState, src: &mail::EmailDetail) -> String {
+    let d = defaults();
+    let self_addr = full_address(
+        &state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default(),
+        &state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
+    )
+    .to_ascii_lowercase();
+    let mut raw: Vec<(String, String)> = vec![(src.from_addr.clone(), src.from_name.clone())];
+    raw.extend(mail::contacts::parse_addr_list(&src.to_addrs));
+    raw.extend(mail::contacts::parse_addr_list(&src.cc_addrs));
+    let mut seen: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for (addr, name) in raw {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() || addr.to_ascii_lowercase() == self_addr {
+            continue;
+        }
+        let key = addr.to_ascii_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        parts.push(if name.trim().is_empty() {
+            addr
+        } else {
+            format!("{name} <{addr}>")
+        });
+    }
+    parts.join(", ")
 }
 
 /// 地址串拆成展示片段（详情页收件人/抄送逐个标注外部）

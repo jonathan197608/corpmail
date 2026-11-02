@@ -3,24 +3,6 @@
 <div class="app on">
     {% include "side.html" %}
     <main class="main">
-        <div class="topbar">
-            <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
-            <a class="unread-toggle {% if unread_only %}on{% endif %}" href="{{ unread_href }}"
-               {% if folder != 'inbox' %}hidden{% endif %}>{% if unread_only %}✓ 显示全部{% else %}● 只看未读{% endif %}</a>
-            <a class="unread-toggle ext-toggle {% if external_only %}on{% endif %}" href="{{ external_href }}"
-               title="只显示发件人为外部域名的邮件"
-               {% if folder != 'inbox' %}hidden{% endif %}>{% if external_only %}✓ 显示全部{% else %}🌐 只看外部{% endif %}</a>
-            <button class="sync-btn" type="button" id="fetch-btn"
-                    hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
-                    hx-trigger="click throttle:3000ms" hx-disabled-elt="this">⟳ 收取新邮件</button>
-            <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
-                <span>🔍</span>
-                <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
-                <input type="hidden" name="folder" value="{{ folder }}">
-                {% if q %}<a class="search-clear" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索">×</a>{% endif %}
-            </form>
-        </div>
-
         {% include "mail_list.html" %}
     </main>
 </div>

@@ -1084,7 +1084,8 @@ fn fetch_flow_without_credential_shows_error_and_refresh() {
     let frag = body(&resp);
     assert!(frag.contains("凭据缺失"), "凭据缺失应在片段中提示：{frag}");
     assert!(!frag.contains("every 2s"), "失败态不应轮询");
-    // 状态轮询（consume）：首次读到 just_finished → HX-Refresh 整页刷新
+    // 状态轮询（consume）：首次读到 just_finished → 下发 mbx:fetchDone 事件，
+    // 前端做定向局部刷新（不整页 reload：Tauri 自定义协议下 reload 不稳定）
     let resp = route(
         &state,
         &assets(),
@@ -1097,11 +1098,15 @@ fn fetch_flow_without_credential_shows_error_and_refresh() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Refresh" && v == "true"),
-        "刚完成应触发整页刷新：{:?}",
+            .any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:fetchDone")),
+        "刚完成应下发完成事件：{:?}",
         resp.extra_headers
     );
-    // 再次轮询：just_finished 已消费，不再刷新
+    assert!(
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Refresh"),
+        "完成不应再依赖整页 reload"
+    );
+    // 再次轮询：just_finished 已消费，不再重复下发事件
     let resp = route(
         &state,
         &assets(),
@@ -1112,8 +1117,8 @@ fn fetch_flow_without_credential_shows_error_and_refresh() {
         },
     );
     assert!(
-        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Refresh"),
-        "完成标记消费后不应重复刷新"
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Trigger"),
+        "完成标记消费后不应重复下发事件"
     );
     // 设置页同步 tab 展示真实收取时间线
     let html = body(&route(
@@ -2385,6 +2390,19 @@ fn dump_smoke_html() {
         "compose-forward.html",
         get_url(&format!("/compose?forward_from={}", inbox_id + 1)),
     );
+    // M7 回复全部：发件人 + 收件人 + 抄送（去自己）
+    dump(
+        "compose-reply-all.html",
+        get_url(&format!("/compose?reply_all_to={}", inbox_id + 4)),
+    );
+    // M7 返回链接保过滤：带未读/外部/搜索/页码进入详情
+    dump(
+        "email-filtered.html",
+        get_url(&format!(
+            "/emails/{}?unread=1&external=1&q=%E6%99%BA%E6%85%A7&page=2",
+            inbox_id + 4
+        )),
+    );
     // M6 状态条素材：发件箱同步阶段（data-running=true 供按钮禁用联调）
     {
         let mut s = state.fetch_state.lock().unwrap();
@@ -3138,5 +3156,297 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     );
     state.clear_password("unit.router@chinatelecom.cn");
     let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
+
+#[test]
+fn detail_back_link_preserves_list_filters() {
+    let (state, dir) = temp_state("m7-back");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '激励清单','正文','激励 清单','正文',1,1,1)",
+                [],
+            )
+            .unwrap();
+            // 已发送一封，用于 folder=sent 的往返
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '已发送件','正文','已 发送 件','正文',0,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
+    // 列表侧：行链接携带当前过滤状态（未读 + 搜索词）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "unread=1&q=%E6%BF%80%E5%8A%B1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("/emails/1?unread=1&amp;q=%E6%BF%80%E5%8A%B1"),
+        "列表行链接应携带过滤参数：{html}"
+    );
+
+    // 详情侧：进入时带上完整过滤状态 → 返回链接原样还原
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/emails/1",
+            "folder=inbox&unread=1&external=1&q=%E6%BF%80%E5%8A%B1&page=3",
+            b"",
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains(
+            r#"href="&#x2f;?unread=1&amp;external=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=3""#
+        ),
+        "返回列表应原样还原过滤状态：{html}"
+    );
+
+    // 无参数进入：回落到邮件所在 folder（sent → /?folder=sent）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/2", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains(r#"href="&#x2f;?folder=sent""#),
+        "无参数时按邮件 folder 生成返回链接：{html}"
+    );
+
+    // 收件箱默认视图：无过滤 → 返回链接就是首页
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains(r#"href="&#x2f;""#),
+        "默认视图返回链接应为首页：{html}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn reply_all_prefills_all_recipients_excluding_self() {
+    let (state, dir) = temp_state("m7-reply-all");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::DISPLAY_NAME, "张伟"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    cc_addrs, subject, body_text, subject_tokens, body_tokens,
+                                    unread, created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','部门领导',
+                         'demo@chinatelecom.cn, peer@x.cn', 'ops@x.cn',
+                         '激励清单','请核对。','激励 清单','请 核对',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "reply_all_to=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("回复全部"), "标题应为回复全部：{html}");
+    assert!(html.contains("Re: 激励清单"), "主题应加 Re: 前缀");
+    // 收件人 = 发件人 + 收件人 + 抄送，去掉自己（demo@chinatelecom.cn）
+    let to_input = html
+        .split("name=\"to_addrs\"")
+        .nth(1)
+        .and_then(|s| s.split("value=\"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default();
+    assert!(
+        to_input.contains("部门领导 &lt;boss@x.cn&gt;"),
+        "应包含原发件人：{to_input}"
+    );
+    assert!(to_input.contains("peer@x.cn"), "应包含原收件人：{to_input}");
+    assert!(to_input.contains("ops@x.cn"), "应包含原抄送：{to_input}");
+    assert!(
+        !to_input
+            .to_ascii_lowercase()
+            .contains("demo@chinatelecom.cn"),
+        "不得把自己列为收件人：{to_input}"
+    );
+    assert!(
+        html.contains("name=\"in_reply_to\" value=\"1\""),
+        "回复链应写入隐藏域"
+    );
+    assert!(
+        !html.contains("name=\"forward_from\" value=\"1\""),
+        "不应误入转发态"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn detail_actions_render_at_top_with_reply_all() {
+    let (state, dir) = temp_state("m7-actions-top");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '主题','正文','主题','正文',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    // 按钮区在头部之前（置顶），且仅有这一处操作区
+    let pos_actions = html
+        .find("md-actions md-actions-top")
+        .expect("应有置顶按钮区");
+    let pos_head = html.find("md-head").expect("应有邮件头");
+    assert!(pos_actions < pos_head, "按钮区应在邮件头上方");
+    assert_eq!(
+        html.matches("md-actions-top").count(),
+        1,
+        "应有且仅有一处置顶按钮区"
+    );
+    assert!(!html.contains("\"md-actions\""), "底部不应再残留旧按钮区");
+    assert!(html.contains("/compose?reply_to=1"), "应有回复");
+    assert!(html.contains("/compose?reply_all_to=1"), "应有回复全部");
+    assert!(html.contains("/compose?forward_from=1"), "应有转发");
+    assert!(html.contains("删除这封邮件"), "应有删除");
+    // 草稿/发件方向不显示回复入口
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '出件','正文','出 件','正文',0,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/2", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        !html.contains("reply_all_to") && !html.contains("reply_to="),
+        "非收件方向不应有回复入口：{html}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn side_frame_returns_bare_sidebar_fragment() {
+    let (state, dir) = temp_state("m7-side-frame");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::DISPLAY_NAME, "张伟"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','demo@chinatelecom.cn',
+                         '主题','正文','主题','正文',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let frag = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/side/frame", "folder=sent", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(frag.contains("<aside"), "应为侧栏片段：{frag}");
+    assert!(!frag.contains("<!doctype"), "不应带整页布局");
+    assert!(frag.contains("fetch-status"), "侧栏含收件状态条");
+    // 计数与高亮：收件箱 1 / 未读 1；当前 folder=sent 高亮
+    assert!(
+        frag.contains("收件箱 <span class=\"cnt\">1"),
+        "计数应刷新：{frag}"
+    );
+    assert!(frag.contains("已发送"), "应有已发送入口");
+    assert!(
+        frag.contains(r#"<a class="folder on" href="/?folder=sent""#),
+        "folder 参数应驱动高亮：{frag}"
+    );
     cleanup(&dir);
 }

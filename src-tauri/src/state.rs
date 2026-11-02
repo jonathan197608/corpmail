@@ -120,7 +120,7 @@ pub struct FetchState {
     /// 最近一轮新增封数
     pub new_count: i64,
     pub last_error: String,
-    /// 刚完成（状态片段读到即清，路由层据此发 HX-Refresh 刷新列表）
+    /// 刚完成（状态片段读到即清，路由层据此下发 mbx:fetchDone 事件做局部刷新）
     pub just_finished: bool,
     /// 轮次代际：每次开始新轮 +1；挂起轮的迟到 finish（epoch 不匹配）不得写状态
     pub epoch: u64,
@@ -1299,7 +1299,10 @@ fn fetch_round(job: FetchJob) {
             Err("发件箱同步内部异常".into())
         });
         let sent_err = match &sent_outcome {
-            Ok(_) => String::new(),
+            // 未发现发件箱（中文服务器的 mUTF-7 名称、命名不规范等）也要可见：
+            // 静默跳过会让用户以为已同步（webmail 有已发送、本地永远空）
+            Ok(None) => "未发现服务器「已发送」邮箱，已跳过发件箱同步".to_string(),
+            Ok(Some(_)) => String::new(),
             Err(e) => {
                 eprintln!("[fetch] 发件箱同步失败（继续收件箱）：{e}");
                 e.clone()
@@ -1345,7 +1348,7 @@ fn fetch_round(job: FetchJob) {
                 let msg = if sent_err.is_empty() {
                     String::new()
                 } else {
-                    format!("收件完成，但发件箱同步失败：{sent_err}")
+                    format!("收件完成，但发件箱未同步：{sent_err}")
                 };
                 finish(added as i64, msg);
                 done = true;

@@ -255,6 +255,13 @@ fn resolve_uids<T: std::io::Read + std::io::Write>(
 /// 本 imap 版本未导出 LIST 的特殊用途属性（\Sent），按常见命名启发式：
 /// 优先全名精确匹配（Sent/Sent Items/Sent Messages/Sent Mail/已发送/已发送邮件/发件箱），
 /// 其次名称包含 "sent"（ASCII）或 "已发送"/"发件"。找不到返回 None（跳过该阶段）。
+///
+/// 邮箱名解码：RFC 3501 规定 LIST 返回非 ASCII 名称须用 modified UTF-7 编码
+/// （如「已发送」=&XfJT0ZAB-）。imap 库的 `Name::name()` 原样返回服务器串，
+/// 不做 mUTF-7 解码——直接在原始串上找 "已发送" 永远匹配不上，中文服务器的
+/// 发件箱会被静默跳过（现象：webmail 能看到已发送邮件，本地永远拉不到）。
+/// 因此匹配一律在解码后的名称上进行；SELECT 用原始串（服务器 LIST 返回的
+/// 名称按规范可直接用于 SELECT，重编码反而可能失败）。
 fn find_sent_mailbox<T: std::io::Read + std::io::Write>(
     sess: &mut imap::Session<T>,
 ) -> Option<String> {
@@ -274,10 +281,19 @@ fn find_sent_mailbox<T: std::io::Read + std::io::Write>(
         if name.eq_ignore_ascii_case("INBOX") {
             continue;
         }
-        let lower = name.to_lowercase();
+        // \Noselect 的名字（层级占位）不可打开，跳过
+        if n.attributes()
+            .iter()
+            .any(|a| matches!(a, imap_proto::NameAttribute::NoSelect))
+        {
+            continue;
+        }
+        let decoded = decode_mutf7(&name);
+        let lower = decoded.to_lowercase();
         let score = if EXACT.iter().any(|c| lower == *c) {
             0
-        } else if lower.contains("sent") || name.contains("已发送") || name.contains("发件") {
+        } else if lower.contains("sent") || decoded.contains("已发送") || decoded.contains("发件")
+        {
             1
         } else {
             continue;
@@ -287,6 +303,97 @@ fn find_sent_mailbox<T: std::io::Read + std::io::Write>(
         }
     }
     best.map(|(_, n)| n)
+}
+
+/// modified UTF-7 解码（RFC 3501 §5.1.3；仅解码——SELECT 用服务器原始串）。
+/// 规则：`&`..`-` 之间是自定义 base64（字母表用 `,` 代替标准 `/`），
+/// 字节流按大端 UTF-16 解出（含代理对）；`&-` 表示字面 `&`；其余原样。
+/// 非法片段（坏 base64/孤立代理/无结束符）按原样保留——解码只影响启发式
+/// 匹配，最坏结果是匹配失败走跳过路径，绝不能 panic 或吞掉整串。
+fn decode_mutf7(input: &str) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,";
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // 安全：输入是 &str，ASCII 字节直接推、多字节 UTF-8 序列整体保留
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            out.push_str(&input[start..i]);
+            continue;
+        }
+        // "&-"：字面 &
+        if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            out.push('&');
+            i += 2;
+            continue;
+        }
+        // 找本段结束符 '-'
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b'-' && bytes[end] != b'&' {
+            end += 1;
+        }
+        let seg = &input[start..end.min(bytes.len())];
+        // 无 '-' 结束：非法段，原样保留防吞串
+        if end >= bytes.len() || bytes[end] != b'-' {
+            out.push('&');
+            i += 1;
+            continue;
+        }
+        push_mutf7_segment(&mut out, seg, B64);
+        i = end + 1;
+    }
+    out
+}
+
+/// 解一段 mUTF-7 base64 → 追加解码后的字符；坏段整体原样追加
+fn push_mutf7_segment(out: &mut String, seg: &str, b64: &[u8; 64]) {
+    let mut units: Vec<u16> = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for ch in seg.bytes() {
+        let Some(v) = b64.iter().position(|&b| b == ch).map(|p| p as u32) else {
+            // 含非 base64 字符：非法段，原样保留
+            out.push('&');
+            out.push_str(seg);
+            out.push('-');
+            return;
+        };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 16 {
+            bits -= 16;
+            units.push(((acc >> bits) & 0xFFFF) as u16);
+        }
+    }
+    // 尾部不足 16 bit 的余数按规范丢弃（允许填充位）
+    let mut chars: Vec<char> = Vec::with_capacity(units.len());
+    let mut idx = 0;
+    while idx < units.len() {
+        let u = units[idx];
+        // 代理对拼合：非法孤代理跳过
+        if (0xD800..0xDC00).contains(&u) {
+            if idx + 1 < units.len() && (0xDC00..0xE000).contains(&units[idx + 1]) {
+                let c = 0x10000 + ((u as u32 - 0xD800) << 10) + (units[idx + 1] as u32 - 0xDC00);
+                if let Some(ch) = char::from_u32(c) {
+                    chars.push(ch);
+                }
+                idx += 2;
+                continue;
+            }
+        } else if !(0xDC00..0xE000).contains(&u)
+            && let Some(ch) = char::from_u32(u as u32)
+        {
+            chars.push(ch);
+        }
+        idx += 1;
+    }
+    out.extend(chars);
 }
 
 /// IMAP 序列集合（"1,2,3"）：UID STORE/FETCH 的 set 参数

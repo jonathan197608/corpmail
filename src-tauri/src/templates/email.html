@@ -7,7 +7,7 @@
     {% include "side.html" %}
     <main class="main">
         <div class="topbar">
-            <a class="back" href="/?folder={{ email.folder }}">‹ 返回列表</a>
+            <a class="back" href="{{ back_href }}">‹ 返回列表</a>
             <h1 class="md-title">{% if email.subject %}{{ email.subject }}{% else %}（无主题）{% endif %}</h1>
         </div>
 
@@ -32,6 +32,20 @@
         {% endif %}
 
         <div class="mail-detail card">
+            {# 操作按钮置顶（原在正文底部）：阅读动作应随手可得；回复全部
+               = 发件人+收件人+抄送（见 reply_all_recipients） #}
+            <div class="md-actions md-actions-top">
+                {% if email.direction == 'in' %}
+                <a class="btn primary" href="/compose?reply_to={{ email.id }}">✎ 回复</a>
+                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}">✎ 回复全部</a>
+                {% endif %}
+                <a class="btn" href="/compose?forward_from={{ email.id }}">↗ 转发</a>
+                <button type="button" class="btn danger"
+                        hx-post="/emails/{{ email.id }}/delete"
+                        hx-trigger="click throttle:500ms"
+                        hx-disabled-elt="this"
+                        hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑 删除</button>
+            </div>
             <div class="md-head">
                 <div class="md-row">
                     <span class="k">发件人</span>
@@ -83,17 +97,6 @@
             </div>
             {% endif %}
 
-            <div class="md-actions">
-                {% if email.direction == 'in' %}
-                <a class="btn primary" href="/compose?reply_to={{ email.id }}">✎ 回复</a>
-                {% endif %}
-                <a class="btn" href="/compose?forward_from={{ email.id }}">↗ 转发</a>
-                <button type="button" class="btn danger"
-                        hx-post="/emails/{{ email.id }}/delete"
-                        hx-trigger="click throttle:500ms"
-                        hx-disabled-elt="this"
-                        hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑 删除</button>
-            </div>
         </div>
         <div id="toast" class="toast-slot"></div>
     </main>

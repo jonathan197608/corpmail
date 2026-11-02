@@ -5,7 +5,7 @@
     <main class="main">
         <div class="topbar">
             <a class="back" href="/?folder=draft">‹ 返回列表</a>
-            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to %}回复邮件{% elif forward_from %}转发邮件{% else %}撰写新邮件{% endif %}</h1>
+            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to and reply_all %}回复全部{% elif in_reply_to %}回复邮件{% elif forward_from %}转发邮件{% else %}撰写新邮件{% endif %}</h1>
         </div>
 
         <div class="card compose-card">

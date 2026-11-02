@@ -726,6 +726,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "imap",
+ "imap-proto",
  "jieba-rs",
  "jiff",
  "keyring",

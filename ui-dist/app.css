@@ -1681,6 +1681,15 @@ body {
     margin-top: 6px;
 }
 
+/* 操作按钮置顶：分隔线下移、去掉上边距，贴住卡片头之上 */
+.md-actions.md-actions-top {
+    flex-wrap: wrap;
+    border-top: none;
+    padding: 0 0 12px;
+    margin: 0 0 14px;
+    border-bottom: 1px solid var(--line-soft);
+}
+
 /* ---------- 撰写页 ---------- */
 .compose-card {
     margin: 4px 12px 12px;

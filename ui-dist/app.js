@@ -174,10 +174,11 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
 
-// ---------- 收取状态：按钮禁用 + 完成后整页刷新（单一通道） ----------
-// 更新逻辑（需求二.2 简化）：状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；
-// 后台收取结束时服务端下发一次 HX-Refresh 整页刷新。旧的 afterSwap 通道与
-// 原生 fetch 10s 看门狗已删除（三通道去重为一）。
+// ---------- 收取状态：按钮禁用 + 完成后局部刷新 ----------
+// 状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；后台收取结束时服务端
+// 下发一次 HX-Trigger 事件 mbx:fetchDone，由此按当前页面做定向局部刷新。
+// 不做整页 location.reload()：Tauri 自定义协议下 reload 行为不稳定，
+// 且会丢失正在撰写的草稿与阅读位置。
 // data-running 标记由状态片段下发：收取中（含后台定时收取）禁用「收取新邮件」按钮。
 function mbxSyncFetchButton() {
     const status = document.getElementById('fetch-status');
@@ -187,6 +188,33 @@ function mbxSyncFetchButton() {
 }
 document.body.addEventListener('htmx:afterSwap', mbxSyncFetchButton);
 document.addEventListener('DOMContentLoaded', mbxSyncFetchButton);
+
+// 后台收取完成：刷新当前页的动态区域（列表片段 + 侧栏计数），URL 与滚动位置不动
+function mbxOnFetchDone() {
+    // 1) 列表页：按当前地址（含未读/外部/搜索/页码）取列表片段换入
+    // 列表页（含顶栏"共 N 封"）：#list-area 存在即列表页——非列表页
+    // （详情/撰写/设置）没有该容器，自动跳过，不影响正在阅读/撰写的内容
+    const list = document.getElementById('list-area');
+    if (list) {
+        htmx.ajax('GET', location.pathname + location.search, {
+            target: '#list-area', swap: 'outerHTML'
+        });
+    }
+    // 2) 侧栏（计数/高亮/状态条）：folder 取侧栏当前高亮项，避免非列表页丢失
+    const on = document.querySelector('aside.side .folder.on');
+    let folder = 'inbox';
+    if (on) {
+        const m = /folder=([a-z]+)/.exec(on.getAttribute('href') || '');
+        if (m) folder = m[1];
+    }
+    const side = document.querySelector('aside.side');
+    if (side) {
+        htmx.ajax('GET', '/side/frame?folder=' + folder, {
+            target: 'aside.side', swap: 'outerHTML'
+        });
+    }
+}
+document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 
 // ---------- 撰写页：收件人/抄送联系人建议（模糊匹配姓名或地址） ----------
 function mbxContactToken(inp) {
