@@ -841,6 +841,12 @@ body {
 
 /* 重新拉取行：作为 .sfield（108px 1fr 两列 grid）的后续子元素，
    不跨列会落回 108px 窄列导致按钮与提示语逐字换行 */
+/* hidden 属性会被下方 display:flex 覆盖（作者规则优先于 UA 样式），
+   必须显式压制，否则“仅范围变化时显示”失效 */
+.refetch-row[hidden] {
+    display: none;
+}
+
 .refetch-row {
     grid-column: 1 / -1;
     display: flex;
@@ -1671,6 +1677,14 @@ body {
 .att-gone {
     color: #9a8f74;
     font-size: 12px;
+}
+
+/* 设置页禁用字段（账号页仅密码/显示名可改）：灰底提示不可编辑 */
+.settings-pane input:disabled,
+.settings-pane select:disabled {
+    background: var(--bg);
+    color: var(--muted);
+    cursor: not-allowed;
 }
 
 .md-actions {

@@ -269,10 +269,22 @@ pub(super) fn settings_account_test(
     imap_channel: bool,
 ) -> Resp {
     let form = parse_form(&req.body);
-    let Some(prefix) = trimmed_field(&form, "account_prefix") else {
-        return test_fragment(Vec::new(), "请先填写登录账号", false);
+    // 账号页仅密码/显示名可改：账号字段为禁用态（不随表单提交），
+    // 缺失时回落到已存配置——测试连接的意义是校验"新密码 + 现有服务器"
+    let (prefix, domain) = match trimmed_field(&form, "account_prefix") {
+        Some(p) => (p, domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT)),
+        None => {
+            let d = defaults();
+            let p = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
+            if p.is_empty() {
+                return test_fragment(Vec::new(), "尚未配置账号，请先完成首次配置向导", false);
+            }
+            (
+                p,
+                state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
+            )
+        }
     };
-    let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
     let account = full_address(&prefix, &domain);
     let password = match trimmed_field(&form, "password") {
         Some(p) => p,
@@ -343,43 +355,43 @@ pub(super) fn account_pairs<'a>(
     ]
 }
 
-/// 设置·账号 tab：保存（密码留空 = 不变；账号变更自动迁移凭据）
+/// 设置·账号 tab：保存。**仅允许修改密码与发件显示名**——账号/域名/双通道
+/// 服务器与加密方式由首次配置确定：一律取已存值，表单同名字段被忽略
+/// （页面渲染为禁用态不提交；服务端再拦一道，防绕过 UI 的提交改掉配置）。
+/// 密码留空 = 不变。
 pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
-    let Some(prefix) = trimmed_field(&form, "account_prefix") else {
-        return account_pane(state, false, "登录账号不能为空");
-    };
     let d = defaults();
-    let old_prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
-    let old_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
-    let domain = domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT);
-    let new_account = full_address(&prefix, &domain);
-    let new_password = trimmed_field(&form, "password");
-    let old_account = full_address(&old_prefix, &old_domain);
-    let account_changed = prefix != old_prefix || domain != old_domain;
-
-    // 1) 凭据预检：账号变更且密码框留空时，旧账号必须存在可迁移凭据。
-    //    先预检再落配置——预检失败不得留下"配置已改、密码未迁"的半状态。
-    let migrate_from = if account_changed && new_password.is_none() {
-        match state.retrieve_password(&old_account) {
-            crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => {
-                Some(p)
-            }
-            crate::secrets::GetResult::Missing => {
-                return account_pane(state, false, "账号已修改，请输入密码后保存");
-            }
-        }
-    } else {
-        None
-    };
-
-    let smtp_host = host_state_or(&form, state, keys::SMTP_HOST, state::SMTP_HOST_DEFAULT);
-    let recv_host = host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT);
-    let smtp_port_s = port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT).to_string();
-    let recv_port_s = port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT).to_string();
-    let smtp_security = security_or(&form, state, keys::SMTP_SECURITY);
-    let recv_security = security_or(&form, state, keys::RECV_SECURITY);
+    let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
+    if prefix.is_empty() {
+        return account_pane(state, false, "尚未配置账号，请先完成首次配置向导");
+    }
+    let account = full_address(
+        &prefix,
+        &state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
+    );
+    // 不可改字段：全部取已存值（含 defaults 兜底），忽略任何表单提交
+    let smtp_host = state
+        .get_or(keys::SMTP_HOST, &d)
+        .unwrap_or_else(|| state::SMTP_HOST_DEFAULT.to_string());
+    let recv_host = state
+        .get_or(keys::RECV_HOST, &d)
+        .unwrap_or_else(|| state::RECV_HOST_DEFAULT.to_string());
+    let smtp_port_s = state
+        .get_or(keys::SMTP_PORT, &d)
+        .unwrap_or_else(|| SMTP_PORT_DEFAULT.to_string());
+    let recv_port_s = state
+        .get_or(keys::RECV_PORT, &d)
+        .unwrap_or_else(|| RECV_PORT_DEFAULT.to_string());
+    let smtp_security = state
+        .get_or(keys::SMTP_SECURITY, &d)
+        .unwrap_or_else(|| state::SECURITY_DEFAULT.to_string());
+    let recv_security = state
+        .get_or(keys::RECV_SECURITY, &d)
+        .unwrap_or_else(|| state::SECURITY_DEFAULT.to_string());
+    // 可编辑字段：发件显示名 + 密码（留空 = 不变）
     let display = trimmed_field(&form, "display_name").unwrap_or_default();
+    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let pairs = account_pairs(
         &prefix,
         &domain,
@@ -391,24 +403,13 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         &recv_port_s,
         &recv_security,
     );
-    // 2) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
+    // 1) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
         return account_pane(state, false, &format!("保存失败：{e}"));
     }
-
-    // 3) 配置已生效，再写/迁移凭据（失败时配置不回滚，但已存密码不会被清掉）
-    if account_changed {
-        let target = new_password.clone().or(migrate_from);
-        if let Some(p) = target
-            && let Err(e) = state.store_password(&new_account, &p)
-        {
-            return account_pane(state, false, &format!("密码保存失败：{e}"));
-        }
-        if !old_prefix.is_empty() {
-            state.clear_password(&old_account);
-        }
-    } else if let Some(p) = &new_password
-        && let Err(e) = state.store_password(&new_account, p)
+    // 2) 配置已生效再写凭据（失败时配置不回滚，但已存密码不会被清掉）
+    if let Some(p) = trimmed_field(&form, "password")
+        && let Err(e) = state.store_password(&account, &p)
     {
         return account_pane(state, false, &format!("密码保存失败：{e}"));
     }

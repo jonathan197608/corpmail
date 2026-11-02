@@ -3,32 +3,28 @@
     <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
         <div class="card settings-card">
             <h3>发信（SMTP）</h3>
-            <p class="desc">修改后请重新测试连接。凭据保存在操作系统凭据保管中。</p>
+            <p class="desc">服务器与账号由首次配置确定，此处仅可修改密码与发件显示名。修改密码后请重新测试连接，凭据保存在操作系统凭据保管中。</p>
 
+            <div class="sfield">
+                <label>登录账号</label>
+                <input class="mono" type="text" value="{{ account_prefix }}{{ account_domain }}" disabled
+                    spellcheck="false" title="首次配置时确定，如需变更请重新配置应用">
+            </div>
             <div class="sfield">
                 <label>SMTP 服务器</label>
                 <div class="port-row">
-                    <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false">
-                    <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric">
+                    <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false" disabled>
+                    <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric" disabled>
                 </div>
             </div>
             <div class="sfield">
                 <label>加密方式<small class="hint">自动 = 465 隐式 TLS、其余 STARTTLS</small></label>
-                <select name="smtp_security">
+                <select name="smtp_security" disabled>
                     <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                     <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465/SMTPS）</option>
                     <option value="starttls" {% if smtp_security == "starttls" %}selected{% endif %}>STARTTLS（587/25）</option>
                     <option value="plain" {% if smtp_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
                 </select>
-            </div>
-            <div class="sfield">
-                <label>登录账号<small class="hint">域名可按需修改</small></label>
-                <div class="port-row">
-                    <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
-                        autocomplete="off" autocapitalize="none" spellcheck="false">
-                    <input class="domain" type="text" name="account_domain" value="{{ account_domain }}"
-                        autocomplete="off" autocapitalize="none" spellcheck="false">
-                </div>
             </div>
             <div class="pair">
                 <div class="pf">
@@ -58,13 +54,13 @@
             <div class="sfield">
                 <label>收信服务器</label>
                 <div class="port-row">
-                    <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
-                    <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
+                    <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false" disabled>
+                    <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric" disabled>
                 </div>
             </div>
             <div class="sfield">
                 <label>加密方式<small class="hint">自动 = 993 隐式 TLS、其余 STARTTLS</small></label>
-                <select name="recv_security">
+                <select name="recv_security" disabled>
                     <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                     <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993/IMAPS）</option>
                     <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>

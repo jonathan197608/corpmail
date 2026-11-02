@@ -416,8 +416,8 @@ fn valid_tab(tab: &str) -> bool {
 fn folder_label(folder: &str) -> &'static str {
     match folder {
         "inbox" => "收件箱",
-        "sent" => "已发送",
-        "draft" => "草稿",
+        "sent" => "发件箱",
+        "draft" => "草稿箱",
         _ => "全部邮件",
     }
 }

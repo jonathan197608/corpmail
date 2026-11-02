@@ -1806,9 +1806,11 @@ fn settings_account_save_keeps_credential_when_blank() {
         state.get_or(keys::DISPLAY_NAME, &d).as_deref(),
         Some("新名字")
     );
+    // 只读字段（服务器/账号）即便随表单提交也不得改动
     assert_eq!(
         state.get_or(keys::SMTP_HOST, &d).as_deref(),
-        Some("smtp.new.cn")
+        Some("smtp.test.cn"),
+        "服务器字段只读：表单值必须被忽略"
     );
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
@@ -1997,9 +1999,10 @@ fn wizard_save_first_run_custom_dir_switches_immediately() {
 }
 
 #[test]
-fn settings_domain_change_migrates_credential() {
-    let (state, dir) = temp_state("acc-domain-chg");
-    // 先经向导写入凭据（默认 @chinatelecom.cn）
+fn settings_account_ignores_readonly_submissions() {
+    // 需求：账号页仅密码与发件显示名可修改。账号/域名/双通道服务器/加密方式
+    // 一律取已存值——即使客户端绕过禁用态提交了这些字段也不得生效
+    let (state, dir) = temp_state("acc-readonly");
     let _ = route(
         &state,
         &assets(),
@@ -2009,7 +2012,6 @@ fn settings_domain_change_migrates_credential() {
             imap_ok: true,
         },
     );
-    // 设置页仅改域名、密码留空 → 凭据随迁
     let resp = route(
         &state,
         &assets(),
@@ -2017,14 +2019,16 @@ fn settings_domain_change_migrates_credential() {
             "POST",
             "/settings/account/save",
             &form(&[
-                ("account_prefix", "unit.router"),
-                ("account_domain", "@custom.cn"),
+                ("account_prefix", "hacker"),
+                ("account_domain", "@evil.cn"),
                 ("password", ""),
-                ("display_name", "单测用户"),
-                ("smtp_host", "smtp.test.cn"),
-                ("smtp_port", "465"),
-                ("recv_host", "imap.test.cn"),
-                ("recv_port", "993"),
+                ("display_name", "新显示名"),
+                ("smtp_host", "smtp.evil.cn"),
+                ("smtp_port", "25"),
+                ("smtp_security", "plain"),
+                ("recv_host", "imap.evil.cn"),
+                ("recv_port", "143"),
+                ("recv_security", "plain"),
             ]),
         ),
         &FakeTester {
@@ -2032,33 +2036,54 @@ fn settings_domain_change_migrates_credential() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("✓ 已保存"));
-    assert!(
-        matches!(
-            state.retrieve_password("unit.router@custom.cn"),
-            GetResult::Keychain(p) | GetResult::Keyfile(p)
-                if p == "pw-test"
-        ),
-        "旧凭据应迁移到新域名账号"
-    );
-    assert!(
-        matches!(
-            state.retrieve_password("unit.router@chinatelecom.cn"),
-            GetResult::Missing
-        ),
-        "旧账号凭据应清除"
-    );
+    assert!(body(&resp).contains("✓ 已保存"), "{}", body(&resp));
     let d = defaults();
     assert_eq!(
-        state.get_or(keys::ACCOUNT_DOMAIN, &d).as_deref(),
-        Some("@custom.cn")
+        state.get_or(keys::ACCOUNT_PREFIX, &d).as_deref(),
+        Some("unit.router"),
+        "账号前缀不得被改动"
     );
-    state.clear_password("unit.router@custom.cn");
+    assert_eq!(
+        state.get_or(keys::ACCOUNT_DOMAIN, &d).as_deref(),
+        Some("@chinatelecom.cn"),
+        "域名不得被改动"
+    );
+    assert_eq!(
+        state.get_or(keys::SMTP_HOST, &d).as_deref(),
+        Some("smtp.test.cn"),
+        "发信服务器不得被改动"
+    );
+    assert_eq!(
+        state.get_or(keys::RECV_HOST, &d).as_deref(),
+        Some("imap.test.cn"),
+        "收信服务器不得被改动"
+    );
+    assert_eq!(
+        state.get_or(keys::SMTP_SECURITY, &d).as_deref(),
+        Some("auto"),
+        "加密方式不得被改动"
+    );
+    assert_eq!(
+        state.get_or(keys::DISPLAY_NAME, &d).as_deref(),
+        Some("新显示名"),
+        "发件显示名是唯一可改字段之一"
+    );
+    // 原账号凭据保持完好，伪造账号不得获得凭据
+    assert!(matches!(
+        state.retrieve_password("unit.router@chinatelecom.cn"),
+        GetResult::Keychain(p) | GetResult::Keyfile(p) if p == "pw-test"
+    ));
+    assert!(matches!(
+        state.retrieve_password("hacker@evil.cn"),
+        GetResult::Missing
+    ));
+    state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
 
 #[test]
-fn settings_account_change_requires_password_when_no_credential() {
+fn settings_account_save_requires_configured_account() {
+    // 账号页只读化：账号由首次配置确定——未配置时不得经设置页落库
     let (state, dir) = temp_state("acc-chg");
     let resp = route(
         &state,
@@ -2081,8 +2106,9 @@ fn settings_account_change_requires_password_when_no_credential() {
         },
     );
     assert!(
-        body(&resp).contains("请输入密码后保存"),
-        "无凭据可迁时应要求输入密码"
+        body(&resp).contains("尚未配置账号"),
+        "未配置账号时应拒绝从设置页保存：{}",
+        body(&resp)
     );
     let d = defaults();
     assert_eq!(state.get_or(keys::ACCOUNT_PREFIX, &d), None, "不应有副作用");
@@ -2658,93 +2684,53 @@ fn router_tolerates_malformed_requests() {
 
 /// 设置·账号：加密方式落盘（conf 键）且端口推断生效；表单非法值回落已存值
 #[test]
-fn settings_account_saves_security_mode() {
-    use crate::net::TlsMode;
-    let (state, dir) = temp_state("acct-security");
-    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
-    let resp = route(
+fn settings_account_pane_disables_readonly_fields() {
+    // 需求：账号页只有密码与发件显示名允许修改——其余字段渲染为禁用态
+    let (state, dir) = temp_state("acct-readonly-ui");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let html = body(&route(
         &state,
         &assets(),
-        &req(
-            "POST",
-            "/settings/account/save",
-            &form(&[
-                ("account_prefix", "demo"),
-                ("account_domain", "@chinatelecom.cn"),
-                ("smtp_host", "smtp.test.cn"),
-                ("smtp_port", "587"),
-                ("smtp_security", "starttls"),
-                ("recv_host", "imap.test.cn"),
-                ("recv_port", "143"),
-                ("recv_security", "starttls"),
-                ("display_name", "张伟"),
-            ]),
-        ),
+        &req("GET", "/settings/account", b""),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
         },
-    );
-    assert!(body(&resp).contains("✓ 已保存"), "{}", body(&resp));
-    let d = defaults();
-    assert_eq!(
-        state.get_or(keys::SMTP_SECURITY, &d).as_deref(),
-        Some("starttls"),
-        "加密方式应写入配置（corpmail.toml 键）"
-    );
-    assert_eq!(
-        state.get_or(keys::RECV_SECURITY, &d).as_deref(),
-        Some("starttls")
-    );
-    assert_eq!(
-        TlsMode::resolve(587, &state.get_or(keys::SMTP_SECURITY, &d).unwrap()),
-        TlsMode::StartTls
-    );
-    // 页面回显：选中项与端口值
-    let pages = route(
-        &state,
-        &assets(),
-        &req("GET", "/settings/panes/account", b""),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    );
-    let html = body(&pages);
+    ));
+    for field in [
+        "name=\"smtp_host\"",
+        "name=\"smtp_port\"",
+        "name=\"smtp_security\"",
+        "name=\"recv_host\"",
+        "name=\"recv_port\"",
+        "name=\"recv_security\"",
+    ] {
+        let idx = html
+            .find(field)
+            .unwrap_or_else(|| panic!("账号页应有字段 {field}"));
+        let tag_end = html[idx..].find('>').unwrap() + idx;
+        assert!(
+            html[idx..tag_end].contains("disabled"),
+            "{field} 应为禁用态：{}",
+            &html[idx..tag_end]
+        );
+    }
+    // 可编辑字段不得带禁用态
+    for field in ["name=\"password\"", "name=\"display_name\""] {
+        let idx = html.find(field).expect("应有可编辑字段 {field}");
+        let tag_end = html[idx..].find('>').unwrap() + idx;
+        assert!(
+            !html[idx..tag_end].contains("disabled"),
+            "{field} 必须可编辑"
+        );
+    }
+    // 登录账号展示为完整地址的只读回显
+    assert!(html.contains("demo@chinatelecom.cn"), "应展示完整登录账号");
     assert!(
-        html.contains("name=\"smtp_security\""),
-        "账号页应有加密方式选择"
-    );
-    assert!(html.contains("name=\"recv_security\""));
-    assert!(html.contains("value=\"587\""));
-
-    // 非法值：保持现值（不得被空串/垃圾值覆盖）
-    let _ = route(
-        &state,
-        &assets(),
-        &req(
-            "POST",
-            "/settings/account/save",
-            &form(&[
-                ("account_prefix", "demo"),
-                ("account_domain", "@chinatelecom.cn"),
-                ("smtp_host", "smtp.test.cn"),
-                ("smtp_port", "587"),
-                ("smtp_security", "bogus"),
-                ("recv_host", "imap.test.cn"),
-                ("recv_port", "143"),
-                ("recv_security", ""),
-            ]),
-        ),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    );
-    assert_eq!(
-        state.get_or(keys::SMTP_SECURITY, &d).as_deref(),
-        Some("starttls"),
-        "非法加密方式应保持原值"
+        html.contains("仅可修改密码与发件显示名"),
+        "应说明可修改范围"
     );
     cleanup(&dir);
 }
@@ -3035,7 +3021,7 @@ fn fetch_status_marks_running_and_phase_for_button_disable() {
         html.contains("data-running=\"true\""),
         "运行中应下发禁用标记：{html}"
     );
-    assert!(html.contains("正在同步已发送"), "发件箱阶段文案");
+    assert!(html.contains("正在同步发件箱"), "发件箱阶段文案");
     assert!(html.contains("（3/10）"), "应展示进度");
     assert!(html.contains("every 2s"), "运行中 2s 轮询");
 
@@ -3443,10 +3429,67 @@ fn side_frame_returns_bare_sidebar_fragment() {
         frag.contains("收件箱 <span class=\"cnt\">1"),
         "计数应刷新：{frag}"
     );
-    assert!(frag.contains("已发送"), "应有已发送入口");
+    assert!(frag.contains("发件箱"), "应有发件箱入口");
     assert!(
         frag.contains(r#"<a class="folder on" href="/?folder=sent""#),
         "folder 参数应驱动高亮：{frag}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn sync_pane_refetch_entry_hidden_until_range_changes() {
+    // 需求：「重新拉取」仅在首次拉取范围有变化时显示——服务端下发已存范围
+    // （data-first-fetch-initial）与隐藏态按钮，前端比对后显隐（app.js）。
+    // 本测试锁定服务端契约：按钮默认隐藏、初始值随保存结果刷新。
+    let (state, dir) = temp_state("sync-refetch-ui");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/sync", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("id=\"refetch-row\"") && html.contains("hidden"),
+        "重新拉取入口应默认隐藏：{html}"
+    );
+    assert!(
+        html.contains("data-first-fetch-initial=\"30\""),
+        "应携带已保存范围作比对基准（默认 30）：{html}"
+    );
+
+    // 保存新范围 → 返回片段的基准同步为新值，按钮保持隐藏（无变化）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[
+                ("sync_on_start", "true"),
+                ("sync_interval_min", "30"),
+                ("first_fetch_days", "90"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("✓ 已保存"));
+    assert!(
+        html.contains("data-first-fetch-initial=\"90\""),
+        "保存后基准应更新为 90：{html}"
+    );
+    assert!(
+        html.contains("id=\"refetch-row\"") && html.contains("hidden"),
+        "保存返回片段仍应隐藏重拉入口：{html}"
     );
     cleanup(&dir);
 }

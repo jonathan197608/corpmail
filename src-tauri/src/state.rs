@@ -887,6 +887,9 @@ impl AppState {
     }
 
     /// 删除密码（账号变更迁移时用；两条路径都清，幂等）
+    /// 清除已存凭据（测试清理用；设置页账号只读化后生产路径暂不触达，
+    /// 保留给后续"退出账号"类功能）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_password(&self, account: &str) {
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::secrets::clear(&conn, account);

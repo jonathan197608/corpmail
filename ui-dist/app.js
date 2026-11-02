@@ -189,6 +189,22 @@ function mbxSyncFetchButton() {
 document.body.addEventListener('htmx:afterSwap', mbxSyncFetchButton);
 document.addEventListener('DOMContentLoaded', mbxSyncFetchButton);
 
+// ---------- 设置·收件同步：「重新拉取」仅在首次拉取范围变化时出现 ----------
+// 服务端把已保存范围写在 data-first-fetch-initial；单选变化与之不一致才
+// 显示按钮（防误触全量重拉）。保存/重拉返回的新片段经 afterSwap 重新校准。
+function mbxRefetchToggle() {
+    const row = document.querySelector('[data-first-fetch-initial]');
+    const btn = document.getElementById('refetch-row');
+    if (!row || !btn) return;
+    const sel = row.querySelector('input[name="first_fetch_days"]:checked');
+    btn.hidden = !sel || sel.value === row.dataset.firstFetchInitial;
+}
+document.body.addEventListener('change', ev => {
+    if (ev.target && ev.target.name === 'first_fetch_days') mbxRefetchToggle();
+});
+document.body.addEventListener('htmx:afterSwap', mbxRefetchToggle);
+document.addEventListener('DOMContentLoaded', mbxRefetchToggle);
+
 // 后台收取完成：刷新当前页的动态区域（列表片段 + 侧栏计数），URL 与滚动位置不动
 function mbxOnFetchDone() {
     // 1) 列表页：按当前地址（含未读/外部/搜索/页码）取列表片段换入

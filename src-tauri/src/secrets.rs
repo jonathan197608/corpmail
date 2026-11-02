@@ -74,6 +74,7 @@ fn cache_put(account: &str, value: GetResult) {
         .insert(account.to_string(), value);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cache_drop(account: &str) {
     let _ = cache()
         .lock()
@@ -129,6 +130,7 @@ pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult 
 
 /// 删除密码（改密/清空时调用）：两条路径都尝试清，幂等；同时丢弃缓存，
 /// 否则本进程仍会用已删的旧密码继续发信
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clear(conn: &Connection, account: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
         let _ = entry.delete_credential();

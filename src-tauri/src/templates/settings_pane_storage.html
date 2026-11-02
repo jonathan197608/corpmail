@@ -66,12 +66,12 @@
 
         <div class="card settings-card">
             <h3>自动清理</h3>
-            <p class="desc">后台定期执行；留空表示永久保留，草稿永不自动清理。删除均连带附件与索引。</p>
+            <p class="desc">后台定期执行；留空表示永久保留，草稿箱永不自动清理。删除均连带附件与索引。</p>
 
             <div class="clean-grid">
                 <div class="tline">
                     <div class="tl-main">
-                        <b>已发送邮件的大附件</b>
+                        <b>发件箱邮件的大附件</b>
                         <span>发送成功 N 天后清理独立附件文件</span>
                     </div>
                     <input class="num" type="text" name="clean_sent_bulk_days" value="{{ clean_days }}"
@@ -87,7 +87,7 @@
                 </div>
                 <div class="tline">
                     <div class="tl-main">
-                        <b>已发送保留时长</b>
+                        <b>发件箱保留时长</b>
                         <span>超期删除整封邮件（含附件索引）</span>
                     </div>
                     <input class="num" type="text" name="keep_sent_days" value="{{ keep_sent }}"
@@ -95,7 +95,7 @@
                 </div>
                 <div class="tline">
                     <div class="tl-main">
-                        <b>草稿</b>
+                        <b>草稿箱</b>
                         <span>永不自动清理</span>
                     </div>
                 </div>
