@@ -103,6 +103,22 @@ fn split_addrs_parses_comma_and_semicolon() {
 }
 
 #[test]
+fn parse_mailbox_accepts_display_name_and_plain_addr() {
+    // 带显示名（转发/通讯录选择常见）：整串曾当 Address 解析导致 Invalid email user
+    let m = parse_mailbox("汤新苑 <tangxy1.gd@chinatelecom.cn>", "").unwrap();
+    assert_eq!(m.email.to_string(), "tangxy1.gd@chinatelecom.cn");
+    assert_eq!(m.name.as_deref(), Some("汤新苑"));
+    // 纯地址 + 外部显示名（发件人场景）
+    let f = parse_mailbox("demo@chinatelecom.cn", "张伟").unwrap();
+    assert_eq!(f.email.to_string(), "demo@chinatelecom.cn");
+    assert_eq!(f.name.as_deref(), Some("张伟"));
+    // 纯地址无显示名
+    let p = parse_mailbox("peer@x.cn", "").unwrap();
+    assert_eq!(p.email.to_string(), "peer@x.cn");
+    assert!(p.name.is_none());
+}
+
+#[test]
 fn dispatch_success_transitions_to_sent() {
     let (state, dir) = temp_state("m3-ok");
     state

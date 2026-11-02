@@ -58,25 +58,14 @@ impl MailSender for RealSender {
     ) -> Result<(), String> {
         use lettre::Transport;
         use lettre::message::header::ContentType;
-        use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
-        let build = |raw: &str, name: &str| -> Result<Mailbox, String> {
-            let addr = raw
-                .trim()
-                .parse()
-                .map_err(|err| format!("邮箱地址无效 {raw}：{err}"))?;
-            let name = name.trim();
-            Ok(if name.is_empty() {
-                Mailbox::new(None, addr)
-            } else {
-                Mailbox::new(Some(name.to_string()), addr)
-            })
-        };
-        let mut builder = lettre::Message::builder().from(build(&msg.from_addr, &msg.from_name)?);
+        use lettre::message::{Attachment, MultiPart, SinglePart};
+        let mut builder =
+            lettre::Message::builder().from(parse_mailbox(&msg.from_addr, &msg.from_name)?);
         for t in &msg.to_addrs {
-            builder = builder.to(build(t, "")?);
+            builder = builder.to(parse_mailbox(t, "")?);
         }
         for c in &msg.cc_addrs {
-            builder = builder.cc(build(c, "")?);
+            builder = builder.cc(parse_mailbox(c, "")?);
         }
         let builder = builder
             .message_id(Some(msg.message_id.clone()))
@@ -110,6 +99,30 @@ impl MailSender for RealSender {
             .map_err(|err| format!("发送失败：{err}{}", mode.hint(port)))
             .map(|_| ())
     }
+}
+
+/// 构造单个收件人/发件人 `Mailbox`。
+///
+/// 兼容“显示名 <地址>”（通讯录选择、转发收件人常见）与纯地址两种输入：
+/// 前者交给 `Mailbox` 的 FromStr 一次性解析出显示名与地址；后者按纯地址解析
+/// 并套用外部 `name`（发件人显示名）。若把 `姓名 <地址>` 整串当 `Address`
+/// 解析，会得到 `Invalid email user`（如 `汤新苑 <tangxy1.gd@chinatelecom.cn>`）。
+fn parse_mailbox(raw: &str, name: &str) -> Result<lettre::message::Mailbox, String> {
+    let raw = raw.trim();
+    if raw.contains('<') {
+        return raw
+            .parse()
+            .map_err(|err| format!("邮箱地址无效 {raw}：{err}"));
+    }
+    let addr = raw
+        .parse()
+        .map_err(|err| format!("邮箱地址无效 {raw}：{err}"))?;
+    let name = name.trim();
+    Ok(if name.is_empty() {
+        lettre::message::Mailbox::new(None, addr)
+    } else {
+        lettre::message::Mailbox::new(Some(name.to_string()), addr)
+    })
 }
 
 /// 生成本封邮件的 Message-ID（<时间.纳秒@域名>）。
