@@ -174,18 +174,29 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
 
-// ---------- 收取状态：按钮禁用 + 完成后局部刷新 ----------
+// ---------- 收取状态：按钮/设置入口禁用 + 完成后局部刷新 ----------
 // 状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；后台收取结束时服务端
 // 下发一次 HX-Trigger 事件 mbx:fetchDone，由此按当前页面做定向局部刷新。
 // 不做整页 location.reload()：Tauri 自定义协议下 reload 行为不稳定，
 // 且会丢失正在撰写的草稿与阅读位置。
-// data-running 标记由状态片段下发：收取中（含后台定时收取）禁用「收取新邮件」按钮。
+// data-running 标记由状态片段下发：收取中（含后台定时收取）禁用「收取新邮件」
+// 按钮与侧栏设置入口（避免拉取中误入设置改范围/重拉等造成竞态）。
 function mbxSyncFetchButton() {
     const status = document.getElementById('fetch-status');
+    const running = !!(status && status.getAttribute('data-running') === 'true');
     const btn = document.getElementById('fetch-btn');
-    if (!status || !btn) return;
-    btn.disabled = status.getAttribute('data-running') === 'true';
+    if (btn) btn.disabled = running;
+    const gear = document.querySelector('a.gear');
+    if (gear) {
+        gear.classList.toggle('disabled', running);
+        gear.title = running ? '收取中，完成后可进入设置' : '设置';
+    }
 }
+// click 兜底：即使 focus/键盘等绕过 pointer-events，仍阻止 disabled 齿轮跳转
+document.body.addEventListener('click', ev => {
+    const gear = ev.target.closest('a.gear');
+    if (gear && gear.classList.contains('disabled')) ev.preventDefault();
+});
 document.body.addEventListener('htmx:afterSwap', mbxSyncFetchButton);
 document.addEventListener('DOMContentLoaded', mbxSyncFetchButton);
 
