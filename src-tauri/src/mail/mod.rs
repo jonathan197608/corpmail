@@ -1475,10 +1475,7 @@ fn comparable_path(p: &Path) -> String {
     if cut == 0 {
         return clean.to_string_lossy().to_lowercase();
     }
-    let mut out = match std::fs::canonicalize(&acc) {
-        Ok(real) => real,
-        Err(_) => acc,
-    };
+    let mut out = std::fs::canonicalize(&acc).unwrap_or(acc);
     for c in &comps[cut..] {
         out.push(c.as_os_str());
     }
