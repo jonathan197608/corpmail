@@ -3121,7 +3121,9 @@ fn dump_smoke_html() {
             inbox_id + 4
         )),
     );
-    // M6 状态条素材：发件箱同步阶段（data-running=true 供按钮禁用联调）
+    // M6 状态条素材：发件箱同步阶段（data-running=true 供按钮禁用联调）。
+    // ETA 场景两态：大批量拉取（12/48，10s 拉了 12 → 剩 36 ≈ 30s <60s 不显示）
+    // 与超大首拉（120/9600，120s 拉 120 → 剩 9480 ≈ 2.6h 显示"约 2 小时 36 分钟"）
     {
         let mut s = state.fetch_state.lock().unwrap();
         s.running = true;
@@ -3129,12 +3131,31 @@ fn dump_smoke_html() {
         s.started_at = mail::now_epoch();
         s.fetch_done = 12;
         s.fetch_total = 48;
+        let now = mail::now_epoch();
+        s.progress_started_at = now - 10;
+        s.progress_updated_at = now;
+        s.progress_started_done = 0;
     }
     dump("fetch-status-running.html", get("/emails/fetch/status"));
     {
         let mut s = state.fetch_state.lock().unwrap();
+        let now = mail::now_epoch();
+        s.fetch_done = 120;
+        s.fetch_total = 9600;
+        s.progress_started_at = now - 120;
+        s.progress_updated_at = now;
+        s.progress_started_done = 0;
+    }
+    dump("fetch-status-eta.html", get("/emails/fetch/status"));
+    {
+        let mut s = state.fetch_state.lock().unwrap();
         s.running = false;
         s.phase.clear();
+        s.fetch_done = 0;
+        s.fetch_total = 0;
+        s.progress_started_at = 0;
+        s.progress_updated_at = 0;
+        s.progress_started_done = 0;
     }
 
     // M3 发送状态素材：sending 轮询态 / failed 重发态 / sent 终态 + 已发送列表。
@@ -4402,4 +4423,58 @@ fn sync_pane_refetch_entry_hidden_until_range_changes() {
         "保存返回片段仍应隐藏重拉入口：{html}"
     );
     cleanup(&dir);
+}
+
+/// 收件 ETA 展示门槛（后台更新时间预估）：仅 running、有计时、跨度≥3s、
+/// 有增量吞吐、且预估剩余 >60s 才出文案；分钟/小时档位格式正确
+#[test]
+fn fetch_eta_label_gates_and_formats() {
+    use crate::state::FetchState;
+    let base = |running: bool, done: usize, total: usize, sa: i64, ua: i64, sd: usize| FetchState {
+        running,
+        new_count: 0,
+        last_error: String::new(),
+        just_finished: false,
+        epoch: 1,
+        started_at: 0,
+        fetch_done: done,
+        fetch_total: total,
+        phase: "inbox".into(),
+        progress_started_at: sa,
+        progress_updated_at: ua,
+        progress_started_done: sd,
+    };
+    let now = mail::now_epoch();
+    // 非进行中：不显示
+    assert_eq!(eta_label(&base(false, 10, 100, now - 10, now, 0)), "");
+    // 无剩余：不显示
+    assert_eq!(eta_label(&base(true, 100, 100, now - 10, now, 0)), "");
+    // 未起表（progress_started_at=0，首拍下载中）：不显示
+    assert_eq!(eta_label(&base(true, 0, 100, 0, 0, 0)), "");
+    // 计时跨度 < 3s：首拍吞吐不可信，不显示
+    assert_eq!(eta_label(&base(true, 5, 100, now, now, 0)), "");
+    // 零增量（started_done==done，计时内无进展）：不显示
+    assert_eq!(eta_label(&base(true, 10, 1000, now - 30, now, 10)), "");
+    // 预估 ≤60s：不显示；36s 拉 40 封（吞吐≈1.1封/s）剩 60 封 → ≈54s
+    assert_eq!(eta_label(&base(true, 100, 160, now - 36, now, 60)), "");
+    // 预估恰 72s（>60s 显示）→ "约 1 分钟"；36s 拉 40 封、剩 80 → 80/40*36 = 72s
+    assert_eq!(
+        eta_label(&base(true, 80, 160, now - 36, now, 40)),
+        "约 1 分钟"
+    );
+    // 60s 拉 100 封剩 900 → 540s → "约 9 分钟"
+    assert_eq!(
+        eta_label(&base(true, 100, 1000, now - 60, now, 0)),
+        "约 9 分钟"
+    );
+    // 3600s 拉 100 封剩 1100 → 约 39600s → 11 小时档（≥10h 不带余分钟）
+    assert_eq!(
+        eta_label(&base(true, 100, 1200, now - 3600, now, 0)),
+        "约 11 小时"
+    );
+    // 90 分钟档：3600s 拉 100 封剩 250 → 9000s = 150 分钟 → 约 2 小时 30 分钟
+    assert_eq!(
+        eta_label(&base(true, 100, 350, now - 3600, now, 0)),
+        "约 2 小时 30 分钟"
+    );
 }

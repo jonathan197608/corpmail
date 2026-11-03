@@ -336,6 +336,10 @@ struct FetchStatusCtx {
     /// M6 分批进度：已入库 / 应拉总数（running 且 total>0 时展示）
     done: usize,
     total: usize,
+    /// 剩余时间预估文案（如 "约 3 分钟"）；空 = 不显示。
+    /// 条件：running、有进度计时、且预估剩余 > 1 分钟——秒级完成不
+    /// 打扰，短估跳变也不值得展示（需求：预估超过 1 分钟才显示）
+    eta_label: String,
     /// 刚完成（片段根节点 data-just-finished 标记）：app.js 原生 fetch
     /// 看门狗据此兜底整页刷新——htmx 轮询链的触发器依赖元素换出后重建，
     /// 任一环节断裂即永不刷新；标记同时随 HX-Refresh 头下发，双通道任一生效
@@ -770,6 +774,51 @@ fn fetch_start(state: &AppState) -> Resp {
 
 /// 收件状态片段（GET /emails/fetch/status 轮询）：进行中每 2s 自轮询；
 /// 刚完成时消费标记并回 HX-Refresh 整页刷新（列表/计数全新）
+/// 收件剩余时间预估（需求：预估超过 1 分钟才显示）。
+///
+/// 口径：首个进度上报起表（progress_started_at），按已入库增量 / 实际耗时
+/// 得吞吐，外推剩余封数所需时间。只看吞吐不引入附件大小加权——批量入库
+/// 的耗时与大小弱相关（每批一次事务，小件主导），复杂模型徒增跳变。
+///
+/// 展示门槛（三项全满足才出文案，逐项防误导）：
+/// - running 且 total > done（有可估的剩余量）
+/// - 计时跨度 ≥ 3s：首拍下载中吞吐严重偏低（连接+首批编码开销），
+///   此时外推会把 10 秒的工作估成几分钟，跳变后再缩小观感极差
+/// - 预估剩余 > 60s：短于 1 分钟的任务不显示（需求），秒级噪音不打扰
+fn eta_label(s: &state::FetchState) -> String {
+    if !s.running || s.fetch_total <= s.fetch_done || s.progress_started_at == 0 {
+        return String::new();
+    }
+    let now = s.progress_updated_at.max(mail::now_epoch());
+    let elapsed = (now - s.progress_started_at).max(0);
+    if elapsed < 3 {
+        return String::new();
+    }
+    let done_delta = s.fetch_done.saturating_sub(s.progress_started_done);
+    if done_delta == 0 {
+        // 计时内零进展（拉取挂起/大批解析中）：吞吐不可算，不估
+        return String::new();
+    }
+    let remaining = s.fetch_total - s.fetch_done;
+    let secs = (remaining as f64 / done_delta as f64 * elapsed as f64).round() as i64;
+    if secs <= 60 {
+        return String::new();
+    }
+    if secs < 90 {
+        return "约 1 分钟".into();
+    }
+    let mins = (secs as f64 / 60.0).round() as i64;
+    if mins < 60 {
+        return format!("约 {mins} 分钟");
+    }
+    let hours = mins / 60;
+    let rem = mins % 60;
+    if rem == 0 || hours >= 10 {
+        return format!("约 {hours} 小时");
+    }
+    format!("约 {hours} 小时 {rem} 分钟")
+}
+
 fn fetch_status(state: &AppState, consume: bool) -> Resp {
     if !state.configured() {
         // 未配置：状态条留空（.fetch-status:empty 隐藏），避免欢迎页出现"没有新邮件"
@@ -794,6 +843,7 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
         },
         done: s.fetch_done,
         total: s.fetch_total,
+        eta_label: eta_label(&s),
         just_finished: s.just_finished,
         phase: s.phase.clone(),
     };

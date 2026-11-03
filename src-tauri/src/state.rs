@@ -136,6 +136,14 @@ pub struct FetchState {
     pub fetch_total: usize,
     /// 当前同步阶段（"sent"=发件箱 / "inbox"=收件箱 / 空=空闲）
     pub phase: String,
+    /// 当前阶段首个进度上报时刻（epoch 秒）：ETA 外推的计时起点；
+    /// 0 = 尚无进度（无法估）。进入新阶段时重置
+    pub progress_started_at: i64,
+    /// 最近一次进度上报时刻（epoch 秒）：与 progress_started_at、fetch_done
+    /// 共同计算吞吐。progress_started_at == 0 时无效
+    pub progress_updated_at: i64,
+    /// progress_started_at 时刻已完成数：ETA = 剩余 /（已增量 / 计时跨度）
+    pub progress_started_done: usize,
 }
 
 /// 收件轮看门狗上限（秒）：imap 无网络超时，挂起轮超过此时长由轮询链复位，
@@ -209,6 +217,9 @@ impl AppState {
                 fetch_done: 0,
                 fetch_total: 0,
                 phase: String::new(),
+                progress_started_at: 0,
+                progress_updated_at: 0,
+                progress_started_done: 0,
             })),
             active_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -705,6 +716,9 @@ impl AppState {
         s.fetch_done = 0;
         s.fetch_total = 0;
         s.phase.clear();
+        s.progress_started_at = 0;
+        s.progress_updated_at = 0;
+        s.progress_started_done = 0;
         Some(s.epoch)
     }
 
@@ -1302,6 +1316,10 @@ fn fetch_phase(p: FetchPhase<'_>) -> Result<Option<(u32, u32)>, String> {
             s.fetch_done = 0;
             s.fetch_total = 0;
             s.started_at = crate::mail::now_epoch();
+            // ETA 计时随阶段重置：跨阶段的吞吐不可比（发件箱常是占位/小件批）
+            s.progress_started_at = 0;
+            s.progress_updated_at = 0;
+            s.progress_started_done = 0;
         }
     }
     // 分批拉取：每批解析后立即入库并推进进度/游标；任一 panic 由上层 catch_unwind 兜住
@@ -1324,6 +1342,13 @@ fn fetch_phase(p: FetchPhase<'_>) -> Result<Option<(u32, u32)>, String> {
         persist_fetch_cursor(conn, uv_key, uid_key, uidvalidity, batch_max, false)?;
         let mut s = fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.epoch == epoch {
+            // ETA 计时锚点：首次进度上报起表，后续以增量吞吐外推剩余时间
+            let now = crate::mail::now_epoch();
+            if s.progress_started_at == 0 {
+                s.progress_started_at = now;
+                s.progress_started_done = done;
+            }
+            s.progress_updated_at = now;
             s.fetch_done = done;
             s.fetch_total = total;
             // 进展即续命：大邮箱首拉远超看门狗 300s，批间进展说明轮次健康存活
