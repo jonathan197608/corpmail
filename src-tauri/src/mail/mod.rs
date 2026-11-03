@@ -151,6 +151,13 @@ pub fn sanitize_html(raw: &str) -> String {
             b.add_generic_attributes([
                 "style", "align", "valign", "width", "height", "bgcolor", "color",
             ]);
+            // 表格边框：企业邮件（Outlook/Foxmail 生成）普遍用 border/cellpadding/
+            // cellspacing 属性而非 CSS；不在白名单会被剥掉——收件箱看是"无边框
+            // 表格"，转发经编辑器往返后差异更明显。放行 table 系标签的这三个属性
+            //（纯视觉历史属性，无安全面；现代 style 边框本就放行）
+            b.add_tag_attributes("table", ["border", "cellpadding", "cellspacing", "style"]);
+            b.add_tag_attributes("td", ["border", "cellpadding", "cellspacing", "style"]);
+            b.add_tag_attributes("th", ["border", "cellpadding", "cellspacing", "style"]);
             b.link_rel(Some("noopener noreferrer"));
             // 外部图片统一改写到本机代理端点（见 ui::router::proxy_image）：
             // WebView 不直接连第三方，避免暴露 Referer/指纹；代理侧再做 SSRF 校验。

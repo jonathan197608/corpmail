@@ -68,6 +68,24 @@ fn unwrap_top_div_expands_wrapper_and_keeps_structures() {
     assert_eq!(unwrap_top_div(inner), r#"<p>a</p><div>b</div>"#);
 }
 
+#[test]
+fn sanitize_html_keeps_table_border_attributes() {
+    // 企业邮件（Outlook/Foxmail）表格边框普遍用属性而非 CSS：
+    // border/cellpadding/cellspacing 不在白名单会被剥掉，表格失去边框
+    let out = sanitize_html(
+        r#"<table border="1" cellpadding="6" cellspacing="0"><tr><th>客户</th><td>200M</td></tr></table>"#,
+    );
+    assert!(out.contains(r#"border="1""#), "border 属性应保留：{out}");
+    assert!(
+        out.contains("cellpadding=\"6\""),
+        "cellpadding 应保留：{out}"
+    );
+    assert!(
+        out.contains("cellspacing=\"0\""),
+        "cellspacing 应保留：{out}"
+    );
+}
+
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
     let dir = std::env::temp_dir().join(format!("corpmail-m2-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

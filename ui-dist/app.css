@@ -1669,10 +1669,17 @@ a.btn.link.disabled {
 .md-html table {
     border-collapse: collapse;
     max-width: 100%;
+    /* 兜底边框：企业邮件表格常用 border="1" 属性（净化已放行），但源邮件
+       （尤其经 wangEditor 编辑器往返的转发件）可能只带结构不带任何边框
+       信息——无兜底时表格内容挤成一团无分隔线。带边框的邮件以自身
+       border 属性/内联样式优先渲染，此规则只在缺失时补线 */
+    border: 1px solid #c3cbd9;
 }
 .md-html td,
 .md-html th {
     padding: 2px 6px;
+    /* 同上：单元格兜底线（border="1" 时浏览器会自行画格线，此规则无缝叠加） */
+    border: 1px solid #c3cbd9;
 }
 .md-html a {
     color: var(--accent);

@@ -260,6 +260,9 @@ struct ComposeCtx {
     keep_ids_json: String,
     /// 「返回列表」链接：保持来源列表的过滤/翻页（无来源时回默认列表）
     back_href: String,
+    /// 来源列表上下文（folder/unread/external/q/page）：随表单透传，
+    /// 发送/存草稿后回详情页或撰写页时保持过滤状态（最后一环，2026-11-03）
+    list_query: String,
     saved: bool,
     error: String,
     /// 本次被跳过的 0 字节文件数（附件选择误选空文件时提示，不阻断整单保存）
@@ -898,6 +901,14 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
                 "inbox"
             },
         ),
+        list_query: list_query_of(
+            req,
+            if req.query_param("draft_id").is_some() {
+                "draft"
+            } else {
+                "inbox"
+            },
+        ),
         saved,
         error,
         skipped,
@@ -1045,12 +1056,19 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
     }
+    let form = parse_form(&req.body);
+    let ctx_qs = form_list_query(&form);
+    let ctx_suffix = if ctx_qs.is_empty() {
+        String::new()
+    } else {
+        format!("&{ctx_qs}")
+    };
     match save_compose_form(state, req) {
         Ok((id, skipped, _)) => Resp::hx_redirect(&format!(
-            "/compose?draft_id={id}&saved=1{}",
+            "/compose?draft_id={id}&saved=1{}{ctx_suffix}",
             skipped_suffix(skipped)
         )),
-        Err((draft_id, e)) => redirect_compose(draft_id, &e),
+        Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
     }
 }
 
@@ -1128,6 +1146,8 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
     }
+    let form = parse_form(&req.body);
+    let ctx_qs = form_list_query(&form);
     match save_compose_form(state, req) {
         Ok((id, skipped, converted)) => {
             // 空文件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
@@ -1143,9 +1163,15 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             if mail::enqueue_draft(state, id) {
                 state.enqueue_send(id);
             }
-            Resp::hx_redirect(&format!("/emails/{id}"))
+            // 跳详情页携带列表上下文：详情页「返回列表」保持进入前的过滤/翻页
+            //（转发/回复/发送全链路最后一环；不带则上下文在此断裂）
+            if ctx_qs.is_empty() {
+                Resp::hx_redirect(&format!("/emails/{id}"))
+            } else {
+                Resp::hx_redirect(&format!("/emails/{id}?{ctx_qs}"))
+            }
         }
-        Err((draft_id, e)) => redirect_compose(draft_id, &e),
+        Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
     }
 }
 
@@ -1167,6 +1193,17 @@ fn email_resend(state: &AppState, req: &Req) -> Resp {
 fn redirect_compose(draft_id: i64, error: &str) -> Resp {
     Resp::hx_redirect(&format!(
         "/compose?draft_id={draft_id}&error={}",
+        urlencode(error)
+    ))
+}
+
+/// 同 redirect_compose，但把列表上下文带回撰写页（保存失败重试后返回链接不退化）
+fn redirect_compose_ctx(draft_id: i64, error: &str, ctx_qs: &str) -> Resp {
+    if ctx_qs.is_empty() {
+        return redirect_compose(draft_id, error);
+    }
+    Resp::hx_redirect(&format!(
+        "/compose?draft_id={draft_id}&error={}&{ctx_qs}",
         urlencode(error)
     ))
 }
@@ -1529,31 +1566,53 @@ pub(super) fn frame_of(
 /// 参数来自列表行链接（见 MainCtx.list_query）；未携带时按邮件所在 folder。
 /// 全部走白名单/夹取：q 需 urlencode（用户输入），folder 只放行已知值，
 /// 页码夹取到 1..=10 万防畸形查询串撑爆。
-/// 还原进入前的列表过滤状态为查询串（folder/unread/external/q/page）。
-/// 全部走白名单/夹取：q 需 urlencode（用户输入），folder 只放行已知值，
-/// 页码夹取到 1..=10 万防畸形查询串撑爆。
 fn list_query_of(req: &Req, fallback_folder: &str) -> String {
-    let folder = match req.query_param("folder").as_deref() {
-        Some("all") | Some("sent") | Some("draft") | Some("inbox") => {
-            req.query_param("folder").unwrap()
-        }
+    let get = |name: &str| req.query_param(name);
+    let folder = match get("folder").as_deref() {
+        Some("all") | Some("sent") | Some("draft") | Some("inbox") => get("folder").unwrap(),
         _ => fallback_folder.to_string(),
+    };
+    let q = get("q");
+    let page = get("page");
+    let unread = get("unread");
+    let external = get("external");
+    rebuild_list_query(
+        &folder,
+        unread.as_deref(),
+        external.as_deref(),
+        q.as_deref(),
+        page.as_deref(),
+    )
+}
+
+/// 列表上下文重组核心（folder/unread/external/q/page 白名单过滤）。
+/// 入口有三：Req 查询串（list_query_of）、表单隐藏域（发送/存草稿回跳）。
+/// 表单值客户端可控，重新过滤防注入畸形查询串。
+fn rebuild_list_query(
+    folder: &str,
+    unread: Option<&str>,
+    external: Option<&str>,
+    q: Option<&str>,
+    page: Option<&str>,
+) -> String {
+    let folder = match folder {
+        "all" | "sent" | "draft" | "inbox" => folder.to_string(),
+        _ => "inbox".to_string(),
     };
     let mut qs: Vec<String> = Vec::new();
     if folder != "inbox" {
         qs.push(format!("folder={folder}"));
     }
-    if req.query_param("unread").as_deref() == Some("1") {
+    if unread == Some("1") {
         qs.push("unread=1".into());
     }
-    if req.query_param("external").as_deref() == Some("1") {
+    if external == Some("1") {
         qs.push("external=1".into());
     }
-    if let Some(q) = req.query_param("q").filter(|v| !v.trim().is_empty()) {
-        qs.push(format!("q={}", urlencode(&q)));
+    if let Some(q) = q.filter(|v| !v.trim().is_empty()) {
+        qs.push(format!("q={}", urlencode(q)));
     }
-    let page = req
-        .query_param("page")
+    let page = page
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(1)
         .clamp(1, 100_000);
@@ -1561,6 +1620,31 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
         qs.push(format!("page={page}"));
     }
     qs.join("&")
+}
+
+/// 表单隐藏域 list_query（compose 页透传的进入前列表上下文）重新过滤——
+/// 客户端可控，不可直接拼 URL。串形态即 list_query_of 产出（k=v&…），
+/// 拆开重走白名单，畸形值全部丢弃
+fn form_list_query(form: &HashMap<String, String>) -> String {
+    let Some(raw) = form.get("list_query") else {
+        return String::new();
+    };
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let pick = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    rebuild_list_query(
+        pick("folder").unwrap_or("inbox"),
+        pick("unread"),
+        pick("external"),
+        pick("q"),
+        pick("page"),
+    )
 }
 
 /// 详情页「返回列表」链接：原样还原进入前的过滤状态。

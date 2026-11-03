@@ -1206,6 +1206,78 @@ fn compose_send_html_mode_keeps_body() {
     cleanup(&dir);
 }
 
+/// 发送跳转保持列表上下文（回归 2026-11-03）：
+/// 转发/回复链接带过滤进入撰写页 → hidden list_query 随表单提交 →
+/// 发送后跳详情页必须原样携带，否则「返回列表」过滤/翻页在此断裂。
+/// 同时验证隐藏域值是客户端可控的：畸形值（folder 注入/页码越界）被重滤丢弃。
+#[test]
+fn compose_send_redirect_keeps_list_context() {
+    let (state, dir) = temp_state("m3-send-ctx");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "上下文保持"),
+                ("body_text", "正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                (
+                    "list_query",
+                    "unread=1&q=%E6%BF%80%E5%8A%B1&page=2&folder=../evil",
+                ),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        loc, "/emails/1?unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+        "发送跳转应携带列表上下文（畸形 folder 被重滤为默认）：{loc}"
+    );
+    // 详情页返回链接还原过滤（folder=inbox 显式携带）
+    let detail = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/emails/1",
+            "folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+            b"",
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        // minijinja 对属性内的 / 与 & 做实体转义（&#x2f; == /，&amp; == &），两种形态都认
+        detail.contains("unread=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=2")
+            || detail.contains("unread=1&q=%E6%BF%80%E5%8A%B1&page=2"),
+        "详情页返回链接应还原过滤/翻页：{}",
+        detail
+            .lines()
+            .find(|l| l.contains("class=\"back\""))
+            .unwrap_or("(未找到)")
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn compose_send_is_idempotent_on_repeat() {
     let (state, dir) = temp_state("m3-send-2");
