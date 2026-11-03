@@ -534,6 +534,78 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     }
 });
 
+// ---------- 撰写页：发送前预校验（M1-2） ----------
+// 挂 htmx:configRequest、精确匹配发送按钮（存草稿允许不完整内容，不校验）。
+// preventDefault 即取消本次请求（htmx 在全部监听器执行完后统一检查），
+// 此时 beforeRequest 未触达，hx-disabled-elt 不会留死锁禁用态。
+// 校验顺序：无收件人（硬拦）→ 空正文（无附件硬拦 / 有附件确认）→ 无主题（确认）。
+document.body.addEventListener('htmx:configRequest', function (ev) {
+    var detail = ev.detail || {};
+    var elt = detail.elt;
+    if (!elt || !elt.matches || !elt.matches('button[hx-post="/compose/send"]')) return;
+    var form = elt.closest('form');
+    if (!form) return;
+    // 每次校验先清旧错误条：校验失败插入新条，修正后重发则干净出发
+    // （不放行态残留误导"仍未通过"），服务端错误条不受影响（无 .precheck 类）
+    var card = form.closest('.compose-card');
+    var oldNote = card && card.querySelector('.compose-note.precheck');
+    if (oldNote) oldNote.remove();
+    var field = function (name) {
+        var el = form.querySelector('[name="' + name + '"]');
+        return el ? String(el.value || '').trim() : '';
+    };
+    // 拦截：表单顶部错误条（.err 复用服务端错误样式；.precheck 供下次先清旧条）
+    var fail = function (msg) {
+        if (card) {
+            var note = document.createElement('div');
+            note.className = 'compose-note err precheck';
+            note.textContent = msg;
+            card.insertBefore(note, card.firstChild);
+        }
+        ev.preventDefault();
+    };
+    // 1) 收件人：to + cc 均空——SMTP 必拒，前端即时拦下，避免
+    //    "存进草稿→入队→异步发失败"一轮往返才见错误
+    if (!field('to_addrs') && !field('cc_addrs')) {
+        fail('请填写收件人或抄送人后再发送');
+        return;
+    }
+    // 2) 正文：按当前模式取值。HTML 模式以 DOM 探针判定——wangEditor
+    //    空内容 getHtml() 返回 <p><br></p>，textContent 为空即可判空；
+    //    只有图片（无文字）视为有正文（贴图发送是完整语义）
+    var modeEl = form.querySelector('#body-mode');
+    var htmlMode = modeEl && modeEl.value === 'html' && mbxEditor;
+    var emptyBody;
+    if (htmlMode) {
+        var probe = document.createElement('div');
+        probe.innerHTML = mbxEditor.getHtml();
+        emptyBody = (probe.textContent || '').trim() === '' && !probe.querySelector('img');
+    } else {
+        var ta = form.querySelector('#body-text');
+        emptyBody = !ta || !(ta.value || '').trim();
+    }
+    if (emptyBody) {
+        // 有附件/已保存附件时空正文是合法诉求（"只发附件"），降级为确认
+        var kept = form.querySelector('#keep-ids');
+        var hasAttach = pickedPaths.length > 0;
+        if (!hasAttach && kept) {
+            try { hasAttach = JSON.parse(kept.value || '[]').length > 0; } catch (e) { /* 空串按无附件 */ }
+        }
+        if (!hasAttach) {
+            fail('正文不能为空；如只想发送附件，请在正文补充一句说明');
+            return;
+        }
+        if (!window.confirm('正文为空，仅发送附件，确定吗？')) {
+            ev.preventDefault();
+            return;
+        }
+    }
+    // 3) 主题为空：确认放行（企业邮件无主题易被过滤/忽视，确认防手滑）
+    if (!field('subject') && !window.confirm('主题为空，确定直接发送吗？')) {
+        ev.preventDefault();
+    }
+});
+
 function mbxRtInit() {
     if (!document.getElementById('editor-container')) return;
     // 富文本模式（回复/转发 HTML 邮件、HTML 草稿）：直接挂载，初始内容
