@@ -459,15 +459,38 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
             .to_string(),
         _ => cur(keys::MAX_MAIL_MB),
     };
-    let pairs = [
+    // 范围变化检测（2026-11-03 Bug 修复）：扩大/缩小首拉范围后，收件箱增量
+    // 游标仍指向旧范围的最大 UID——resolve_uids 兜底分支 filter(u > last.uid)
+    // 会把新范围内低 UID 的历史邮件全部滤掉，表现为"改了范围收件箱不更新、
+    // 手动收取提示没有新邮件"。变化即清双箱游标（走首拉分支全量重拉，入库
+    // 按 remote_uid 去重，已有邮件不会重复），并立即触发收取。
+    let days_changed = days != cur(keys::FIRST_FETCH_DAYS);
+    if days_changed && state.fetch_snapshot().running {
+        // C5（同 refetch）：运行轮收尾会把游标写回库，此刻清了也会被覆盖；
+        // 拒绝保存本轮并提示等待（其余参数随本次一并保存会误导"范围已生效"）
+        let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+        ctx.refetch_busy = true;
+        return render_html(&pane_template("sync"), &ctx);
+    }
+    let mut pairs = vec![
         (keys::SYNC_ON_START, if on { "true" } else { "false" }),
         (keys::SYNC_INTERVAL_MIN, interval.as_str()),
         (keys::FIRST_FETCH_DAYS, days.as_str()),
         (keys::MAX_MAIL_MB, max_mail.as_str()),
     ];
+    if days_changed {
+        pairs.push((keys::LAST_UIDVALIDITY, "0"));
+        pairs.push((keys::LAST_UID, "0"));
+        pairs.push((keys::LAST_UIDVALIDITY_SENT, "0"));
+        pairs.push((keys::LAST_UID_SENT, "0"));
+    }
     if state.set_batch(&pairs).is_err() {
         // 保存失败回渲染当前值，用户重试（库错误在此无更优交互）
         return sync_pane(state, false);
+    }
+    // 范围变化立即按新范围拉取（未配置凭据等失败由状态条展示）
+    if days_changed {
+        state.start_fetch();
     }
     sync_pane(state, true)
 }
@@ -493,9 +516,12 @@ pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
     };
     let pairs = [
         (keys::FIRST_FETCH_DAYS, days.as_str()),
-        // 清空游标 → 走首拉分支（无游标 = 首次拉取），按新范围 UID SEARCH ALL / SINCE
+        // 清空游标 → 走首拉分支（无游标 = 首次拉取），按新范围 UID SEARCH ALL / SINCE。
+        // 双箱都清（2026-11-03 修复：此前漏清发件箱游标，重拉对发件箱不完整）
         (keys::LAST_UID, "0"),
         (keys::LAST_UIDVALIDITY, "0"),
+        (keys::LAST_UID_SENT, "0"),
+        (keys::LAST_UIDVALIDITY_SENT, "0"),
     ];
     if state.set_batch(&pairs).is_err() {
         return sync_pane(state, false);

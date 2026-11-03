@@ -733,3 +733,29 @@ fn attachment_ops_require_owner_email() {
     );
     cleanup(&dir);
 }
+
+/// strip_html 数字字符引用解码（2026-11-03 Bug 修复）：中文邮件常把正文
+/// 编码为数字实体（GB2312 网关/老客户端），此前原样输出残串——列表预览
+/// "乱码"而详情页（浏览器解码 body_html）正常
+#[test]
+fn strip_html_decodes_numeric_char_refs() {
+    // 十进制：&#20320;&#22909; = "你好"
+    assert_eq!(strip_html("<p>&#20320;&#22909;</p>"), "你好");
+    // 十六进制（小写 x / 大写 X）
+    assert_eq!(strip_html("&#x4f60;&#X597D;"), "你好");
+    // 与命名实体混排：你 + & + 好 + 空格
+    assert_eq!(strip_html("&#20320;&amp;&#22909;&nbsp;"), "你&好 ");
+    // 非法码位：0（NUL 不可成 char）、代理区 D800、超 0x10FFFF → 原样保留
+    assert_eq!(strip_html("&#0;"), "#0");
+    assert_eq!(strip_html("&#xD800;"), "#xD800");
+    assert_eq!(strip_html("&#x110000;"), "#x110000");
+    // 纯数字但超出 8 字符实体扫描窗口 → 原文输出（含 & 与 ;）
+    assert_eq!(
+        strip_html("&#99999999999999999999;"),
+        "&#99999999999999999999;"
+    );
+    // 未闭合实体 '&' 原样
+    assert_eq!(strip_html("a&b"), "a&b");
+    // 截断实体（超过 8 字符扫描窗口）按字面输出
+    assert_eq!(strip_html("&#12345678901;"), "&#12345678901;");
+}

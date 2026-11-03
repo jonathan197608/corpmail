@@ -375,6 +375,23 @@ pub fn strip_html(html: &str) -> String {
                             "gt" => out.push('>'),
                             "amp" => out.push('&'),
                             "quot" => out.push('"'),
+                            // 数字字符引用：&#20320;（十进制）/ &#x4f60;（十六进制）。
+                            // 中文邮件常把正文编码成数字实体（GB2312 网关/老客户端
+                            // 常见）；此前走 other 分支原样输出残串（"#20320"），
+                            // 列表预览即"乱码"而详情页（浏览器解码）正常。
+                            // 非法码位（0/越大/代理区）原样保留，不 panic
+                            other if other.starts_with('#') => {
+                                let num = other[1..].strip_prefix(['x', 'X']);
+                                let parsed = match num {
+                                    Some(hex) => u32::from_str_radix(hex, 16),
+                                    None => other[1..].parse::<u32>(),
+                                };
+                                match parsed.ok().and_then(char::from_u32) {
+                                    // 控制字符（含 \0）对预览/检索文本无意义，原样保留标记
+                                    Some(c) if !c.is_control() => out.push(c),
+                                    _ => out.push_str(other),
+                                }
+                            }
                             other => out.push_str(other),
                         }
                         i += 1 + pos + 1;
