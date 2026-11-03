@@ -18,6 +18,9 @@ use crate::templates;
 use crate::ui::Assets;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
 use url::form_urlencoded;
 
 /// 连接测试注入点（生产实现真连服务器；单测注入假实现避免网络依赖）
@@ -372,6 +375,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         }
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
+        ("GET", "/proxy/image") => Some(proxy_image(req)),
         ("GET", "/contacts/suggest") => Some(contacts_suggest(state, req)),
         ("GET", "/side/frame") => Some(side_frame(state, req)),
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
@@ -643,6 +647,105 @@ fn contacts_suggest(state: &AppState, req: &Req) -> Resp {
 }
 
 /// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
+/// 邮件外部图片代理（GET /proxy/image?url=…）。
+///
+/// HTML 正文内的远程图片统一经本机拉取后回传，WebView 不直接向第三方发请求，
+/// 避免暴露 Referer/客户端指纹；同时阻断内网地址（SSRF）。只回传 image/*，
+/// 限制大小与超时，且不跟随重定向（防跳转到内网）。
+fn proxy_image(req: &Req) -> Resp {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let Some(raw) = req.query_param("url") else {
+        return proxy_error(400, "缺少 url");
+    };
+    let Ok(parsed) = url::Url::parse(&raw) else {
+        return proxy_error(400, "URL 无效");
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return proxy_error(400, "仅支持 http/https");
+    }
+    let Some(host) = parsed.host_str() else {
+        return proxy_error(400, "缺少主机");
+    };
+    if !is_public_host(host) {
+        return proxy_error(403, "禁止访问内网地址");
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .redirects(0)
+        .build();
+    let resp = match agent.get(&raw).set("Accept", "image/*").call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => return proxy_error(502, &format!("上游返回 {code}")),
+        Err(_) => return proxy_error(502, "图片拉取失败"),
+    };
+    let ctype = resp.header("Content-Type").unwrap_or("").to_string();
+    if !ctype.starts_with("image/") {
+        return proxy_error(400, "目标不是图片");
+    }
+    let mut body = Vec::new();
+    if resp
+        .into_reader()
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return proxy_error(502, "图片读取失败");
+    }
+    if body.len() as u64 > MAX_BYTES {
+        return proxy_error(400, "图片过大");
+    }
+    Resp {
+        status: 200,
+        content_type: ctype,
+        cache_control: "private, max-age=3600",
+        body,
+        extra_headers: Vec::new(),
+    }
+}
+
+fn proxy_error(status: u16, msg: &str) -> Resp {
+    Resp {
+        status,
+        content_type: "text/plain; charset=utf-8".into(),
+        cache_control: "no-store",
+        body: msg.as_bytes().to_vec(),
+        extra_headers: Vec::new(),
+    }
+}
+
+/// 仅允许公网主机：拒绝 localhost/单标签主机；解析后任一地址为内网即拒绝。
+/// （未做 IP 固定连接，DNS 重绑定属本地代理可接受的残留风险）
+fn is_public_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || !host.contains('.') {
+        return false;
+    }
+    let addrs: Vec<IpAddr> = match (host, 0u16).to_socket_addrs() {
+        Ok(it) => it.map(|s| s.ip()).collect(),
+        Err(_) => return false,
+    };
+    !addrs.is_empty() && addrs.iter().all(|ip| !is_private_ip(*ip))
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.octets()[0] == 0
+                || (v.octets()[0] == 100 && (64..=127).contains(&v.octets()[1])) // 100.64/10
+        }
+        IpAddr::V6(v) => {
+            v.is_loopback()
+                || v.is_unspecified()
+                || v.is_unique_local()
+                || v.is_unicast_link_local()
+        }
+    }
+}
+
 fn fetch_start(state: &AppState) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
@@ -723,6 +826,41 @@ struct SideFrameCtx {
     frame: FrameCtx,
 }
 
+/// 回复引用的纯文本（原邮件无 HTML 时）：逐行加「· 」前缀
+fn quoted_plain(src: &mail::EmailDetail) -> String {
+    let quoted = src
+        .body_text
+        .lines()
+        .map(|l| format!("· {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\n----- 原文 -----\n{quoted}\n")
+}
+
+/// 回复引用（原邮件有 HTML 时）：引用头 + 原 HTML 裸拼接（不加 blockquote）。
+/// 类型保持不变：HTML 原件 → 富文本模式回复，纯文本原件 → 纯文本回复。
+/// 不用 blockquote 包裹：wangEditor 的 blockquote 节点不接纳表格（会打平为文字），
+/// 配案清单等企业邮件的表格保真优先（实测 2026-11-03）。
+fn quoted_html(src: &mail::EmailDetail) -> String {
+    format!(
+        "<p><br></p><p>----- 原文 -----</p>{}",
+        mail::unwrap_top_div(&src.body_html)
+    )
+}
+
+/// 预填回复正文（同时给出纯文本与 HTML 两种形态，按原邮件类型选模式）
+fn fill_reply_body(ctx: &mut ComposeCtx, src: &mail::EmailDetail) {
+    if src.body_html.trim().is_empty() {
+        ctx.body_mode = "plain".into();
+        ctx.body_text = quoted_plain(src);
+    } else {
+        ctx.body_mode = "html".into();
+        ctx.body_html = quoted_html(src);
+        // 纯文本版仅存不显（升级不可逆，但保存时服务端会重新生成）
+        ctx.body_text = String::new();
+    }
+}
+
 /// 撰写页（GET /compose：空表单 / ?reply_to=N 回复预填 / ?draft_id=M 草稿编辑）
 fn compose_page(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
@@ -774,7 +912,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.cc_addrs = draft.cc_addrs;
             ctx.subject = draft.subject;
             ctx.body_text = draft.body_text;
-            ctx.body_html = draft.body_html;
+            ctx.body_html = mail::unwrap_top_div(&draft.body_html);
             ctx.body_mode = if ctx.body_html.trim().is_empty() {
                 "plain".into()
             } else {
@@ -797,13 +935,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         } else {
             format!("Re: {}", src.subject)
         };
-        let quoted = src
-            .body_text
-            .lines()
-            .map(|l| format!("· {l}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ctx.body_text = format!("\n\n----- 原文 -----\n{quoted}\n");
+        fill_reply_body(&mut ctx, &src);
     } else if let Some(rid) = req
         .query_param("reply_all_to")
         .and_then(|v| v.parse::<i64>().ok())
@@ -818,13 +950,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         } else {
             format!("Re: {}", src.subject)
         };
-        let quoted = src
-            .body_text
-            .lines()
-            .map(|l| format!("· {l}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ctx.body_text = format!("\n\n----- 原文 -----\n{quoted}\n");
+        fill_reply_body(&mut ctx, &src);
     } else if let Some(fid) = req
         .query_param("forward_from")
         .and_then(|v| v.parse::<i64>().ok())
@@ -842,15 +968,38 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         } else {
             format!("{} <{}>", src.from_name, src.from_addr)
         };
-        let cc_line = if src.cc_addrs.trim().is_empty() {
-            String::new()
+        // 转发同样保持类型：HTML 原件 → 富文本模式；头部字段全部转义防注入
+        if src.body_html.trim().is_empty() {
+            let cc_line = if src.cc_addrs.trim().is_empty() {
+                String::new()
+            } else {
+                format!("抄送：{}\n", src.cc_addrs)
+            };
+            ctx.body_mode = "plain".into();
+            ctx.body_text = format!(
+                "\n\n---------- 转发的邮件 ----------\n发件人：{from_disp}\n日期：{}\n收件人：{}\n{cc_line}主题：{}\n\n{}\n",
+                src.time_full, src.to_addrs, src.subject, src.body_text
+            );
         } else {
-            format!("抄送：{}\n", src.cc_addrs)
-        };
-        ctx.body_text = format!(
-            "\n\n---------- 转发的邮件 ----------\n发件人：{from_disp}\n日期：{}\n收件人：{}\n{cc_line}主题：{}\n\n{}\n",
-            src.time_full, src.to_addrs, src.subject, src.body_text
-        );
+            let esc = |s: &str| html_escape(s);
+            let cc_row = if src.cc_addrs.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<div>抄送：{}</div>", esc(&src.cc_addrs))
+            };
+            ctx.body_mode = "html".into();
+            let head = format!(
+                "<p><br></p><p>---------- 转发的邮件 ----------</p>\
+                 <div>发件人：{}</div><div>日期：{}</div><div>收件人：{}</div>{cc_row}<div>主题：{}</div>\
+                 <p><br></p>",
+                esc(&from_disp),
+                esc(&src.time_full),
+                esc(&src.to_addrs),
+                esc(&src.subject)
+            );
+            ctx.body_html = format!("{head}{}", mail::unwrap_top_div(&src.body_html));
+            ctx.body_text = String::new();
+        }
     }
     render_html("compose.html", &ctx)
 }

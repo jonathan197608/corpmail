@@ -1769,21 +1769,31 @@ body {
     background: #fff;
 }
 
-/* 正文模式切换（纯文本 / HTML）与 HTML 源码编辑区 */
-.body-mode {
+/* 正文：纯文本区 + 富文本编辑器（wangEditor 5 输出 HTML，纯文本仅可单向升级）；
+   编辑器自身样式由 vendor/wang-editor/style.css 提供，此处仅做容器适配 */
+.body-mode-hint {
     margin-left: 10px;
     font-weight: 400;
     font-size: 12px;
     color: var(--muted);
 }
-.body-mode .mode-opt {
-    margin-left: 10px;
-    cursor: pointer;
+.upgrade-btn {
+    margin-top: 8px;
 }
-.compose-card textarea.html-edit {
-    font-family: var(--mono);
-    font-size: 12.5px;
-    line-height: 1.6;
+#toolbar-container {
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 9px 9px 0 0;
+    z-index: 5; /* 颜色/字号等展开菜单需浮于上方表单区域 */
+}
+#editor-container {
+    min-height: 260px;
+    border: 1px solid var(--line);
+    border-radius: 0 0 9px 9px;
+}
+#editor-container .w-e-text-container {
+    background: #fff;
+    border-radius: 0 0 9px 9px;
 }
 
 .compose-note {

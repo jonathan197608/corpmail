@@ -1,0 +1,2 @@
+// wangEditor 5.1.23 (MIT) — https://github.com/wangeditor-team/wangEditor
+// UMD 构建原样内嵌，来源 npmmirror registry tarball；升级时整体替换并更新本注释。

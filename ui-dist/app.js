@@ -349,18 +349,99 @@ document.addEventListener("click", function (e) {
     stab.classList.add("on");
 });
 
-// ---------- 撰写页：正文模式切换（纯文本 / HTML） ----------
-// 两个 textarea 都在表单内，按模式显隐；提交时服务端按 body_mode 取用对应字段
-function mbxSyncBodyMode() {
-    const mode = document.querySelector('input[name="body_mode"]:checked');
-    if (!mode) return;
-    const isHtml = mode.value === 'html';
-    const plain = document.getElementById('body-text');
-    const html = document.getElementById('body-html');
-    if (plain) plain.hidden = isHtml;
-    if (html) html.hidden = !isHtml;
+// ---------- 撰写页：富文本编辑器（wangEditor 5，输出 HTML；纯文本只可单向升级） ----------
+// 挂载/工具栏由编辑器渲染；提交时经 htmx:configRequest 把 getHtml() 注入参数。
+var mbxEditor = null; // wangEditor 实例（富文本模式下存在）
+
+function mbxReadInitialHtml() {
+    const el = document.getElementById('rt-initial');
+    return el ? el.value : '';
 }
-document.body.addEventListener('change', ev => {
-    if (ev.target && ev.target.name === 'body_mode') mbxSyncBodyMode();
+
+// 创建（或重建）编辑器：initial 为 HTML 字符串（已是净化后的安全内容）
+function mbxBuildEditor(initial) {
+    if (!window.wangEditor) return;
+    // 升级/重建前销毁旧实例（editor 与 toolbar 成对销毁，防重复挂载）
+    if (mbxEditor) {
+        try { mbxEditor.destroy(); } catch (e) { /* 已销毁则忽略 */ }
+        mbxEditor = null;
+    }
+    const { createEditor, createToolbar } = window.wangEditor;
+    const editorConfig = {
+        placeholder: '输入正文…（支持表格 / 颜色 / 列表 / 链接 / 图片）',
+        MENU_CONF: {
+            // 本地图片统一转 data URI 内嵌（企业内网无外置上传端点；
+            // 保存/发送由后端净化管线只放行 data:image/*）
+            uploadImage: {
+                customUpload(file, insertFn) {
+                    const reader = new FileReader();
+                    reader.onload = () => insertFn(reader.result, file.name, '');
+                    reader.readAsDataURL(file);
+                }
+            }
+        }
+    };
+    try {
+        mbxEditor = createEditor({
+            selector: '#editor-container',
+            html: initial,
+            config: editorConfig,
+            mode: 'default'
+        });
+        createToolbar({
+            selector: '#toolbar-container',
+            editor: mbxEditor,
+            // 邮件场景不需要视频与全屏
+            config: { excludeKeys: ['group-video', 'fullScreen'] },
+            mode: 'default'
+        });
+    } catch (e) {
+        console.error('编辑器初始化失败', e);
+    }
+}
+
+// 纯文本 → 富文本（单向）：转义后按换行拆 <br> 作为初始内容；创建成功才切换显示
+function mbxUpgradeHtml() {
+    const ta = document.getElementById('body-text');
+    const plainBox = document.getElementById('body-plain');
+    const htmlBox = document.getElementById('body-html-box');
+    const mode = document.getElementById('body-mode');
+    let initial = '';
+    if (ta) {
+        const esc = ta.value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        initial = '<p>' + esc.replace(/\r?\n/g, '<br>') + '</p>';
+    }
+    mbxBuildEditor(initial);
+    if (mbxEditor) {
+        if (plainBox) plainBox.hidden = true;
+        if (htmlBox) htmlBox.hidden = false;
+        if (mode) mode.value = 'html';
+    }
+}
+
+// htmx 发请求前注入编辑器当前 HTML。不能靠 submit 事件刷新 hidden：
+// htmx 的 submit 处理先注册（defer 顺序 htmx→app.js）且序列化发生在
+// 其 handler 内，后注册的 submit 监听来不及更新字段值。
+document.body.addEventListener('htmx:configRequest', function (ev) {
+    const detail = ev.detail || {};
+    const elt = detail.elt;
+    const hidden = document.getElementById('body-html');
+    if (mbxEditor && hidden && elt && typeof elt.querySelector === 'function'
+        && elt.querySelector('#body-html') && detail.parameters) {
+        detail.parameters['body_html'] = mbxEditor.getHtml();
+    }
 });
-document.addEventListener('DOMContentLoaded', mbxSyncBodyMode);
+
+function mbxRtInit() {
+    if (!document.getElementById('editor-container')) return;
+    // 富文本模式（回复/转发 HTML 邮件、HTML 草稿）：直接挂载，初始内容
+    // 来自服务端净化的 blockquote/正文；纯文本模式保持 textarea（升级按钮触发）
+    const box = document.getElementById('body-html-box');
+    if (box && !box.hidden) {
+        mbxBuildEditor(mbxReadInitialHtml());
+    }
+}
+document.addEventListener('DOMContentLoaded', mbxRtInit);

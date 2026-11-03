@@ -16,6 +16,58 @@ fn sanitize_html_removes_xss_vectors() {
     assert!(out.contains("color:red"), "内联样式应保留：{out}");
 }
 
+#[test]
+fn sanitize_html_rewrites_remote_images_to_proxy() {
+    let out = sanitize_html(r#"<p><img src="https://img.189.cn/a.png" alt="x"></p>"#);
+    assert!(
+        out.contains("/proxy/image?url=https%3A%2F%2Fimg.189.cn%2Fa.png"),
+        "远程图片应改写为代理地址：{out}"
+    );
+    // 非 http(s) 地址不改写（cid 内联等由净化器自行处理）
+    let local = sanitize_html(r#"<img src="cid:inline1">"#);
+    assert!(!local.contains("/proxy/image"), "内联图片不改写：{local}");
+}
+
+#[test]
+fn sanitize_html_allows_inline_data_image_but_blocks_other_data() {
+    // 编辑器插入的本地图片（data:image/*）应保留
+    let ok =
+        sanitize_html(r##"<p>你好</p><img src="data:image/png;base64,iVBORw0KGgo=" alt="图">"##);
+    assert!(
+        ok.contains("data:image/png;base64,iVBORw0KGgo="),
+        "data:image/* 内嵌图片应放行：{ok}"
+    );
+    // 危险 URI：data:text/html（可执行）在链接与图片上一律删除
+    let evil = sanitize_html(
+        r#"<a href="data:text/html,<script>alert(1)</script>">x</a><img src="data:text/html,evil">"#,
+    );
+    assert!(
+        !evil.contains("data:text/html"),
+        "危险 data: 应全部移除：{evil}"
+    );
+}
+
+#[test]
+fn unwrap_top_div_expands_wrapper_and_keeps_structures() {
+    // 单一顶层 div 包裹（企业邮件常见全文包一层）：应展开内部
+    let wrapped = r#"<div style="font-family:sans-serif"><h2>标题</h2><table><tr><td>格</td></tr></table></div>"#;
+    let out = unwrap_top_div(wrapped);
+    assert!(out.starts_with("<h2>"), "顶层 div 应剥除：{out}");
+    assert!(out.ends_with("</table>"), "内部结构应保留：{out}");
+    // 多重包裹：循环剥壳
+    let nested = "<div><div><p>内文</p></div></div>";
+    assert_eq!(unwrap_top_div(nested), "<p>内文</p>");
+    // 多顶层节点混排：原样（不误剥）
+    let mixed = r#"<div>a</div><p>b</p>"#;
+    assert_eq!(unwrap_top_div(mixed), mixed);
+    // 顶层非 div：原样
+    let plain = r#"<p>仅段落</p><table><tr><td>x</td></tr></table>"#;
+    assert_eq!(unwrap_top_div(plain), plain);
+    // 嵌套子 div 且顶层为包裹 div：只剥外层，内层保留
+    let inner = r#"<div><p>a</p><div>b</div></div>"#;
+    assert_eq!(unwrap_top_div(inner), r#"<p>a</p><div>b</div>"#);
+}
+
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
     let dir = std::env::temp_dir().join(format!("corpmail-m2-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -689,6 +689,95 @@ fn reply_prefills_and_in_reply_to_persisted() {
         html.contains("name=\"in_reply_to\" value=\"1\""),
         "回复链应写入隐藏域"
     );
+    assert!(
+        html.contains(r#"<textarea name="body_text" id="body-text" rows="14">"#),
+        "纯文本原件回复应为纯文本模式"
+    );
+    assert!(
+        html.contains(r#"<input type="hidden" name="body_mode" id="body-mode" value="plain">"#),
+        "纯文本回复应下发 plain 模式"
+    );
+    assert!(
+        html.contains("id=\"body-html-box\" hidden"),
+        "纯文本回复的富文本区应隐藏（wangEditor 不挂载）"
+    );
+    cleanup(&dir);
+}
+
+/// HTML 原件的回复/转发应保持富文本模式（类型不降级）；纯文本原件保持纯文本
+#[test]
+fn reply_and_forward_keep_body_kind() {
+    let (state, dir) = temp_state("m2-reply-html");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, body_html, subject_tokens, body_tokens,
+                                    unread, created_at, received_at)
+                 VALUES ('in', 'inbox', 'received', 'boss@x.cn', '领导', 'demo@chinatelecom.cn',
+                         'HTML 来件', '表格正文', '<table><tr><td>表格正文</td></tr></table>',
+                         'html 来件', '表格 正文', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    // 回复：HTML 原件 → 富文本模式（wangEditor 挂载点 + 初始 HTML 存 rt-initial）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "reply_to=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains(r#"<input type="hidden" name="body_mode" id="body-mode" value="html">"#),
+        "HTML 原件回复应下发 html 模式"
+    );
+    assert!(
+        html.contains("id=\"body-plain\" hidden"),
+        "HTML 回复应隐藏纯文本区（单向不降级）"
+    );
+    assert!(
+        !html.contains("id=\"body-html-box\" hidden"),
+        "富文本区应可见（wangEditor 挂载）"
+    );
+    // 初始 HTML 经模板属性转义：< 变 &lt;进入 rt-initial，前端由浏览器解转义回填编辑器
+    assert!(
+        html.contains("&lt;table&gt;"),
+        "回复应携带原 HTML 表格（表格保真，不包 blockquote）：{}",
+        html.lines()
+            .find(|l| l.contains("rt-initial"))
+            .unwrap_or("(未找到 rt-initial)")
+    );
+    // 转发：HTML 原件 → 富文本模式 + 转发头（字段转义，value 中二次转义）
+    let fwd = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "forward_from=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        fwd.contains("---------- 转发的邮件 ----------"),
+        "转发头应存在"
+    );
+    assert!(
+        fwd.contains("&lt;table&gt;"),
+        "转发应携带原 HTML 表格（不包 blockquote）"
+    );
+    assert!(
+        fwd.contains("发件人：领导 &amp;lt;boss@x.cn&amp;gt;"),
+        "转发头发件人应转义（value 属性二次转义后为 &amp;lt; 形态）：{}",
+        fwd.lines()
+            .find(|l| l.contains("rt-initial"))
+            .unwrap_or("(未找到 rt-initial)")
+    );
     cleanup(&dir);
 }
 
@@ -799,6 +888,55 @@ fn delete_redirects_back_with_list_context() {
         loc, "/?unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
         "删除应保持列表过滤与翻页：{loc}"
     );
+    cleanup(&dir);
+}
+
+#[test]
+fn image_proxy_rejects_private_and_non_http() {
+    let (state, dir) = temp_state("proxy-guard");
+    // 内网地址：不发网络请求，直接 403
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/proxy/image",
+            "url=http%3A%2F%2F127.0.0.1%2Fx.png",
+            b"",
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 403, "内网地址应拒绝");
+    // 非 http(s) scheme
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/proxy/image",
+            "url=file%3A%2F%2F%2Fetc%2Fpasswd",
+            b"",
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 400, "非 http(s) 应拒绝");
+    // 非法 URL
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/proxy/image", "url=not-a-url", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 400, "非法 URL 应拒绝");
     cleanup(&dir);
 }
 
@@ -2281,7 +2419,16 @@ fn dump_smoke_html() {
             .replace("href=\"/app.css\"", "href=\"app.css\"")
             .replace("src=\"/htmx.min.js\"", "src=\"htmx.min.js\"")
             .replace("src=\"/app.js\"", "src=\"app.js\"")
-            .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"");
+            .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"")
+            // wangEditor vendor 资源（仅 compose 页引入）
+            .replace(
+                "href=\"/vendor/wang-editor/style.css\"",
+                "href=\"vendor/wang-editor/style.css\"",
+            )
+            .replace(
+                "src=\"/vendor/wang-editor/index.js\"",
+                "src=\"vendor/wang-editor/index.js\"",
+            );
         std::fs::write(root.join(name), html).unwrap();
     };
 
@@ -2681,6 +2828,12 @@ fn dump_smoke_html() {
     let ui_dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-dist");
     for f in ["app.css", "htmx.min.js", "app.js", "favicon.svg"] {
         std::fs::copy(ui_dist.join(f), root.join(f)).unwrap();
+    }
+    // wangEditor vendor（compose 页富文本编辑器）：保持子目录结构
+    let vendor = root.join("vendor/wang-editor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    for f in ["index.js", "style.css", "VERSION.txt"] {
+        std::fs::copy(ui_dist.join("vendor/wang-editor").join(f), vendor.join(f)).unwrap();
     }
     let _ = std::fs::remove_dir_all(&db_dir);
 }

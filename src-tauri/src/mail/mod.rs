@@ -152,9 +152,109 @@ pub fn sanitize_html(raw: &str) -> String {
                 "style", "align", "valign", "width", "height", "bgcolor", "color",
             ]);
             b.link_rel(Some("noopener noreferrer"));
+            // 外部图片统一改写到本机代理端点（见 ui::router::proxy_image）：
+            // WebView 不直接连第三方，避免暴露 Referer/指纹；代理侧再做 SSRF 校验。
+            // 改写结果是相对路径，需允许相对 URL（默认 Deny 会把它过滤掉）。
+            b.url_relative(ammonia::UrlRelative::PassThrough);
+            // 撰写页富文本编辑器插入的本地图片为 data: URI（无网络端点可上传）。
+            // ammonia 的 scheme 白名单按整体串放行，故此处放行 "data" 后必须由
+            // 下面的 attribute_filter 收紧：仅 img src 且 data:image/* 前缀放行，
+            // 其余元素（a href 等）的任何 data: 一律移除（防 data:text/html 等）。
+            b.add_url_schemes(["data"]);
+            b.attribute_filter(|element, attribute, value| {
+                let v = value.trim();
+                let lower = v.to_ascii_lowercase();
+                match (element, attribute) {
+                    // 图片：远程 → 代理改写；内嵌 data:image/* 放行；其余 data: 移除
+                    ("img", "src") => {
+                        if is_remote_http_url(v) {
+                            let enc: String =
+                                url::form_urlencoded::byte_serialize(v.as_bytes()).collect();
+                            Some(std::borrow::Cow::Owned(format!("/proxy/image?url={enc}")))
+                        } else if lower.starts_with("data:image/") {
+                            Some(std::borrow::Cow::Borrowed(value))
+                        } else if lower.starts_with("data:") {
+                            None
+                        } else {
+                            Some(std::borrow::Cow::Borrowed(value))
+                        }
+                    }
+                    // 链接等：data: 属危险协议（data:text/html 可执行），一律移除
+                    (_, "href") if lower.starts_with("data:") => None,
+                    _ => Some(std::borrow::Cow::Borrowed(value)),
+                }
+            });
             b
         });
     SANITIZER.clean(raw).to_string()
+}
+
+/// 是否 http(s) 远程 URL（用于图片代理改写）
+fn is_remote_http_url(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// 剥掉顶层单一包裹 div（企业 HTML 邮件常把全文包在一层 `<div style=…>` 里）。
+///
+/// 富文本编辑器（wangEditor）按顶层元素解析：p/table/h2 等顶层节点均保真，
+/// 但顶层未知容器 div 会被整体打平成纯文本（配案表格变一行字，实测 2026-11-03）。
+/// 仅当整串恰好被一个 div 包裹（首个标签是 `<div…>` 且其配对 `</div>` 在末尾）
+/// 才展开内部内容；嵌套子 div 或多顶层节点混排原样返回。循环剥壳处理多重包裹。
+/// 只用于编辑器注入链路（回复/转发/草稿回填），展示与收件存储仍保留原 div 版式。
+pub fn unwrap_top_div(html: &str) -> String {
+    let mut cur = html.trim().to_string();
+    while let Some(inner) = single_top_div(&cur) {
+        cur = inner.trim().to_string();
+    }
+    cur
+}
+
+/// 若 `s` 恰好被一个顶层 div 包裹，返回其内部内容；否则 None
+fn single_top_div(s: &str) -> Option<String> {
+    let after_div = s.strip_prefix("<div")?;
+    // 开标签结束位置（ammonia 输出的属性值中 > 已转义为 &gt;，首个 > 即标签边界）
+    // 注意：tag_end 相对 after_div，换算回 s 的绝对下标需 +4（前缀 "<div" 长度）
+    let tag_end = after_div.find('>')?;
+    let tag_body = &after_div[..tag_end];
+    // 自闭合 <div/> 不是包裹容器
+    if tag_body.ends_with('/') {
+        return None;
+    }
+    let content_start = 4 + tag_end + 1;
+    // 扫描 div 深度找配对闭合
+    let mut depth = 1i32;
+    let mut i = content_start;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        let Some(gt) = rest.find('>') else { break };
+        let tag = &rest[1..gt];
+        let lower = tag.to_ascii_lowercase();
+        if lower.starts_with("div") || lower.starts_with("/div") {
+            if lower.starts_with('/') {
+                depth -= 1;
+            } else if !lower.rsplit('/').next().is_some_and(str::is_empty) {
+                depth += 1;
+            } else {
+                return None; // <div/> 自闭合：按非包裹处理
+            }
+            if depth == 0 {
+                // 闭合标签后必须到末尾（否则该 div 只是多个顶层节点之一）
+                return if s[i + gt + 1..].trim().is_empty() {
+                    Some(s[content_start..i].to_string())
+                } else {
+                    None
+                };
+            }
+        }
+        i += gt + 1;
+    }
+    None
 }
 
 /// HTML 剥标签为纯文本（基础实体解码）：用于 HTML 正文的检索/列表预览/转发引用。
