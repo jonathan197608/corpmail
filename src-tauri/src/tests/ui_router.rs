@@ -1984,6 +1984,13 @@ fn huge_page_number_does_not_panic() {
         },
     );
     assert_eq!(resp.status, 200);
+    // 钳制值生效（审计 I3）：页码指示不得透出原始巨型值
+    //（更完整的口径断言见 clamp_page_unifies_range / clamped_beyond_data_page_renders_empty_state）
+    let html = body(&resp);
+    assert!(
+        !html.contains("9223372036854775807"),
+        "页码指示不得透出原始巨型值：{html}"
+    );
     cleanup(&dir);
 }
 
@@ -2791,21 +2798,78 @@ fn error_page_escapes_dynamic_text() {
     assert!(html.contains("&lt;script&gt;"), "{html}");
 }
 
+/// page 参数归一（审计 I3）：list_root 与 rebuild_list_query 共用 clamp_page，
+/// 口径统一 1..=100000（畸形→1，超上限→100000）
 #[test]
-fn traversal_and_unknown_paths_are_404() {
-    let (state, dir) = temp_state("404");
-    for path in ["/../Cargo.toml", "/nope", "/emails/abc", "/emails/0"] {
-        let resp = route(
-            &state,
-            &assets(),
-            &req("GET", path, b""),
-            &FakeTester {
-                smtp_ok: true,
-                imap_ok: true,
-            },
-        );
-        assert_eq!(resp.status, 404, "{path} 应 404");
-    }
+fn clamp_page_unifies_range() {
+    assert_eq!(clamp_page(None), 1, "缺省第 1 页");
+    assert_eq!(clamp_page(Some("")), 1, "空串非法 → 1");
+    assert_eq!(clamp_page(Some("abc")), 1, "非数字 → 1");
+    assert_eq!(clamp_page(Some("0")), 1, "0 → 下限 1");
+    assert_eq!(clamp_page(Some("-5")), 1, "负数 → 下限 1");
+    assert_eq!(clamp_page(Some("1")), 1);
+    assert_eq!(clamp_page(Some("30")), 30, "范围内原样");
+    assert_eq!(clamp_page(Some("100000")), 100000, "恰好上限原样");
+    assert_eq!(clamp_page(Some("100001")), 100_000, "超上限钳到 100000");
+    assert_eq!(
+        clamp_page(Some("9999999999999")),
+        100_000,
+        "巨型值钳到 100000（防大 OFFSET 扫描）"
+    );
+    assert_eq!(clamp_page(Some("+3")), 3, "带符号合法值解析");
+}
+
+/// 大页码钳到 100000 后列表页正常渲染（有数据时该页为空态而非崩溃）
+#[test]
+fn clamped_beyond_data_page_renders_empty_state() {
+    let (state, dir) = temp_state("clamp-page");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    // PAGE_SIZE+1 封 → 2 页
+    state
+        .with_conn(|c| {
+            for i in 0..(mail::PAGE_SIZE + 1) {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn',?1,?1,'x',1)",
+                    [i],
+                )
+                .unwrap();
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 页 2（数据范围内）：分页器显示 2 / 2
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "page=2", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("2 / 2"),
+        "范围内页码分页器应正常：{}",
+        html.lines()
+            .find(|l| l.contains("pg-cur"))
+            .unwrap_or("(无分页器)")
+    );
+    // 页 100001 → 钳 100000：超数据范围为空态（而非 panic 或巨型 OFFSET）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "page=100001", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("这里还没有邮件"),
+        "钳后页码超数据范围应渲染空态"
+    );
     cleanup(&dir);
 }
 

@@ -460,11 +460,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         Some("all") | Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
         _ => "inbox".to_string(),
     };
-    let page = req
-        .query_param("page")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = clamp_page(req.query_param("page").as_deref());
     let unread_only = req.query_param("unread").map(|v| v == "1").unwrap_or(false);
     let external_only = req
         .query_param("external")
@@ -1648,14 +1644,21 @@ fn rebuild_list_query(
     if let Some(q) = q.filter(|v| !v.trim().is_empty()) {
         qs.push(format!("q={}", urlencode(q)));
     }
-    let page = page
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1)
-        .clamp(1, 100_000);
+    let page = clamp_page(page);
     if page > 1 {
         qs.push(format!("page={page}"));
     }
     qs.join("&")
+}
+
+/// URL page 参数归一：非法 → 1，上限 100000。
+/// list_root（列表渲染）与 rebuild_list_query（上下文回填）共用同一口径
+///（审计 I3）：此前列表侧只 max(1) 无上限，极端大页码会造成巨大 OFFSET
+/// 扫描，且与回填侧 clamp 后的页码往返不一致导致前后页跳动
+fn clamp_page(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100_000)
 }
 
 /// 表单隐藏域 list_query（compose 页透传的进入前列表上下文）重新过滤——
