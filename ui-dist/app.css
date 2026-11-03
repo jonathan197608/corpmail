@@ -980,6 +980,45 @@ body {
     margin-top: 16px;
 }
 
+/* 向导"测试并保存"进行中反馈（hx-indicator）：请求期间加 .htmx-request 显示 */
+.setup-busy {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    background: var(--accent-soft);
+    border-radius: 9px;
+    padding: 9px 12px;
+    margin: 10px 0 0;
+}
+
+#setup-busy.htmx-request {
+    display: flex;
+}
+
+.setup-busy .spin {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    border: 2px solid #b8ccea;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: mbxspin 0.7s linear infinite;
+}
+
+@keyframes mbxspin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* 测试进行中：上一步链接与表单锁定（a 元素无 disabled，用类拦截） */
+a.btn.link.disabled {
+    pointer-events: none;
+    opacity: .45;
+}
+
 /* ============ 常规设置（tab） ============ */
 .settings-tabs {
     display: flex;

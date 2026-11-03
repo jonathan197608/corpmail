@@ -23,8 +23,9 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 use url::form_urlencoded;
 
-/// 连接测试注入点（生产实现真连服务器；单测注入假实现避免网络依赖）
-pub trait ConnTester {
+/// 连接测试注入点（生产实现真连服务器；单测注入假实现避免网络依赖）。
+/// Send + Sync：向导保存时 SMTP/IMAP 双通道并行测试（std::thread::scope 借用）
+pub trait ConnTester: Send + Sync {
     fn smtp(
         &self,
         host: &str,
@@ -1375,8 +1376,23 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
     let smtp_mode = crate::net::TlsMode::resolve(smtp_port, &smtp_security);
     let recv_mode = crate::net::TlsMode::resolve(recv_port, &recv_security);
 
-    let smtp = tester.smtp(&smtp_host, smtp_port, smtp_mode, &account, &password);
-    let imap = tester.imap(&recv_host, recv_port, recv_mode, &account, &password);
+    // SMTP/IMAP 并行测试：两通道互不依赖，串行最坏 2×15s 超时（内网拦 TLS
+    // 不回 RST 的场景下长达 30s 无反馈）；并行把最坏等待压到单通道上限。
+    // scope 借用 tester/参数（无 'static 要求）；线程 panic 兑底为失败结果
+    let (smtp, imap) = std::thread::scope(|s| {
+        let smtp_handle =
+            s.spawn(|| tester.smtp(&smtp_host, smtp_port, smtp_mode, &account, &password));
+        let imap_handle =
+            s.spawn(|| tester.imap(&recv_host, recv_port, recv_mode, &account, &password));
+        let panicky = |label: &str| TestOutcome {
+            ok: false,
+            elapsed_ms: 0,
+            detail: format!("{label}测试线程异常"),
+        };
+        let smtp = smtp_handle.join().unwrap_or_else(|_| panicky("发信"));
+        let imap = imap_handle.join().unwrap_or_else(|_| panicky("收信"));
+        (smtp, imap)
+    });
     if smtp.ok && imap.ok {
         // 首次邮件拉取范围（7/30/90/全部=0，非法回落 30）
         let first_fetch = match form.get("first_fetch_days") {

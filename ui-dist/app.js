@@ -349,6 +349,52 @@ document.addEventListener("click", function (e) {
     stab.classList.add("on");
 });
 
+// ---------- 向导"测试并保存"：进行中锁定表单，结束后恢复 ----------
+// 双通道真实连接测试最长 ~15s（并行后）。htmx:configRequest触发时参数已收集完毕，
+// 此处禁用 inputs 不影响本次提交序列化；afterRequest 无论成败都解锁，
+// 保证失败重试（结果片段换入 #test-results 后表单必须可编辑）。
+// 按钮禁用/恢复由 hx-disabled-elt 负责，此处只补文案与全表单锁定。
+function mbxLockSetupForm(form, lock) {
+    if (!form) return;
+    form.querySelectorAll('input, select, textarea').forEach(function (el) {
+        if (lock) {
+            // 只标记"被我们禁用"的元素：天然 disabled（如有）解锁时不误开
+            if (!el.disabled) {
+                el.disabled = true;
+                el.dataset.mbxLocked = '1';
+            }
+        } else if (el.dataset.mbxLocked) {
+            el.disabled = false;
+            delete el.dataset.mbxLocked;
+        }
+    });
+    var back = form.querySelector('a.btn.link');
+    if (back) back.classList.toggle('disabled', lock);
+    var submit = form.querySelector('button[type=submit]');
+    if (submit) {
+        if (lock) {
+            submit.dataset.mbxLabel = submit.textContent;
+            submit.textContent = submit.dataset.busyLabel || '测试中…';
+        } else if (submit.dataset.mbxLabel) {
+            submit.textContent = submit.dataset.mbxLabel;
+        }
+    }
+}
+
+document.body.addEventListener('htmx:configRequest', function (ev) {
+    var elt = ev.detail && ev.detail.elt;
+    if (elt && elt.classList && elt.classList.contains('setup-card')) {
+        mbxLockSetupForm(elt, true);
+    }
+});
+
+document.body.addEventListener('htmx:afterRequest', function (ev) {
+    var elt = ev.detail && ev.detail.elt;
+    if (elt && elt.classList && elt.classList.contains('setup-card')) {
+        mbxLockSetupForm(elt, false);
+    }
+});
+
 // ---------- 撰写页：富文本编辑器（wangEditor 5，输出 HTML；纯文本只可单向升级） ----------
 // 挂载/工具栏由编辑器渲染；提交时经 htmx:configRequest 把 getHtml() 注入参数。
 var mbxEditor = null; // wangEditor 实例（富文本模式下存在）
