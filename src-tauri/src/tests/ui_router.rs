@@ -2113,7 +2113,8 @@ fn settings_storage_save_triggers_cleanup_and_enables_clean_button() {
         "有待清理项时立即清理按钮应可用：{btn_ctx}"
     );
     // 保存 30 天保留 → 自动执行清理：老邮件删除、报告显示
-    let resp = body(&route(
+    //（保存响应为 pane 片段，须取完整Resp看响应头）
+    let save_resp = route(
         &state,
         &assets(),
         &req(
@@ -2130,14 +2131,22 @@ fn settings_storage_save_triggers_cleanup_and_enables_clean_button() {
             smtp_ok: true,
             imap_ok: true,
         },
-    ));
-    assert!(resp.contains("✓ 已保存"), "保存成功提示：{resp}");
+    );
+    let resp = body(&save_resp);
     assert!(
         resp.contains("过期邮件 1"),
         "保存后自动清理应报告删除结果：{}",
         resp.lines()
             .find(|l| l.contains("清理完成") || l.contains("暂无可清理"))
             .unwrap_or("(未找到报告)")
+    );
+    assert!(
+        save_resp
+            .extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:fetchDone")),
+        "清理删除了邮件，保存响应须携带 HX-Trigger mbx:fetchDone 驱动边栏局部刷新：{:?}",
+        save_resp.extra_headers
     );
     let total: i64 = state.with_conn(|c| {
         c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))

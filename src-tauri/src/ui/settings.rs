@@ -7,7 +7,8 @@
 
 use super::router::{
     ConnTester, FrameCtx, RECV_PORT_DEFAULT, Req, Resp, SMTP_PORT_DEFAULT, domain_or, frame_of,
-    human_bytes, parse_form, render_html, security_or, test_fragment, test_view, trimmed_field,
+    human_bytes, parse_form, render_html, render_pane_with_sidebar_refresh, security_or,
+    test_fragment, test_view, trimmed_field,
 };
 use crate::state::{self, AppState, defaults, full_address, keys};
 use serde::Serialize;
@@ -545,7 +546,8 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
     // 立即可见效果，无需等每日定时器或手动点「立即清理」（2026-11-03 需求：
     // 此前只改值不清理，“收件保留时长”看起来不生效）。清理失败不影响保存成功
     let view = clean_view_of(crate::clean::run(state));
-    render_html(
+    // 清理可能删邮件 → 边栏计数需要同步刷新（HX-Trigger 事件驱动局部刷新）
+    render_pane_with_sidebar_refresh(
         &pane_template("storage"),
         &settings_ctx(state, "storage", true, "", Some(view), None),
     )
@@ -598,7 +600,8 @@ fn clean_view_of(result: Result<crate::clean::CleanReport, String>) -> CleanView
 /// 设置·存储管理：立即清理（手动触发，同步执行；回 pane 带报告）
 pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
     let view = clean_view_of(crate::clean::run(state));
-    render_html(
+    // 清理删行后边栏计数需刷新（同保存路径）
+    render_pane_with_sidebar_refresh(
         &pane_template("storage"),
         &settings_ctx(state, "storage", false, "", Some(view), None),
     )

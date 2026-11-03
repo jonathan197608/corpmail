@@ -144,6 +144,14 @@ impl Resp {
         resp
     }
 
+    /// 附带 HX-Trigger 事件（htmx 收到后派发同名 body 事件，
+    /// app.js 监听 mbx:fetchDone 做侧栏+列表局部刷新）
+    fn with_event(mut self, event: &str) -> Self {
+        self.extra_headers
+            .push(("HX-Trigger".into(), format!("{{\"{event}\":true}}")));
+        self
+    }
+
     fn asset(mime: String, body: Vec<u8>) -> Self {
         Self {
             status: 200,
@@ -1784,6 +1792,13 @@ pub(super) fn render_html(name: &str, ctx: &impl Serialize) -> Resp {
         Ok(html) => Resp::html(html),
         Err(err) => Resp::internal_error(format!("模板 {name} 渲染失败：{err}")),
     }
+}
+
+/// 渲染片段并附带侧栏刷新事件：清理/删除等改变文件夹计数的动作，
+/// 返回的 pane 只换主区，边栏计数停在旧值——由 HX-Trigger 派发
+/// mbx:fetchDone（app.js 既有的局部刷新通道：side+list，不整页 reload）
+pub(super) fn render_pane_with_sidebar_refresh(name: &str, ctx: &impl Serialize) -> Resp {
+    render_html(name, ctx).with_event("mbx:fetchDone")
 }
 
 /// 静态资源：仅 GET，路径不含 `..`/空段；MIME 与字节由资源提供方给出
