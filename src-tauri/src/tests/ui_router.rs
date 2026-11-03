@@ -2057,6 +2057,114 @@ fn settings_sync_save_roundtrip() {
     cleanup(&dir);
 }
 
+/// 存储保存后自动按新策略清理（2026-11-03 需求：改短保留时长立即生效，
+/// 无需等每日定时器或手动点立即清理）+「立即清理」按钮在有可释放项时可用
+#[test]
+fn settings_storage_save_triggers_cleanup_and_enables_clean_button() {
+    let (state, dir) = temp_state("sto-save-clean");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let now = mail::now_epoch();
+    // 首拉形态历史件：今天入库（created_at=now）、40 天前接收
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at)
+             VALUES ('in','inbox','received','老邮件','a@x.cn','甲','demo@chinatelecom.cn',
+                     '旧正文','老 邮件','旧 正文',0,?1,?2)",
+                rusqlite::params![now, now - 40 * 86_400],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 有过期项时按钮可用（按钮窗口内不得出现 disabled）
+    state.set_batch(&[(keys::KEEP_INBOX_DAYS, "30")]).unwrap();
+    let pane = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/storage", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    let btn_ctx = pane
+        .lines()
+        .position(|l| l.contains("hx-post=\"/settings/storage/clean\""))
+        .map(|i| {
+            let s = i.saturating_sub(2);
+            let e = (i + 5).min(pane.lines().count());
+            pane.lines()
+                .skip(s)
+                .take(e - s)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(!btn_ctx.is_empty(), "应找到立即清理按钮：{pane}");
+    // 可用态判定用 title：禁用分支 title 为"当前没有可释放的空间"
+    //（按钮固定声明含 hx-disabled-elt 属性名，不能以 disabled 字样判）
+    assert!(
+        btn_ctx.contains("title=\"按上方策略立即执行清理\""),
+        "有待清理项时立即清理按钮应可用：{btn_ctx}"
+    );
+    // 保存 30 天保留 → 自动执行清理：老邮件删除、报告显示
+    let resp = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/storage/save",
+            &form(&[
+                ("inline_attach_max_mb", "20"),
+                ("clean_sent_bulk_days", ""),
+                ("keep_inbox_days", "30"),
+                ("keep_sent_days", ""),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(resp.contains("✓ 已保存"), "保存成功提示：{resp}");
+    assert!(
+        resp.contains("过期邮件 1"),
+        "保存后自动清理应报告删除结果：{}",
+        resp.lines()
+            .find(|l| l.contains("清理完成") || l.contains("暂无可清理"))
+            .unwrap_or("(未找到报告)")
+    );
+    let total: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(total, 0, "40 天前的历史件应随保存动作被清理");
+    // 清理后无待清理项 → 按钮禁用 + 文案
+    let pane2 = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/storage", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        pane2.contains("title=\"当前没有可释放的空间\""),
+        "无可释放空间时按钮应有禁用提示：{pane2}"
+    );
+    assert!(
+        pane2.contains("收件箱保留时长"),
+        "文案应为收件箱保留时长：{pane2}"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn settings_sync_refetch_resets_cursor_and_keeps_range() {
     let (state, dir) = temp_state("sync-refetch");

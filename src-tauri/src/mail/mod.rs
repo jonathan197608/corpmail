@@ -188,6 +188,11 @@ pub fn sanitize_html(raw: &str) -> String {
                     }
                     // 链接等：data: 属危险协议（data:text/html 可执行），一律移除
                     (_, "href") if lower.starts_with("data:") => None,
+                    // CSS url()：background 等样式内的远程资源与 img src 同口径改写代理
+                    //（审计 L3：否则转发外发后跟踪像素仍可加载）
+                    (_, "style") if lower.contains("url(") => {
+                        Some(std::borrow::Cow::Owned(rewrite_css_urls(value)))
+                    }
                     _ => Some(std::borrow::Cow::Borrowed(value)),
                 }
             });
@@ -197,9 +202,89 @@ pub fn sanitize_html(raw: &str) -> String {
 }
 
 /// 是否 http(s) 远程 URL（用于图片代理改写）
-fn is_remote_http_url(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
+fn is_remote_http_url(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// CSS `url(...)` 远程资源改写（审计 L3）：
+/// style 属性里的 `url(http://…)`（背景图等）与 img src 同口径改写到本机
+/// 代理——应用内不直连第三方（代理侧做 SSRF 校验）；HTML 正文被转发到
+/// 外部收件人后为相对路径，外部客户端解析不了 → 远程图不加载，
+/// 阻断跟踪像素随转发泄露（此前 img 已改写而 style 未改写，恰是缺口）。
+/// `data:image/*` 内嵌保留；相对路径与其余 URL 原样；解析不了的整段原样。
+fn rewrite_css_urls(css: &str) -> String {
+    let chars: Vec<char> = css.chars().collect();
+    // 是否在 i 处出现 url( （关键字大小写不敏感，'(' 无大小写）
+    let eq_ci = |idx: usize, want: char| {
+        chars
+            .get(idx)
+            .is_some_and(|c| c.eq_ignore_ascii_case(&want))
+    };
+    let is_url_open = |i: usize| {
+        eq_ci(i, 'u') && eq_ci(i + 1, 'r') && eq_ci(i + 2, 'l') && chars.get(i + 3) == Some(&'(')
+    };
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if eq_ci(i, 'u') && is_url_open(i) {
+            // 解析参数：可选空白 + 可选引号 + 内容 + 闭引号 + 可选空白 + ')'
+            let mut j = i + 4;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let quote = match chars.get(j) {
+                Some('\'') => Some('\''),
+                Some('"') => Some('"'),
+                _ => None,
+            };
+            let start = if quote.is_some() { j + 1 } else { j };
+            let mut end = start;
+            match quote {
+                Some(q) => {
+                    while end < chars.len() && chars[end] != q {
+                        end += 1;
+                    }
+                }
+                None => {
+                    while end < chars.len() && !chars[end].is_whitespace() && chars[end] != ')' {
+                        end += 1;
+                    }
+                }
+            }
+            let mut close = end;
+            if quote.is_some() && close < chars.len() {
+                close += 1; // 越过闭引号
+            }
+            while close < chars.len() && chars[close].is_whitespace() {
+                close += 1;
+            }
+            if close < chars.len() && chars[close] == ')' {
+                let url: String = chars[start..end].iter().collect();
+                let trimmed = url.trim();
+                if is_remote_http_url(trimmed) {
+                    let enc: String =
+                        url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+                    out.push_str(&format!("url(\"/proxy/image?url={enc}\")"));
+                } else {
+                    // 非远程（data:、相对、cid 等）：整段原样
+                    for c in &chars[i..=close] {
+                        out.push(*c);
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+            // 闭括号缺失（畸形 CSS）：剩余原文吐出，不再解析
+            for c in &chars[i..] {
+                out.push(*c);
+            }
+            return out;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// 剥掉顶层单一包裹 div（企业 HTML 邮件常把全文包在一层 `<div style=…>` 里）。

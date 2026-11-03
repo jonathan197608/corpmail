@@ -28,6 +28,44 @@ fn sanitize_html_rewrites_remote_images_to_proxy() {
     assert!(!local.contains("/proxy/image"), "内联图片不改写：{local}");
 }
 
+/// style 属性内 CSS url() 远程资源改写（审计 L3）：与 img src 同口径走代理，
+/// data:image/* 与相对路径保留，畸形 CSS 原样
+#[test]
+fn sanitize_html_rewrites_css_urls_to_proxy() {
+    // 裸 URL 形态（Outlook 常见）
+    let out = sanitize_html(
+        r##"<div style="background-image:url(http://t.189.cn/pixel.gif);color:red">x</div>"##,
+    );
+    assert!(
+        // 属性值内的双引号被 HTML 转义为 &quot;，浏览器解析 style 时还原
+        out.contains("url(&quot;/proxy/image?url=http%3A%2F%2Ft.189.cn%2Fpixel.gif&quot;)"),
+        "裸 URL 应改写为代理（属性值内引号转义形态）：{out}"
+    );
+    assert!(out.contains("color:red"), "其余 CSS 声明保留：{out}");
+    // 引号形态 + 多条 URL 混合
+    let q = sanitize_html(
+        r##"<div style="background:url('https://a.189.cn/x.png'),url( http://b.189.cn/y.png )">y</div>"##,
+    );
+    let proxy_cnt = q.matches("/proxy/image?url=").count();
+    assert_eq!(proxy_cnt, 2, "两条远程 URL 均应改写：{q}");
+    // data:image/* 内嵌保留
+    let d = sanitize_html(
+        r##"<div style="background:url(data:image/png;base64,iVBORw0KGgo=)">z</div>"##,
+    );
+    assert!(
+        d.contains("url(data:image/png;base64,iVBORw0KGgo=)"),
+        "data:image 应保留：{d}"
+    );
+    // 相对路径 / 非 url() 样式原样
+    let r = sanitize_html(r##"<div style="width:100px;background:url(/local/x.png)">w</div>"##);
+    assert!(r.contains("url(/local/x.png)"), "相对路径保留：{r}");
+    assert!(r.contains("width:100px"), "非 url 样式原样：{r}");
+    // 畸形（无闭括号）：整段原样吐出，不得 panic/截断
+    let m = sanitize_html(r##"<div style="background:url(http://x.189.cn/a.png">m</div>"##);
+    assert!(m.contains("http://x.189.cn/a.png"), "畸形 CSS 原样：{m}");
+    assert!(m.contains(">m<"), "畸形 CSS 之后的正文保留：{m}");
+}
+
 #[test]
 fn sanitize_html_allows_inline_data_image_but_blocks_other_data() {
     // 编辑器插入的本地图片（data:image/*）应保留

@@ -99,7 +99,12 @@ fn detach_targets(
     .map_err(e)
 }
 
-/// 步骤 2 目标：过期邮件 id（inbox 按 created_at、sent 按 sent_at）
+/// 步骤 2 目标：过期邮件 id。
+/// 口径：inbox 按 `COALESCE(received_at, created_at)`（**邮件自身时间**，
+/// 与列表展示 t 同口径）、sent 按 sent_at。
+/// 历史 bug：此前 inbox 按 created_at（入库时刻）判定——按天数范围首拉的历史
+/// 邮件 created_at 都是拉取当天，用户改短保留时长后全部"新到"，等多久都不删，
+/// 表现为"收件保留时长不生效"（2026-11-03 用户实测报告）。
 fn expire_targets(
     conn: &rusqlite::Connection,
     (inbox_cut, sent_cut): (Option<i64>, Option<i64>),
@@ -109,7 +114,8 @@ fn expire_targets(
         ids.extend(
             crate::db::collect_rows(
                 conn,
-                "SELECT id FROM emails WHERE folder = 'inbox' AND created_at < ?1",
+                "SELECT id FROM emails
+                  WHERE folder = 'inbox' AND COALESCE(received_at, created_at) < ?1",
                 &[&cut],
                 |r| r.get::<_, i64>(0),
             )

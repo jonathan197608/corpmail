@@ -39,7 +39,8 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
         return;
     };
     // 窗口内未读新件（inbox 方向；发件箱同步是自己发的信，不通知）。
-    // 窗口上界 now+60s：容忍时钟回拨/边界抖动，重叠部分由 id 去重兜住
+    // 窗口上界取当前时刻（审计 L4：原 since+3600 在单轮收件超 1 小时后
+    // 会漏掉窗口外入库的邮件，且 id 去重不补漏）；重叠部分由 id 去重兜住
     let candidates: Vec<(i64, String)> = conn
         .prepare(
             "SELECT id, COALESCE(subject, '') FROM emails
@@ -48,7 +49,7 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
               ORDER BY id",
         )
         .and_then(|mut stmt| {
-            let rows = stmt.query_map([since, since + 3600], |r| {
+            let rows = stmt.query_map([since, crate::mail::now_epoch()], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?;
             Ok(rows.filter_map(Result::ok).collect::<Vec<_>>())

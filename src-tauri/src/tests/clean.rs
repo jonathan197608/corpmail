@@ -180,6 +180,63 @@ fn clean_removes_expired_emails_but_never_drafts() {
     cleanup(&dir);
 }
 
+/// 收件过期判定口径（2026-11-03 回归）：按邮件自身时间（COALESCE(received_at,
+/// created_at)）而非入库时刻 created_at——首拉的历史邮件 created_at 都是拉取
+/// 当天，按入库时间判定时设多短保留时长都不删（用户报"不生效"）
+#[test]
+fn clean_expires_inbox_by_received_time_not_ingest_time() {
+    let (state, dir) = temp_state("expire-recv");
+    let now = now_epoch();
+    // 首拉形态：今天入库（created_at=now）、邮件本身 40 天前（received_at）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                 subject_tokens, body_tokens, created_at, received_at)
+             VALUES ('in','inbox','received','历史件','a@x.cn','b@x.cn','历史 件','正文',?1,?2)",
+                rusqlite::params![now, now - 40 * 86_400],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 同封今天入库、今天接收：保留
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                 subject_tokens, body_tokens, created_at, received_at)
+             VALUES ('in','inbox','received','新件','a@x.cn','b@x.cn','新 件','正文',?1,?1)",
+                [now],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    set_days(&state, "", "30", "");
+    let report = run(&state).unwrap();
+    assert_eq!(report.removed_emails, 1, "按接收时间判定的历史件应删");
+    assert_eq!(email_count(&state), 1, "今天的新件保留");
+    // received_at 为空的老数据（NULL）回退 created_at：40 天前入库 → 删
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                 subject_tokens, body_tokens, created_at)
+             VALUES ('in','inbox','received','无收件时间','a@x.cn','b@x.cn','无 收件 时间','正文',?1)",
+            [now - 40 * 86_400],
+        )
+        .unwrap();
+        Ok::<(), String>(())
+    })
+    .unwrap();
+    let report2 = run(&state).unwrap();
+    assert_eq!(
+        report2.removed_emails, 1,
+        "NULL received_at 回退 created_at 判定"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn clean_sweeps_stale_orphans_but_keeps_fresh_and_referenced() {
     let (state, dir) = temp_state("orphan");

@@ -68,6 +68,9 @@ pub(super) struct SettingsCtx {
     // 存储管理 tab（M5 清理器）：预估 + 手动清理报告
     clean_estimate_bytes: String,
     clean_estimate_detail: String,
+    /// 预估有待清理项（大附件/过期邮件/孤儿任一 > 0）→“立即清理”可点；
+    /// 无可释放空间时置禁用（2026-11-03 需求）
+    can_clean: bool,
     clean_view: Option<CleanView>,
     // 待生效的数据目录（M5 迁移成功后展示，重启后消失）
     pending_dir: String,
@@ -140,7 +143,7 @@ pub(super) fn settings_ctx(
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let counts = state.folder_counts();
     // M5 清理预估：仅存储 tab 计算（含孤儿 fs 扫描，其他 tab 免开销）
-    let (est_bytes, est_detail) = if tab == "storage" {
+    let (est_bytes, est_detail, can_clean) = if tab == "storage" {
         let est = crate::clean::estimate(state);
         let mut parts: Vec<String> = Vec::new();
         if est.detach_files > 0 {
@@ -152,9 +155,13 @@ pub(super) fn settings_ctx(
         if est.orphan_files > 0 {
             parts.push(format!("孤儿文件 {} 个", est.orphan_files));
         }
-        (human_bytes(est.bytes), parts.join(" · "))
+        (
+            human_bytes(est.bytes),
+            parts.join(" · "),
+            est.detach_files > 0 || est.expire_emails > 0 || est.orphan_files > 0,
+        )
     } else {
-        (human_bytes(0), String::new())
+        (human_bytes(0), String::new(), false)
     };
     let (attach_bytes, attach_files) = state.attachments_stats();
     let db_bytes = state.db_size_bytes();
@@ -228,6 +235,7 @@ pub(super) fn settings_ctx(
         // M5 清理预估与手动清理报告（仅存储 tab 有意义）
         clean_estimate_bytes: est_bytes,
         clean_estimate_detail: est_detail,
+        can_clean,
         clean_view: clean,
         pending_dir: if tab == "storage" {
             state.pending_data_dir().unwrap_or_default()
@@ -533,7 +541,14 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
         // 保存失败也回渲染当前值，用户重试（库错误在此无更优交互）
         return storage_pane(state, false);
     }
-    storage_pane(state, true)
+    // 新策略落地即同步执行一轮清理（个人邮箱规模毫秒级）：改短保留时长
+    // 立即可见效果，无需等每日定时器或手动点「立即清理」（2026-11-03 需求：
+    // 此前只改值不清理，“收件保留时长”看起来不生效）。清理失败不影响保存成功
+    let view = clean_view_of(crate::clean::run(state));
+    render_html(
+        &pane_template("storage"),
+        &settings_ctx(state, "storage", true, "", Some(view), None),
+    )
 }
 
 /// 设置·存储管理：迁移数据目录（M5；dest 由前端系统对话框选定后 POST）。
@@ -556,9 +571,9 @@ pub(super) fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
     )
 }
 
-/// 设置·存储管理：立即清理（手动触发，同步执行；回 pane 带报告）
-pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
-    let view = match crate::clean::run(state) {
+/// 清理结果 → 展示视图（手动/保存后自动共用）
+fn clean_view_of(result: Result<crate::clean::CleanReport, String>) -> CleanView {
+    match result {
         Ok(report) => CleanView {
             ok: true,
             freed: human_bytes(report.freed_bytes),
@@ -577,7 +592,12 @@ pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
             error: err,
             warning: String::new(),
         },
-    };
+    }
+}
+
+/// 设置·存储管理：立即清理（手动触发，同步执行；回 pane 带报告）
+pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
+    let view = clean_view_of(crate::clean::run(state));
     render_html(
         &pane_template("storage"),
         &settings_ctx(state, "storage", false, "", Some(view), None),

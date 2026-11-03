@@ -79,8 +79,8 @@
                 </div>
                 <div class="tline">
                     <div class="tl-main">
-                        <b>收件保留时长</b>
-                        <span>超期删除整封邮件（含附件索引）</span>
+                        <b>收件箱保留时长</b>
+                        <span>按邮件接收时间超期删除整封邮件（含附件索引）</span>
                     </div>
                     <input class="num" type="text" name="keep_inbox_days" value="{{ keep_inbox }}"
                         inputmode="numeric"> 天
@@ -119,7 +119,11 @@
         {% if clean_view %}
         <div class="test-result {% if clean_view.ok %}ok{% else %}fail{% endif %}">
             {% if clean_view.ok %}
+            {% if clean_view.detached > 0 or clean_view.removed > 0 or clean_view.orphans > 0 %}
             ✓ 清理完成：释放 {{ clean_view.freed }}（大附件 {{ clean_view.detached }} · 过期邮件 {{ clean_view.removed }} · 孤儿文件 {{ clean_view.orphans }}）
+            {% else %}
+            ✓ 已按当前策略完成检查，暂无可清理项
+            {% endif %}
             {% if clean_view.warning %}<div class="compose-note">{{ clean_view.warning }}</div>{% endif %}
             {% else %}
             ✗ 清理失败：{{ clean_view.error }}
@@ -127,7 +131,10 @@
         </div>
         {% endif %}
         <div class="settings-actions">
-            <button type="button" class="btn" hx-post="/settings/storage/clean"
+            <button type="button" class="btn"
+                    {% if not can_clean %}disabled
+                    title="当前没有可释放的空间"{% else %}title="按上方策略立即执行清理"{% endif %}
+                    hx-post="/settings/storage/clean"
                     hx-target="#settings-pane" hx-swap="outerHTML"
                     hx-confirm="立即执行清理？超期的附件文件与过期邮件将被删除，草稿不受影响。"
                     hx-disabled-elt="this">立即清理</button>
