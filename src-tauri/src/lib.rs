@@ -98,13 +98,12 @@ pub fn run() {
             // M3 发送队列：单飞 worker（崩溃残留 queued 补发），窗口创建前就绪
             state.start_send_worker();
             // 新邮件通知钩子（收件轮完成 → 本轮窗口内未读新件汇总一条系统通知）
-            // notify 自建独立连接查询（WAL 下与主库读写不互阻，收件线程回调零锁竞争）
+            // notify 自建独立连接查询（WAL 下与主库读写不互阻，收件线程回调零锁竞争）。
+            // db_path 直接取自手上的 state（勿用 app.state()：本注册点在 manage() 之前，
+            // state() 会 panic "called before manage()"）
             {
                 let handle: tauri::AppHandle = app.handle().clone();
-                let db_path = app
-                    .state::<state::AppState>()
-                    .data_dir()
-                    .join("corpmail.db");
+                let db_path = state.data_dir().join("corpmail.db");
                 state.set_notify_hook(std::sync::Arc::new(move |since, _added| {
                     notify::on_fetch_finished(&handle, &db_path, since);
                 }));
