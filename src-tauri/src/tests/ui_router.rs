@@ -829,8 +829,8 @@ fn detail_marks_read_and_delete_redirects() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
-        "删除应整页回列表（inbox 无上下文 → 根路径）：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/?folder=inbox"),
+        "删除应整页回列表（收件箱显式带 folder）：{:?}",
         resp.extra_headers
     );
     // 二次访问 404
@@ -885,7 +885,7 @@ fn delete_redirects_back_with_list_context() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/?unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+        loc, "/?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
         "删除应保持列表过滤与翻页：{loc}"
     );
     cleanup(&dir);
@@ -1247,8 +1247,8 @@ fn compose_send_redirect_keeps_list_context() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/emails/1?unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
-        "发送跳转应携带列表上下文（畸形 folder 被重滤为默认）：{loc}"
+        loc, "/emails/1?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+        "发送跳转应携带列表上下文（畸形 folder 被重滤为默认 inbox）：{loc}"
     );
     // 详情页返回链接还原过滤（folder=inbox 显式携带）
     let detail = body(&route(
@@ -1267,13 +1267,166 @@ fn compose_send_redirect_keeps_list_context() {
     ));
     assert!(
         // minijinja 对属性内的 / 与 & 做实体转义（&#x2f; == /，&amp; == &），两种形态都认
-        detail.contains("unread=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=2")
-            || detail.contains("unread=1&q=%E6%BF%80%E5%8A%B1&page=2"),
-        "详情页返回链接应还原过滤/翻页：{}",
+        detail.contains("folder=inbox&amp;unread=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=2")
+            || detail.contains("folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2"),
+        "详情页返回链接应还原过滤/翻页（含 folder=inbox）：{}",
         detail
             .lines()
             .find(|l| l.contains("class=\"back\""))
             .unwrap_or("(未找到)")
+    );
+    cleanup(&dir);
+}
+
+/// M9：转发件发送应跳回来源信箱文件夹（folder=sent 保持），而非退化到收件箱
+#[test]
+fn forward_compose_redirect_keeps_source_folder() {
+    let (state, dir) = temp_state("m3-fwd-ctx");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 发件箱一封邮件（folder=sent），作为转发来源
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, created_at,
+                                sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '原发邮件','正文','原 发件','正文',1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 转发撰写页：携带 folder=sent，hidden list_query 应含 folder=sent
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "forward_from=1&folder=sent", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    let lq = html
+        .split("name=\"list_query\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default();
+    assert_eq!(
+        lq, "folder=sent",
+        "转发页 hidden list_query 应保持来源文件夹：{lq}"
+    );
+    // 发送：list_query 随表单提交 → 跳详情页携带 folder=sent（返回列表=发件箱）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "新主题"),
+                ("body_text", "正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                ("list_query", lq),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        loc, "/emails/2?folder=sent",
+        "转发发送应跳回来源文件夹上下文：{loc}"
+    );
+    cleanup(&dir);
+}
+
+/// M9 回归：从收件箱转发/回复时 folder 省略（inbox 为默认路由），list_query_of 会
+/// 把 folder= 段省掉 → 发送后回跳详情页丢文件夹，详情页"返回列表"退到邮件自身
+/// folder（发送中=draft）→ 落到草稿箱。修复：撰写页 hidden list_query 始终带 folder。
+#[test]
+fn inbox_compose_send_redirect_keeps_inbox_folder() {
+    let (state, dir) = temp_state("m9-inbox-ctx");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '来件','正文','来 件','正文',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 回复撰写页：不显式 folder（inbox 默认），hidden list_query 仍应含 folder=inbox
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "reply_to=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    let lq = html
+        .split("name=\"list_query\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default();
+    assert!(
+        lq.contains("folder=inbox"),
+        "收件箱来源的撰写页 list_query 应始终携带 folder=inbox：{lq}"
+    );
+    // 发送 → 跳详情页带 folder=inbox（返回列表=收件箱，而非草稿箱）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "boss@x.com"),
+                ("cc_addrs", ""),
+                ("subject", "回复主题"),
+                ("body_text", "正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                ("list_query", lq),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        loc.starts_with("/emails/2?folder=inbox"),
+        "收件箱来源发送后回跳应带 folder=inbox：{loc}"
     );
     cleanup(&dir);
 }
@@ -3220,8 +3373,8 @@ fn forward_prefills_headers_body_and_attachment_hint() {
         },
     ));
     assert!(
-        detail.contains("href=\"/compose?forward_from=1\""),
-        "详情页应有转发入口"
+        detail.contains("href=\"/compose?forward_from=1&folder=inbox\""),
+        "详情页应有转发入口（收件箱 context 带 folder）"
     );
     cleanup(&dir);
 }
@@ -3577,9 +3730,9 @@ fn detail_back_link_preserves_list_filters() {
     ));
     assert!(
         html.contains(
-            r#"href="&#x2f;?unread=1&amp;external=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=3""#
+            r#"href="&#x2f;?folder=inbox&amp;unread=1&amp;external=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=3"#
         ),
-        "返回列表应原样还原过滤状态：{html}"
+        "返回列表应原样还原过滤状态（含 folder=inbox）：{html}"
     );
 
     // 无参数进入：回落到邮件所在 folder（sent → /?folder=sent）
@@ -3597,7 +3750,7 @@ fn detail_back_link_preserves_list_filters() {
         "无参数时按邮件 folder 生成返回链接：{html}"
     );
 
-    // 收件箱默认视图：无过滤 → 返回链接就是首页
+    // 收件箱默认视图：无过滤 → 返回链接显式 folder=inbox（不再省略）
     let html = body(&route(
         &state,
         &assets(),
@@ -3608,8 +3761,8 @@ fn detail_back_link_preserves_list_filters() {
         },
     ));
     assert!(
-        html.contains(r#"href="&#x2f;""#),
-        "默认视图返回链接应为首页：{html}"
+        html.contains(r#"href="&#x2f;?folder=inbox""#),
+        "收件箱默认视图返回链接应显式带 folder=inbox：{html}"
     );
     cleanup(&dir);
 }

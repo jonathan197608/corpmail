@@ -1625,9 +1625,10 @@ fn rebuild_list_query(
         _ => "inbox".to_string(),
     };
     let mut qs: Vec<String> = Vec::new();
-    if folder != "inbox" {
-        qs.push(format!("folder={folder}"));
-    }
+    // 恒携带 folder（含 inbox）：发送/存草稿回跳详情页、详情页「返回列表」、
+    // 列表链接都依赖 folder 明确，省略会让回跳退到邮件自身 folder 而错落
+    // 草稿箱/发件箱。收件箱显式 folder=inbox 只是 URL 更明确，语义不变。
+    qs.push(format!("folder={folder}"));
     if unread == Some("1") {
         qs.push("unread=1".into());
     }
