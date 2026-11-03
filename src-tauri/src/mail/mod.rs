@@ -693,20 +693,174 @@ fn folder_of(raw: &str) -> &str {
     }
 }
 
-/// 列表分页查询，返回 (当前页行, 命中总数)
-pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64), String> {
+/// 列表过滤条件片段（list/search/批量操作共用，保证"选中的 N 封"与
+/// 列表显示严格同口径——批量操作跨页全选的直接依据）。
+///
+/// - `alias`：emails 表别名（list 为空串、search/批量为 "e."）；
+///   alias 非空时各列引用带前缀
+/// - 产出 `(where_sql, ext_col)`：where_sql 形如
+///   ` AND folder = 'inbox' AND unread = 1 AND (:extf = 0 OR …)`，
+///   ⚠️ 调用方需再拼 WHERE 主体或 FTS MATCH 段；:extf/:dom 由调用方绑定
+fn list_filter_sql(q: &ListQuery, alias: &str) -> (String, String) {
+    let a = alias;
     let folder = folder_of(&q.folder);
     let folder_sql = if folder == "all" {
         String::new()
     } else {
-        format!(" AND folder = '{folder}'")
+        format!(" AND {a}folder = '{folder}'")
     };
-    let unread_sql = if q.unread_only { " AND unread = 1" } else { "" };
+    let unread_sql = if q.unread_only {
+        format!(" AND {a}unread = 1")
+    } else {
+        String::new()
+    };
     let domain = q.internal_domain.trim();
-    let ext_col = external_col("", domain);
-    let ext_filter = if q.external_only { 1 } else { 0 };
+    let ext_col = external_col(a, domain);
     // :extf = 0 时整段条件恒真：无需为"是否过滤"拼两套 SQL
-    let where_sql = format!("WHERE 1=1{folder_sql}{unread_sql} AND (:extf = 0 OR {ext_col})");
+    let ext_sql = format!(" AND (:extf = 0 OR {ext_col})");
+    (format!("{folder_sql}{unread_sql}{ext_sql}"), ext_col)
+}
+
+/// 批量操作目标解析（POST /emails/batch 双模式）：
+/// - 页内精确：`ids` 指定集合
+/// - 跨页全选：`select_all=1` + 可选 `exclude_ids`（排除集），配 ListQuery
+///   过滤条件——筛选条件与列表同口径（list_filter_sql），保证"全部 M 封"
+///   就是当前列表筛选命中的集合
+pub enum BatchTarget {
+    /// 页内精确 ids（空 = 无操作）
+    Ids(Vec<i64>),
+    /// 跨页全选：当前筛选全集 - exclude_ids + 附加排除（见 batch_apply 注释）
+    SelectAll { exclude: Vec<i64>, query: ListQuery },
+}
+
+/// 批量动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BatchAction {
+    MarkRead,
+    MarkUnread,
+    Delete,
+}
+
+impl BatchAction {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "read" => Some(Self::MarkRead),
+            "unread" => Some(Self::MarkUnread),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// 批量执行（M1-1）。单事务；delete 先收附件路径、删行（FTS 触发器同步）、
+/// 提交后删文件、回收空目录——与单删同一模式。
+/// 返回受影响行数（Ids 模式含不存在的 id；SelectAll 模式 = 命中数）。
+pub fn batch_apply(
+    state: &AppState,
+    target: &BatchTarget,
+    action: BatchAction,
+) -> Result<usize, String> {
+    let read_set = |sql_where: &str, params: &[&dyn rusqlite::ToSql]| {
+        state.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT id FROM emails WHERE 1=1 {sql_where}"))
+                .map_err(e)?;
+            let rows = stmt.query_map(params, |r| r.get::<_, i64>(0)).map_err(e)?;
+            rows.collect::<Result<Vec<i64>, _>>().map_err(e)
+        })
+    };
+    // 解析目标 ids
+    let ids: Vec<i64> = match target {
+        BatchTarget::Ids(v) if v.is_empty() => return Ok(0),
+        BatchTarget::Ids(v) => v.clone(),
+        BatchTarget::SelectAll { exclude, query } => {
+            let ext_filter = if query.external_only { 1 } else { 0 };
+            let domain = query.internal_domain.trim().to_string();
+            let (filter_sql, _) = list_filter_sql(query, "");
+            // NOT IN 空集在 SQLite 恒真（与语义一致），但显式分段防拼接歧义
+            let exclude_sql = if exclude.is_empty() {
+                String::new()
+            } else {
+                let marks = exclude.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                format!(" AND id NOT IN ({marks})")
+            };
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&ext_filter, &domain];
+            let owned: Vec<i64> = exclude.to_vec();
+            for x in &owned {
+                params.push(x as &dyn rusqlite::ToSql);
+            }
+            let sql = format!("{filter_sql}{exclude_sql}");
+            read_set(&sql, &params)?
+        }
+    };
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    // 单事务执行
+    let root = attach_root(state);
+    let n = state.with_conn(|conn| {
+        let tx = conn.transaction().map_err(e)?;
+        let marks = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let changed = match action {
+            BatchAction::MarkRead | BatchAction::MarkUnread => {
+                let v: i64 = if action == BatchAction::MarkRead {
+                    0
+                } else {
+                    1
+                };
+                // 仅收件箱有意义（unread 列语义限定；批量标已读时对草稿/发件 noop）
+                tx.execute(
+                    &format!(
+                        "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
+                    ),
+                    rusqlite::params_from_iter(ids.iter()),
+                )
+                .map_err(e)?
+            }
+            BatchAction::Delete => {
+                // 先收独立附件路径（行删除前；外键级联删附件行）
+                let mut stmt = tx
+                    .prepare(&format!(
+                        "SELECT a.file_path FROM attachments a
+                          JOIN emails e ON e.id = a.email_id
+                          WHERE a.storage = 'file' AND e.id IN ({marks})"
+                    ))
+                    .map_err(e)?;
+                let files: Vec<String> = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(e)?
+                    .filter_map(Result::ok)
+                    .collect();
+                drop(stmt);
+                let n = tx
+                    .execute(
+                        &format!("DELETE FROM emails WHERE id IN ({marks})"),
+                        rusqlite::params_from_iter(ids.iter()),
+                    )
+                    .map_err(e)?;
+                tx.commit().map_err(e)?;
+                // 提交后删文件（与单删/clean 同模式：失败残留由孤儿回收兜底）
+                for rel in &files {
+                    let _ = std::fs::remove_file(root.join(rel));
+                }
+                prune_empty_dirs(&root);
+                return Ok::<usize, String>(n);
+            }
+        };
+        tx.commit().map_err(e)?;
+        Ok(changed)
+    })?;
+    Ok(n)
+}
+
+/// 列表分页查询，返回 (当前页行, 命中总数)
+pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64), String> {
+    let (filter_sql, ext_col) = list_filter_sql(q, "");
+    let ext_filter = if q.external_only { 1 } else { 0 };
+    let domain = q.internal_domain.trim();
+    let where_sql = format!("WHERE 1=1{filter_sql}");
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
     let offset = (page - 1).saturating_mul(PAGE_SIZE);
@@ -846,21 +1000,10 @@ pub fn search(
     let Some(match_expr) = build_query(input) else {
         return Ok(None);
     };
-    let folder = folder_of(&q.folder);
-    let folder_sql = if folder == "all" {
-        String::new()
-    } else {
-        format!(" AND e.folder = '{folder}'")
-    };
-    let unread_sql = if q.unread_only {
-        " AND e.unread = 1"
-    } else {
-        ""
-    };
-    let domain = q.internal_domain.trim();
-    let ext_col = external_col("e.", domain);
+    // 复用 list_filter_sql（alias=e.）：检索结果与列表筛选同口径
+    let (filter_sql, ext_col) = list_filter_sql(q, "e.");
     let ext_filter = if q.external_only { 1 } else { 0 };
-    let ext_sql = format!(" AND (:extf = 0 OR {ext_col})");
+    let domain = q.internal_domain.trim();
     let page = q.page.max(1);
     let offset = (page - 1).saturating_mul(PAGE_SIZE);
     let words = tokenize_words(input);
@@ -870,7 +1013,7 @@ pub fn search(
                 &format!(
                     "SELECT count(*)
                      FROM email_fts JOIN emails e ON e.id = email_fts.rowid
-                     WHERE email_fts MATCH :match{folder_sql}{unread_sql}{ext_sql}"
+                     WHERE email_fts MATCH :match{filter_sql}"
                 ),
                 rusqlite::named_params! { ":match": match_expr, ":extf": ext_filter, ":dom": domain },
                 |r| r.get(0),
@@ -883,7 +1026,7 @@ pub fn search(
                         COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
                         {ext_col} AS from_external
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
-                 WHERE email_fts MATCH :match{folder_sql}{unread_sql}{ext_sql}
+                 WHERE email_fts MATCH :match{filter_sql}
                  ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
                  LIMIT :lim OFFSET :off"
             ))

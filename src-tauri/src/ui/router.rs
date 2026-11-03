@@ -391,6 +391,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/read") => {
             Some(email_read(state, req))
         }
+        ("POST", "/emails/batch") => Some(emails_batch(state, req)),
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
         ("GET", "/proxy/image") => Some(proxy_image(req)),
@@ -641,6 +642,105 @@ fn email_read(state: &AppState, req: &Req) -> Resp {
 /// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
 fn mark_read_and_sync_seen(state: &AppState, id: i64) {
     mail::mark_read(state, id);
+}
+
+/// 批量操作（POST /emails/batch，M1-1）双模式：
+/// - 页内精确：`ids`（JSON 数组）
+/// - 跨页全选：`select_all=1` + `exclude_ids`（JSON 数组，可空）+
+///   `folder/unread/external/q`（与列表 URL 同名参数，走同一白名单）
+///
+/// action：read|unread|delete。返回 mail_list 片段（整段换入，页码可能收缩）
+/// + mbx:fetchDone（边栏计数/未读角标刷新）。
+fn emails_batch(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let form = parse_form(&req.body);
+    let Some(action) =
+        mail::BatchAction::parse(form.get("action").map(String::as_str).unwrap_or(""))
+    else {
+        return batch_error_fragment("未知操作");
+    };
+    // 目标解析：跨页全选优先；否则 ids（两者都缺 → 无目标）
+    let target = if form.get("select_all").map(|v| v == "1").unwrap_or(false) {
+        let d = defaults();
+        let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
+        let q = mail::ListQuery {
+            folder: form
+                .get("folder")
+                .cloned()
+                .unwrap_or_else(|| "inbox".into()),
+            page: 1, // 目标解析与页无关：全量命中
+            unread_only: form.get("unread").map(|v| v == "1").unwrap_or(false),
+            external_only: form.get("external").map(|v| v == "1").unwrap_or(false),
+            internal_domain: g(keys::ACCOUNT_DOMAIN),
+        };
+        // q（检索词）仅在非空时参与：批量检索结果全选 = 命中即选中。
+        // 检索走 FTS MATCH，与列表检索同源；此处简化为非空时拒绝批量（检索
+        // 词场景跨页全选与列表高亮口径不一致的风险高，先用页内 ids 模式覆盖）
+        if form.get("q").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            return batch_error_fragment("检索结果下暂不支持跨页全选，请使用页内选择");
+        }
+        mail::BatchTarget::SelectAll {
+            exclude: form_json_i64s(&form, "exclude_ids"),
+            query: q,
+        }
+    } else {
+        mail::BatchTarget::Ids(form_json_i64s(&form, "ids"))
+    };
+    // 执行计数：delete 需确认——由前端 hx-confirm 承担（数量动态，见 app.js）
+    let affected = match mail::batch_apply(state, &target, action) {
+        Ok(n) => n,
+        Err(e) => return batch_error_fragment(&e),
+    };
+    if affected == 0 {
+        return batch_error_fragment("未选中任何邮件");
+    }
+    let _ = affected;
+    // 回列表片段：不带 select 上下文（操作后选择清零），保持当前 folder/筛选；
+    // 删除可能收缩页数 → 页码 clamp 由 list_root 承担（这里直接复用其解析）
+    let list_req = reconstruct_list_req(req, &form);
+    let resp = list_root(state, &list_req);
+    // 改变计数的动作（delete/已读类影响未读角标）附带边栏刷新事件
+    resp.with_event("mbx:fetchDone")
+}
+
+/// 批量操作的错误反馈：回当前列表片段 + 顶部错误提示（复用 error 通道，
+/// 与删除失败同交互形态）。简化实现：错误文案以 toast 形态返回给 #toast 容器。
+fn batch_error_fragment(msg: &str) -> Resp {
+    Resp::html(format!(
+        r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
+        html_escape(msg)
+    ))
+}
+
+/// 从批量 POST 表单重建 GET 列表请求（list_root 需要 Req 形态）：
+/// folder/unread/external/q 与 page 从表单取（前端提交时携带当前列表状态）。
+fn reconstruct_list_req(req: &Req, form: &HashMap<String, String>) -> Req {
+    let mut qs: Vec<String> = Vec::new();
+    let folder = form.get("folder").map(String::as_str).unwrap_or("inbox");
+    if folder != "inbox" {
+        qs.push(format!("folder={folder}"));
+    }
+    if form.get("unread").map(|v| v == "1").unwrap_or(false) {
+        qs.push("unread=1".into());
+    }
+    if form.get("external").map(|v| v == "1").unwrap_or(false) {
+        qs.push("external=1".into());
+    }
+    if let Some(q) = form.get("q").filter(|v| !v.trim().is_empty()) {
+        qs.push(format!("q={}", urlencode(q)));
+    }
+    if let Some(p) = form.get("page").filter(|v| v.parse::<i64>().is_ok()) {
+        qs.push(format!("page={p}"));
+    }
+    Req {
+        method: "GET".into(),
+        path: req.path.clone(),
+        query: qs.join("&"),
+        is_htmx_request: true,
+        body: Vec::new(),
+    }
 }
 
 /// 联系人建议（GET /contacts/suggest?q=）：撰写页收/抄送输入框模糊匹配。

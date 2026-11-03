@@ -4478,3 +4478,426 @@ fn fetch_eta_label_gates_and_formats() {
         "约 2 小时 30 分钟"
     );
 }
+
+/// 批量操作（M1-1）：页内精确模式——标已读/未读/删除 + 响应含边栏刷新事件
+#[test]
+fn batch_actions_ids_mode() {
+    let (state, dir) = temp_state("batch-ids");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let mut ids = Vec::new();
+    state
+        .with_conn(|c| {
+            for i in 0..5 {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, unread, created_at, received_at)
+                     VALUES ('in','inbox','received','a@x.cn','b@x.cn',?1,?1,'x',1,?2,?2)",
+                    rusqlite::params![i.to_string(), 100 + i],
+                )
+                .unwrap();
+                ids.push(c.last_insert_rowid());
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 标已读（3 封：第 3、4、5 封 = ids[2..5]）
+    let ids_read = format!("[{},{},{}]", ids[2], ids[3], ids[4]);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "read"),
+                ("ids", ids_read.as_str()),
+                ("folder", "inbox"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:fetchDone")),
+        "批量操作须附带边栏刷新事件"
+    );
+    let unread_cnt: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails WHERE unread = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(unread_cnt, 2, "3 封应置已读");
+    // 删除（2 封，其中 ids[0] 含独立文件附件）——附件文件应一并清理。
+    // 先把 inline 上限设为 1MB 并写入 1.5MB 文件，确保附件落 file 存储
+    state
+        .set_batch(&[(keys::INLINE_ATTACH_MAX_MB, "1")])
+        .unwrap();
+    let big: Vec<u8> = vec![7u8; 1536 * 1024];
+    let f = dir.join("att.bin");
+    std::fs::write(&f, &big).unwrap();
+    mail::add_attachments(&state, ids[0], &[f.to_str().unwrap().into()]).unwrap();
+    let file_rel: String = state.with_conn(|c| {
+        c.query_row(
+            "SELECT COALESCE(file_path,'') FROM attachments WHERE email_id = ?1 AND storage = 'file'",
+            [ids[0]],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert!(!file_rel.is_empty(), "前置：附件应落 file 存储");
+    assert!(
+        state
+            .data_dir()
+            .join("attachments")
+            .join(&file_rel)
+            .exists(),
+        "前置：附件文件已落盘"
+    );
+    let ids_del = format!("[{},{}]", ids[0], ids[1]);
+    let responses = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "delete"),
+                ("ids", ids_del.as_str()),
+                ("folder", "inbox"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(responses.status, 200);
+    let total: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(total, 3, "2 封已删");
+    assert!(
+        !state
+            .data_dir()
+            .join("attachments")
+            .join(&file_rel)
+            .exists(),
+        "删除邮件的附件文件应清理"
+    );
+    let fts: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM email_fts JOIN emails e ON e.id = email_fts.rowid",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(fts, 3, "FTS 行随批量删除同步");
+    // 空集合：无操作提示
+    let empty = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[("action", "read"), ("ids", "[]"), ("folder", "inbox")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let b = body(&empty);
+    assert!(
+        b.contains("toast") && b.contains("未选中"),
+        "空集合应提示未选中：{b}"
+    );
+    cleanup(&dir);
+}
+
+/// 批量操作：跨页全选模式——select_all + exclude_ids + 筛选条件同口径
+#[test]
+fn batch_actions_select_all_mode() {
+    let (state, dir) = temp_state("batch-all");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let now = mail::now_epoch();
+    state
+        .with_conn(|c| {
+            for i in 0..100 {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, unread, created_at, received_at)
+                     VALUES ('in','inbox','received','a@chinatelecom.cn','b@x.cn',?1,?1,'x',?2,?3,?3)",
+                    rusqlite::params![i.to_string(), if i < 90 { 1 } else { 0 }, now],
+                )
+                .unwrap();
+            }
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, unread, created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','b@x.cn','s','s','x',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 跨页标已读：未读筛选 90 封命中，排除前 3 → 87 置已读
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "read"),
+                ("select_all", "1"),
+                ("exclude_ids", "[1,2,3]"),
+                ("folder", "inbox"),
+                ("unread", "1"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 200);
+    let unread_cnt: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM emails WHERE unread = 1 AND folder = 'inbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(unread_cnt, 3, "90 未读 - 3 排除 = 87 置已读，剩 3 封排除项");
+    // 跨页删除：inbox 全删（含已读），sent 不受牵连
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "delete"),
+                ("select_all", "1"),
+                ("folder", "inbox"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let in_cnt: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM emails WHERE folder = 'inbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    let sent_cnt: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM emails WHERE folder = 'sent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(in_cnt, 0, "inbox 全删");
+    assert_eq!(sent_cnt, 1, "其他文件夹不受牵连");
+    cleanup(&dir);
+}
+
+/// 批量操作防护：未知 action / 畸形 folder 白名单回落 / 检索词跨页全选拒绝
+#[test]
+fn batch_actions_guards() {
+    let (state, dir) = temp_state("batch-guard");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, unread, created_at, received_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn','t','t','x',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let r = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[("action", "purge"), ("ids", "[1]"), ("folder", "inbox")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(body(&r).contains("未知操作"));
+    let r = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "read"),
+                ("select_all", "1"),
+                ("folder", "inbox' OR 1=1 --"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(r.status, 200, "畸形 folder 应被白名单回落而非错误");
+    let r = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "read"),
+                ("select_all", "1"),
+                ("folder", "inbox"),
+                ("q", "合同"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let b = body(&r);
+    assert!(b.contains("暂不支持跨页全选"), "检索态应拒绝跨页全选：{b}");
+    cleanup(&dir);
+}
+
+/// 首拉范围变化即清双箱游标（2026-11-03 Bug 修复）：扩大范围后收件箱
+/// 增量游标挡住低 UID 的历史邮件，表现为"收件箱不更新、手动收取无新邮件"。
+/// 保存时检测范围变化 → 清 INBOX+SENT 四游标（首拉分支全量重拉 + 去重回填）
+#[test]
+fn sync_save_range_change_resets_both_cursors() {
+    let (state, dir) = temp_state("sync-range");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::FIRST_FETCH_DAYS, "30"),
+            (keys::LAST_UID, "9503"),
+            (keys::LAST_UIDVALIDITY, "7"),
+            (keys::LAST_UID_SENT, "1200"),
+            (keys::LAST_UIDVALIDITY_SENT, "7"),
+        ])
+        .unwrap();
+    // 范围 30 → 90：四游标清零
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[
+                ("sync_on_start", "true"),
+                ("sync_interval_min", "15"),
+                ("first_fetch_days", "90"),
+                ("max_mail_mb", "20"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let d = defaults();
+    for k in [
+        keys::LAST_UID,
+        keys::LAST_UIDVALIDITY,
+        keys::LAST_UID_SENT,
+        keys::LAST_UIDVALIDITY_SENT,
+    ] {
+        assert_eq!(
+            state.get_or(k, &d).as_deref(),
+            Some("0"),
+            "范围变化应清游标 {k}"
+        );
+    }
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(),
+        Some("90"),
+        "新范围已保存"
+    );
+    // 范围不变：游标不动（不触发无谓全量重拉）
+    state
+        .set_batch(&[(keys::LAST_UID, "5"), (keys::LAST_UIDVALIDITY, "7")])
+        .unwrap();
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[
+                ("sync_on_start", "true"),
+                ("sync_interval_min", "15"),
+                ("first_fetch_days", "90"),
+                ("max_mail_mb", "20"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(
+        state.get_or(keys::LAST_UID, &d).as_deref(),
+        Some("5"),
+        "范围未变不得清游标"
+    );
+    // 重新拉取：同样清双箱游标（修复了此前漏清发件箱）
+    state
+        .set_batch(&[(keys::LAST_UID_SENT, "88"), (keys::FIRST_FETCH_DAYS, "7")])
+        .unwrap();
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/refetch",
+            &form(&[("first_fetch_days", "7")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    for k in [
+        keys::LAST_UID,
+        keys::LAST_UIDVALIDITY,
+        keys::LAST_UID_SENT,
+        keys::LAST_UIDVALIDITY_SENT,
+    ] {
+        assert_eq!(
+            state.get_or(k, &d).as_deref(),
+            Some("0"),
+            "重新拉取应清双箱游标 {k}"
+        );
+    }
+    cleanup(&dir);
+}

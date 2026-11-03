@@ -21,28 +21,46 @@
     </div>
     <div class="mail-list" id="mail-list">
     {% if items %}
+        {# 批量操作：表头三态全选 + 行复选框；选中后底部操作条由 app.js 浮出。
+           全选跨页语义由 app.js 维护（ids 页内 / select_all+exclude 跨页），
+           batch_state 隐藏域承载提交形态 #}
+        <div class="mbx-row mbx-head" id="batch-bar">
+            <label class="mbx-check"><input type="checkbox" id="batch-all" aria-label="全选本页"></label>
+            <span class="mbx-hint">选择本页邮件可批量操作</span>
+            <input type="hidden" id="batch-mode" value="ids">
+            <input type="hidden" id="batch-exclude" value="[]">
+        </div>
         {% for m in items %}
-        <a class="mail-row {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
-           href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
-            <div class="mr-side">
-                <span class="mr-dot" aria-hidden="true"></span>
-                <span class="mr-who">{{ m.from_display }}</span>
-                <span class="mr-time">{{ m.time_label }}</span>
-            </div>
-            <div class="mr-main">
-                <div class="mr-top">
-                    {# 外部发件人：醒目标记（按域名后缀判定，见 mail::is_external_addr） #}
-                    {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
-                    <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
-                    {% if m.preview_tip %}<span class="mr-tip" aria-hidden="true">{{ m.preview_tip }}</span>{% endif %}
-                    {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
-                    {% if m.status == 'failed' %}<span class="mr-flag fail">发送失败</span>{% endif %}
-                    {% if m.status == 'queued' or m.status == 'sending' %}<span class="mr-flag send">发送中</span>{% endif %}
-                    {% if m.attach_cnt > 0 %}<span class="mr-clip" title="{{ m.attach_cnt }} 个附件">📎 {{ m.attach_cnt }}</span>{% endif %}
+        {# 行 = div（复选框区）+ a（内容区链接）。复选框在链接**外**：
+           两者天然各管各的默认行为，无需任何 click 拦截——嵌套进 <a> 时
+           checkbox 激活行为与链接导航共享同一 click 默认行为，preventDefault
+           会连带取消勾选，WebView 编程点击下还会双重翻转（实测 2026-11-03） #}
+        <div class="mail-row {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
+             data-mail-id="{{ m.id }}" data-mail-unread="{{ 1 if m.unread else 0 }}">
+            <label class="mbx-check">
+                <input type="checkbox" class="mbx-item" value="{{ m.id }}">
+            </label>
+            <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
+                <div class="mr-side">
+                    <span class="mr-dot" aria-hidden="true"></span>
+                    <span class="mr-who">{{ m.from_display }}</span>
+                    <span class="mr-time">{{ m.time_label }}</span>
                 </div>
-                <div class="mr-preview">{{ m.body_preview }}</div>
-            </div>
-        </a>
+                <div class="mr-main">
+                    <div class="mr-top">
+                        {# 外部发件人：醒目标记（按域名后缀判定，见 mail::is_external_addr） #}
+                        {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
+                        <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
+                        {% if m.preview_tip %}<span class="mr-tip" aria-hidden="true">{{ m.preview_tip }}</span>{% endif %}
+                        {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
+                        {% if m.status == 'failed' %}<span class="mr-flag fail">发送失败</span>{% endif %}
+                        {% if m.status == 'queued' or m.status == 'sending' %}<span class="mr-flag send">发送中</span>{% endif %}
+                        {% if m.attach_cnt > 0 %}<span class="mr-clip" title="{{ m.attach_cnt }} 个附件">📎 {{ m.attach_cnt }}</span>{% endif %}
+                    </div>
+                    <div class="mr-preview">{{ m.body_preview }}</div>
+                </div>
+            </a>
+        </div>
         {% endfor %}
         {% if pages > 1 %}
         <div class="pager">
@@ -74,5 +92,23 @@
             {% endif %}
         </div>
     {% endif %}
+</div>
+{# 批量操作条（选中 >0 浮出；js 控制显隐与文案）。
+   total：当前筛选总数（跨页全选上限）；q 状态随检索场景禁用跨页全选。
+   hx-confirm 由 app.js 按动作与数量动态设置 #}
+<div class="batch-actions" id="batch-actions" hidden>
+    <span class="ba-count" id="ba-count"></span>
+    <a href="#" id="ba-select-all" hidden>选择全部 {{ total }} 封</a>
+    <span class="ba-sep">|</span>
+    <button type="button" class="btn small" data-batch="read">标已读</button>
+    <button type="button" class="btn small" data-batch="unread">标未读</button>
+    <button type="button" class="btn small danger" data-batch="delete">🗑 删除</button>
+    <button type="button" class="btn small ghost" id="ba-clear">取消</button>
+    <input type="hidden" id="ba-folder" value="{{ folder }}">
+    <input type="hidden" id="ba-unread" value="{{ '1' if unread_only else '0' }}">
+    <input type="hidden" id="ba-external" value="{{ '1' if external_only else '0' }}">
+    <input type="hidden" id="ba-q" value="{{ q }}">
+    <input type="hidden" id="ba-page" value="{{ page }}">
+    <input type="hidden" id="ba-total" value="{{ total }}">
 </div>
 </div>

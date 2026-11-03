@@ -598,3 +598,177 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         rebaseline(document.querySelector('#settings-pane form'));
     });
 })();
+
+// ---------- 列表批量操作（M1-1）：页内精确 + 跨页全选 ----------
+// 状态机：
+// - ids 模式：勾选的行 id 集合（页内）；
+// - all 模式：表头全选触发跨页全选，exclude 为反勾选集合
+//   （「选择全部 N 封」> 全部 N 封 · 排除 k 封）
+// 提交两种形态：ids=[..] 或 select_all=1&exclude_ids=[..]（附列表筛选上下文）
+// 操作后服务端回 mail_list 片段（#list-area 整段换入）+ mbx:fetchDone（边栏）
+(function () {
+    var stateBox = { mode: 'ids', ids: [], exclude: [], total: 0 };
+
+    function val(id) {
+        var el = document.getElementById(id);
+        return el ? el.value : '';
+    }
+    function num(id) {
+        return parseInt(val(id), 10) || 0;
+    }
+    // 当前筛选的检索态：检索场景禁用跨页全选（前后端口径一致）
+    function isSearch() { return (val('ba-q') || '').trim() !== ''; }
+
+    function bar() { return document.getElementById('batch-actions'); }
+    function items() {
+        return Array.prototype.slice.call(document.querySelectorAll('.mbx-item'));
+    }
+
+    function selectedCount() {
+        if (stateBox.mode === 'all') {
+            return Math.max(stateBox.total - stateBox.exclude.length, 0);
+        }
+        return stateBox.ids.length;
+    }
+
+    function render() {
+        var barEl = bar();
+        if (!barEl) return;
+        var n = selectedCount();
+        barEl.hidden = n === 0;
+        var countEl = document.getElementById('ba-count');
+        var allLink = document.getElementById('ba-select-all');
+        if (!countEl) return;
+        if (stateBox.mode === 'all') {
+            var ex = stateBox.exclude.length;
+            countEl.textContent = ex > 0
+                ? '已选全部 ' + stateBox.total + ' 封 · 排除 ' + ex + ' 封'
+                : '已选全部 ' + stateBox.total + ' 封';
+            if (allLink) allLink.hidden = true;
+        } else {
+            countEl.textContent = '已选 ' + n + ' 封';
+            // 跨页入口：总命中 > 本页行数 且非检索态
+            if (allLink) {
+                allLink.hidden = isSearch() || stateBox.total <= items().length;
+                allLink.textContent = '选择全部 ' + stateBox.total + ' 封';
+            }
+        }
+        // 表头三态
+        var all = document.getElementById('batch-all');
+        if (all) {
+            var checked = items().filter(function (c) { return c.checked; }).length;
+            all.checked = checked > 0 && checked === items().length;
+            all.indeterminate = checked > 0 && checked < items().length;
+        }
+    }
+
+    function resetSelection() {
+        stateBox = { mode: 'ids', ids: [], exclude: [], total: num('ba-total') };
+        items().forEach(function (c) { c.checked = false; });
+        render();
+    }
+
+    function collectIds() {
+        return items().filter(function (c) { return c.checked; })
+            .map(function (c) { return parseInt(c.value, 10); });
+    }
+
+    function apply(action, confirmMsg) {
+        var params = new URLSearchParams();
+        params.set('action', action);
+        params.set('folder', val('ba-folder') || 'inbox');
+        params.set('unread', val('ba-unread') || '0');
+        params.set('external', val('ba-external') || '0');
+        var q = (val('ba-q') || '').trim();
+        if (q) params.set('q', q);
+        params.set('page', val('ba-page') || '1');
+        if (stateBox.mode === 'all') {
+            params.set('select_all', '1');
+            params.set('exclude_ids', JSON.stringify(stateBox.exclude));
+        } else {
+            params.set('ids', JSON.stringify(stateBox.ids));
+        }
+        if (confirmMsg && !window.confirm(confirmMsg)) return;
+        htmx.ajax('POST', '/emails/batch', {
+            target: '#list-area', swap: 'outerHTML',
+            values: Object.fromEntries(params.entries())
+        });
+    }
+
+    function confirmText(action) {
+        var n = selectedCount();
+        if (action === 'delete') {
+            return '确定删除选中的 ' + n + ' 封邮件？删除后无法恢复（含附件），草稿也会一并删除。';
+        }
+        return null;
+    }
+
+    document.body.addEventListener('change', function (ev) {
+        var t = ev.target;
+        if (!t.classList) return;
+        if (t.id === 'batch-all') {
+            if (t.checked) {
+                // 表头全选：若跨页可用则提示入口，仍先做页内全选
+                items().forEach(function (c) { c.checked = true; });
+                stateBox.mode = 'ids';
+                stateBox.ids = collectIds();
+            } else {
+                // 取消全选：若在跨页模式则整体退出，否则清页内
+                resetSelection();
+            }
+            render();
+            return;
+        }
+        if (t.classList.contains('mbx-item')) {
+            var id = parseInt(t.value, 10);
+            if (stateBox.mode === 'all') {
+                // 跨页模式下行勾选 = 排除/撤销排除
+                var idx = stateBox.exclude.indexOf(id);
+                if (t.checked && idx >= 0) stateBox.exclude.splice(idx, 1);
+                if (!t.checked && idx < 0) stateBox.exclude.push(id);
+            } else {
+                stateBox.ids = collectIds();
+            }
+            render();
+        }
+    });
+
+    document.body.addEventListener('click', function (ev) {
+        var t = ev.target;
+        if (!t.closest) return;
+        // 复选框位于行链接之外的独立 label 内（2026-11-03 结构修正）：
+        // 原生勾选/原生 change 事件天然工作，无需任何 click 拦截
+        var allLink = t.closest('#ba-select-all');
+        if (allLink) {
+            ev.preventDefault();
+            stateBox.mode = 'all';
+            stateBox.exclude = [];
+            items().forEach(function (c) { c.checked = true; });
+            render();
+            return;
+        }
+        var clearBtn = t.closest('#ba-clear');
+        if (clearBtn) {
+            resetSelection();
+            return;
+        }
+        var btn = t.closest('[data-batch]');
+        if (btn) {
+            var action = btn.getAttribute('data-batch');
+            var sel = selectedCount();
+            if (sel === 0) return;
+            apply(action, confirmText(action));
+        }
+    });
+
+    // 片段换入（首次加载/批量操作返回/收取刷新）重建基线
+    function init() {
+        if (!bar()) return;
+        stateBox = { mode: 'ids', ids: [], exclude: [], total: num('ba-total') };
+        render();
+    }
+    document.body.addEventListener('htmx:afterSwap', function (ev) {
+        if (ev.detail && ev.detail.target && ev.detail.target.id === 'list-area') init();
+    });
+    document.addEventListener('DOMContentLoaded', init);
+})();
