@@ -503,12 +503,22 @@ function mbxMigrateInlineImages() {
     return [];
 }
 
+// 提交归属表单判定：evt.elt 可能是 form（存草稿 submit）也可能是发送按钮本身
+//（type=button + hx-include="closest form" 的 click 触发）。旧实现用
+// elt.querySelector('#body-html')：button 的 querySelector 只查其自身子树，
+// 找不到兄弟节点里的编辑器 hidden——发送路径 body_html 从未注入成功，
+// HTML 转发邮件以空正文发出（2026-11-03 修复）。统一以 closest('form')
+// 判定，两种触发路径等价。
+function mbxComposeForm(evtElt) {
+    if (!evtElt || typeof evtElt.closest !== 'function') return null;
+    return evtElt.closest('form');
+}
+
 document.body.addEventListener('htmx:configRequest', function (ev) {
     var detail = ev.detail || {};
-    var elt = detail.elt;
+    var form = mbxComposeForm(detail.elt);
     var hidden = document.getElementById('body-html');
-    if (mbxEditor && hidden && elt && typeof elt.querySelector === 'function'
-        && elt.querySelector('#body-html') && detail.parameters) {
+    if (mbxEditor && form && hidden && form.contains(hidden) && detail.parameters) {
         var converted = mbxMigrateInlineImages();
         if (converted.length > 0) {
             detail.parameters['inline_images'] = JSON.stringify(converted);
@@ -518,7 +528,9 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             var card = document.querySelector('.compose-card');
             if (card) card.insertBefore(note, card.firstChild);
         }
-        detail.parameters['body_html'] = mbxEditor.getHtml();
+        // 双保险：hidden.value 同步 + 参数显式覆盖（后者优先生效）
+        hidden.value = mbxEditor.getHtml();
+        detail.parameters['body_html'] = hidden.value;
     }
 });
 

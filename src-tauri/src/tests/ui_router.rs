@@ -1129,6 +1129,83 @@ fn compose_send_enqueues_and_redirects() {
     cleanup(&dir);
 }
 
+/// 富文本发送（回归 2026-11-03）：前端曾因发送按钮（click + hx-include）的
+/// configRequest 注入条件失效，body_html 参数恒空——HTML 转发以空正文发出，
+/// 详情页只剩空 pre。此测试锁定后端契约：body_mode=html + body_html 表单
+/// 必须保存为 HTML 正文且详情页正常渲染。
+#[test]
+fn compose_send_html_mode_keeps_body() {
+    let (state, dir) = temp_state("m3-send-html");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let html_body =
+        "<p>转发正文段落</p><table><tbody><tr><td>客户A</td><td>200M</td></tr></tbody></table>";
+    // 表单形态与前端注入后一致：body_mode=html + body_html（body_text 由后端从 HTML 生成）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("subject", "HTML 转发"),
+                ("body_mode", "html"),
+                ("body_html", html_body),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
+        "发送应跳转详情页：{:?}",
+        resp.extra_headers
+    );
+    let detail = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(detail.contains("md-html"), "HTML 正文应走富文本渲染分支");
+    assert!(
+        detail.contains("转发正文段落"),
+        "详情页应包含正文文字（不再是空 pre）：{}",
+        detail
+            .lines()
+            .find(|l| l.contains("md-body"))
+            .unwrap_or("(未找到正文容器)")
+    );
+    assert!(detail.contains("<table"), "表格应保留");
+    // 库内形态：body_html 净化入库 + body_text 由 HTML 生成（发件箱列表预览/检索用）
+    let (stored_html, stored_text): (String, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT COALESCE(body_html,''), body_text FROM emails WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert!(stored_html.contains("<table>"), "HTML 入库应含表格");
+    assert!(
+        stored_text.contains("客户A") && stored_text.contains("200M"),
+        "纯文本版应从 HTML 剥出（预览/检索/转发引用）：{stored_text}"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn compose_send_is_idempotent_on_repeat() {
     let (state, dir) = temp_state("m3-send-2");
