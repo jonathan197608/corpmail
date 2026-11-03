@@ -2042,8 +2042,8 @@ fn settings_storage_save_roundtrip_with_blank_semantics() {
     );
     assert_eq!(
         state.get_or(keys::KEEP_SENT_DAYS, &d).as_deref(),
-        Some("180"),
-        "非法值保持默认"
+        Some("3650"),
+        "非法值保持默认（发件箱保留默认 3650 天）"
     );
     cleanup(&dir);
 }
@@ -2803,10 +2803,12 @@ fn dump_smoke_html() {
         s.phase.clear();
     }
 
-    // M3 发送状态素材：sending 轮询态 / failed 重发态 / sent 终态 + 已发送列表
-    let sending_id = d2 + 2;
-    let failed_id = d2 + 3;
-    let sent_id = d2 + 4;
+    // M3 发送状态素材：sending 轮询态 / failed 重发态 / sent 终态 + 已发送列表。
+    // 注意：此前用 d2+2/3/4 推算 id 会与上方 inbox 种子(id 3..8)冲突，导致
+    // email-sent.html 等实际渲染的是收件箱邮件——改为插入后取 last_insert_rowid。
+    let mut sending_id = 0i64;
+    let mut failed_id = 0i64;
+    let mut sent_id = 0i64;
     state.with_conn(|c| {
         c.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
@@ -2817,26 +2819,29 @@ fn dump_smoke_html() {
             [],
         )
         .unwrap();
+        sending_id = c.last_insert_rowid();
         c.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     subject, body_text, subject_tokens, body_tokens, created_at,
                                     error, sent_at)
                  VALUES ('out', 'sent', 'failed', 'demo@chinatelecom.cn', '张伟', 'ops@x.cn',
-                         '投递失败的巡检报告', '重试一次仍未送达。', '投递 失败 的 巡检 报告',
-                         '重试 一次 仍未 送达', 2, '服务器 535 拒绝：发信认证失败', 2)",
+                          '投递失败的巡检报告', '重试一次仍未送达。', '投递 失败 的 巡检 报告',
+                          '重试 一次 仍未 送达', 2, '服务器 535 拒绝：发信认证失败', 2)",
             [],
         )
         .unwrap();
+        failed_id = c.last_insert_rowid();
         c.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     subject, body_text, subject_tokens, body_tokens, created_at,
                                     sent_at)
                  VALUES ('out', 'sent', 'sent', 'demo@chinatelecom.cn', '张伟', 'ops@x.cn',
-                         '已送达的周报', '本周完成情况详见正文。', '已 送达 的 周报',
-                         '本周 完成 情况 详见 正文', 2, 2)",
+                          '已送达的周报', '本周完成情况详见正文。', '已 送达 的 周报',
+                          '本周 完成 情况 详见 正文', 2, 2)",
             [],
         )
         .unwrap();
+        sent_id = c.last_insert_rowid();
     });
     dump("email-sending.html", get(&format!("/emails/{sending_id}")));
     dump("email-failed.html", get(&format!("/emails/{failed_id}")));
@@ -3646,24 +3651,47 @@ fn reply_all_prefills_all_recipients_excluding_self() {
     ));
     assert!(html.contains("回复全部"), "标题应为回复全部：{html}");
     assert!(html.contains("Re: 激励清单"), "主题应加 Re: 前缀");
-    // 收件人 = 发件人 + 收件人 + 抄送，去掉自己（demo@chinatelecom.cn）
+    // 收件人 = 原发件人 + 原收件人，去掉自己（demo@chinatelecom.cn）；
+    // 抄送 = 原抄送（ops@x.cn），不再塞进收件人（M9 拆分）
     let to_input = html
         .split("name=\"to_addrs\"")
         .nth(1)
         .and_then(|s| s.split("value=\"").nth(1))
         .and_then(|s| s.split('"').next())
         .unwrap_or_default();
+    let cc_input = html
+        .split("name=\"cc_addrs\"")
+        .nth(1)
+        .and_then(|s| s.split("value=\"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default();
     assert!(
         to_input.contains("部门领导 &lt;boss@x.cn&gt;"),
-        "应包含原发件人：{to_input}"
+        "收件人应含原发件人：{to_input}"
     );
-    assert!(to_input.contains("peer@x.cn"), "应包含原收件人：{to_input}");
-    assert!(to_input.contains("ops@x.cn"), "应包含原抄送：{to_input}");
+    assert!(
+        to_input.contains("peer@x.cn"),
+        "收件人应含原收件人：{to_input}"
+    );
+    assert!(
+        !to_input.to_ascii_lowercase().contains("ops@x.cn"),
+        "原抄送不应再进收件人：{to_input}"
+    );
     assert!(
         !to_input
             .to_ascii_lowercase()
             .contains("demo@chinatelecom.cn"),
         "不得把自己列为收件人：{to_input}"
+    );
+    assert!(
+        cc_input.contains("ops@x.cn"),
+        "抄送应复制原抄送：{cc_input}"
+    );
+    assert!(
+        !cc_input
+            .to_ascii_lowercase()
+            .contains("demo@chinatelecom.com"),
+        "不得把自己列为抄送：{cc_input}"
     );
     assert!(
         html.contains("name=\"in_reply_to\" value=\"1\""),
@@ -3672,6 +3700,147 @@ fn reply_all_prefills_all_recipients_excluding_self() {
     assert!(
         !html.contains("name=\"forward_from\" value=\"1\""),
         "不应误入转发态"
+    );
+    cleanup(&dir);
+}
+
+/// M9：回复（非全部）也把原邮件的抄送人复制到新邮件（去自己、去重）
+#[test]
+fn reply_copies_original_cc() {
+    let (state, dir) = temp_state("m9-reply-cc");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::DISPLAY_NAME, "张伟"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    cc_addrs, subject, body_text, subject_tokens, body_tokens,
+                                    unread, created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','部门领导',
+                         'demo@chinatelecom.cn, peer@x.cn',
+                         'cc1@x.cn, demo@chinatelecom.cn, cc1@x.cn',
+                         '主题','正文','主题','正文',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "reply_to=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("回复邮件"), "回复态标题：{html}");
+    // 收件人 = 原发件人（地址；display name 不用于收件人回填）
+    assert!(html.contains("boss@x.cn"), "收件人应预填原发件人");
+    // 抄送 = 原抄送（去自己 demo、去重 cc1）
+    let cc_input = html
+        .split("name=\"cc_addrs\"")
+        .nth(1)
+        .and_then(|s| s.split("value=\"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default();
+    assert!(cc_input.contains("cc1@x.cn"), "应复制原抄送：{cc_input}");
+    assert!(
+        !cc_input
+            .to_ascii_lowercase()
+            .contains("demo@chinatelecom.cn"),
+        "不得把自己列为抄送：{cc_input}"
+    );
+    assert_eq!(
+        cc_input.matches("cc1@x.cn").count(),
+        1,
+        "原抄送重复应去重：{cc_input}"
+    );
+    cleanup(&dir);
+}
+
+/// M9：发件箱「重新编辑」——载入已发送邮件正文/主题/收件人/抄送（原样，非转发引文），
+/// 首次保存复制原附件
+#[test]
+fn edit_from_prefills_sent_content() {
+    let (state, dir) = temp_state("m9-edit-from");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::DISPLAY_NAME, "张伟"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    cc_addrs, subject, body_text, body_html, subject_tokens,
+                                    body_tokens, unread, created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟',
+                         'peer@x.cn','cc1@x.cn','已发送主题','正文',
+                         '<div style=\"font-family:sans-serif\"><h2>配案</h2><table><tr><td>表</td></tr></table></div>',
+                         '已 发送 主题','正文',0,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 一个附件：重新编辑首次保存应复制
+    let p = dir.join("a.txt");
+    std::fs::write(&p, "x").unwrap();
+    mail::add_attachments(&state, 1, &[p.to_str().unwrap().into()]).unwrap();
+
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "edit_from=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("name=\"to_addrs\" value=\"peer@x.cn\""),
+        "收件人应原样回填：{html}"
+    );
+    assert!(
+        html.contains("name=\"cc_addrs\" value=\"cc1@x.cn\""),
+        "抄送应原样回填"
+    );
+    assert!(
+        html.contains("name=\"subject\" value=\"已发送主题\""),
+        "主题应原样回填"
+    );
+    assert!(
+        html.contains(r#"<input type="hidden" name="body_mode" id="body-mode" value="html">"#),
+        "HTML 原件重新编辑应为 html 模式"
+    );
+    assert!(
+        html.contains("name=\"forward_from\" value=\"1\""),
+        "重新编辑应写入 forward_from（首次保存复制附件）"
+    );
+    assert!(
+        html.contains("将携带原邮件 1 个附件"),
+        "应提示保存后携带原附件"
+    );
+    assert!(
+        !html.contains("---------- 转发的邮件 ----------"),
+        "重新编辑不应是转发引文"
+    );
+    assert!(
+        html.contains("&lt;table&gt;"),
+        "正文应原样保留（表格透传，非 blockquote 包裹）：{}",
+        html.lines()
+            .find(|l| l.contains("rt-initial"))
+            .unwrap_or("(未找到 rt-initial)")
     );
     cleanup(&dir);
 }
@@ -3748,6 +3917,49 @@ fn detail_actions_render_at_top_with_reply_all() {
     assert!(
         !html.contains("reply_all_to") && !html.contains("reply_to="),
         "非收件方向不应有回复入口：{html}"
+    );
+    // M9 发件箱：重新编辑（载入撰写页重发），不显示转发
+    assert!(
+        html.contains("/compose?edit_from=2"),
+        "发件箱应有重新编辑入口：{html}"
+    );
+    assert!(html.contains("重新编辑"), "发件箱按钮文案应为重新编辑");
+    assert!(
+        !html.contains("forward_from=2"),
+        "发件箱不应有转发入口：{html}"
+    );
+    // M9 草稿箱：编辑草稿，不显示转发
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, sent_at)
+                 VALUES ('out','draft','draft','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '草稿','正文','草 稿','正文',0,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/3", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("/compose?draft_id=3"),
+        "草稿箱应有编辑入口：{html}"
+    );
+    assert!(html.contains(">✎ 编辑</a>"), "草稿箱按钮应为编辑：{html}");
+    assert!(
+        !html.contains("forward_from=3"),
+        "草稿箱不应有转发入口：{html}"
     );
     cleanup(&dir);
 }

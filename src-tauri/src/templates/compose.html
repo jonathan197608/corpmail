@@ -77,7 +77,7 @@
                             <span class="att-name clickable"
                                   onclick="mbxPreviewAttachment('/emails/{{ draft_id }}/attachments/{{ a.id }}/view', {{ a.preview_kind | js_str }}, {{ a.filename | js_str }})"
                                   title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
-                            <span class="att-size">{{ a.size_orig }} 字节</span>
+                            <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                             <button type="button" class="btn small"
                                     onclick="mbxRemoveKept({{ a.id }}, this)">移除</button>
                         </li>

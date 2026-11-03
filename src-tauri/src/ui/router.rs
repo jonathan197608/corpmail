@@ -944,6 +944,8 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
     {
         ctx.in_reply_to = rid;
         ctx.to_addrs = src.from_addr.clone();
+        // 需求：回复时原邮件的抄送人也复制到新邮件（去自己、去重、保序）
+        ctx.cc_addrs = merge_addrs(&[&src.cc_addrs], &own_address(state), &[]);
         ctx.subject = if src.subject.starts_with("Re:") {
             src.subject.clone()
         } else {
@@ -955,16 +957,39 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         .and_then(|v| v.parse::<i64>().ok())
         && let Some(src) = mail::get(state, rid)
     {
-        // 回复全部：收件人 = 原发件人 + 原收件人 + 原抄送（去自己、去重、保序）
+        // 回复全部：收件人 = 原发件人 + 原收件人（去自己、去重、保序）；
+        // 抄送 = 原抄送（去自己、去掉已进收件人的、去重、保序）
         ctx.in_reply_to = rid;
         ctx.reply_all = true;
-        ctx.to_addrs = reply_all_recipients(state, &src);
+        let (to, cc) = reply_all_parts(state, &src);
+        ctx.to_addrs = to;
+        ctx.cc_addrs = cc;
         ctx.subject = if src.subject.starts_with("Re:") {
             src.subject.clone()
         } else {
             format!("Re: {}", src.subject)
         };
         fill_reply_body(&mut ctx, &src);
+    } else if let Some(eid) = req
+        .query_param("edit_from")
+        .and_then(|v| v.parse::<i64>().ok())
+        && let Some(src) = mail::get(state, eid)
+    {
+        // 发件箱「重新编辑」：载入已发送邮件内容到撰写页（非转发引文）。
+        // forward_from=eid 使首次保存时复制原附件，正文/主题/收件人/抄送原样回填。
+        ctx.forward_from = eid;
+        ctx.forward_attach_cnt = src.attach_cnt;
+        ctx.to_addrs = src.to_addrs.clone();
+        ctx.cc_addrs = src.cc_addrs.clone();
+        ctx.subject = src.subject.clone();
+        if src.body_html.trim().is_empty() {
+            ctx.body_mode = "plain".into();
+            ctx.body_text = src.body_text.clone();
+        } else {
+            ctx.body_mode = "html".into();
+            ctx.body_html = mail::unwrap_top_div(&src.body_html);
+            ctx.body_text = String::new();
+        }
     } else if let Some(fid) = req
         .query_param("forward_from")
         .and_then(|v| v.parse::<i64>().ok())
@@ -1660,35 +1685,59 @@ fn detail_back_href(req: &Req, fallback_folder: &str) -> String {
 
 /// 回复全部的收件人串：发件人 + 收件人 + 抄送，去掉自己（大小写不敏感）、
 /// 去重保序；有姓名按 "Name <addr>" 回填（联系人库识别更友好）
-fn reply_all_recipients(state: &AppState, src: &mail::EmailDetail) -> String {
+/// 本账号完整地址（小写）。回复/回复全部过滤"自己"用
+fn own_address(state: &AppState) -> String {
     let d = defaults();
-    let self_addr = full_address(
+    full_address(
         &state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default(),
         &state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
     )
-    .to_ascii_lowercase();
-    let mut raw: Vec<(String, String)> = vec![(src.from_addr.clone(), src.from_name.clone())];
-    raw.extend(mail::contacts::parse_addr_list(&src.to_addrs));
-    raw.extend(mail::contacts::parse_addr_list(&src.cc_addrs));
-    let mut seen: Vec<String> = Vec::new();
+    .to_ascii_lowercase()
+}
+
+/// 多个原始地址串 → 剔除自己与 exclude 集、去重、保序，返回 ", " 拼接的展示串
+/// （保留 "姓名 <地址>" 显示名）。exclude 为已进收件人的小写地址，避免 To/Cc 重复。
+fn merge_addrs(raw_sets: &[&str], self_addr: &str, exclude: &[String]) -> String {
+    let mut seen: Vec<String> = exclude.iter().map(|s| s.to_ascii_lowercase()).collect();
     let mut parts: Vec<String> = Vec::new();
-    for (addr, name) in raw {
-        let addr = addr.trim().to_string();
-        if addr.is_empty() || addr.to_ascii_lowercase() == self_addr {
-            continue;
+    for raw in raw_sets {
+        for (addr, name) in mail::contacts::parse_addr_list(raw) {
+            let addr = addr.trim().to_string();
+            if addr.is_empty() || addr.to_ascii_lowercase() == self_addr {
+                continue;
+            }
+            let key = addr.to_ascii_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            parts.push(if name.trim().is_empty() {
+                addr
+            } else {
+                format!("{name} <{addr}>")
+            });
         }
-        let key = addr.to_ascii_lowercase();
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.push(key);
-        parts.push(if name.trim().is_empty() {
-            addr
-        } else {
-            format!("{name} <{addr}>")
-        });
     }
     parts.join(", ")
+}
+
+/// 回复全部拆分：收件人 = 原发件人+原收件人（去自己）；抄送 = 原抄送
+/// （去自己、去掉已进收件人的、去重）——原抄送不再"全塞进收件人"（M9）
+fn reply_all_parts(state: &AppState, src: &mail::EmailDetail) -> (String, String) {
+    let self_addr = own_address(state);
+    // 原发件人保留显示名（"姓名 <地址>"），收件人/抄送串按原样解析
+    let from_disp = if src.from_name.trim().is_empty() {
+        src.from_addr.clone()
+    } else {
+        format!("{} <{}>", src.from_name, src.from_addr)
+    };
+    let to = merge_addrs(&[&from_disp, &src.to_addrs], &self_addr, &[]);
+    let to_keys: Vec<String> = mail::contacts::parse_addr_list(&to)
+        .into_iter()
+        .map(|(a, _)| a.to_ascii_lowercase())
+        .collect();
+    let cc = merge_addrs(&[&src.cc_addrs], &self_addr, &to_keys);
+    (to, cc)
 }
 
 /// 地址串拆成展示片段（详情页收件人/抄送逐个标注外部）
@@ -1813,16 +1862,10 @@ pub(super) fn security_or(form: &HashMap<String, String>, state: &AppState, key:
 pub(super) const SMTP_PORT_DEFAULT: u16 = 465;
 pub(super) const RECV_PORT_DEFAULT: u16 = 993;
 
+/// 文件大小人性化（设置页 DB/附件/备份/预估统一入口；B 起步，GB/TB 也覆盖，
+/// 与模板 fmt_size 过滤器同逻辑，全局一致）
 pub(super) fn human_bytes(b: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    if b >= MB {
-        format!("{:.1} MB", b as f64 / MB as f64)
-    } else if b >= KB {
-        format!("{:.0} KB", b as f64 / KB as f64)
-    } else {
-        format!("{b} B")
-    }
+    templates::fmt_size(b as i64)
 }
 
 #[cfg(test)]

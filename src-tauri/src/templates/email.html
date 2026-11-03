@@ -33,13 +33,23 @@
 
         <div class="mail-detail card">
             {# 操作按钮置顶（原在正文底部）：阅读动作应随手可得；回复全部
-               = 发件人+收件人+抄送（见 reply_all_recipients） #}
+               = 收件人 + 原抄送（见 reply_all_parts）。
+               按信箱区分：草稿箱=编辑草稿、发件箱=重新编辑（载入撰写页重发），
+               收件箱才显示回复/回复全部/转发。 #}
             <div class="md-actions md-actions-top">
+                {% if email.folder == 'draft' %}
+                <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                   title="打开草稿继续编辑">✎ 编辑</a>
+                {% elif email.folder == 'sent' %}
+                <a class="btn primary" href="/compose?edit_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                   title="载入该邮件内容到撰写页，修改后重新发送">✎ 重新编辑</a>
+                {% else %}
                 {% if email.direction == 'in' %}
                 <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复</a>
                 <a class="btn primary" href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复全部</a>
                 {% endif %}
                 <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↗ 转发</a>
+                {% endif %}
                 <button type="button" class="btn danger"
                         hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                         hx-trigger="click throttle:500ms"
@@ -76,7 +86,7 @@
 
             {% if email.attachments %}
             <div class="md-attach">
-                <div class="md-attach-title">附件（{{ email.attach_cnt }}，共 {{ email.attach_bytes }} 字节）</div>
+                <div class="md-attach-title">附件（{{ email.attach_cnt }}，共 {{ email.attach_bytes | fmt_size }}）</div>
                 <ul class="att-list">
                     {% for a in email.attachments %}
                     <li class="att-row">
@@ -89,7 +99,7 @@
                               onclick="mbxPreviewAttachment('/emails/{{ email.id }}/attachments/{{ a.id }}/view', {{ a.preview_kind | js_str }}, {{ a.filename | js_str }})"
                               title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
                         {% endif %}
-                        <span class="att-size">{{ a.size_orig }} 字节</span>
+                        <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                         {% if not a.detached %}
                         <button type="button" class="btn small"
                                 onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.filename | js_str }})"

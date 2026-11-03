@@ -544,3 +544,57 @@ function mbxRtInit() {
     }
 }
 document.addEventListener('DOMContentLoaded', mbxRtInit);
+
+// ---------- 设置页保存按钮：配置无变化时禁用 ----------
+// 进入/保存后按表单当前值建立基线；任一表单控件变化即启用保存，无修改则保持禁用。
+// 排除 disabled（服务端只读字段）与 submit/button/file；password 空=保持不变，
+// 清回空串视为无变化。sync 的开关改 hidden 值不走 input/change，需补 click 监听。
+// 每次 swap 后经 htmx:afterSettle 重建基线（保存结果/切 Tab 均被覆盖）。
+(function () {
+    var base = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+    function snapshot(form) {
+        var out = {}, els = form.querySelectorAll('input, select, textarea');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (el.disabled || !el.name) continue;
+            var t = (el.type || '').toLowerCase();
+            if (t === 'submit' || t === 'button' || t === 'file') continue;
+            out[el.name] = t === 'radio' || t === 'checkbox'
+                ? (el.checked ? el.value : '')
+                : el.value;
+        }
+        return JSON.stringify(out);
+    }
+    function paneForm(node) {
+        var f = node && node.closest ? node.closest('#settings-pane form') : null;
+        return f;
+    }
+    function refresh(form) {
+        if (!base || !form) return;
+        var b = form.querySelector('button[type="submit"]');
+        if (b) b.disabled = base.get(form) === snapshot(form);
+    }
+    function rebaseline(form) {
+        if (!base || !form || !form.querySelector('button[type="submit"]')) return;
+        base.set(form, snapshot(form));
+        refresh(form);
+    }
+    document.addEventListener('input', function (ev) { refresh(paneForm(ev.target)); });
+    document.addEventListener('change', function (ev) { refresh(paneForm(ev.target)); });
+    document.addEventListener('click', function (ev) {
+        var t = ev.target;
+        var f = paneForm(t);
+        if (f && t.classList && t.classList.contains('toggle')) refresh(f);
+    });
+    document.body.addEventListener('htmx:afterSettle', function (ev) {
+        var pane = ev.detail && ev.detail.elt;
+        var f = pane
+            ? (pane.matches && pane.matches('#settings-pane form') ? pane
+               : (pane.querySelector ? pane.querySelector('#settings-pane form') : null))
+            : null;
+        rebaseline(f);
+    });
+    document.addEventListener('DOMContentLoaded', function () {
+        rebaseline(document.querySelector('#settings-pane form'));
+    });
+})();

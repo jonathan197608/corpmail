@@ -51,10 +51,39 @@ fn js_str(s: String) -> String {
     serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// 文件大小人性化：按 1024 进制自动选 B/KB/MB/GB/TB，非 B 单位保留 1 位小数。
+/// 模板过滤器（`{{ n | fmt_size }}`）与设置页 human_bytes 共用，保证全局一致。
+pub(crate) fn fmt_size(bytes: i64) -> String {
+    if bytes < 0 {
+        return "0 B".into();
+    }
+    const K: i64 = 1024;
+    const M: i64 = 1024 * 1024;
+    const G: i64 = 1024 * 1024 * 1024;
+    const T: i64 = 1024 * 1024 * 1024 * 1024;
+    let (val, unit) = if bytes >= T {
+        (bytes as f64 / T as f64, "TB")
+    } else if bytes >= G {
+        (bytes as f64 / G as f64, "GB")
+    } else if bytes >= M {
+        (bytes as f64 / M as f64, "MB")
+    } else if bytes >= K {
+        (bytes as f64 / K as f64, "KB")
+    } else {
+        (bytes as f64, "B")
+    };
+    if unit == "B" {
+        format!("{val:.0} B")
+    } else {
+        format!("{val:.1} {unit}")
+    }
+}
+
 fn build_env() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_auto_escape_callback(minijinja::default_auto_escape_callback);
     env.add_filter("js_str", js_str);
+    env.add_filter("fmt_size", fmt_size);
     for (name, src) in TEMPLATES {
         // include_str 内嵌的模板编译失败属于程序 bug（模板语法错误），直接 panic 暴露
         env.add_template(name, src).expect("模板语法有误");

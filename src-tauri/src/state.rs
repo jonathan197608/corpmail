@@ -81,9 +81,9 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
         (keys::SYNC_INTERVAL_MIN, "30"),
         (keys::FIRST_FETCH_DAYS, "30"),
         (keys::INLINE_ATTACH_MAX_MB, "20"),
-        (keys::CLEAN_SENT_BULK_DAYS, "7"),
-        (keys::KEEP_INBOX_DAYS, "365"),
-        (keys::KEEP_SENT_DAYS, "180"),
+        (keys::CLEAN_SENT_BULK_DAYS, "365"),
+        (keys::KEEP_INBOX_DAYS, "3650"),
+        (keys::KEEP_SENT_DAYS, "3650"),
     ]
 }
 
