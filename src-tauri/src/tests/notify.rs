@@ -54,15 +54,37 @@ fn summary_truncates_to_max_chars() {
 #[test]
 fn notified_set_dedupes_on_repeat() {
     reset_for_test();
-    // 复用 on_fetch_finished 的去重段逻辑等价验证：直接操作 NOTIFIED
+    // 复用 on_fetch_finished 的去重段逻辑等价验证：直接操作集合
     {
-        let mut notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
-        notified.push(42);
+        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        notified.insert(42);
     }
     let dup_again = {
-        let notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
-        !notified.contains(&42)
+        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        !notified.insert(42)
     };
-    assert!(!dup_again, "重复 id 应被识别为已通知");
+    assert!(dup_again, "重复 id 应被识别为已通知");
+    reset_for_test();
+}
+
+/// 上限截断：达到 NOTIFIED_MAX 后整表清空，防止常驻进程无限增长
+#[test]
+fn notified_set_caps_growth() {
+    reset_for_test();
+    {
+        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..NOTIFIED_MAX as i64 {
+            notified.insert(i);
+        }
+        assert_eq!(notified.len(), NOTIFIED_MAX, "前置：集合已满");
+        // 达上限清空（与 on_fetch_finished 内联逻辑一致）
+        if notified.len() >= NOTIFIED_MAX {
+            notified.clear();
+        }
+    }
+    {
+        let notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(notified.is_empty(), "达上限应整表清空");
+    }
     reset_for_test();
 }

@@ -455,7 +455,7 @@ fn attachments_inline_and_file_tiers() {
     // 另存 roundtrip（gzip 解压回原文）
     let aid = d.attachments[0].id;
     let dest = dir.join("saved.txt");
-    save_attachment_to(&state, aid, dest.to_str().unwrap()).unwrap();
+    save_attachment_to(&state, id, aid, dest.to_str().unwrap()).unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"hello attachment");
     // keep 裁剪
     remove_attachments_except(&state, id, &[]).unwrap();
@@ -604,12 +604,94 @@ fn copy_attachments_duplicates_files_and_skips_detached() {
     assert_eq!(d.attach_cnt, 1);
     assert_eq!(d.attachments[0].filename, "a.txt");
     let out = dir.join("copied.txt");
-    save_attachment_to(&state, d.attachments[0].id, out.to_str().unwrap()).unwrap();
+    save_attachment_to(&state, dst, d.attachments[0].id, out.to_str().unwrap()).unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), b"alpha");
 
     // 源邮件附件不受影响（复制而非移动）
     assert_eq!(get(&state, src).unwrap().attach_cnt, 2);
     assert_eq!(get(&state, src).unwrap().attachments[0].filename, "a.txt");
 
+    cleanup(&dir);
+}
+
+/// 敏感路径守卫（审计 M1/M2）：附件添加与另存为不得指向库/密钥/配置；
+/// `..` 逃逸与符号链接形态同样拦截；普通用户路径放行
+#[test]
+fn attachment_paths_guard_sensitive_targets() {
+    let (state, dir) = temp_state("attach-guard");
+    let id = save_draft(&state, &draft("守卫", "体")).unwrap();
+    // temp_state 中锚点目录与数据目录同为 dir；corpmail.db 已随 open 存在
+    let db = dir.join("corpmail.db").to_string_lossy().into_owned();
+    let key = dir.join("corpmail.key").to_string_lossy().into_owned();
+    let toml = dir.join("corpmail.toml").to_string_lossy().into_owned();
+    let dotdot = dir
+        .join("sub/../corpmail.db")
+        .to_string_lossy()
+        .into_owned();
+
+    let assert_rejected = |path: &str| {
+        let err = add_attachments(&state, id, &[path.to_string()]);
+        assert!(err.is_err(), "添加附件路径应被拒：{path}");
+        assert!(
+            err.unwrap_err().contains("已拒绝"),
+            "拒绝原因应为敏感路径守卫：{path}"
+        );
+    };
+    assert_rejected(&db);
+    assert_rejected(&key);
+    assert_rejected(&toml);
+    assert_rejected(&dotdot);
+
+    // 符号链接指向敏感文件：canonicalize 穿透后仍属同一路径（unixonly；windows 无符号权限）
+    #[cfg(unix)]
+    {
+        let link = dir.join("db-link");
+        std::os::unix::fs::symlink(dir.join("corpmail.db"), &link).unwrap();
+        assert_rejected(&link.to_string_lossy());
+    }
+
+    // 另存方向（M1）：dest 指向库文件应被拒，且不触碰原库内容
+    let before = std::fs::read(dir.join("corpmail.db")).unwrap_or_default();
+    assert!(
+        save_attachment_to(&state, id, 1, &db).is_err(),
+        "另存到库路径应被拒"
+    );
+    let after = std::fs::read(dir.join("corpmail.db")).unwrap_or_default();
+    assert_eq!(before, after, "被拒的另存不得写坏库文件");
+
+    // 普通路径放行
+    let ok = dir.join("普通附件.txt");
+    std::fs::write(&ok, b"normal").unwrap();
+    assert!(add_attachments(&state, id, &[ok.to_str().unwrap().into()]).is_ok());
+    cleanup(&dir);
+}
+
+/// 附件归属校验（审计 L1）：URL 里的 email_id 必须是附件真实属主，
+/// 跨邮件 id 取附件（预览/另存）应 404/失败
+#[test]
+fn attachment_ops_require_owner_email() {
+    let (state, dir) = temp_state("attach-owner");
+    let one = save_draft(&state, &draft("有附件", "体")).unwrap();
+    let two = save_draft(&state, &draft("无附件", "体")).unwrap();
+    let f = dir.join("a.txt");
+    std::fs::write(&f, b"hello").unwrap();
+    add_attachments(&state, one, &[f.to_str().unwrap().into()]).unwrap();
+    let aid = get(&state, one).unwrap().attachments[0].id;
+
+    // 正确属主：可读可另存
+    assert!(attachment_bytes(&state, one, aid).is_some());
+    let out = dir.join("ok.txt");
+    save_attachment_to(&state, one, aid, out.to_str().unwrap()).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+
+    // 错误属主（他邮件 id + 本附件 id）：一律拒绝
+    assert!(
+        attachment_bytes(&state, two, aid).is_none(),
+        "跨邮件取附件应返回 None"
+    );
+    assert!(
+        save_attachment_to(&state, two, aid, out.to_str().unwrap()).is_err(),
+        "跨邮件另存应失败"
+    );
     cleanup(&dir);
 }

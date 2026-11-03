@@ -1240,10 +1240,10 @@ fn redirect_compose_ctx(draft_id: i64, error: &str, ctx_qs: &str) -> Resp {
 /// text 类强制 text/plain（防 HTML 脚本执行）；SVG 不在图片白名单（顶层渲染可执行脚本）；
 /// 非内联类型附 Content-Disposition: attachment（强制下载）。
 fn attachment_view(state: &AppState, req: &Req) -> Resp {
-    let Some((_, aid)) = path_attach(&req.path) else {
+    let Some((email_id, aid)) = path_attach(&req.path) else {
         return Resp::not_found();
     };
-    match mail::attachment_bytes(state, aid) {
+    match mail::attachment_bytes(state, email_id, aid) {
         Some((view, bytes)) => {
             let mime = view.mime.trim().to_ascii_lowercase();
             let (content_type, inline) = if view.preview_kind == "text" {
@@ -1280,7 +1280,7 @@ fn attachment_view(state: &AppState, req: &Req) -> Resp {
 }
 
 fn attachment_save(state: &AppState, req: &Req) -> Resp {
-    let Some((_, aid)) = path_attach(&req.path) else {
+    let Some((email_id, aid)) = path_attach(&req.path) else {
         return Resp::not_found();
     };
     let form = parse_form(&req.body);
@@ -1289,7 +1289,7 @@ fn attachment_save(state: &AppState, req: &Req) -> Resp {
             r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
         );
     };
-    match mail::save_attachment_to(state, aid, &dest) {
+    match mail::save_attachment_to(state, email_id, aid, &dest) {
         Ok(()) => Resp::html(format!(
             r#"<div id="toast" class="toast ok" hx-swap-oob="true">已另存到 {}</div>"#,
             html_escape(&dest)

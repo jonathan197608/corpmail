@@ -1211,6 +1211,11 @@ pub fn add_attachments(
     let root = attach_root(state);
     let month = month_dir_of(state, email_id);
     let mut written_files: Vec<PathBuf> = Vec::new();
+    // 敏感路径守卫（审计 M2）：paths 是表单值（客户端可改），入库前逐一校验，
+    // 拒绝读取库/密钥/配置自身（防"读库+读密钥 → 外泄 keyfile 密码"原语）
+    for p in paths {
+        guard_sensitive_path(state, p)?;
+    }
     let result = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         let mut count = 0usize;
@@ -1345,16 +1350,103 @@ pub fn remove_attachments_except(
     Ok(())
 }
 
-/// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）
-pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView, Vec<u8>)> {
+/// 路径词法归一（无 I/O）：去 `.`/冗余分隔符，解析 `..` 为父目录。
+/// 仅用于路径比对，不保证与文件系统真实路径一致（符号链接场景见 comparable_path）
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop(); // 根目录上 pop 为 no-op
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 比较用路径串：目标存在则取 canonicalize 实路径（穿透符号链接与 `..`）；
+/// 含不存在组件时先词法归一，再对最长存在前缀 canonicalize（穿祖先符号链接，
+/// 如 macOS `/var`→`/private/var`，保证与敏感文件实路径同一基准），余下
+/// 部分逐组件附加。统一小写：macOS/Windows 文件系统大小写不敏感；Linux
+/// 上大小写变体过度拦截无攻击获益，保守可用
+fn comparable_path(p: &Path) -> String {
+    let clean = lexical_normalize(p);
+    if let Ok(real) = std::fs::canonicalize(&clean) {
+        return real.to_string_lossy().to_lowercase();
+    }
+    let comps: Vec<std::path::Component<'_>> = clean.components().collect();
+    // 最长存在前缀：从根逐组件累积，遇第一个不存在组件截断
+    let mut acc = PathBuf::new();
+    let mut cut = comps.len();
+    for (i, c) in comps.iter().enumerate() {
+        acc.push(c.as_os_str());
+        if !acc.exists() {
+            cut = i;
+            break;
+        }
+    }
+    if cut == 0 {
+        return clean.to_string_lossy().to_lowercase();
+    }
+    let mut out = match std::fs::canonicalize(&acc) {
+        Ok(real) => real,
+        Err(_) => acc,
+    };
+    for c in &comps[cut..] {
+        out.push(c.as_os_str());
+    }
+    out.to_string_lossy().to_lowercase()
+}
+
+/// 敏感路径守卫（审计 M1/M2）：拒绝“另存为/附件添加”目标指向本应用关键
+/// 数据文件——数据库（corpmail.db 及 wal/shm）、凭据回退密钥（corpmail.key）、
+/// 配置（corpmail.toml）及它们的原子写临时文件。
+///
+/// 背景：dest/attach_paths 是表单值，客户端可改（合法值来自系统对话框）。
+/// 一旦上游净化器或 CSP 被击穿出现脚本执行，这两个入口就是“写坏数据库/
+/// 密钥/配置”与“读出密钥+数据库外泄 keyfile 密码”的现成原语。本守卫独立
+/// 于前端与净化防线，属纵深防御。精确到文件级，不拦目录。
+pub fn guard_sensitive_path(state: &AppState, raw: &str) -> Result<(), String> {
+    let target = comparable_path(Path::new(raw));
+    let data = state.data_dir();
+    let anchor = state.anchor_dir().to_path_buf();
+    let hit = ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"]
+        .iter()
+        .any(|n| comparable_path(&data.join(n)) == target)
+        || [
+            "corpmail.key",
+            "corpmail.key.tmp",
+            "corpmail.toml",
+            "corpmail.toml.tmp",
+        ]
+        .iter()
+        .any(|n| comparable_path(&anchor.join(n)) == target);
+    if hit {
+        return Err(format!(
+            "目标路径属于应用数据文件（数据库/密钥/配置），已拒绝：{raw}"
+        ));
+    }
+    Ok(())
+}
+
+/// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）。
+/// 归属校验：email_id 与 attach_id 联合匹配——URL 里的邮件 id 必须是附件
+/// 真实属主，防 /emails/{other}/attachments/{aid} 跨邮件取附件（审计 L1）
+pub fn attachment_bytes(
+    state: &AppState,
+    email_id: i64,
+    attach_id: i64,
+) -> Option<(AttachView, Vec<u8>)> {
     let root = attach_root(state);
     state.with_conn(|conn| {
         let row = conn
             .query_row(
                 "SELECT filename, storage, COALESCE(file_path,''), data, detached = 1,
                         COALESCE(mime, 'application/octet-stream')
-                 FROM attachments WHERE id = ?1",
-                [attach_id],
+                 FROM attachments WHERE id = ?1 AND email_id = ?2",
+                [attach_id, email_id],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1390,10 +1482,17 @@ pub fn attachment_bytes(state: &AppState, attach_id: i64) -> Option<(AttachView,
     })
 }
 
-/// 另存为：解压落盘到用户选择的路径（前端 __TAURI__.dialog 选好 dest 后 POST）
-pub fn save_attachment_to(state: &AppState, attach_id: i64, dest: &str) -> Result<(), String> {
-    let (_, bytes) =
-        attachment_bytes(state, attach_id).ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
+/// 另存为：解压落盘到用户选择的路径（前端 __TAURI__.dialog 选好 dest 后 POST）。
+/// dest 属表单值（客户端可改），先过敏感路径守卫（M1：防覆盖库/密钥/配置）
+pub fn save_attachment_to(
+    state: &AppState,
+    email_id: i64,
+    attach_id: i64,
+    dest: &str,
+) -> Result<(), String> {
+    guard_sensitive_path(state, dest)?;
+    let (_, bytes) = attachment_bytes(state, email_id, attach_id)
+        .ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
     std::fs::write(dest, &bytes).map_err(|err| format!("另存失败：{err}"))
 }
 

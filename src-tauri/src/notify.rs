@@ -15,8 +15,18 @@ const MAX_TITLES: usize = 5;
 /// 通知正文最长字符数（超长截断 + 省略号）
 const MAX_BODY_CHARS: usize = 120;
 
-/// 已通知过的邮件 id（进程内去重；重启清零属预期——首轮增量拉不到旧件）
-static NOTIFIED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+/// 已通知过的邮件 id（进程内去重；重启清零属预期——首轮增量拉不到旧件）。
+/// 上限截断：常驻进程的极端长会话下（如长期不关机 + 海量收件）无界增长，
+/// 达上限整表清空——代价是极端清空后同轮可能重复通知一次，属可接受的
+/// 稀有退化（通知本就是尽力而为的增值体验）
+const NOTIFIED_MAX: usize = 50_000;
+type NotifiedSet = std::sync::Mutex<std::collections::HashSet<i64>>;
+
+/// HashSet::new 非 const fn（RandomState），沿用 OnceLock 惰性初始化
+fn notified_set() -> &'static NotifiedSet {
+    static SET: std::sync::OnceLock<NotifiedSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
 
 /// 一轮收件完成后调用：发一条新邮件摘要系统通知。
 ///
@@ -52,14 +62,15 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
     }
     // 进程内去重：已通知过的 id 剔除（同轮窗口重叠/多轮重复拉取都拦在此处）
     let pending: Vec<(i64, String)> = {
-        let mut notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        if notified.len() >= NOTIFIED_MAX {
+            notified.clear();
+        }
         let mut out = Vec::new();
         for (id, subject) in candidates {
-            if notified.contains(&id) {
-                continue;
+            if notified.insert(id) {
+                out.push((id, subject));
             }
-            notified.push(id);
-            out.push((id, subject));
         }
         out
     };
@@ -115,7 +126,10 @@ fn build_summary(pending: &[(i64, String)]) -> String {
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn reset_for_test() {
-    NOTIFIED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    notified_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
