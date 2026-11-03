@@ -1096,8 +1096,8 @@ fn compose_send_enqueues_and_redirects() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
-        "发送应跳转详情页轮询：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
+        "发送应回来源列表页（无上下文 → 默认收件箱 /）：{:?}",
         resp.extra_headers
     );
     let (status, folder): (String, String) = state.with_conn(|c| {
@@ -1166,8 +1166,8 @@ fn compose_send_html_mode_keeps_body() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
-        "发送应跳转详情页：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
+        "发送应回来源列表页（默认收件箱 /）：{:?}",
         resp.extra_headers
     );
     let detail = body(&route(
@@ -1247,8 +1247,8 @@ fn compose_send_redirect_keeps_list_context() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/emails/1?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
-        "发送跳转应携带列表上下文（畸形 folder 被重滤为默认 inbox）：{loc}"
+        loc, "/?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
+        "发送后回来源列表页（保持过滤/翻页/文件夹）：{loc}"
     );
     // 详情页返回链接还原过滤（folder=inbox 显式携带）
     let detail = body(&route(
@@ -1348,8 +1348,8 @@ fn forward_compose_redirect_keeps_source_folder() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/emails/2?folder=sent",
-        "转发发送应跳回来源文件夹上下文：{loc}"
+        loc, "/?folder=sent",
+        "转发发送后应回来源文件夹列表（发件箱）：{loc}"
     );
     cleanup(&dir);
 }
@@ -1425,8 +1425,8 @@ fn inbox_compose_send_redirect_keeps_inbox_folder() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert!(
-        loc.starts_with("/emails/2?folder=inbox"),
-        "收件箱来源发送后回跳应带 folder=inbox：{loc}"
+        loc.starts_with("/?folder=inbox"),
+        "收件箱来源发送后应回收件箱列表：{loc}"
     );
     cleanup(&dir);
 }
@@ -1462,8 +1462,8 @@ fn compose_send_is_idempotent_on_repeat() {
         assert!(
             resp.extra_headers
                 .iter()
-                .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
-            "重复提交仍应跳转详情页"
+                .any(|(k, v)| k == "HX-Redirect" && v == "/"),
+            "重复提交仍应回来源列表（默认收件箱）"
         );
     }
     let total: i64 = state.with_conn(|c| {

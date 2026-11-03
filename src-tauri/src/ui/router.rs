@@ -1188,13 +1188,15 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             if mail::enqueue_draft(state, id) {
                 state.enqueue_send(id);
             }
-            // 跳详情页携带列表上下文：详情页「返回列表」保持进入前的过滤/翻页
-            //（转发/回复/发送全链路最后一环；不带则上下文在此断裂）
-            if ctx_qs.is_empty() {
-                Resp::hx_redirect(&format!("/emails/{id}"))
+            // 发送完成 → 回来源文件夹列表（保持过滤/翻页），而非停详情页。
+            // ctx_qs 恒含 folder（rebuild_list_query 不再省略 inbox），
+            // 从哪转发/回复/重新编辑进来就回哪个列表。
+            let target = if ctx_qs.is_empty() {
+                "/".to_string()
             } else {
-                Resp::hx_redirect(&format!("/emails/{id}?{ctx_qs}"))
-            }
+                format!("/?{ctx_qs}")
+            };
+            Resp::hx_redirect(&target)
         }
         Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
     }
