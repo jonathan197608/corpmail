@@ -191,7 +191,7 @@ impl AppState {
         if let Err(err) = crate::mail::contacts::backfill(&mut conn) {
             eprintln!("[contacts] 历史邮件回填失败（忽略）：{err}");
         }
-        Ok(Self {
+        let state = Self {
             db: Mutex::new(conn),
             data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
             anchor_dir: anchor_dir.to_path_buf(),
@@ -211,7 +211,10 @@ impl AppState {
                 phase: String::new(),
             })),
             active_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        })
+        };
+        // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
+        state.try_auto_clean_empty_old_backup();
+        Ok(state)
     }
 
     /// 打开/初始化数据库（锚点=数据目录本身，测试便捷入口）。
@@ -303,7 +306,8 @@ impl AppState {
         }
 
         Ok(format!(
-            "数据已迁移到新目录，重启应用后生效。旧目录中的数据库备份可在 设置 → 存储管理 中手动删除。新目录：{}",
+            "数据已迁移到新目录，重启应用后生效。旧目录中若有邮件数据，其备份可在 设置 → 存储管理 中手动删除\
+             （旧目录无邮件时重启后将自动清理）。新目录：{}",
             dest_path.display()
         ))
     }
@@ -397,6 +401,88 @@ impl AppState {
     /// 锚点目录（corpmail.toml 与凭据回退密钥所在；完成页展示目录提示用）
     pub fn anchor_dir(&self) -> &Path {
         &self.anchor_dir
+    }
+
+    /// 启动时自动清理"空的"旧目录遗留（迁移场景收尾）。
+    ///
+    /// 背景：move_data_dir 保留原目录库/附件作迁移备份（防误删），由用户在
+    /// 存储页手动删除。但"装好首设后立即改目录"这类场景原库只有空 schema，
+    /// 备份毫无价值还占用存储页的"迁移备份"展示位，误导用户。
+    ///
+    /// 时机：仅在重启后（本进程打开的是新目录库，与锚点遗留库零连接，
+    /// 无 orphan-inode 风险——同 delete_old_backup 拒绝 pending 的理由）。
+    /// 条件（任一不满足即保留，走手动删除路径）：
+    /// - 已迁移（data_dir ≠ anchor）且锚点存在遗留 corpmail.db
+    /// - 遗留库可只读打开且 emails 与 attachments 均为 0 行（彻底无数据；
+    ///   打不开/计数失败一律保留——文件损坏时宁可留给用户处置）
+    ///
+    /// 命中即删锚点 corpmail.db[-wal/-shm] 与空的 attachments/（清理范围同
+    /// delete_old_backup：corpmail.toml 与新目录数据不动）。
+    fn try_auto_clean_empty_old_backup(&self) {
+        if self.data_dir() == self.anchor_dir {
+            return; // 未迁移（或回退锚点）：锚点库就是当前库，绝不能碰
+        }
+        let backup_db = self.anchor_dir.join("corpmail.db");
+        if !backup_db.is_file() {
+            return; // 无遗留（或此前已自动清理过）：无事可做
+        }
+        // 只读打开遗留库计数：不开写句柄，不留 -shm/-wal 变更
+        let counted =
+            Connection::open_with_flags(&backup_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|conn| {
+                    let mails: i64 =
+                        conn.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))?;
+                    let atts: i64 =
+                        conn.query_row("SELECT count(*) FROM attachments", [], |r| r.get(0))?;
+                    Ok((mails, atts))
+                });
+        match counted {
+            Ok((0, 0)) => { /* 空库：继续清理 */ }
+            Ok((mails, atts)) => {
+                eprintln!(
+                    "[startup] 旧目录保留迁移备份（{mails} 封邮件 / {atts} 个附件），可在存储页手动删除"
+                );
+                return;
+            }
+            // 打不开/表不存在：损坏或异构文件，保留给用户判断
+            Err(err) => {
+                eprintln!("[startup] 旧目录遗留库无法核验（保留备份，不自动清理）：{err}");
+                return;
+            }
+        }
+        let mut freed = 0u64;
+        let mut files = 0u64;
+        for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+            let p = self.anchor_dir.join(f);
+            if p.is_file() {
+                freed += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                if let Err(err) = std::fs::remove_file(&p) {
+                    eprintln!("[startup] 旧目录遗留 {f} 删除失败（停止自动清理）：{err}");
+                    return;
+                }
+                files += 1;
+            }
+        }
+        let att = self.anchor_dir.join("attachments");
+        if att.is_dir() {
+            let (b, n) = dir_stats(&att);
+            match std::fs::remove_dir_all(&att) {
+                Ok(()) => {
+                    freed += b;
+                    files += n;
+                }
+                Err(err) => {
+                    eprintln!("[startup] 旧目录遗留附件目录删除失败（停止自动清理）：{err}");
+                    return;
+                }
+            }
+        }
+        if files > 0 {
+            eprintln!(
+                "[startup] 旧目录遗留空库已自动清理（{} 个文件，{} 字节）；如需保留历史请从新目录备份",
+                files, freed
+            );
+        }
     }
 
     /// 迁移备份统计：锚点（默认安装目录）中的 corpmail.db[-wal/-shm] + attachments/。

@@ -416,12 +416,28 @@ fn config_keys_stored_in_toml_only() {
 
 #[test]
 fn delete_old_backup_removes_files_but_keeps_config() {
-    // 迁移后（重启生效态）：删除锚点备份 —— 数据/定位不受影响
+    // 迁移后（重启生效态）：删除锚点备份 —— 数据/定位不受影响。
+    // 注意 fixture 必须有邮件：启动自动清理会删掉空的遗留库
+    //（try_auto_clean_empty_old_backup），无邮件的话备份活不到手动删除那一步
     let base = temp_dir("backup-del");
     let anchor = base.join("anchor");
     std::fs::create_dir_all(&anchor).unwrap();
     let state = AppState::open(&anchor);
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    save_draft(
+        &state,
+        &crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            subject: "备份保留用例".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+        },
+    )
+    .unwrap();
     let att = anchor.join("attachments/2026-10/1");
     std::fs::create_dir_all(&att).unwrap();
     std::fs::write(att.join("1_a.bin.gz"), [7u8; 64]).unwrap();
@@ -450,6 +466,90 @@ fn delete_old_backup_removes_files_but_keeps_config() {
     assert!(dest.join("corpmail.db").is_file(), "当前数据完好");
     // 重复删除 → 无备份可删
     assert!(state2.delete_old_backup().is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 迁移重启后：旧目录遗留库为空（仅配置、无邮件/附件）→ 启动自动清理，
+/// 免去存储页手动删除；配置文件与新目录数据不受影响
+#[test]
+fn auto_clean_removes_empty_old_backup_after_restart() {
+    let base = temp_dir("auto-clean-empty");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    // 空库：仅配置行（典型：装好首设后立即改目录，还没收到任何邮件）
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let dest = base.join("moved");
+    state.move_data_dir(dest.to_str().unwrap()).unwrap();
+    drop(state);
+    // 迁移后未重启：本进程还持有旧库，自动清理不得在迁移会话内提前发生
+    //（该断言同时验证清理只在重启后触发）
+    // 模拟重启：新目录生效，启动链自动清理空遗留
+    let state2 = AppState::open_with_anchor(&dest, &anchor);
+    assert!(
+        !anchor.join("corpmail.db").exists(),
+        "空遗留库应在重启后被自动清理"
+    );
+    assert!(
+        !anchor.join("corpmail.db-wal").exists() && !anchor.join("corpmail.db-shm").exists(),
+        "遗留 wal/shm 一并清理"
+    );
+    assert!(!anchor.join("attachments").exists(), "空附件目录一并清理");
+    assert!(
+        anchor.join(crate::conf::CONFIG_FILE).is_file(),
+        "配置文件必须保留（指针仍指向新目录）"
+    );
+    assert!(
+        state2.old_backup_stats().is_none(),
+        "清理后存储页不再显示迁移备份"
+    );
+    assert!(dest.join("corpmail.db").is_file(), "新目录数据完好");
+    assert_eq!(
+        AppState::resolve_start_dir(&anchor),
+        dest,
+        "定位不受清理影响"
+    );
+    // 幂等：再次重启不误删任何东西（无遗留可清）
+    drop(state2);
+    AppState::open_with_anchor(&dest, &anchor);
+    assert!(dest.join("corpmail.db").is_file());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 迁移重启后：旧目录遗留库有邮件 → 自动清理跳过，备份保留给用户手动删
+#[test]
+fn auto_clean_keeps_backup_when_old_db_has_mails() {
+    let base = temp_dir("auto-clean-keep");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    save_draft(
+        &state,
+        &crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            subject: "遗留数据".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+        },
+    )
+    .unwrap();
+    let dest = base.join("moved");
+    state.move_data_dir(dest.to_str().unwrap()).unwrap();
+    drop(state);
+    let state2 = AppState::open_with_anchor(&dest, &anchor);
+    assert!(
+        anchor.join("corpmail.db").is_file(),
+        "有邮件的遗留库不得被自动清理"
+    );
+    assert!(
+        state2.old_backup_stats().is_some(),
+        "存储页仍应显示迁移备份"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
