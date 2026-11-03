@@ -422,15 +422,56 @@ function mbxUpgradeHtml() {
     }
 }
 
-// htmx 发请求前注入编辑器当前 HTML。不能靠 submit 事件刷新 hidden：
-// htmx 的 submit 处理先注册（defer 顺序 htmx→app.js）且序列化发生在
-// 其 handler 内，后注册的 submit 监听来不及更新字段值。
+// htmx 发请求前注入编辑器当前 HTML，并执行"超大内嵌图片转附件"策略：
+// ≥2MB 的 data:image 从正文剥离为 inline_images 参数（后端落为附件），
+// 编辑器内替换为占位说明，防止 base64 撑爆单封体积。
+// 注：不能靠 submit 事件刷新 hidden——htmx 的 submit 处理先注册
+//（defer 顺序 htmx→app.js），后注册的监听来不及更新字段值。
+var MBX_INLINE_IMG_LIMIT = 2 * 1024 * 1024;
+
+function mbxExtractOversizedInlineImages(html) {
+    var converted = [];
+    var out = html.replace(/<img[^>]*src="(data:image\/[^"]+)"[^>]*>/gi, function (tag, uri) {
+        // data:<mime>;base64,<payload>
+        var m = uri.match(/^data:(image\/[a-z0-9.+-]+);base64,(.*)$/i);
+        if (!m) return tag;
+        var payload = m[2];
+        // base64 长度 ≈ 字节 * 4/3
+        var approxBytes = Math.floor(payload.length * 3 / 4);
+        if (approxBytes < MBX_INLINE_IMG_LIMIT) return tag;
+        var ext = (m[1].split('/')[1] || 'png').split('+')[0];
+        converted.push({ name: 'image.' + ext, mime: m[1], data: payload });
+        return '<p>〔图片超过 2MB，已转为附件：image.' + ext + '〕</p>';
+    });
+    return { html: out, converted: converted };
+}
+
+function mbxMigrateInlineImages() {
+    if (mbxEditor) {
+        var r = mbxExtractOversizedInlineImages(mbxEditor.getHtml());
+        if (r.converted.length > 0) {
+            mbxEditor.setHtml(r.html);
+            return r.converted;
+        }
+    }
+    return [];
+}
+
 document.body.addEventListener('htmx:configRequest', function (ev) {
-    const detail = ev.detail || {};
-    const elt = detail.elt;
-    const hidden = document.getElementById('body-html');
+    var detail = ev.detail || {};
+    var elt = detail.elt;
+    var hidden = document.getElementById('body-html');
     if (mbxEditor && hidden && elt && typeof elt.querySelector === 'function'
         && elt.querySelector('#body-html') && detail.parameters) {
+        var converted = mbxMigrateInlineImages();
+        if (converted.length > 0) {
+            detail.parameters['inline_images'] = JSON.stringify(converted);
+            var note = document.querySelector('.compose-note-inline') || document.createElement('div');
+            note.className = 'compose-note ok compose-note-inline';
+            note.textContent = '✓ ' + converted.length + ' 张超过 2MB 的内嵌图片已转为附件，将随邮件发送';
+            var card = document.querySelector('.compose-card');
+            if (card) card.insertBefore(note, card.firstChild);
+        }
         detail.parameters['body_html'] = mbxEditor.getHtml();
     }
 });

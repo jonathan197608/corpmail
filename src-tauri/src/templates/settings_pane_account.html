@@ -36,6 +36,10 @@
                     <input type="text" name="display_name" value="{{ display_name }}">
                 </div>
             </div>
+            {# 集团邮箱指引：放 pair 之后独立全宽行（.pf 双列内放不下完整路径文案） #}
+            {% if is_ct_domain %}
+            <div class="ct-guide">⚠ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</div>
+            {% endif %}
 
             <div class="settings-actions">
                 <button type="button" class="btn" hx-post="/settings/account/test-smtp" hx-target="#smtp-result"

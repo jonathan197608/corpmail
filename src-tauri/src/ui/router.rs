@@ -287,6 +287,8 @@ struct SetupCtx {
     data_dir: String,
     /// 凭据保管说明（按编译平台自适应：Windows 凭据管理器 / macOS 钥匙串）
     cred_note: String,
+    /// 账号域名为 chinatelecom.cn：客户端专用密码/拉取范围需 OA 预先设置，展示指引
+    is_ct_domain: bool,
 }
 
 /// 首启向导·完成页
@@ -1004,13 +1006,46 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
     render_html("compose.html", &ctx)
 }
 
+/// 内嵌图片载荷（表单 inline_images JSON 数组项）
+#[derive(serde::Deserialize)]
+struct InlineImageForm {
+    name: String,
+    mime: String,
+    /// base64（data:image 载荷部分，不带前缀）
+    data: String,
+}
+
+/// 解析 inline_images 表单域为字节载荷（解码失败剔除并记日志，不阻断保存）
+fn parse_inline_images(form: &HashMap<String, String>) -> Vec<mail::InlineImage> {
+    let Some(raw) = form.get("inline_images") else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_str::<Vec<InlineImageForm>>(raw) else {
+        eprintln!("[compose] inline_images 解析失败，忽略");
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter_map(|f| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(f.data.as_bytes())
+                .ok()
+                .map(|bytes| mail::InlineImage {
+                    filename: format!("image-{}-{}", mail::now_epoch(), f.name),
+                    mime: f.mime,
+                    bytes,
+                })
+        })
+        .collect()
+}
+
 /// 存/覆盖草稿（POST /compose/draft）：表单含 keep_ids/attach_paths（JSON 数组）
 fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
         return render_html("welcome.html", &());
     }
     match save_compose_form(state, req) {
-        Ok((id, skipped)) => Resp::hx_redirect(&format!(
+        Ok((id, skipped, _)) => Resp::hx_redirect(&format!(
             "/compose?draft_id={id}&saved=1{}",
             skipped_suffix(skipped)
         )),
@@ -1029,7 +1064,7 @@ fn skipped_suffix(skipped: usize) -> String {
 
 /// 撰写表单公共保存（存草稿与发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
 /// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回 (邮件 id, 被跳过的空文件数)。
-fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, String)> {
+fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize), (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
@@ -1079,7 +1114,11 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize), (i64, 
         // 0 字节文件被跳过（不再整单失败），数量回传给页面提示
         skipped = skipped_names.len();
     }
-    Ok((id, skipped))
+    // 超大内嵌图片转附件（前端已把它从正文剥离，此处落库为附件）
+    let inlines = parse_inline_images(&form);
+    let converted = mail::add_inline_images(state, id, &inlines)
+        .map_err(|e| (id, format!("内嵌图片转附件失败：{e}")))?;
+    Ok((id, skipped, converted))
 }
 
 /// 发送（POST /compose/send §9）：先存最新内容 → 原子排队（重复提交 0 行，幂等 §7）
@@ -1089,13 +1128,16 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
         return render_html("welcome.html", &());
     }
     match save_compose_form(state, req) {
-        Ok((id, skipped)) => {
-            // 有空文件被跳过时先回撰写页确认：绝不带着"以为已附加"的认知把信发出去
+        Ok((id, skipped, converted)) => {
+            // 空文件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
             if skipped > 0 {
                 return redirect_compose(
                     id,
                     &format!("已跳过 {skipped} 个 0 字节文件（未附加），请确认附件后再次发送"),
                 );
+            }
+            if converted > 0 {
+                eprintln!("[compose] {converted} 张超大内嵌图片已转为附件随信发送");
             }
             if mail::enqueue_draft(state, id) {
                 state.enqueue_send(id);
@@ -1262,8 +1304,20 @@ fn wizard_setup_page(state: &AppState) -> Resp {
             .pending_data_dir()
             .unwrap_or_else(|| state.data_dir().display().to_string()),
         cred_note: cred_storage_note(),
+        is_ct_domain: is_ct_mail_domain(&g(keys::ACCOUNT_DOMAIN)),
     };
     render_html("setup.html", &ctx)
+}
+
+/// 是否集团统一邮箱域名（chinatelecom.cn）：需在 OA 预先生成客户端专用密码、
+/// 开启客户端收取选项，向导/设置页据此展示指引文案
+/// 是否集团统一邮箱域名（chinatelecom.cn）：需在 OA 预先生成客户端专用密码、
+/// 开启客户端收取选项，向导/设置页据此展示指引文案（settings.rs 复用）
+pub(crate) fn is_ct_mail_domain(domain: &str) -> bool {
+    domain
+        .trim()
+        .trim_start_matches('@')
+        .eq_ignore_ascii_case("chinatelecom.cn")
 }
 
 /// 凭据保管文案（编译期平台自适应；模板不再写死两个平台名）

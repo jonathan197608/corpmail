@@ -87,7 +87,9 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-#[derive(Debug)]
+/// 新邮件通知钩子类型（收件线程完成后调用，参数：本轮开始时刻、本轮新增数）
+pub(crate) type NotifyHook = std::sync::Arc<dyn Fn(i64, i64) + Send + Sync>;
+
 pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）。
@@ -104,6 +106,9 @@ pub struct AppState {
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
     /// 已读服务器回写唤醒口（seen worker；None = 未装配/测试环境，本地已读照常生效）
     seen_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// 新邮件通知钩子（收件线程完成后调用，参数 (本轮开始时刻, 本轮新增数)）。
+    /// None = 未装配（测试环境）；生产由 setup 注入系统通知闭包（notify.rs）
+    notify_hook: Mutex<Option<NotifyHook>>,
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）。
     /// pub(crate)：路由层回归测试需注入运行中态（C5 拒绝重拉）
     pub(crate) fetch_state: std::sync::Arc<Mutex<FetchState>>,
@@ -193,6 +198,7 @@ impl AppState {
             config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
             send_tx: Mutex::new(None),
             seen_tx: Mutex::new(None),
+            notify_hook: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
                 new_count: 0,
@@ -517,6 +523,11 @@ impl AppState {
         self.with_conn(|conn| read_fetch_cursor(conn, uv_key, uid_key))
     }
 
+    /// 装配新邮件通知钩子（lib.rs setup：打包 AppHandle 调 notify::on_fetch_finished）
+    pub fn set_notify_hook(&self, hook: NotifyHook) {
+        *self.notify_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
     pub fn start_fetch(&self) {
         // 挂起轮上限（审计 P1-5）：看门狗只复位 UI 状态，挂起线程仍在跑。
         // 达到上限即拒绝新轮并给出明确原因，而不是继续叠加线程
@@ -551,6 +562,12 @@ impl AppState {
         let last_sent = self.last_cursor(crate::mail::MailDest::Sent);
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
         let active_rounds = std::sync::Arc::clone(&self.active_rounds);
+        // 通知钩子提前 clone（spawn 要 'static，锁守卫不得跨线程）
+        let notify = self
+            .notify_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let cur_dir = self.data_dir();
         let db_path = cur_dir.join("corpmail.db");
         let data_dir = cur_dir;
@@ -572,6 +589,7 @@ impl AppState {
                 last,
                 last_sent,
                 epoch,
+                notify,
             });
         });
     }
@@ -1105,6 +1123,8 @@ struct FetchJob {
     last_sent: crate::mail::LastCursor,
     /// 本轮代际（fetch_cas_begin 发放；finish 时的凭证）
     epoch: u64,
+    /// 新邮件通知钩子（完成且 added>0 时在本线程内触发；None = 测试/未装配）
+    notify: Option<NotifyHook>,
 }
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
@@ -1309,7 +1329,12 @@ fn fetch_round(job: FetchJob) {
         last,
         last_sent,
         epoch,
+        notify,
     } = job;
+    // 本轮开始时刻：完成后作为新增邮件查询窗口下界（通知用）。
+    // 取在拆 job 后、首个入库前：宁可窗口稍宽（前一轮尾部重叠由进程内
+    // id 去重兜住），不可狭窄漏掉本轮早期入库的邮件。
+    let round_started_at = crate::mail::now_epoch();
     // finish 携带轮次凭证：epoch 失配（看门狗已复位/新一轮已开始）则仅记日志不写状态，
     // 防止挂起轮迟到完成污染当前轮的展示
     let finish = |new_count: i64, error: String| {
@@ -1415,6 +1440,10 @@ fn fetch_round(job: FetchJob) {
                     format!("收件完成，但发件箱未同步：{sent_err}")
                 };
                 finish(added as i64, msg);
+                // 新邮件摘要通知（异步钩子在收件线程内触发；失败静默不影响主流程）
+                if let Some(hook) = notify {
+                    hook(round_started_at, added as i64);
+                }
                 done = true;
                 break;
             }

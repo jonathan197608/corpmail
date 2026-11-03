@@ -40,17 +40,17 @@
                     <label>主题</label>
                     <input type="text" name="subject" value="{{ subject }}">
                 </div>
-                <div class="sfield">
-                    <label>正文
-                        <span class="body-mode-hint">{% if body_mode == 'html' %}富文本{% else %}纯文本{% endif %}</span>
-                    </label>
+                <div class="sfield body-field">
+                    {# 无标签栏：正文区全宽（wangEditor 工具栏即视觉分区） #}
                     <input type="hidden" name="body_mode" id="body-mode" value="{{ body_mode }}">
 
                     {# 纯文本区：textarea + 单向升级入口（HTML 不能降级回纯文本） #}
                     <div id="body-plain" {% if body_mode == 'html' %}hidden{% endif %}>
+                        <div class="plain-head">
+                            <button type="button" class="btn small upgrade-btn" onclick="mbxUpgradeHtml()"
+                                    title="把当前纯文本转为富文本（不可再降级）">切换为富文本 ›</button>
+                        </div>
                         <textarea name="body_text" id="body-text" rows="14">{{ body_text }}</textarea>
-                        <button type="button" class="btn small upgrade-btn" onclick="mbxUpgradeHtml()"
-                                title="把当前纯文本转为富文本（不可再降级）">切换为富文本</button>
                     </div>
 
                     {# 富文本区（wangEditor 5，MIT，ui-dist/vendor/wang-editor/）：

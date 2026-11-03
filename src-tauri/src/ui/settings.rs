@@ -30,6 +30,8 @@ pub(super) struct SettingsCtx {
     smtp_security: String,
     account_prefix: String,
     account_domain: String,
+    /// 域名为 chinatelecom.cn：展示客户端专用密码/拉取范围 OA 指引
+    is_ct_domain: bool,
     display_name: String,
     recv_host: String,
     recv_port: String,
@@ -171,6 +173,7 @@ pub(super) fn settings_ctx(
     let domain = g(keys::ACCOUNT_DOMAIN);
     // 凭据降级态需在 prefix/domain 被 move 进字段前算（借用先于所有权转移）
     let degraded = state.secrets_degraded(&full_address(&prefix, &domain));
+    let is_ct_domain = crate::ui::router::is_ct_mail_domain(&domain);
     SettingsCtx {
         frame: frame_of(&prefix, &domain, &display, "", &counts),
         tab: tab.into(),
@@ -179,6 +182,7 @@ pub(super) fn settings_ctx(
         smtp_security: g(keys::SMTP_SECURITY),
         account_prefix: prefix,
         account_domain: domain,
+        is_ct_domain,
         display_name: display,
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),

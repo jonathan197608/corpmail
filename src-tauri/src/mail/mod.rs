@@ -1248,6 +1248,60 @@ pub fn add_attachments(
     result
 }
 
+/// 富文本撰写页"超大内嵌图片转附件"策略的载荷形态（前端从 data:image 抽取）
+#[derive(Clone)]
+pub struct InlineImage {
+    pub filename: String,
+    pub mime: String,
+    /// 原始字节（非 base64——解码在解析表单 JSON 时完成）
+    pub bytes: Vec<u8>,
+}
+
+/// 内嵌图片入库为附件（与 add_attachments 同一套分级存储语义）。
+/// 前端把 ≥2MB 的 data:image 从正文抽出转到这里，防止内嵌 base64 撑爆单封体积。
+pub fn add_inline_images(
+    state: &AppState,
+    email_id: i64,
+    imgs: &[InlineImage],
+) -> Result<usize, String> {
+    if imgs.is_empty() {
+        return Ok(0);
+    }
+    let limit = inline_limit(state);
+    let root = attach_root(state);
+    let month = month_dir_of(state, email_id);
+    let mut written_files: Vec<PathBuf> = Vec::new();
+    let result = state.with_conn(|conn| {
+        let tx = conn.transaction().map_err(e)?;
+        let mut count = 0usize;
+        for img in imgs {
+            insert_attachment(
+                &AttachCtx {
+                    tx: &tx,
+                    root: &root,
+                    month: &month,
+                    email_id,
+                    limit,
+                },
+                &img.filename,
+                &img.mime,
+                &img.bytes,
+                &mut written_files,
+            )?;
+            count += 1;
+        }
+        sync_attach_stats(&tx, email_id)?;
+        tx.commit().map_err(e)?;
+        Ok(count)
+    });
+    if result.is_err() {
+        for f in &written_files {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+    result
+}
+
 /// 草稿重存时按 keep 列表裁剪附件（删除行 + 独立文件；attach_cnt/bytes 回写）
 pub fn remove_attachments_except(
     state: &AppState,
