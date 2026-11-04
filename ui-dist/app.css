@@ -2543,3 +2543,8 @@ a.btn.link.disabled {
 .md-attach-title .att-save-all {
     margin-left: auto;
 }
+
+/* 撤销发送 toast（A1）：文案 + 按钮同行，按钮不撑高 toast */
+.toast .toast-undo {
+    margin-left: 10px;
+}

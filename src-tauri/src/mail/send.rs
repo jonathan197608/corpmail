@@ -188,10 +188,41 @@ pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
     })
 }
 
+/// 撤销窗口（A1）：立即发送不再直接入队，而是先设 scheduled_at = now + secs
+/// （status 保持 draft），由调度线程到点派发；窗口内可 POST /undo-send 拦截。
+/// 返回是否设置成功（仅 draft 态可设：已入队/已发送的不动，幂等）。
+pub fn schedule_send_in(state: &AppState, id: i64, secs: i64) -> bool {
+    let at = now_epoch() + secs.max(1);
+    state.with_conn(|conn| {
+        conn.execute(
+            "UPDATE emails SET status = 'draft', error = NULL, scheduled_at = ?2
+             WHERE id = ?1 AND status = 'draft'",
+            rusqlite::params![id, at],
+        )
+        .map(|n| n == 1)
+        .unwrap_or(false)
+    })
+}
+
+/// 取消待发送（A1 撤销 / 定时取消）：仅当仍在 draft 且尚未派发时生效。
+/// 返回是否真的取消（已入队/已发送返回 false，调用方据此提示窗口已过）。
+pub fn cancel_scheduled_send(state: &AppState, id: i64) -> bool {
+    state.with_conn(|conn| {
+        conn.execute(
+            "UPDATE emails SET scheduled_at = 0
+             WHERE id = ?1 AND status = 'draft' AND scheduled_at > 0",
+            [id],
+        )
+        .map(|n| n == 1)
+        .unwrap_or(false)
+    })
+}
+
 /// 定时发送调度（M4-2）：补发/扫描到点草稿。命中 folder/status 均为 draft 且
 /// scheduled_at > 0 且已到点（<= now）的行，逐封入队并唤醒发送 worker，
-/// 返回派发数。由常驻调度线程每 20s 与启动首轮调用；应用关闭期间到点的
-/// 邮件在下次启动立即补发。单个 enqueue 失败仅记日志（下轮重扫自然重试）
+/// 返回派发数。由常驻调度线程每 2s（A1 撤销窗口需要秒级精度）与启动首轮调用；
+/// 应用关闭期间到点的邮件在下次启动立即补发。单个 enqueue 失败仅记日志
+/// （下轮重扫自然重试）
 pub fn dispatch_due_scheduled(state: &AppState) -> usize {
     let now = now_epoch();
     let due: Vec<i64> = state.with_conn(|conn| {

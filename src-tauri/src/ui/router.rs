@@ -331,6 +331,8 @@ struct ComposeCtx {
     /// 定时发送时刻（M4-2，datetime-local 控件值 `YYYY-MM-DDTHH:MM`；空 = 非定时）。
     /// 供控件回显 + 隐藏域初值（提交时服务端同一字符串再解析）
     sched_local: String,
+    /// 刚撤销发送（A1）：显示「已撤销，可继续编辑」提示
+    undone: bool,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -436,6 +438,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         // M3-1 草稿自动保存：与存草稿同一保存路径，返回轻量 JSON（无跳转）
         ("POST", "/compose/autosave") => Some(compose_autosave(state, req)),
         ("POST", "/compose/send") => Some(compose_send(state, req)),
+        // A1 撤销发送：窗口内清 scheduled_at 回撰写页；窗口外提示已发出
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/undo-send") => {
+            Some(email_undo_send(state, req))
+        }
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/resend") => {
             Some(email_resend(state, req))
         }
@@ -848,6 +854,21 @@ fn email_delete(state: &AppState, req: &Req) -> Resp {
             q.push_str(&format!("error={}", urlencode(&format!("删除失败：{e}"))));
             Resp::hx_redirect(&format!("/emails/{id}?{q}"))
         }
+    }
+}
+
+/// 撤销发送（POST /emails/{id}/undo-send，A1）：只在撤销窗口内有效
+/// （status=draft 且 scheduled_at 未到点）。成功回撰写页继续编辑；
+/// 窗口已过（已入队/已发出）回详情页提示，不误改发送状态。
+fn email_undo_send(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    if mail::cancel_scheduled_send(state, id) {
+        Resp::hx_redirect(&format!("/compose?draft_id={id}&undone=1"))
+    } else {
+        let msg = urlencode("发送已开始，撤销窗口已过（可在发件箱确认）");
+        Resp::hx_redirect(&format!("/emails/{id}?error={msg}"))
     }
 }
 
@@ -1438,6 +1459,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         forward_from: 0,
         forward_attach_cnt: 0,
         sched_local: String::new(),
+        undone: req.query_param("undone").map(|v| v == "1").unwrap_or(false),
     };
     if let Some(id) = req
         .query_param("draft_id")
@@ -1806,11 +1828,10 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             if converted > 0 {
                 eprintln!("[compose] {converted} 张超大内嵌图片已转为附件随信发送");
             }
-            if mail::enqueue_draft(state, id) {
-                state.enqueue_send(id);
-                // 入队成功：列表页据此启动发送反馈 toast（M1-6，轮询至终态）。
-                // 重复提交（enqueue 返回 false，已是 queued）不带——避免已在
-                // 发送中的邮件重置一次提示
+            // A1 撤销窗口：不立即入队，先写 scheduled_at = now + 8s（status 仍
+            // 为 draft），由调度线程到点派发；窗口内可 POST /undo-send 拦截。
+            // 列表页据此启动倒计时 toast（先给撤销按钮，再轮询至终态）。
+            if mail::schedule_send_in(state, id, UNDO_SEND_SECS) {
                 just_sent = Some(id);
             }
             // 发送完成 → 回来源文件夹列表（保持过滤/翻页），而非停详情页。
@@ -2352,6 +2373,10 @@ fn clamp_page(raw: Option<&str>) -> i64 {
 /// 合法选项 10/20/50/100，clamp 而非白名单：直链任意值也能得到合理表现
 const PER_MIN: i64 = 10;
 const PER_MAX: i64 = 100;
+
+/// 撤销发送窗口（A1）：点发送后先等这么多秒才真正入队，
+/// 窗口内 toast 提供「撤销发送」。与 app.js 的倒计时保持一致。
+const UNDO_SEND_SECS: i64 = 8;
 
 /// URL per 参数归一：非法/缺省 → None，越界钳到 [PER_MIN, PER_MAX]
 fn clamp_per(raw: Option<&str>) -> Option<i64> {

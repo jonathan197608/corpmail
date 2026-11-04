@@ -1234,12 +1234,18 @@ fn compose_send_enqueues_and_redirects() {
         })
         .unwrap()
     });
-    assert_eq!(
-        status, "queued",
-        "发送应将草稿置排队（worker 侧未启动，状态保持）"
-    );
-    assert_eq!(folder, "draft", "排队态仍在草稿箱，sent 终态才迁移");
-    // 详情页（排队中）应带 2s 轮询属性与状态条
+    assert_eq!(status, "draft", "撤销窗口内保持草稿态，未立即入队（A1）");
+    assert_eq!(folder, "draft", "撤销窗口仍在草稿箱");
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    let now = mail::now_epoch();
+    assert!(at > now, "撤销窗口的 scheduled_at 应在未来：{at} vs {now}");
+    assert!(at <= now + 10, "撤销窗口应为 8 秒左右：{at} vs {now}");
+    // 详情页：窗口内显示「即将发送」+ 撤销按钮，不做 2s 轮询
     let html = body(&route(
         &state,
         &assets(),
@@ -1249,11 +1255,12 @@ fn compose_send_enqueues_and_redirects() {
             imap_ok: true,
         },
     ));
+    assert!(html.contains("即将发送"), "应显示即将发送状态：{html}");
+    assert!(html.contains("/undo-send"), "应提供撤销入口：{html}");
     assert!(
-        html.contains("hx-trigger=\"every 2s\""),
-        "排队态详情页应轮询"
+        !html.contains("hx-trigger=\"every 2s\""),
+        "撤销窗口内不应轮询"
     );
-    assert!(html.contains("排队中"), "排队态应显示状态条");
     cleanup(&dir);
 }
 
@@ -1911,9 +1918,9 @@ fn compose_send_is_idempotent_on_repeat() {
                 imap_ok: true,
             },
         );
-        // 首轮入队成功 → 带 just_sent；幂等轮 enqueue 返回 false → 不带
-        // （避免已在发送中的邮件重置一次反馈轮询）
-        let expected = if i == 0 { "/?just_sent=1" } else { "/" };
+        // A1 后语义：两轮都处于草稿态（无调度线程时窗口未到期），
+        // 重复提交 = 重新确认发送 → 重置撤销窗口并再次带 just_sent
+        let expected = "/?just_sent=1";
         assert!(
             resp.extra_headers
                 .iter()
@@ -1934,10 +1941,15 @@ fn compose_send_is_idempotent_on_repeat() {
         })
         .unwrap()
     });
-    assert_eq!(
-        status, "queued",
-        "第二次提交不应把 queued 拉回 draft 后再入队失败"
-    );
+    assert_eq!(status, "draft", "重复提交保持在撤销窗口（未入队）");
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert!(at > mail::now_epoch(), "撤销窗口应被重置到未来");
+    assert!(at <= mail::now_epoch() + 10, "窗口仍为 8 秒左右");
     assert!(error.is_none());
     cleanup(&dir);
 }
@@ -3782,6 +3794,20 @@ fn dump_smoke_html() {
         .unwrap();
     }
     dump("email-attachments.html", get(&format!("/emails/{d1}")));
+
+    // A1 撤销窗口素材：即将发送详情（scheduled_at = now+5）+ 撤销后的撰写页提示
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET scheduled_at = ?1 WHERE id = ?2",
+            rusqlite::params![mail::now_epoch() + 5, d1],
+        )
+        .unwrap();
+    });
+    dump("email-scheduled-soon.html", get(&format!("/emails/{d1}")));
+    dump(
+        "compose-undone.html",
+        get_url(&format!("/compose?draft_id={d1}&undone=1")),
+    );
 
     // 首设直切素材：全新状态真实走一遍向导（含自定义目录）。
     // 验证点：done 页“已设置（无需重启）”、存储页当前目录 = 新目录且无“待生效/备份”
@@ -5906,8 +5932,11 @@ fn compose_schedule_send_flow() {
         )
         .unwrap()
     });
-    assert_eq!(status, "queued", "清空定时后立即发送应排队");
-    assert_eq!(at, 0, "发送路径应清除 scheduled_at");
+    assert_eq!(status, "draft", "清空定时后立即发送先进入撤销窗口（A1）");
+    assert!(
+        at > mail::now_epoch() && at <= mail::now_epoch() + 10,
+        "撤销窗口的 scheduled_at 应为未来 8 秒左右：{at}"
+    );
 
     cleanup(&dir);
 }
@@ -6509,5 +6538,99 @@ fn save_all_attachments_route_writes_and_reports_errors() {
     );
     assert_eq!(resp.status, 200, "错误应回 toast 而非 500");
     assert!(body(&resp).contains("目录不存在"));
+    cleanup(&dir);
+}
+
+/// A1 撤销发送：窗口内撤销 → 清 scheduled_at 回撰写页（带 undone 提示）；
+/// 窗口已过（已入队）→ 拒绝撤销并回详情页提示，不改发送状态
+#[test]
+fn undo_send_cancels_window_or_reports_too_late() {
+    let (state, dir) = temp_state("a1-undo");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 发送（进入撤销窗口）
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "待撤销"),
+                ("body_text", "正文"),
+                ("body_mode", "plain"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    // 撤销：回撰写页并带 undone=1
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/undo-send", b""),
+        &t,
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/compose?draft_id=1&undone=1"),
+        "撤销应回撰写页：{:?}",
+        resp.extra_headers
+    );
+    let (status, at): (String, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT status, scheduled_at FROM emails WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(status, "draft");
+    assert_eq!(at, 0, "撤销应清除 scheduled_at");
+    // 撰写页提示已撤销
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "draft_id=1&undone=1", b""),
+        &t,
+    ));
+    assert!(html.contains("已撤销发送"), "撰写页应提示已撤销：{html}");
+    // 模拟窗口已过（调度线程已入队）：撤销请求应被拒绝
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET status = 'queued', scheduled_at = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/undo-send", b""),
+        &t,
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        loc.starts_with("/emails/1?error="),
+        "窗口已过应回详情页提示：{loc}"
+    );
+    let status: String = state.with_conn(|c| {
+        c.query_row("SELECT status FROM emails WHERE id = 1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(status, "queued", "拒绝撤销不得改动发送状态");
     cleanup(&dir);
 }

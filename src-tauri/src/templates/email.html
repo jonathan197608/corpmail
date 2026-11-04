@@ -18,8 +18,17 @@
         {% endif %}
         {# 定时发送（M4-2）：草稿带 scheduled_at 到点由调度线程自动入队。 #}
         {% if email.status == 'draft' and email.scheduled_at > 0 %}
+        {% if email.scheduled_soon %}
+        {# A1 撤销窗口：8 秒内点进详情仍可拦截 #}
+        <div class="md-status sending">⏳ 即将发送（撤销窗口内）
+            <button type="button" class="btn small"
+                    hx-post="/emails/{{ email.id }}/undo-send"
+                    hx-trigger="click throttle:500ms" hx-disabled-elt="this">撤销发送</button>
+        </div>
+        {% else %}
         <div class="md-status sending">⏰ 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
         <div class="sched-tip">修改或取消：编辑草稿并调整定时时间；或清空定时后「发送」立即发出。</div>
+        {% endif %}
         {% endif %}
         {% if email.status == 'queued' %}
         <div class="md-status sending">⏳ 排队中，即将发送…</div>

@@ -339,21 +339,26 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     });
 }
 
-/// 定时发送调度线程（M4-2）：每 20s 扫描到点草稿并派发。
+/// 定时发送调度线程（M4-2 + A1）：每 2s 扫描到点草稿并派发。
+/// A1 撤销窗口只有 8 秒，扫描间隔必须降到秒级（否则窗口被扫描周期吞掉）；
+/// 查询走 idx_scheduled_due 部分索引，2s 一次的代价可忽略。
 /// 启动即扫一轮——应用关闭期间到点的定时邮件，下次启动立即补发。
-/// 同一轮兼作托盘角标兑底刷新：missed poke（未穷举的未读变更点）
-/// 至多一个扫描周期内自动收敛
+/// 同一轮兼作托盘角标兑底刷新：每 10 轮（20s）一次，保持原有节奏
 fn spawn_send_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
         let dispatched = mail::dispatch_due_scheduled(&handle.state::<state::AppState>());
         if dispatched > 0 {
             eprintln!("[sched] 启动补发定时邮件 {dispatched} 封");
         }
+        let mut tick = 0u32;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_secs(2));
             let state = handle.state::<state::AppState>();
             mail::dispatch_due_scheduled(&state);
-            tray::refresh_badge(&handle);
+            tick += 1;
+            if tick.is_multiple_of(10) {
+                tray::refresh_badge(&handle);
+            }
         }
     });
 }

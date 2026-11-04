@@ -288,10 +288,11 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     }
 });
 
-// ---------- 列表页：发送后瞬时反馈（M1-6） ----------
-// 发送跳回列表携带 just_sent=N（compose_send 入队成功时附加）：
-// toast 即时提示"发送中…"并轮询 /emails/{id}/status 至终态：
-// - sent → "已发送"（ok）2.5s 后淡出；failed → 错误文案（err）停留 6s
+// ---------- 列表页：发送后瞬时反馈（M1-6）+ 撤销发送窗口（A1） ----------
+// 发送跳回列表携带 just_sent=N（compose_send 排入撤销窗口时附加）：
+// - 前 8 秒：toast 显示倒计时 + 「撤销发送」（POST /undo-send 回撰写页）
+// - 倒计时结束：转为"邮件发送中…"，轮询 /emails/{id}/status 至终态：
+//   sent → "已发送"（ok）2.5s 后淡出；failed → 错误文案（err）停留 6s
 // - 终态后刷新列表区+侧栏（复用收取完成同一刷新路径），"发送中"行落定
 // - 1.2s 间隔轮询；30s 未终态（SMTP 卡顿）不再打扰，提示稍后到发件箱查看
 // URL 参数即刻清除（replaceState 不触发导航），刷新页面不会重复提示
@@ -304,9 +305,23 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     history.replaceState(null, '', location.pathname + (clean ? '?' + clean : ''));
     var slot = document.getElementById('toast');
     if (!slot) return;
+    var UNDO_SECS = 8;
+    var left = UNDO_SECS;
     var toast = document.createElement('div');
     toast.className = 'toast busy';
-    toast.textContent = '邮件发送中…';
+    var label = document.createElement('span');
+    label.textContent = '邮件已进入发送队列（' + left + ' 秒内可撤销）';
+    toast.appendChild(label);
+    var undo = document.createElement('button');
+    undo.type = 'button';
+    undo.className = 'btn small toast-undo';
+    undo.textContent = '撤销发送';
+    undo.addEventListener('click', function () {
+        undo.disabled = true;
+        // htmx 会跟随 HX-Redirect 整页跳到撰写页（继续编辑）
+        htmx.ajax('POST', '/emails/' + id + '/undo-send', { target: 'body', swap: 'none' });
+    });
+    toast.appendChild(undo);
     slot.appendChild(toast);
     var started = Date.now();
     var settle = function (text, cls, stayMs) {
@@ -316,7 +331,7 @@ document.body.addEventListener('mbx:starDone', function (ev) {
         if (window.mbxOnFetchDone) mbxOnFetchDone();
         setTimeout(function () { toast.remove(); }, stayMs);
     };
-    (function poll() {
+    var poll = function () {
         fetch('/emails/' + id + '/status', { cache: 'no-store' })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (s) {
@@ -332,7 +347,19 @@ document.body.addEventListener('mbx:starDone', function (ev) {
                 setTimeout(poll, 1200);
             })
             .catch(function () { return settle('网络异常，发送状态未知', 'err', 6000); });
-    })();
+    };
+    // 撤销倒计时；到点后移除按钮并转入发送轮询
+    var timer = setInterval(function () {
+        left -= 1;
+        if (left > 0) {
+            label.textContent = '邮件已进入发送队列（' + left + ' 秒内可撤销）';
+            return;
+        }
+        clearInterval(timer);
+        if (undo.parentNode) undo.remove();
+        label.textContent = '邮件发送中…';
+        poll();
+    }, 1000);
 })();
 
 // ---------- 撰写页：收件人/抄送联系人建议（模糊匹配姓名或地址） ----------

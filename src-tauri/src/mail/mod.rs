@@ -23,8 +23,8 @@ pub use recv::{
 #[cfg(test)]
 pub use recv::{FetchOutcome, store_incoming};
 pub use send::{
-    RealSender, SmtpConfig, dispatch_due_scheduled, dispatch_one, enqueue_draft,
-    recover_interrupted_sends, reopen_failed,
+    RealSender, SmtpConfig, cancel_scheduled_send, dispatch_due_scheduled, dispatch_one,
+    recover_interrupted_sends, reopen_failed, schedule_send_in,
 };
 
 use crate::err as e;
@@ -1575,6 +1575,9 @@ pub struct EmailDetail {
     pub scheduled_at: i64,
     /// 定时时刻完整文本 `YYYY-MM-DD HH:MM`（scheduled_at=0 时为空串；模板直接渲染）
     pub scheduled_full: String,
+    /// 撤销窗口内（scheduled_at 在未来 10s 内，A1）：详情页显示「即将发送」
+    /// 而非「已定时」，提示此时仍可撤销
+    pub scheduled_soon: bool,
     /// 原始信头（A5；空串 = 旧版本收取或未保存）：源码页排查投递/编码问题
     pub raw_headers: String,
     pub attachments: Vec<AttachView>,
@@ -1618,6 +1621,10 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         scheduled_full: {
                             let at = r.get::<_, i64>(19)?;
                             if at > 0 { time_full(at) } else { String::new() }
+                        },
+                        scheduled_soon: {
+                            let at = r.get::<_, i64>(19)?;
+                            at > 0 && at <= now_epoch() + 10
                         },
                         raw_headers: r.get(20)?,
                         attachments: Vec::new(),
