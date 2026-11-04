@@ -1,17 +1,26 @@
-{# 侧栏（主界面 / 设置页 / 撰写页共用；上下文：frame）#}
+{# 侧栏（主界面 / 设置页 / 撰写页共用；上下文：frame）
+   图标规范（2026-11-04 审查）：outline/低填充符号字形瘦小、视觉占不满
+   按钮画面——统一换 open emoji 形态（📥📤📝👥🩶⚙，实心饱满，各平台
+   渲染一致）；brand 用内联 SVG 信封（几何可控，30px 盒内填满）。 #}
 <aside class="side">
     <div class="brand">
-        <span class="brand-mark">✉</span>
+        <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                <path d="M2 5.5A2.5 2.5 0 0 1 4.5 3h15A2.5 2.5 0 0 1 22 5.5v13a2.5 2.5 0 0 1-2.5 2.5h-15A2.5 2.5 0 0 1 2 18.5v-13Zm2.7.5 7.3 5.4L19.3 6H4.7Zm15.3 2-6.9 5.1a2 2 0 0 1-2.3 0L4 8v10.5c0 .3.2.5.5.5h15a.5.5 0 0 0 .5-.5V8Z"/>
+            </svg>
+        </span>
         <div><b>CorpMail</b><small>企业邮箱客户端</small></div>
     </div>
-    <a class="compose-btn" href="/compose"><span class="ico">✎</span>撰写邮件</a>
-    <div class="side-title">文件夹</div>
-    <a class="folder {% if frame.folder == 'inbox' %}on{% endif %}" href="/?folder=inbox">📥 收件箱 <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
+    <a class="compose-btn" href="/compose"><span class="ico">✏️</span>撰写邮件</a>
+    <a class="folder {% if frame.folder == 'inbox' %}on{% endif %}" href="/?folder=inbox">📥 <span class="fw">收件箱</span> <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>
-    <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">📤 发件箱 <span class="cnt">{{ frame.sent }}</span></a>
-    <a class="folder {% if frame.folder == 'draft' %}on{% endif %}" href="/?folder=draft">📝 草稿箱 <span class="cnt">{{ frame.draft }}</span></a>
+    <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">📤 <span class="fw">发件箱</span> <span class="cnt">{{ frame.sent }}</span></a>
+    <a class="folder {% if frame.folder == 'draft' %}on{% endif %}" href="/?folder=draft">📝 <span class="fw">草稿箱</span> <span class="cnt">{{ frame.draft }}</span></a>
     {# 联系人管理（M3-3）：随收/发件自动采集，支持搜索与删除 #}
-    <a class="folder {% if frame.folder == 'contacts' %}on{% endif %}" href="/contacts">👥 联系人</a>
+    <a class="folder {% if frame.folder == 'contacts' %}on{% endif %}" href="/contacts">👥 <span class="fw">联系人</span></a>
+    {# 设置入口（2026-11-04）：从底部账号区 gear 迁到侧栏列表——bottom 区
+       常年不移动形成"盲区"，列表内入口随视线自然扫到 #}
+    <a class="folder settings-entry {% if frame.folder == 'settings' %}on{% endif %}" href="/settings">⚙️ <span class="fw">设置</span></a>
     {# 收件状态条（原全局浮条移入侧栏；空闲态每 8s 低频轮询——否则后台定时收取
        完成时 just_finished 无人消费，前端永不刷新；收取中每 2s） #}
     <div id="fetch-status" class="fetch-status fetch-status-side"
@@ -23,7 +32,6 @@
                 <div class="who">{{ frame.display_name }}</div>
                 <div class="addr">{{ frame.full_addr }}</div>
             </div>
-            <a class="gear" href="/settings" title="设置">⚙</a>
         </div>
     </div>
 </aside>

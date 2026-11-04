@@ -14,7 +14,7 @@
         {% if notice %}<div class="compose-note err">{{ notice }}</div>{% endif %}
 
         {% if email.too_large %}
-        <div class="md-status sending">⚠ 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
+        <div class="md-status sending">⚠️ 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
         {% endif %}
         {# 定时发送（M4-2）：草稿带 scheduled_at 到点由调度线程自动入队。 #}
         {% if email.status == 'draft' and email.scheduled_at > 0 %}
@@ -47,25 +47,25 @@
                         hx-post="/emails/{{ email.id }}/star"
                         hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
                         aria-pressed="{% if email.starred %}true{% else %}false{% endif %}"
-                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}★ 已星标{% else %}☆ 星标{% endif %}</button>
+                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}⭐ 已星标{% else %}<span class="dim">⭐</span> 星标{% endif %}</button>
                 {% if email.folder == 'draft' %}
                 <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                   title="打开草稿继续编辑">✎ 编辑</a>
+                   title="打开草稿继续编辑">✏️ 编辑</a>
                 {% elif email.folder == 'sent' %}
                 <a class="btn primary" href="/compose?edit_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                   title="载入该邮件内容到撰写页，修改后重新发送">✎ 重新编辑</a>
+                   title="载入该邮件内容到撰写页，修改后重新发送">✏️ 重新编辑</a>
                 {% else %}
                 {% if email.direction == 'in' %}
-                <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复</a>
-                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✎ 回复全部</a>
+                <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✏️ 回复</a>
+                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✏️ 回复全部</a>
                 {% endif %}
-                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↗ 转发</a>
+                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↪️ 转发</a>
                 {% endif %}
                 <button type="button" class="btn danger"
                         hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                         hx-trigger="click throttle:500ms"
                         hx-disabled-elt="this"
-                        hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑 删除</button>
+                        hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑️ 删除</button>
             </div>
             <div class="md-head">
                 <div class="md-row">

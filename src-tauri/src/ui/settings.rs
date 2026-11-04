@@ -185,7 +185,9 @@ pub(super) fn settings_ctx(
     let degraded = state.secrets_degraded(&full_address(&prefix, &domain));
     let is_ct_domain = crate::ui::router::is_ct_mail_domain(&domain);
     SettingsCtx {
-        frame: frame_of(&prefix, &domain, &display, "", &counts),
+        // 侧栏设置入口高亮（2026-11-04 迁入 folder 列表）：设置页 frame
+        // folder 记 "settings"，side.html 的 .settings-entry 据此点亮
+        frame: frame_of(&prefix, &domain, &display, "settings", &counts),
         tab: tab.into(),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),

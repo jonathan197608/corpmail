@@ -28,7 +28,7 @@
                 <label>密码 / 授权码</label>
                 <input type="password" name="password" required autocomplete="new-password">
                 {% if is_ct_domain %}
-                <p class="ct-guide">⚠ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
+                <p class="ct-guide">⚠️ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
                 {% endif %}
             </div>
                 <div class="sfield">
@@ -85,7 +85,7 @@
                             {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
                     </div>
                     {% if is_ct_domain %}
-                    <p class="ct-guide">⚠ 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
+                    <p class="ct-guide">⚠️ 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
                     {% endif %}
                 </div>
                 <div class="sfield">

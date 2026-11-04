@@ -12,11 +12,11 @@
         {# 会话/单封视图切换（M2-2）：仅收件箱/全部启用；保留 folder/unread/external/q，翻页重置 #}
         {% if folder == 'inbox' or folder == 'all' %}
         <a class="unread-toggle thread-toggle {% if is_thread %}on{% endif %}" href="{{ thread_href }}"
-           title="按主题归组往来邮件（会话视图）">{% if is_thread %}📄 单封视图{% else %}💬 会话视图{% endif %}</a>
+           title="按主题归组往来邮件（会话视图）">{% if is_thread %}🗒️ 单封视图{% else %}💬 会话视图{% endif %}</a>
         {% endif %}
         <button class="sync-btn" type="button" id="fetch-btn"
                 hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
-                hx-trigger="click throttle:3000ms" hx-disabled-elt="this"><span class="ico">⟳</span>收取新邮件</button>
+                hx-trigger="click throttle:3000ms" hx-disabled-elt="this"><span class="ico">🔄</span>收取新邮件</button>
         {# 每页条数（默认 10；选择即提交回当前列表，页码重置，其余筛选/视图保持。
            服务端将选择持久化到 settings，下次无参访问沿用） #}
         <form class="per-form" method="get" action="/" title="列表每页显示条数">
@@ -93,9 +93,9 @@
             <span class="ba-spacer"></span>
             <button type="button" class="btn small" data-batch="read">标已读</button>
             <button type="button" class="btn small" data-batch="unread">标未读</button>
-            <button type="button" class="btn small star-op" data-batch="star">★ 星标</button>
-            <button type="button" class="btn small star-op" data-batch="unstar">☆ 取消星标</button>
-            <button type="button" class="btn small danger" data-batch="delete">🗑 删除</button>
+            <button type="button" class="btn small star-op" data-batch="star">⭐ 星标</button>
+            <button type="button" class="btn small star-op" data-batch="unstar">✩ 取消星标</button>
+            <button type="button" class="btn small danger" data-batch="delete">🗑️ 删除</button>
             <button type="button" class="btn small ghost" id="ba-clear">取消</button>
             <input type="hidden" id="batch-mode" value="ids">
             <input type="hidden" id="batch-exclude" value="[]">
@@ -166,7 +166,7 @@
             <div class="empty-mark">📭</div>
             <h2>这里还没有邮件</h2>
             <p>撰写并保存的草稿会出现在这里，<br>收取与发送功能将在后续版本开放。</p>
-            <a class="btn" href="/compose">✎ 撰写邮件</a>
+            <a class="btn" href="/compose">✏️ 撰写邮件</a>
             {% endif %}
         </div>
     {% endif %}

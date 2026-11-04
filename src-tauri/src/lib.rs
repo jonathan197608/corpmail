@@ -47,11 +47,9 @@ pub fn run() {
         // 附件目录（WAL 容许多连接，但收件/清理双线程互踩会互相平白发工作）。
         // 第二实例不进入 run，交出 argv 后立即退出
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.unminimize();
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+            // 唤起聚焦与托盘左键/菜单同一实现（tray::show_main：
+            // unminimize + show + set_focus，窗口曾被隐藏时 show 幂等恢复）
+            tray::show_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())

@@ -71,7 +71,7 @@
                 </div>
 
                 <div class="attach-area">
-                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎 添加附件</button>
+                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎️ 添加附件</button>
                     <ul id="picked-list" class="att-list"></ul>
                     {% if attachments %}
                     <div class="kept-title">已保存的附件（保存草稿时保留）</div>
@@ -106,8 +106,8 @@
                     <input type="hidden" name="scheduled_at" id="sched-at" value="{{ sched_local }}">
                     <button type="button" class="btn primary big"
                             hx-post="/compose/send" hx-include="closest form"
-                            hx-trigger="click throttle:500ms" hx-disabled-elt="this">✉ 发送</button>
-                    <button type="submit" class="btn big">💾 存草稿</button>
+                            hx-trigger="click throttle:500ms" hx-disabled-elt="this">📨 发送</button>
+                    <button type="submit" class="btn big">💾️ 存草稿</button>
                 </div>
             </form>
         </div>

@@ -1415,7 +1415,7 @@ fn star_endpoint_toggles_and_pins_to_top() {
         },
     ));
     assert!(
-        detail.contains("★ 已星标"),
+        detail.contains("⭐ 已星标"),
         "详情页星标按钮应回显已星标文案"
     );
     // 再翻一次（取消）→ 置顶解除
@@ -4750,7 +4750,7 @@ fn detail_actions_render_at_top_with_reply_all() {
         html.contains("/compose?draft_id=3"),
         "草稿箱应有编辑入口：{html}"
     );
-    assert!(html.contains(">✎ 编辑</a>"), "草稿箱按钮应为编辑：{html}");
+    assert!(html.contains(">✏️ 编辑</a>"), "草稿箱按钮应为编辑：{html}");
     assert!(
         !html.contains("forward_from=3"),
         "草稿箱不应有转发入口：{html}"
@@ -4794,14 +4794,15 @@ fn side_frame_returns_bare_sidebar_fragment() {
     assert!(frag.contains("<aside"), "应为侧栏片段：{frag}");
     assert!(!frag.contains("<!doctype"), "不应带整页布局");
     assert!(frag.contains("fetch-status"), "侧栏含收件状态条");
-    // 计数与高亮：收件箱 1 / 未读 1；当前 folder=sent 高亮
+    // 计数与高亮：收件箱 1 / 未读 1；当前 folder=sent 高亮（2026-11-04 起
+    // 文件夹名套 .fw 胶囊、列表增加设置行，断言按新结构）
     assert!(
-        frag.contains("收件箱 <span class=\"cnt\">1"),
+        frag.contains("收件箱") && frag.contains("<span class=\"cnt\">1"),
         "计数应刷新：{frag}"
     );
     assert!(frag.contains("发件箱"), "应有发件箱入口");
     assert!(
-        frag.contains(r#"<a class="folder on" href="/?folder=sent""#),
+        frag.contains(r#"class="folder on" href="/?folder=sent""#),
         "folder 参数应驱动高亮：{frag}"
     );
     cleanup(&dir);
@@ -6200,6 +6201,53 @@ fn list_rows_show_starred_as_spine_not_button() {
     assert!(
         !html.contains("data-mail-id=\"1\" class") || !html.contains("star-btn"),
         "会话行无星标按钮"
+    );
+    cleanup(&dir);
+}
+
+/// 侧栏改版（2026-11-04）：「文件夹」分组标题删除；设置入口从底部 gear
+/// 迁到联系人下方的 folder 行（settings-entry，可被收取屏蔽）；核心图标
+/// emoji 化（瘦符号换实心形态）
+#[test]
+fn side_settings_entry_in_folder_list_and_no_folder_title() {
+    let (state, dir) = temp_state("side-entry");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    // 「文件夹」标题删除（分组自明，冗余）
+    assert!(
+        !html.contains("side-title") && !html.contains(">文件夹<"),
+        "侧栏不应再有「文件夹」分组标题"
+    );
+    // 设置入口：folder 列表内 settings-entry（gear 已除名）
+    assert!(
+        html.contains("settings-entry") && html.contains("⚙️"),
+        "设置应为侧栏 folder 行入口"
+    );
+    assert!(!html.contains("class=\"gear\""), "底部 gear 入口应移除");
+    // 位置：设置行紧跟联系人行（DOM 顺序 = 渲染顺序）
+    let contacts_pos = html.find("/contacts").unwrap_or(usize::MAX);
+    let settings_pos = html.find("/settings").unwrap_or(usize::MAX);
+    assert!(
+        contacts_pos < settings_pos,
+        "设置入口应在联系人下方（DOM 序）"
+    );
+    // emoji 化核心图标在场（侧栏/列表/操作）
+    assert!(html.contains("📥"), "收件箱 emoji");
+    assert!(html.contains("👥"), "联系人 emoji");
+    assert!(html.contains("🔄"), "收取按钮 emoji");
+    assert!(html.contains("✏️"), "撰写 emoji");
+    // 设置页侧栏：settings-entry 高亮（frame.folder=settings）
+    let html = body(&route(&state, &assets(), &req("GET", "/settings", b""), &t));
+    assert!(
+        html.contains("folder settings-entry on"),
+        "设置页侧栏设置行应高亮：{}",
+        html.lines().nth(30).unwrap_or("?")
     );
     cleanup(&dir);
 }

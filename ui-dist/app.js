@@ -186,7 +186,7 @@ function mbxSyncFetchButton() {
     const running = !!(status && status.getAttribute('data-running') === 'true');
     const btn = document.getElementById('fetch-btn');
     if (btn) btn.disabled = running;
-    const gear = document.querySelector('a.gear');
+    const gear = document.querySelector('a.settings-entry');
     if (gear) {
         gear.classList.toggle('disabled', running);
         gear.title = running ? '收取中，完成后可进入设置' : '设置';
@@ -194,7 +194,7 @@ function mbxSyncFetchButton() {
 }
 // click 兜底：即使 focus/键盘等绕过 pointer-events，仍阻止 disabled 齿轮跳转
 document.body.addEventListener('click', ev => {
-    const gear = ev.target.closest('a.gear');
+    const gear = ev.target.closest('a.settings-entry');
     if (gear && gear.classList.contains('disabled')) ev.preventDefault();
 });
 document.body.addEventListener('htmx:afterSwap', mbxSyncFetchButton);
