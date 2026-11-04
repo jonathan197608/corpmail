@@ -16,6 +16,7 @@ use crate::mail::{self, AttachView, EmailSummary, html_escape};
 use crate::state::{self, AppState, defaults, full_address, keys};
 use crate::templates;
 use crate::ui::Assets;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
@@ -478,6 +479,8 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         // M3-3 联系人管理页：整页 + 删除（htmx 片段刷新列表）
         ("GET", "/contacts") => Some(contacts_page(state, req)),
         ("POST", "/contacts/delete") => Some(contacts_delete(state, req)),
+        // B3 手动新增/编辑联系人（addr 主键不可改；已存在时只更新姓名）
+        ("POST", "/contacts/save") => Some(contacts_save(state, req)),
         ("GET", "/side/frame") => Some(side_frame(state, req)),
         // A4 全部另存：必须在通用 attachments 分支之前（all 不是数字 id）
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/attachments/all") => {
@@ -1213,6 +1216,13 @@ struct ContactsCtx {
     q: String,
     total: usize,
     items: Vec<ContactView>,
+    /// 手动保存结果（B3；空串 = 无提示）
+    notice: String,
+    error: String,
+    /// 编辑态（B3）：地址非空时顶部表单预填并锁定地址
+    edit_addr: String,
+    edit_name: String,
+    editing: bool,
 }
 
 /// 联系人条目展示（首字母头像 + 最近联系时间标签）
@@ -1224,10 +1234,27 @@ struct ContactView {
     avatar: String,
     time_label: String,
     hits: i64,
+    /// 编辑链接的地址参数（已百分号编码；模板直接拼 query）
+    edit_qs: String,
 }
 
-/// 联系人列表渲染（整页 contacts.html 与删除后片段 contacts_area.html 共用）
+/// 联系人列表渲染（整页 contacts.html 与删除/保存后片段 contacts_area.html 共用）
 fn contacts_ctx(state: &AppState, q: &str) -> ContactsCtx {
+    contacts_ctx_full(state, q, "", "", "")
+}
+
+fn contacts_ctx_with(state: &AppState, q: &str, notice: &str, error: &str) -> ContactsCtx {
+    contacts_ctx_full(state, q, "", notice, error)
+}
+
+/// 编辑态取姓名（地址不存在则退化为新增表单，不报错）
+fn contacts_ctx_full(
+    state: &AppState,
+    q: &str,
+    edit_addr: &str,
+    notice: &str,
+    error: &str,
+) -> ContactsCtx {
     let rows = state
         .with_conn(|conn| mail::contacts::list_rows(conn, q, 500))
         .unwrap_or_default();
@@ -1249,6 +1276,7 @@ fn contacts_ctx(state: &AppState, q: &str) -> ContactsCtx {
             } else {
                 "—".into()
             },
+            edit_qs: urlencode(&r.addr),
             hits: r.hits,
         })
         .collect::<Vec<_>>();
@@ -1258,6 +1286,26 @@ fn contacts_ctx(state: &AppState, q: &str) -> ContactsCtx {
         q: q.to_string(),
         total,
         items,
+        notice: notice.to_string(),
+        error: error.to_string(),
+        edit_name: if edit_addr.is_empty() {
+            String::new()
+        } else {
+            state
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT name FROM contacts WHERE addr = ?1",
+                        [edit_addr],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        },
+        edit_addr: edit_addr.to_string(),
+        editing: !edit_addr.is_empty(),
     }
 }
 
@@ -1266,12 +1314,45 @@ fn contacts_page(state: &AppState, req: &Req) -> Resp {
         return render_html("welcome.html", &());
     }
     let q = req.query_param("q").unwrap_or_default().trim().to_string();
-    let ctx = contacts_ctx(state, &q);
+    let edit = req.query_param("edit").unwrap_or_default();
+    let ctx = contacts_ctx_full(state, &q, edit.trim(), "", "");
     if req.is_htmx_request {
         render_html("contacts_area.html", &ctx)
     } else {
         render_html("contacts.html", &ctx)
     }
+}
+
+/// 新增/编辑联系人（B3，POST /contacts/save）：返回当前搜索态列表片段。
+/// addr 是主键，编辑只改姓名；校验失败/超长回错误提示，不落库。
+fn contacts_save(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let form = parse_form(&req.body);
+    let addr_raw = form.get("addr").cloned().unwrap_or_default();
+    let name = form.get("name").cloned().unwrap_or_default();
+    let q = form
+        .get("q")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let (notice, error) = match mail::contacts::validate_addr(&addr_raw) {
+        Ok(_addr) if name.trim().chars().count() > 60 => {
+            (String::new(), "姓名最多 60 个字符".to_string())
+        }
+        Ok(addr) => {
+            let now = mail::now_epoch();
+            match state.with_conn(|conn| mail::contacts::save_manual(conn, &addr, &name, now)) {
+                Ok(()) => (format!("已保存联系人 {addr}"), String::new()),
+                Err(e) => (String::new(), format!("保存失败：{e}")),
+            }
+        }
+        Err(e) => (String::new(), e),
+    };
+    let ctx = contacts_ctx_with(state, &q, &notice, &error);
+    render_html("contacts_area.html", &ctx)
 }
 
 /// 删除联系人（M3-3，POST /contacts/delete）：删后返回当前搜索态列表片段

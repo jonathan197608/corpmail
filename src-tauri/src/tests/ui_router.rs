@@ -3886,6 +3886,11 @@ fn dump_smoke_html() {
         "contacts-search.html",
         get_url("/contacts?q=%E7%8E%8B"), // 「王」
     );
+    // B3 编辑态素材（地址回填 + 只读）
+    dump(
+        "contacts-edit.html",
+        get_url("/contacts?edit=boss%40chinatelecom.cn"),
+    );
 
     // M5 检索素材："激励"命中收件与草稿（标题 <mark> 高亮）/ 无命中空态
     dump("main-search.html", get_url("/?q=%E6%BF%80%E5%8A%B1"));
@@ -5747,7 +5752,7 @@ fn contacts_page_lists_searches_and_deletes() {
             imap_ok: true,
         },
     ));
-    assert!(html.contains("boss@x.cn"), "列表应含地址");
+    assert!(html.contains("boss@x.cn"), "列表应含地址：{html}");
     assert!(html.contains("王副总"), "列表应含姓名");
     assert!(
         html.contains("联系人 <span class=\"sub\">2 位"),
@@ -6799,5 +6804,115 @@ fn template_settings_and_compose_picker() {
     );
     let html = body(&resp);
     assert!(html.contains("还没有模板"), "删除后回到空态");
+    cleanup(&dir);
+}
+
+/// B3 联系人手动新增/编辑：校验、hits 不因编辑变化、编辑态回显
+#[test]
+fn contact_save_creates_updates_and_validates() {
+    let (state, dir) = temp_state("b3-contact");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 新增（无搜索词）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/contacts/save",
+            &form(&[("addr", "New.Peer@Example.com"), ("name", "新同事")]),
+        ),
+        &t,
+    );
+    let html = body(&resp);
+    assert!(
+        html.contains("已保存联系人 New.Peer@Example.com"),
+        "应回保存提示：{html}"
+    );
+    assert!(html.contains("新同事"), "列表应出现新联系人");
+    let (name, hits): (String, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT name, hits FROM contacts WHERE addr = 'New.Peer@Example.com'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(name, "新同事");
+    assert_eq!(hits, 1, "手动新增 hits 从 1 起");
+    // 编辑：只改姓名，hits 不变
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/contacts/save",
+            &form(&[("addr", "new.peer@example.com"), ("name", "改名后")]),
+        ),
+        &t,
+    );
+    assert!(body(&resp).contains("已保存联系人"));
+    let (name, hits): (String, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT name, hits FROM contacts WHERE addr = 'New.Peer@Example.com'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(name, "改名后");
+    assert_eq!(hits, 1, "手动编辑不应累加往来次数");
+    let total: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(total, 1, "NOCASE 主键下同地址不应新增行");
+    // 非法地址与超长姓名
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/contacts/save",
+            &form(&[("addr", "not-an-addr"), ("name", "")]),
+        ),
+        &t,
+    );
+    assert!(body(&resp).contains("缺少 @"), "应提示地址格式");
+    let long_name = "名".repeat(61);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/contacts/save",
+            &form(&[("addr", "ok@x.cn"), ("name", long_name.as_str())]),
+        ),
+        &t,
+    );
+    assert!(body(&resp).contains("最多 60"), "应提示姓名超长");
+    let total: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(total, 1, "非法输入不应落库");
+    // 编辑态回显：地址只读、姓名预填
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "edit=New.Peer%40Example.com", b""),
+        &t,
+    );
+    let html = body(&resp);
+    assert!(
+        html.contains("value=\"New.Peer@Example.com\""),
+        "应预填地址：{html}"
+    );
+    assert!(html.contains("readonly"), "编辑态地址只读");
+    assert!(html.contains("value=\"改名后\""), "应预填姓名");
+    assert!(html.contains("保存修改"), "按钮文案切换");
     cleanup(&dir);
 }

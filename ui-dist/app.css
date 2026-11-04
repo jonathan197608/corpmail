@@ -2713,3 +2713,70 @@ a.btn.link.disabled {
 .tpl-edit .sfield {
     margin-top: 8px;
 }
+
+/* ============ 联系人新增/编辑（B3） ============ */
+.ct-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 0 16px 10px;
+    padding: 10px 12px;
+    background: #f7f9fc;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+}
+
+.ct-form {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.ct-form input {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 9px;
+    font-size: 12.5px;
+    background: var(--panel);
+    color: var(--ink);
+    width: 210px;
+}
+
+.ct-form input[name="name"] {
+    width: 140px;
+}
+
+.ct-form input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.ct-form input[readonly] {
+    background: var(--bg);
+    color: var(--muted);
+}
+
+.ct-notice {
+    font-size: 12.5px;
+    padding: 3px 9px;
+    border-radius: 7px;
+}
+
+.ct-notice.ok {
+    background: #e8f6ec;
+    color: #1d7a3a;
+}
+
+.ct-notice.err {
+    background: #fdecec;
+    color: #a12a2a;
+}
+
+.ct-edit-link {
+    text-decoration: none;
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}

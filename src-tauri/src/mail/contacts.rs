@@ -206,3 +206,39 @@ pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 #[path = "../tests/contacts.rs"]
 mod tests;
+
+/// 地址格式校验（B3 手动新增/编辑）：必须含 @、无空白、长度上限 254。
+/// 只做"能作为邮件地址使用"的最低限度校验——联系人库不是协议解析器，
+/// 真投递时 SMTP 会再校验；这里拦住明显的误输入（缺 @、带空格）。
+pub fn validate_addr(addr: &str) -> Result<String, String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err("邮件地址不能为空".into());
+    }
+    if addr.len() > 254 {
+        return Err("邮件地址过长".into());
+    }
+    if addr.chars().any(char::is_whitespace) {
+        return Err("邮件地址不能包含空格".into());
+    }
+    let Some((local, domain)) = addr.rsplit_once('@') else {
+        return Err("邮件地址缺少 @".into());
+    };
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err("邮件地址格式不正确".into());
+    }
+    Ok(addr.to_string())
+}
+
+/// 手动新增/编辑（B3）：已存在时只更新姓名（hits 与往来次数语义无关，
+/// 不因手动编辑而累加）；新增时 hits=1。
+pub fn save_manual(conn: &Connection, addr: &str, name: &str, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
+         ON CONFLICT(addr) DO UPDATE SET
+             name = excluded.name,
+             updated_at = excluded.updated_at",
+        rusqlite::params![addr.trim(), name.trim(), now],
+    )?;
+    Ok(())
+}

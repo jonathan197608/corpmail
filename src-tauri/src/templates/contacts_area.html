@@ -11,6 +11,24 @@
             {% if q %}<a class="search-clear" href="/contacts" title="清除搜索">×</a>{% endif %}
         </form>
     </div>
+
+    {# B3 手动新增/编辑：地址是主键（编辑时只读，改地址请删除后重加）；
+       hx-include 保留搜索词，保存后回到同一过滤视图 #}
+    <div class="ct-toolbar">
+        <form class="ct-form" hx-post="/contacts/save" hx-target="#contacts-area"
+              hx-swap="outerHTML" hx-include="#contacts-search">
+            <input type="email" name="addr" value="{{ edit_addr }}" placeholder="someone@example.com"
+                   {% if editing %}readonly title="地址是主键，如需更换请删除后重新添加"{% endif %} required>
+            <input type="text" name="name" value="{{ edit_name }}" maxlength="60" placeholder="姓名（可选）">
+            <button class="btn small primary" type="submit">{{ '保存修改' if editing else '添加联系人' }}</button>
+            {% if editing %}
+            <a class="btn small" href="/contacts">取消</a>
+            {% endif %}
+        </form>
+        {% if notice %}<span class="ct-notice ok">{{ notice }}</span>{% endif %}
+        {% if error %}<span class="ct-notice err">{{ error }}</span>{% endif %}
+    </div>
+
     <div class="contacts-list">
     {% if items %}
         {% for c in items %}
@@ -24,6 +42,9 @@
                 <span class="ct-time" title="最近联系时间">{{ c.time_label if c.time_label == '—' else '最近 ' + c.time_label }}</span>
                 <span class="ct-hits" title="往来次数">往来 {{ c.hits }} 次</span>
             </div>
+            <a class="btn small ct-edit-link"
+               href="/contacts?edit={{ c.edit_qs }}"
+               title="修改姓名（地址不可改）">编辑</a>
             <button type="button" class="btn small danger ct-del"
                     hx-post="/contacts/delete"
                     hx-include="#contacts-search" hx-vals='{"addr": {{ c.addr | js_str }}}'
