@@ -7041,3 +7041,35 @@ fn compose_attach_eml_saves_once() {
     assert_eq!(d.attach_cnt, 1, "重存后仍只有一份 .eml");
     cleanup(&dir);
 }
+
+/// B5 打印入口：详情页提供打印按钮（调用 window.print，配合 @media print 隐藏界面）
+#[test]
+fn detail_page_has_print_action() {
+    let (state, dir) = temp_state("b5-print");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','打印测试',
+                     '正文','打印 测试','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("mbxPrintEmail()"),
+        "详情页应有打印按钮：{html}"
+    );
+    assert!(html.contains("🖨 打印"), "打印按钮文案：{html}");
+    cleanup(&dir);
+}

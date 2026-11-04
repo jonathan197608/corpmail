@@ -162,7 +162,12 @@ async function mbxPickSetupDir(btn) {
     }
 }
 
-// ---------- 附件预览（M5）：img / pdf / text 三类内嵌渲染 ----------
+// 打印邮件（B5）：@media print 只保留信头/正文/附件清单，系统对话框由 WebView 弹出
+function mbxPrintEmail() {
+    window.print();
+}
+
+// 附件预览（M5）：img / pdf / text 三类内嵌渲染
 // text 类服务端强制 text/plain 返回（防 text/html 脚本执行），前端 pre 渲染
 
 function mbxPreviewAttachment(url, kind, name) {

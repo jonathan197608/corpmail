@@ -76,6 +76,9 @@
                 {# B4 导出 .eml：选保存位置后由服务端重建报文写盘 #}
                 <button type="button" class="btn" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
                         title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">💾 导出 .eml</button>
+                {# B5 打印：系统打印对话框，@media print 只输出邮件内容（无侧栏/按钮） #}
+                <button type="button" class="btn" onclick="mbxPrintEmail()"
+                        title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">🖨 打印</button>
                 {# A5 源码排查：HTML/纯文本/原始信头（乱码、表格丢失、投递问题） #}
                 <a class="btn" href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
                    title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">🔎 源码</a>

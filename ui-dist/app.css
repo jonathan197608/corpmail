@@ -2780,3 +2780,85 @@ a.btn.link.disabled {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
+
+/* ============ B5 打印邮件（详情页） ============ */
+/* 打印时只保留邮件内容本身：侧栏/顶栏/操作按钮/状态条/预览层全部隐藏，
+   主区取消滚动与限高，长正文自动分页；HTML 正文保留原底色（color-adjust）。 */
+@page {
+    margin: 12mm;
+}
+
+@media print {
+    html,
+    body {
+        background: #fff !important;
+        overflow: visible !important;
+        height: auto !important;
+    }
+
+    .side,
+    .topbar,
+    .md-actions,
+    .md-status,
+    .sched-tip,
+    .toast-slot,
+    #toast,
+    #preview-modal,
+    .mail-detail .btn,
+    .att-row .btn {
+        display: none !important;
+    }
+
+    .app.on {
+        display: block !important;
+        height: auto !important;
+        min-height: 0 !important;
+        background: #fff !important;
+    }
+
+    .main {
+        display: block !important;
+        height: auto !important;
+        overflow: visible !important;
+        padding: 0 !important;
+        background: #fff !important;
+    }
+
+    .mail-detail {
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        overflow: visible !important;
+        max-height: none !important;
+    }
+
+    .md-head {
+        border-bottom: 1px solid #ccc !important;
+    }
+
+    .md-body {
+        min-height: 0 !important;
+        max-height: none !important;
+        overflow: visible !important;
+    }
+
+    .md-html,
+    .md-html * {
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+    }
+
+    .md-html img {
+        max-width: 100% !important;
+    }
+
+    .md-attach {
+        break-inside: avoid;
+    }
+
+    a {
+        color: inherit !important;
+        text-decoration: none !important;
+    }
+}
