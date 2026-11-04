@@ -202,7 +202,6 @@ struct AddrChip {
 pub(super) struct FrameCtx {
     pub(super) display_name: String,
     pub(super) full_addr: String,
-    pub(super) avatar: String,
     pub(super) inbox: i64,
     pub(super) inbox_unread: i64,
     pub(super) all_mail: i64,
@@ -2107,12 +2106,6 @@ pub(super) fn frame_of(
         } else {
             full_address(prefix, domain)
         },
-        avatar: display
-            .chars()
-            .next()
-            .or(prefix.chars().next())
-            .unwrap_or('✉')
-            .to_string(),
         inbox: counts["inbox"],
         inbox_unread: counts["inbox_unread"],
         all_mail: counts["all"],

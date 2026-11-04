@@ -26,12 +26,10 @@
     <div id="fetch-status" class="fetch-status fetch-status-side"
          hx-get="/emails/fetch/status" hx-trigger="load" hx-swap="outerHTML"></div>
     <div class="side-foot">
+        {# 账号信息（2026-11-04）：头像删除，姓名+邮箱两行占满侧栏宽 #}
         <div class="account">
-            <span class="avatar">{{ frame.avatar }}</span>
-            <div>
-                <div class="who">{{ frame.display_name }}</div>
-                <div class="addr">{{ frame.full_addr }}</div>
-            </div>
+            <div class="who">{{ frame.display_name }}</div>
+            <div class="addr">{{ frame.full_addr }}</div>
         </div>
     </div>
 </aside>
