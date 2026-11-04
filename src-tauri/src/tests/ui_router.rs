@@ -1394,9 +1394,15 @@ fn star_endpoint_toggles_and_pins_to_top() {
         "星标邮件应置顶：{}",
         top
     );
+    // 行内星标按钮已移除（2026-11-04 设计变更）：星标行以 starred class
+    // （金色脊线）表达，按钮仅存于详情页
     assert!(
-        h.contains("star-btn on\" data-mail-id=\"1\""),
-        "id=1 星标按钮应 on 态"
+        h.contains("mail-row starred"),
+        "星标行应以 starred class（金脊线）标记"
+    );
+    assert!(
+        !h.contains("class=\"star-btn on\""),
+        "列表行不应再有星标按钮"
     );
     // 详情页：按钮显示已星标态
     let detail = body(&route(
@@ -3155,10 +3161,11 @@ fn clamp_page_unifies_range() {
 fn clamped_beyond_data_page_renders_empty_state() {
     let (state, dir) = temp_state("clamp-page");
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
-    // PAGE_SIZE+1 封 → 2 页
+    // 默认每页 10：11 封 → 2 页（per 语义 2026-11-04：全局常量 PAGE_SIZE 已
+    // 除名，分页规格来自 settings/URL，本测试走 HTTP 路由即默认 10）
     state
         .with_conn(|c| {
-            for i in 0..(mail::PAGE_SIZE + 1) {
+            for i in 0..11 {
                 c.execute(
                     "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
                                     subject_tokens, body_tokens, created_at)
@@ -6053,5 +6060,146 @@ fn batch_actions_star_unstar() {
         .unwrap()
     });
     assert_eq!(starred, 0, "unstar 跨页全量应清零星标");
+    cleanup(&dir);
+}
+
+/// 每页条数（per）语义：默认 10；URL per=20 生效且持久化到 settings；
+/// 非法/越界钳制；非默认值在翻页链接与 list_query 往返保持
+#[test]
+fn list_per_page_select_and_persist() {
+    let (state, dir) = temp_state("per-page");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state
+        .with_conn(|c| {
+            for i in 0..25 {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn',?1,?1,'x',1)",
+                    [i],
+                )
+                .unwrap();
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 默认（无 per）：10 条/页、第 1 页显示 "1 / 3"
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    assert!(html.contains("1 / 3"), "25 封默认 10/页 = 3 页");
+    assert_eq!(html.matches("data-mail-id").count(), 10, "默认每页 10 行");
+    // 选择器存在且 selected=10
+    assert!(html.contains("per-select"), "顶栏应有每页选择器");
+    assert!(html.contains("<option value=\"10\" selected"));
+    // ?per=20：第 1 页显示 "1 / 2"、URL 持久化到 settings
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "per=20", b""),
+        &t,
+    ));
+    assert!(html.contains("1 / 2"), "25 封 per=20 = 2 页");
+    let saved: Option<String> = state.get(keys::PAGE_SIZE).unwrap();
+    assert_eq!(saved.as_deref(), Some("20"), "per 选择应持久化");
+    // 分页链接携带 per（page_base 注入；第 1 页下一页指向 page=2）
+    assert!(
+        html.contains("per=20&amp;page=2") || html.contains("per=20&page=2"),
+        "翻页链接应保持 per：{}",
+        html.lines().find(|l| l.contains("pg-cur")).unwrap_or("?")
+    );
+    // 无参访问沿用持久化值 20
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    assert!(html.contains("1 / 2"), "settings 持久化的 20 条/页应生效");
+    // 越界钳制：per=9999 → 100，25 封一页装下（无分页器）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "per=9999", b""),
+        &t,
+    ));
+    assert_eq!(
+        html.matches("data-mail-id").count(),
+        25,
+        "per 钳到 100 后 25 封一页"
+    );
+    // 非法值：回退 settings（已被上一步持久化为 100）不炸、不致 0 页
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "per=abc", b""),
+        &t,
+    ));
+    assert_eq!(
+        html.matches("data-mail-id").count(),
+        25,
+        "非法 per 应回退 settings(100)"
+    );
+    // list_query 往返（详情上下文）：per=20 进链
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "per=20&page=2", b""),
+        &t,
+    ));
+    assert!(
+        html.contains("per=20"),
+        "list_query 应携带非默认 per（详情往返保持）"
+    );
+    cleanup(&dir);
+}
+
+/// 列表行不再渲染星标按钮（2026-11-04 设计变更）：星标行以金色脊线 class
+/// 表达（.mail-row.starred），行内无 star-btn；批量工具栏 star/unstar 仍在
+#[test]
+fn list_rows_show_starred_as_spine_not_button() {
+    let (state, dir) = temp_state("star-spine");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "x.cn"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at, starred) VALUES
+                 ('in','inbox','received','a@x.cn','b@x.cn','星标件','星标件','x',1,1),
+                 ('in','inbox','received','a@x.cn','b@x.cn','普通件','普通件','x',1,0)",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    assert!(
+        html.contains("mail-row starred"),
+        "星标行应有 starred class（金脊线钩子）：{html}"
+    );
+    assert!(
+        !html.contains("class=\"star-btn on\""),
+        "列表行不应再有星标按钮"
+    );
+    assert!(
+        html.contains("data-batch=\"unstar\""),
+        "批量工具栏保留星标/取消星标操作"
+    );
+    // 会话视图同样无按钮
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "mode=thread", b""),
+        &t,
+    ));
+    assert!(
+        !html.contains("data-mail-id=\"1\" class") || !html.contains("star-btn"),
+        "会话行无星标按钮"
+    );
     cleanup(&dir);
 }

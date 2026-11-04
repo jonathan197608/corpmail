@@ -265,6 +265,7 @@ fn search_ranks_matches_and_highlights_subject() {
         unread_only: false,
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
+        per: 50,
     };
     let (items, total) = search(&state, "激励", &q).unwrap().unwrap();
     assert_eq!(total, 1);
@@ -291,6 +292,7 @@ fn search_ranks_matches_and_highlights_subject() {
         unread_only: false,
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
+        per: 50,
     };
     let inbox_result = search(&state, "激励", &q_inbox).unwrap().unwrap();
     assert_eq!(inbox_result.1, 0, "inbox 无邮件");
@@ -360,6 +362,7 @@ fn list_filters_folder_and_pages() {
             unread_only: false,
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
+            per: 10,
         },
     )
     .unwrap();
@@ -372,6 +375,7 @@ fn list_filters_folder_and_pages() {
             unread_only: false,
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
+            per: 10,
         },
     )
     .unwrap();
@@ -384,6 +388,7 @@ fn list_filters_folder_and_pages() {
             unread_only: true,
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
+            per: 10,
         },
     )
     .unwrap();
@@ -397,6 +402,7 @@ fn list_filters_folder_and_pages() {
             unread_only: false,
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
+            per: 10,
         },
     )
     .unwrap();
@@ -850,6 +856,7 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         unread_only: false,
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
+        per: 50,
     };
     let (items, total) = list_threads(&state, &q).unwrap();
     // 草稿/发送失败不入会、空主题不归组：只剩「会议(2)」「报价(1)」两组
@@ -871,6 +878,7 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         unread_only: false,
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
+        per: 50,
     };
     let (items, total) = list_threads(&state, &inbox).unwrap();
     assert_eq!(total, 2, "inbox 下两组（各 1 封）");

@@ -36,6 +36,8 @@ pub mod keys {
     pub const KEEP_SENT_DAYS: &str = "keep_sent_days";
     /// 签名档（M3-2，多行纯文本）：撰写新邮件时预填到正文底部；空 = 不启用
     pub const SIGNATURE: &str = "signature";
+    /// 每页显示条数（默认 10，列表页顶栏可选；URL per 参数覆盖）
+    pub const PAGE_SIZE: &str = "page_size";
     // 收件状态（M4，设计 §3 schema 注释"状态"节）
     pub const LAST_SYNC_AT: &str = "last_sync_at";
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
@@ -87,6 +89,7 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
         (keys::KEEP_INBOX_DAYS, "3650"),
         (keys::KEEP_SENT_DAYS, "3650"),
         (keys::SIGNATURE, ""),
+        (keys::PAGE_SIZE, "10"),
     ]
 }
 

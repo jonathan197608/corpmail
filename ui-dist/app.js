@@ -964,6 +964,9 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         var q = (val('ba-q') || '').trim();
         if (q) params.set('q', q);
         params.set('page', val('ba-page') || '1');
+        // 每页条数（M4/紧凑化）：批量后回列表片段保持用户的分页规格
+        var per = val('ba-per');
+        if (per && per !== '10') params.set('per', per);
         if (stateBox.mode === 'all') {
             params.set('select_all', '1');
             params.set('exclude_ids', JSON.stringify(stateBox.exclude));

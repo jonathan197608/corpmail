@@ -229,7 +229,9 @@ struct MainCtx {
     page: i64,
     pages: i64,
     total: i64,
-    /// 分页链接前缀（含 folder/unread/external/q 参数；模板拼 page=N）
+    /// 每页条数（当前生效值：URL per 或 settings；顶栏选择器回显）
+    per: i64,
+    /// 分页链接前缀（含 folder/unread/external/q/per 参数；模板拼 page=N）
     page_base: String,
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
@@ -520,6 +522,17 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         .map(|v| v == "1")
         .unwrap_or(false);
     let q_input = req.query_param("q").unwrap_or_default().trim().to_string();
+    // 每页条数：URL per 优先（选中即跳转并顺手持久化到 settings，下次无参
+    // 访问沿用；非法/缺省回退 settings，再退默认 10）。非默认值进 base
+    // /list_query，翻页、筛选开关、详情往返全部保持用户选择
+    let per_url = clamp_per(req.query_param("per").as_deref());
+    let settings_per = per_from_settings(state);
+    let per = per_url.unwrap_or(settings_per);
+    if let Some(p) = per_url
+        && p != settings_per
+    {
+        let _ = state.set_batch(&[(keys::PAGE_SIZE, p.to_string().as_str())]);
+    }
     // 内部域取账号域名（默认 chinatelecom.cn）：判定外部发件人的唯一口径
     let d = defaults();
     let internal_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
@@ -529,6 +542,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         unread_only,
         external_only,
         internal_domain,
+        per,
     };
     // 会话视图（M2-2）：mode=thread 且仅收件箱/全部下可用（草稿/已发保持单封）；
     // 搜索下同样可切会话（命中代表行=最新一封）
@@ -554,9 +568,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         };
         (items, Vec::new(), total)
     };
-    let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
-    // 基址 = folder + q（不含筛选）：两个开关各自"取反自己、保留对方"，
-    // 否则开关一次会丢掉另一个筛选（多筛选项并存时的常见坑）
+    let pages = (total + per - 1) / per;
+    // 基址 = folder + q + per（不含筛选）：两个开关各自"取反自己、保留对方"，
+    // 否则开关一次会丢掉另一个筛选（多筛选项并存时的常见坑）；per 恒带
+    // （默认 10 除外，保持 URL 干净）
     let mut base = if folder == "inbox" {
         "/?".to_string()
     } else {
@@ -564,6 +579,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     };
     if !q_input.is_empty() {
         base = format!("{base}q={}&", urlencode(&q_input));
+    }
+    if per != PER_MIN {
+        base = format!("{base}per={per}&");
     }
     let unread_part = if unread_only { "unread=1&" } else { "" };
     let external_part = if external_only { "external=1&" } else { "" };
@@ -606,6 +624,12 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
         list_query.push_str(&format!("q={}", urlencode(&q_input)));
     }
+    if per != PER_MIN {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("per={per}"));
+    }
     if page > 1 {
         if !list_query.is_empty() {
             list_query.push('&');
@@ -624,6 +648,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         page,
         pages,
         total,
+        per,
         page_base,
         q: q_input,
         items,
@@ -794,10 +819,11 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
                 .get("folder")
                 .cloned()
                 .unwrap_or_else(|| "inbox".into()),
-            page: 1, // 目标解析与页无关：全量命中
+            page: 1, // 目标解析与页无关：全量命中（per 同理不影响结果集）
             unread_only: form.get("unread").map(|v| v == "1").unwrap_or(false),
             external_only: form.get("external").map(|v| v == "1").unwrap_or(false),
             internal_domain: g(keys::ACCOUNT_DOMAIN),
+            per: PER_MIN,
         };
         // q（检索词）仅在非空时参与：批量检索结果全选 = 命中即选中。
         // 检索走 FTS MATCH，与列表检索同源；此处简化为非空时拒绝批量（检索
@@ -2110,24 +2136,30 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let page = get("page");
     let unread = get("unread");
     let external = get("external");
+    let per = get("per");
     rebuild_list_query(
         &folder,
         unread.as_deref(),
         external.as_deref(),
         q.as_deref(),
         page.as_deref(),
+        per.as_deref(),
     )
 }
 
-/// 列表上下文重组核心（folder/unread/external/q/page 白名单过滤）。
+/// 列表上下文查询串还原（详情页「返回列表」/撰写页回跳/批量操作重建列表
+/// 请求共用）：folder 恒带，unread/external/q 按需；per 仅非默认时携带
+/// （默认 10 时 URL 保持干净，详见 list_root per 解析注释）。
 /// 入口有三：Req 查询串（list_query_of）、表单隐藏域（发送/存草稿回跳）。
-/// 表单值客户端可控，重新过滤防注入畸形查询串。
+/// 表单值客户端可控，重新过滤防注入畸形查询串
+#[allow(clippy::too_many_arguments)]
 fn rebuild_list_query(
     folder: &str,
     unread: Option<&str>,
     external: Option<&str>,
     q: Option<&str>,
     page: Option<&str>,
+    per: Option<&str>,
 ) -> String {
     let folder = match folder {
         "all" | "sent" | "draft" | "inbox" => folder.to_string(),
@@ -2147,6 +2179,11 @@ fn rebuild_list_query(
     if let Some(q) = q.filter(|v| !v.trim().is_empty()) {
         qs.push(format!("q={}", urlencode(q)));
     }
+    if let Some(p) = clamp_per(per)
+        && p != PER_MIN
+    {
+        qs.push(format!("per={p}"));
+    }
     let page = clamp_page(page);
     if page > 1 {
         qs.push(format!("page={page}"));
@@ -2162,6 +2199,27 @@ fn clamp_page(raw: Option<&str>) -> i64 {
     raw.and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(1)
         .clamp(1, 100_000)
+}
+
+/// 每页条数下限（再少无意义）与上限（防恶意大值一次拉全表）。
+/// 合法选项 10/20/50/100，clamp 而非白名单：直链任意值也能得到合理表现
+const PER_MIN: i64 = 10;
+const PER_MAX: i64 = 100;
+
+/// URL per 参数归一：非法/缺省 → None，越界钳到 [PER_MIN, PER_MAX]
+fn clamp_per(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.clamp(PER_MIN, PER_MAX))
+}
+
+/// settings 中每页条数（缺省/非法 → 10；越界钳制）
+fn per_from_settings(state: &AppState) -> i64 {
+    let d = defaults();
+    state
+        .get_or(keys::PAGE_SIZE, &d)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(PER_MIN)
+        .clamp(PER_MIN, PER_MAX)
 }
 
 /// 表单隐藏域 list_query（compose 页透传的进入前列表上下文）重新过滤——
@@ -2186,6 +2244,7 @@ fn form_list_query(form: &HashMap<String, String>) -> String {
         pick("external"),
         pick("q"),
         pick("page"),
+        pick("per"),
     )
 }
 

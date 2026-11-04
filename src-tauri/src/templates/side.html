@@ -4,7 +4,7 @@
         <span class="brand-mark">✉</span>
         <div><b>CorpMail</b><small>企业邮箱客户端</small></div>
     </div>
-    <a class="compose-btn" href="/compose">✎ 撰写邮件</a>
+    <a class="compose-btn" href="/compose"><span class="ico">✎</span>撰写邮件</a>
     <div class="side-title">文件夹</div>
     <a class="folder {% if frame.folder == 'inbox' %}on{% endif %}" href="/?folder=inbox">📥 收件箱 <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>

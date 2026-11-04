@@ -38,9 +38,6 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// 列表分页大小
-pub const PAGE_SIZE: i64 = 50;
-
 // ---------- 分词（FTS 索引源，§4.1） ----------
 
 static JIEBA: std::sync::LazyLock<jieba_rs::Jieba> = std::sync::LazyLock::new(jieba_rs::Jieba::new);
@@ -779,6 +776,9 @@ pub struct ListQuery {
     pub external_only: bool,
     /// 账号内部域（如 chinatelecom.cn；用于判定外部发件人，空 = 无内部域）
     pub internal_domain: String,
+    /// 每页条数（路由层从 settings/URL 解析并钳制；list/search/list_threads
+    /// 统一以本字段作 LIMIT，不再用全局常量）
+    pub per: i64,
 }
 
 /// 外部发件人判定：域名与内部域相同或为其子域时为内部。
@@ -1086,7 +1086,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
     let where_sql = format!("WHERE 1=1{filter_sql}");
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
-    let offset = (page - 1).saturating_mul(PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(q.per);
     state.with_conn(|conn| {
         let total: i64 = conn
             .query_row(
@@ -1109,7 +1109,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         let rows = stmt
             .query_map(
                 rusqlite::named_params! {
-                    ":extf": ext_filter, ":dom": domain, ":lim": PAGE_SIZE, ":off": offset
+                    ":extf": ext_filter, ":dom": domain, ":lim": q.per, ":off": offset
                 },
                 |r| summary_from_row(r, None),
             )
@@ -1130,7 +1130,7 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
     let domain = q.internal_domain.trim();
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
-    let offset = (page - 1).saturating_mul(PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(q.per);
     // where_sql 作用于子查询内行（e 别名）：组级过滤沿用行级（代表行口径）
     let where_sql = format!(
         "WHERE 1=1{filter_sql}
@@ -1174,7 +1174,7 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
         let rows = stmt
             .query_map(
                 rusqlite::named_params! {
-                    ":extf": ext_filter, ":dom": domain, ":lim": PAGE_SIZE, ":off": offset
+                    ":extf": ext_filter, ":dom": domain, ":lim": q.per, ":off": offset
                 },
                 thread_summary_from_row,
             )
@@ -1375,7 +1375,7 @@ pub fn search(
     let ext_filter = if q.external_only { 1 } else { 0 };
     let domain = q.internal_domain.trim();
     let page = q.page.max(1);
-    let offset = (page - 1).saturating_mul(PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(q.per);
     let words = tokenize_words(input);
     state.with_conn(|conn| {
         let total: i64 = conn
@@ -1405,7 +1405,7 @@ pub fn search(
             .query_map(
                 rusqlite::named_params! {
                     ":match": match_expr, ":extf": ext_filter, ":dom": domain,
-                    ":lim": PAGE_SIZE, ":off": offset
+                    ":lim": q.per, ":off": offset
                 },
                 |r| summary_from_row(r, Some(&words)),
             )

@@ -16,7 +16,24 @@
         {% endif %}
         <button class="sync-btn" type="button" id="fetch-btn"
                 hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
-                hx-trigger="click throttle:3000ms" hx-disabled-elt="this">⟳ 收取新邮件</button>
+                hx-trigger="click throttle:3000ms" hx-disabled-elt="this"><span class="ico">⟳</span>收取新邮件</button>
+        {# 每页条数（默认 10；选择即提交回当前列表，页码重置，其余筛选/视图保持。
+           服务端将选择持久化到 settings，下次无参访问沿用） #}
+        <form class="per-form" method="get" action="/" title="列表每页显示条数">
+            <input type="hidden" name="folder" value="{{ folder }}">
+            {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
+            {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
+            {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
+            {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+            <label class="per-page">每页
+                <select class="per-select" name="per" aria-label="每页显示条数" onchange="this.form.submit()">
+                    <option value="10" {% if per == 10 %}selected{% endif %}>10 封</option>
+                    <option value="20" {% if per == 20 %}selected{% endif %}>20 封</option>
+                    <option value="50" {% if per == 50 %}selected{% endif %}>50 封</option>
+                    <option value="100" {% if per == 100 %}selected{% endif %}>100 封</option>
+                </select>
+            </label>
+        </form>
         <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
             <span>🔍</span>
             <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
@@ -30,13 +47,8 @@
            星标=组内任一；thread_count 徽标显示往来件数。批量操作不介入会话模式 #}
         {% if threads %}
         {% for t in threads %}
-        <div class="mail-row {% if t.unread %}unread{% endif %}" data-mail-id="{{ t.id }}" data-mail-unread="{{ 1 if t.unread else 0 }}">
-            {# 星标按钮：置顶组内任一星标（与单封视图同端点）；须在 <a> 链接外 #}
-            <button type="button" class="star-btn {% if t.starred %}on{% endif %}" data-mail-id="{{ t.id }}"
-                    hx-post="/emails/{{ t.id }}/star"
-                    hx-trigger="click throttle:300ms" hx-swap="none" hx-disabled-elt="this"
-                    aria-pressed="{% if t.starred %}true{% else %}false{% endif %}"
-                    title="{% if t.starred %}取消星标（不再置顶）{% else %}星标：置顶本信箱{% endif %}">★</button>
+        <div class="mail-row {% if t.starred %}starred{% endif %} {% if t.unread %}unread{% endif %}" data-mail-id="{{ t.id }}" data-mail-unread="{{ 1 if t.unread else 0 }}"
+             {% if t.starred %}title="已星标（置顶）"{% endif %}>
             <a class="mr-link" href="/threads/{{ t.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="mr-side">
                     <span class="mr-who-row"><span class="mr-dot" aria-hidden="true"></span><span class="mr-who">{{ t.from_display }}</span></span>
@@ -92,27 +104,22 @@
             <input type="hidden" id="ba-external" value="{{ '1' if external_only else '0' }}">
             <input type="hidden" id="ba-q" value="{{ q }}">
             <input type="hidden" id="ba-page" value="{{ page }}">
+            <input type="hidden" id="ba-per" value="{{ per }}">
             <input type="hidden" id="ba-total" value="{{ total }}">
         </div>
         {% for m in items %}
         {# 行 = div（复选框区）+ a（内容区链接）。复选框在链接**外**：
-           两者天然各管各的默认行为，无需任何 click 拦截——嵌套进 <a> 时
-           checkbox 激活行为与链接导航共享同一 click 默认行为，preventDefault
-           会连带取消勾选，WebView 编程点击下还会双重翻转（实测 2026-11-03） #}
-        <div class="mail-row {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
-             data-mail-id="{{ m.id }}" data-mail-unread="{{ 1 if m.unread else 0 }}">
+            两者天然各管各的默认行为，无需任何 click 拦截（2026-11-03 实测）。
+            星标不再有行内按钮：以左侧脊线色区分——金=星标置顶行、蓝=未读行
+            （星标与未读同存取金，未读另有蓝点+加粗表达），翻转入口在详情页
+            与批量工具栏 #}
+        <div class="mail-row {% if m.starred %}starred{% endif %} {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
+             data-mail-id="{{ m.id }}" data-mail-unread="{{ 1 if m.unread else 0 }}"
+             {% if m.starred %}title="已星标（置顶）"{% endif %}>
             <label class="mbx-check">
                 <input type="checkbox" class="mbx-item" value="{{ m.id }}">
             </label>
-            {# 星标按钮（M2-1）：与复选框同理必须在 <a> 链接外，避免激活行为与
-            导航冲突；hs-swap=none，翻转响应带 mbx:starDone 事件（携带新态），
-            app.js 列表页重拉片段（置顶重排）/详情页就地翻色 #}
-         <button type="button" class="star-btn {% if m.starred %}on{% endif %}" data-mail-id="{{ m.id }}"
-                 hx-post="/emails/{{ m.id }}/star"
-                 hx-trigger="click throttle:300ms" hx-swap="none" hx-disabled-elt="this"
-                 aria-pressed="{% if m.starred %}true{% else %}false{% endif %}"
-                 title="{% if m.starred %}取消星标（不再置顶）{% else %}星标：置顶本信箱{% endif %}">★</button>
-         <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
+            <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="mr-side">
                     <span class="mr-who-row"><span class="mr-dot" aria-hidden="true"></span><span class="mr-who">{{ m.from_display }}</span></span>
                     <span class="mr-time">{{ m.time_label }}</span>
