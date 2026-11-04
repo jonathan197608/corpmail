@@ -1920,6 +1920,13 @@ a.btn.link.disabled {
     border: 1px solid #f0dbe0;
 }
 
+/* 发送中反馈（M1-6）：中性蓝灰——还无终态，既非成功绿也非失败红 */
+.toast.busy {
+    background: #eef2f8;
+    color: var(--ink, #35527a);
+    border: 1px solid #dbe4f0;
+}
+
 .btn.small {
     font-size: 12px;
     padding: 4px 10px;

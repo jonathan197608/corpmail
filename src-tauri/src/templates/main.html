@@ -4,6 +4,8 @@
     {% include "side.html" %}
     <main class="main">
         {% include "mail_list.html" %}
+        {# 发送反馈 toast 承载（M1-6：发送跳回列表后轮询至终态） #}
+        <div id="toast" class="toast-slot"></div>
     </main>
 </div>
 {% endblock %}

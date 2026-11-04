@@ -243,6 +243,53 @@ function mbxOnFetchDone() {
 }
 document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 
+// ---------- 列表页：发送后瞬时反馈（M1-6） ----------
+// 发送跳回列表携带 just_sent=N（compose_send 入队成功时附加）：
+// toast 即时提示"发送中…"并轮询 /emails/{id}/status 至终态：
+// - sent → "已发送"（ok）2.5s 后淡出；failed → 错误文案（err）停留 6s
+// - 终态后刷新列表区+侧栏（复用收取完成同一刷新路径），"发送中"行落定
+// - 1.2s 间隔轮询；30s 未终态（SMTP 卡顿）不再打扰，提示稍后到发件箱查看
+// URL 参数即刻清除（replaceState 不触发导航），刷新页面不会重复提示
+(function () {
+    var params = new URLSearchParams(location.search);
+    var id = params.get('just_sent');
+    if (!id || !document.getElementById('list-area')) return;
+    params.delete('just_sent');
+    var clean = params.toString();
+    history.replaceState(null, '', location.pathname + (clean ? '?' + clean : ''));
+    var slot = document.getElementById('toast');
+    if (!slot) return;
+    var toast = document.createElement('div');
+    toast.className = 'toast busy';
+    toast.textContent = '邮件发送中…';
+    slot.appendChild(toast);
+    var started = Date.now();
+    var settle = function (text, cls, stayMs) {
+        toast.className = 'toast ' + cls;
+        toast.textContent = text;
+        // 终态刷新：列表区（过滤/页码保持）+侧栏计数，复用收取完成路径
+        if (window.mbxOnFetchDone) mbxOnFetchDone();
+        setTimeout(function () { toast.remove(); }, stayMs);
+    };
+    (function poll() {
+        fetch('/emails/' + id + '/status', { cache: 'no-store' })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (s) {
+                if (!s) return settle('发送状态查询失败，请在发件箱确认', 'err', 6000);
+                if (s.status === 'sent') return settle('✓ 已发送', 'ok', 2500);
+                if (s.status === 'failed') {
+                    return settle('发送失败：' + (s.error || '未知原因'), 'err', 6000);
+                }
+                // queued/sending：继续轮询；超 30s 停止（SMTP 卡顿不动声色等太久）
+                if (Date.now() - started > 30000) {
+                    return settle('发送仍在进行，稍后可在发件箱确认', 'busy', 6000);
+                }
+                setTimeout(poll, 1200);
+            })
+            .catch(function () { return settle('网络异常，发送状态未知', 'err', 6000); });
+    })();
+})();
+
 // ---------- 撰写页：收件人/抄送联系人建议（模糊匹配姓名或地址） ----------
 function mbxContactToken(inp) {
     const v = inp.value;
@@ -251,7 +298,8 @@ function mbxContactToken(inp) {
 }
 
 function mbxInitContacts() {
-    document.querySelectorAll('input[name="to_addrs"], input[name="cc_addrs"]').forEach(inp => {
+    // 密送框同样接入（M1-3 引入；与收/抄送同体验）
+    document.querySelectorAll('input[name="to_addrs"], input[name="cc_addrs"], input[name="bcc_addrs"]').forEach(inp => {
         if (inp.dataset.mbxContacts === '1') return;
         inp.dataset.mbxContacts = '1';
         inp.setAttribute('autocomplete', 'off');

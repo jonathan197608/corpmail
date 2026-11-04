@@ -1100,8 +1100,8 @@ fn compose_send_enqueues_and_redirects() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
-        "发送应回来源列表页（无上下文 → 默认收件箱 /）：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/?just_sent=1"),
+        "发送应回来源列表页（无上下文 → 默认收件箱）且带 just_sent（M1-6）：{:?}",
         resp.extra_headers
     );
     let (status, folder): (String, String) = state.with_conn(|c| {
@@ -1170,8 +1170,8 @@ fn compose_send_html_mode_keeps_body() {
     assert!(
         resp.extra_headers
             .iter()
-            .any(|(k, v)| k == "HX-Redirect" && v == "/"),
-        "发送应回来源列表页（默认收件箱 /）：{:?}",
+            .any(|(k, v)| k == "HX-Redirect" && v == "/?just_sent=1"),
+        "发送应回来源列表页（默认收件箱）且带 just_sent：{:?}",
         resp.extra_headers
     );
     let detail = body(&route(
@@ -1214,6 +1214,105 @@ fn compose_send_html_mode_keeps_body() {
 /// 转发/回复链接带过滤进入撰写页 → hidden list_query 随表单提交 →
 /// 发送后跳详情页必须原样携带，否则「返回列表」过滤/翻页在此断裂。
 /// 同时验证隐藏域值是客户端可控的：畸形值（folder 注入/页码越界）被重滤丢弃。
+/// M1-6 发送状态端点（GET /emails/{id}/status）：列表页反馈 toast 轮询用，
+/// 轻量 JSON 承载 status/error；终态（sent 带 error 空、failed 带原因）、
+/// 发送中（queued）、不存在的 id（404）
+#[test]
+fn email_status_endpoint_returns_lightweight_json() {
+    let (state, dir) = temp_state("m16-status");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let input = mail::DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: "peer@x.cn".into(),
+        cc_addrs: String::new(),
+        bcc_addrs: String::new(),
+        subject: "状态查询".into(),
+        body_text: "正文".into(),
+        in_reply_to: None,
+    };
+    let id = mail::save_draft(&state, &input).unwrap();
+    // queued：发送中
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/{id}/status"), b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    // serde_json 的对象键序不稳定（serde_json 空间用 BTreeMap/随机序取决于 feature），
+    // 做包含性断言而非全文比对
+    assert!(
+        body(&resp).contains(r#""status":"draft""#) && body(&resp).contains("error"),
+        "发送中状态载荷：{}",
+        body(&resp)
+    );
+    // sent：终态空 error
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET status='sent', error='' WHERE id=?1",
+                [id],
+            )
+        })
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/{id}/status"), b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        body(&resp).contains(r#""status":"sent""#) && body(&resp).contains(r#""error":"""#),
+        "sent 终态载荷：{}",
+        body(&resp)
+    );
+    // failed：带原因（含中文与引号转义）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET status='failed', error='SMTP 应答：550 \"unknown user\"' WHERE id=?1",
+                [id],
+            )
+        })
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/{id}/status"), b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let json = body(&resp);
+    assert!(json.contains(r#""status":"failed""#), "状态载荷：{json}");
+    assert!(
+        json.contains("550 \\\"unknown user\\\"") || json.contains("550"),
+        "失败原因含引用内容（serde_json 转义）：{json}"
+    );
+    // 不存在的 id：404
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/99999/status", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 404);
+    cleanup(&dir);
+}
+
 #[test]
 fn compose_send_redirect_keeps_list_context() {
     let (state, dir) = temp_state("m3-send-ctx");
@@ -1251,8 +1350,8 @@ fn compose_send_redirect_keeps_list_context() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2",
-        "发送后回来源列表页（保持过滤/翻页/文件夹）：{loc}"
+        loc, "/?folder=inbox&unread=1&q=%E6%BF%80%E5%8A%B1&page=2&just_sent=1",
+        "发送后回来源列表页（保持过滤/翻页/文件夹）且带 just_sent：{loc}"
     );
     // 详情页返回链接还原过滤（folder=inbox 显式携带）
     let detail = body(&route(
@@ -1437,8 +1536,8 @@ fn forward_compose_redirect_keeps_source_folder() {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     assert_eq!(
-        loc, "/?folder=sent",
-        "转发发送后应回来源文件夹列表（发件箱）：{loc}"
+        loc, "/?folder=sent&just_sent=2",
+        "转发发送后应回来源文件夹列表（发件箱）且带 just_sent（种子占 id=1，新草稿=2）：{loc}"
     );
     cleanup(&dir);
 }
@@ -1548,11 +1647,16 @@ fn compose_send_is_idempotent_on_repeat() {
                 imap_ok: true,
             },
         );
+        // 首轮入队成功 → 带 just_sent；幂等轮 enqueue 返回 false → 不带
+        // （避免已在发送中的邮件重置一次反馈轮询）
+        let expected = if i == 0 { "/?just_sent=1" } else { "/" };
         assert!(
             resp.extra_headers
                 .iter()
-                .any(|(k, v)| k == "HX-Redirect" && v == "/"),
-            "重复提交仍应回来源列表（默认收件箱）"
+                .any(|(k, v)| k == "HX-Redirect" && v == expected),
+            "第 {} 轮回跳失败（首轮带 just_sent / 幂等轮不带）：{:?}",
+            i + 1,
+            resp.extra_headers
         );
     }
     let total: i64 = state.with_conn(|c| {

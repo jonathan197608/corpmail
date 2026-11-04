@@ -409,6 +409,12 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         {
             Some(attachment_view(state, req))
         }
+        // M1-6 发送状态轮询（/emails/{id}/status）：须在 email_detail_page
+        // 通配（仅匹配纯数字 id 路径）之前注册——虽然通配不会吃掉多段路径，
+        // 显式保留顺序避免将来通配调整后行为漂移
+        ("GET", p) if p.starts_with("/emails/") && p.ends_with("/status") => {
+            Some(email_status(state, req))
+        }
         ("GET", p) if p.starts_with("/emails/") => email_detail_page(state, req),
         ("GET", "/welcome") => Some(render_html("welcome.html", &())),
         ("GET", "/welcome/setup") => Some(wizard_setup_page(state)),
@@ -1337,6 +1343,7 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
     }
     let form = parse_form(&req.body);
     let ctx_qs = form_list_query(&form);
+    let mut just_sent = None;
     match save_compose_form(state, req) {
         Ok((id, skipped, converted)) => {
             // 空文件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
@@ -1351,18 +1358,49 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             }
             if mail::enqueue_draft(state, id) {
                 state.enqueue_send(id);
+                // 入队成功：列表页据此启动发送反馈 toast（M1-6，轮询至终态）。
+                // 重复提交（enqueue 返回 false，已是 queued）不带——避免已在
+                // 发送中的邮件重置一次提示
+                just_sent = Some(id);
             }
             // 发送完成 → 回来源文件夹列表（保持过滤/翻页），而非停详情页。
             // ctx_qs 恒含 folder（rebuild_list_query 不再省略 inbox），
             // 从哪转发/回复/重新编辑进来就回哪个列表。
-            let target = if ctx_qs.is_empty() {
+            let mut target = if ctx_qs.is_empty() {
                 "/".to_string()
             } else {
                 format!("/?{ctx_qs}")
             };
+            if let Some(id) = just_sent {
+                if target.contains('?') {
+                    target.push_str(&format!("&just_sent={id}"));
+                } else {
+                    target.push_str(&format!("?just_sent={id}"));
+                }
+            }
             Resp::hx_redirect(&target)
         }
         Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
+    }
+}
+
+/// 发送状态查询（GET /emails/{id}/status，M1-6）：列表页发送反馈 toast 轮询用。
+/// 轻量 JSON（status + error）而非整页片段——轮询高频，响应体控制到最小
+fn email_status(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    match state.with_conn(|c| {
+        c.query_row(
+            "SELECT status, COALESCE(error, '') FROM emails WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+    }) {
+        Ok((status, error)) => {
+            Resp::json(serde_json::json!({ "status": status, "error": error }).to_string())
+        }
+        Err(_) => Resp::not_found(),
     }
 }
 
