@@ -37,6 +37,12 @@
                按信箱区分：草稿箱=编辑草稿、发件箱=重新编辑（载入撰写页重发），
                收件箱才显示回复/回复全部/转发。 #}
             <div class="md-actions md-actions-top">
+                {# 星标（M2-1）：与列表行同端点；hs-swap=none + 事件翻色（详情页无重排） #}
+                <button type="button" class="btn star-btn {% if email.starred %}on{% endif %}" data-mail-id="{{ email.id }}"
+                        hx-post="/emails/{{ email.id }}/star"
+                        hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
+                        aria-pressed="{% if email.starred %}true{% else %}false{% endif %}"
+                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}★ 已星标{% else %}☆ 星标{% endif %}</button>
                 {% if email.folder == 'draft' %}
                 <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
                    title="打开草稿继续编辑">✎ 编辑</a>

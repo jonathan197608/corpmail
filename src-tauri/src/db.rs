@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -75,6 +75,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         3 => migrate_v4(tx),
         4 => migrate_v5(tx),
         5 => migrate_v6(tx),
+        6 => migrate_v7(tx),
         _ => Ok(()),
     }
 }
@@ -120,7 +121,19 @@ fn migrate_v5(tx: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁），
+/// v6 → v7：星标（M2-1）。starred=1 的邮件在各信箱列表置顶
+/// （ORDER BY starred DESC, 时间 DESC）。列表排序用的是
+/// COALESCE(received_at, sent_at, created_at) 表达式（t），本就无法走单列索引，
+/// 置顶前缀不额外建索引：排序器开销在桌面单机库（万级行）可忽略。
+/// emails_au 触发器仅盯 subject/body_tokens 列，星标翻转不引发 FTS 重写。
+fn migrate_v7(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "starred")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
+}
+
+/// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁，
 /// 与 cc 同为逗号分隔纯地址；发出的 MIME 头不含 Bcc（lettre drop_bcc 语义），
 /// 收到的邮件恒为空（IMAP 同步副本无 Bcc 头），展示层有值才渲染。
 fn migrate_v6(tx: &Connection) -> rusqlite::Result<()> {

@@ -680,6 +680,8 @@ pub struct EmailSummary {
     pub body_preview: String,
     pub attach_cnt: i64,
     pub unread: bool,
+    /// 星标（M2-1）：列表置顶 + 金色★图标；各信箱通用（收/发/草稿均可标）
+    pub starred: bool,
     /// 外部发件人（列表「外部」标记；口径见 is_external_addr）
     pub from_external: bool,
     pub time_label: String,
@@ -881,9 +883,9 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
                         COALESCE(received_at, sent_at, created_at) AS t,
-                        {ext_col} AS from_external
+                        {ext_col} AS from_external, starred
                  FROM emails {where_sql}
-                 ORDER BY t DESC, id DESC
+                 ORDER BY starred DESC, t DESC, id DESC
                  LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;
@@ -928,6 +930,8 @@ fn summary_from_row(
         from_external: r.get::<_, i64>(11)? == 1,
         time_label: time_label(r.get(10)?),
         subject_html,
+        // 列尾追加（列序 12）：list/search 两条 SELECT 同位拼接，缺列即此函数报错
+        starred: r.get::<_, i64>(12)? == 1,
     })
 }
 
@@ -1028,7 +1032,7 @@ pub fn search(
                 "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                         e.to_addrs, e.body_text, e.attach_cnt, e.unread,
                         COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
-                        {ext_col} AS from_external
+                        {ext_col} AS from_external, e.starred
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
                  WHERE email_fts MATCH :match{filter_sql}
                  ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
@@ -1134,6 +1138,8 @@ pub struct EmailDetail {
     pub attach_cnt: i64,
     pub attach_bytes: i64,
     pub unread: bool,
+    /// 星标（M2-1；详情页按钮回显 + 回复/转发等场景不继承）
+    pub starred: bool,
     pub in_reply_to: Option<i64>,
     pub error: String,
     pub time_full: String,
@@ -1150,7 +1156,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
                         cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
                         attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
-                        COALESCE(received_at, sent_at, created_at), too_large
+                        COALESCE(received_at, sent_at, created_at), too_large, starred
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -1174,6 +1180,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         error: r.get(15)?,
                         time_full: time_full(r.get(16)?),
                         too_large: r.get::<_, i64>(17)? == 1,
+                        starred: r.get::<_, i64>(18)? == 1,
                         attachments: Vec::new(),
                     })
                 },
@@ -1209,6 +1216,31 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
         .map(|rows| rows.filter_map(Result::ok).collect())
     })
     .unwrap_or_default()
+}
+
+/// 星标翻转（M2-1）：单语句原子取反，返回翻转后的状态。
+/// 本地语义（不上 IMAP）；收件同步按 remote_uid 查重后仅 INSERT 新行、
+/// 不 UPDATE 已有行，星标不会被同步覆盖（recv.rs store_incoming_conn）。
+/// None = 邮件不存在（404）
+pub fn toggle_star(state: &AppState, id: i64) -> Option<bool> {
+    let flipped: Result<Option<bool>, String> = state.with_conn(|conn| {
+        let changed = conn
+            .execute(
+                "UPDATE emails SET starred = 1 - starred WHERE id = ?1",
+                [id],
+            )
+            .map_err(e)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let v: i64 = conn
+            .query_row("SELECT starred FROM emails WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .map_err(e)?;
+        Ok(Some(v == 1))
+    });
+    flipped.unwrap_or(None)
 }
 
 /// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。返回是否生效

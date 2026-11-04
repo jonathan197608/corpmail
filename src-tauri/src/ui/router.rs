@@ -152,6 +152,14 @@ impl Resp {
         self
     }
 
+    /// 同 with_event，但事件携带详情载荷（htmx 语义：{"事件名": {…}}
+    /// → 监听回调从 ev.detail 取值；M2-1 mbx:starDone 回传翻转后的星标态）
+    fn with_event_detail(mut self, event: &str, detail: &str) -> Self {
+        self.extra_headers
+            .push(("HX-Trigger".into(), format!("{{\"{event}\":{detail}}}")));
+        self
+    }
+
     fn asset(mime: String, body: Vec<u8>) -> Self {
         Self {
             status: 200,
@@ -394,6 +402,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         }
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/read") => {
             Some(email_read(state, req))
+        }
+        // M2-1 星标翻转：列表/详情页星标按钮（hs-swap=none，事件驱动后续处理）
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/star") => {
+            Some(email_star(state, req))
         }
         ("POST", "/emails/batch") => Some(emails_batch(state, req)),
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
@@ -646,6 +658,22 @@ fn email_read(state: &AppState, req: &Req) -> Resp {
     };
     mark_read_and_sync_seen(state, id);
     Resp::html(String::new())
+}
+
+/// 星标翻转（POST /emails/{id}/star，M2-1）。返回空体 + mbx:starDone 事件
+/// 携带翻转后的星标态：列表页据此重拉列表片段（星标置顶会重排行序），
+/// 详情页就地翻转按钮态（无重排）。 hx-swap="none" 由按钮侧声明
+fn email_star(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    match mail::toggle_star(state, id) {
+        Some(starred) => Resp::html(String::new()).with_event_detail(
+            "mbx:starDone",
+            &serde_json::json!({ "starred": starred }).to_string(),
+        ),
+        None => Resp::not_found(),
+    }
 }
 
 /// 本地置已读（从未读翻转时同时写 seen_pending 并唤醒回写 worker）。

@@ -303,3 +303,60 @@ fn migrate_v5_to_v6_adds_bcc_column() {
         .unwrap();
     assert_eq!(cols, 1, "新库应直接含 bcc_addrs 列");
 }
+
+/// v6 → v7 增量（M2-1 星标）：加 starred 列，存量邮件默认 0（未星标）；
+/// 翻转取反语义由业务层（toggle_star）承担，迁移只铺列
+#[test]
+fn migrate_v6_to_v7_adds_starred_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         CREATE TABLE contacts (
+           addr TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 1);
+         CREATE INDEX idx_contacts_name ON contacts(name);
+         ALTER TABLE emails ADD COLUMN body_html TEXT;
+         ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT '';",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 6i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let starred: i64 = conn
+        .query_row("SELECT starred FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(starred, 0, "存量邮件默认未星标");
+    // 取反语句在 v7 库上直接可用（业务层 toggle_star 的 SQL 形态）
+    conn.execute("UPDATE emails SET starred = 1 - starred WHERE id = 1", [])
+        .unwrap();
+    let flipped: i64 = conn
+        .query_row("SELECT starred FROM emails WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(flipped, 1, "星标取反语句应可用");
+    // 新库亦一步建到 v7（含列）
+    let fresh = mem();
+    let cols: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='starred'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "新库应直接含 starred 列");
+}

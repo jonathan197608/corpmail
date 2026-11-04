@@ -40,7 +40,15 @@
             <label class="mbx-check">
                 <input type="checkbox" class="mbx-item" value="{{ m.id }}">
             </label>
-            <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
+            {# 星标按钮（M2-1）：与复选框同理必须在 <a> 链接外，避免激活行为与
+            导航冲突；hs-swap=none，翻转响应带 mbx:starDone 事件（携带新态），
+            app.js 列表页重拉片段（置顶重排）/详情页就地翻色 #}
+         <button type="button" class="star-btn {% if m.starred %}on{% endif %}" data-mail-id="{{ m.id }}"
+                 hx-post="/emails/{{ m.id }}/star"
+                 hx-trigger="click throttle:300ms" hx-swap="none" hx-disabled-elt="this"
+                 aria-pressed="{% if m.starred %}true{% else %}false{% endif %}"
+                 title="{% if m.starred %}取消星标（不再置顶）{% else %}星标：置顶本信箱{% endif %}">★</button>
+         <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="mr-side">
                     <span class="mr-dot" aria-hidden="true"></span>
                     <span class="mr-who">{{ m.from_display }}</span>

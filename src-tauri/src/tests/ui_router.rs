@@ -1313,6 +1313,139 @@ fn email_status_endpoint_returns_lightweight_json() {
     cleanup(&dir);
 }
 
+/// M2-1 星标：端点翻转（事件头携带新态）、列表置顶排序、再翻取消置顶、
+/// 不存在 id 404、详情页按钮状态回显
+#[test]
+fn star_endpoint_toggles_and_pins_to_top() {
+    let (state, dir) = temp_state("m21-star");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 3 封收件（时间递增：id1 最旧）。unread=0 先出已读，避免与未读筛选行为耦合
+    state
+        .with_conn(|c| {
+            for i in 1..=3i64 {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, subject_tokens, body_tokens, unread, created_at)
+                     VALUES ('in','inbox','received',?1,'demo@chinatelecom.cn',?2,'正文','s','b',0,?3)",
+                    rusqlite::params![format!("peer{i}@x.cn"), format!("第 {i} 封"), i * 100],
+                )
+                .unwrap();
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let list_html = |q: &str| {
+        body(&route(
+            &state,
+            &assets(),
+            &req("GET", "/", q.as_bytes()),
+            &FakeTester {
+                smtp_ok: true,
+                imap_ok: true,
+            },
+        ))
+    };
+    // 基线：无星标按时间倒序（3 → 2 → 1）
+    let first = |h: &str| {
+        h.lines()
+            .find(|l| l.contains("data-mail-id="))
+            .unwrap()
+            .to_string()
+    };
+    let h = list_html("");
+    assert!(
+        first(&h).contains("data-mail-id=\"3\""),
+        "无星标按时间倒序：{}",
+        first(&h)
+    );
+    // 星标最旧的 id=1 → 事件头携带 starred:true（htmx ev.detail 回传）
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/star", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let trigger = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Trigger")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        trigger.contains("mbx:starDone") && trigger.contains("\"starred\":true"),
+        "事件头应携带翻转后状态：{trigger}"
+    );
+    // 列表：id=1 置顶且星标按钮 on（按钮自身带 data-mail-id，直接定位；
+    // 行开标签与按钮分属不同行，不能在同一行内同时断言）
+    let h = list_html("");
+    let top = first(&h);
+    assert!(
+        top.contains("data-mail-id=\"1\""),
+        "星标邮件应置顶：{}",
+        top
+    );
+    assert!(
+        h.contains("star-btn on\" data-mail-id=\"1\""),
+        "id=1 星标按钮应 on 态"
+    );
+    // 详情页：按钮显示已星标态
+    let detail = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        detail.contains("★ 已星标"),
+        "详情页星标按钮应回显已星标文案"
+    );
+    // 再翻一次（取消）→ 置顶解除
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/star", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let trigger = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Trigger")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        trigger.contains("\"starred\":false"),
+        "再翻应回 false：{trigger}"
+    );
+    let h = list_html("");
+    assert!(
+        first(&h).contains("data-mail-id=\"3\""),
+        "取消星标后恢复时间倒序"
+    );
+    // 不存在的 id：404
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/999/star", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 404);
+    cleanup(&dir);
+}
+
 #[test]
 fn compose_send_redirect_keeps_list_context() {
     let (state, dir) = temp_state("m3-send-ctx");
@@ -3276,11 +3409,28 @@ fn dump_smoke_html() {
     }
     let inbox_id = inbox_first_id;
 
+    // M2-1 星标素材：第二封收件打上星标——列表页金色★且置顶（跨时间序）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET starred = 1 WHERE id = ?1",
+                [inbox_id + 1],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
     dump("main.html", get("/"));
     dump("main-inbox-unread.html", get_url("/?unread=1"));
     dump("main-draft.html", get_url("/?folder=draft"));
     dump("main-all.html", get_url("/?folder=all"));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
+    // M2-1 星标详情页素材（email-inbox.html 为未星标态，两态各有对照）
+    dump(
+        "email-starred.html",
+        get(&format!("/emails/{}", inbox_id + 1)),
+    );
     // 带列表上下文（未读筛选 + 检索 + 第 2 页）：验证返回/回复/删除链接保持状态
     dump(
         "email-inbox-filtered.html",

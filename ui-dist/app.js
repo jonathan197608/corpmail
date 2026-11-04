@@ -243,6 +243,32 @@ function mbxOnFetchDone() {
 }
 document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 
+// ---------- 星标翻转（M2-1）：mbx:starDone 事件携带新态 ----------
+// 后端 POST /emails/{id}/star 空体 + 事件头；前端按所在页面分派：
+// - 列表页：星标置顶会重排行序 → 重拉当前列表片段换入（保持过滤/页码，
+//   与收取完成同路径；侧栏计数不随星标变，一并刷新无副作用）
+// - 详情页：无重排，就地翻转按钮态（★/☆ 文案 + on 类 + aria-pressed）
+document.body.addEventListener('mbx:starDone', function (ev) {
+    var starred = !!(ev.detail && ev.detail.starred);
+    if (document.getElementById('list-area')) {
+        htmx.ajax('GET', location.pathname + location.search, {
+            target: '#list-area', swap: 'outerHTML'
+        });
+        return;
+    }
+    var btn = document.querySelector('.star-btn[data-mail-id]');
+    if (!btn) return;
+    btn.classList.toggle('on', starred);
+    btn.setAttribute('aria-pressed', starred ? 'true' : 'false');
+    btn.title = starred ? '取消星标（不再置顶）' : '星标：置顶显示';
+    // 详情页按钮带文字（列表页按钮仅 ★ 符号）、两形态统一一套文案
+    if (btn.textContent.indexOf('星') >= 0) {
+        btn.textContent = starred ? '★ 已星标' : '☆ 星标';
+    } else {
+        btn.textContent = '★';
+    }
+});
+
 // ---------- 列表页：发送后瞬时反馈（M1-6） ----------
 // 发送跳回列表携带 just_sent=N（compose_send 入队成功时附加）：
 // toast 即时提示"发送中…"并轮询 /emails/{id}/status 至终态：
