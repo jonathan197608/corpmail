@@ -6456,3 +6456,58 @@ fn list_sort_applies_and_persists_in_list_query() {
     );
     cleanup(&dir);
 }
+
+/// A4 全部另存路由：POST /emails/{id}/attachments/all 逐附件落盘；
+/// 目录缺失/无附件时回错误 toast（不 500）
+#[test]
+fn save_all_attachments_route_writes_and_reports_errors() {
+    let (state, dir) = temp_state("a4-save-all");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@x.cn','demo@chinatelecom.cn','带附件',
+                     '正文','带 附件','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("清单.xlsx"), b"XLSX").unwrap();
+    mail::add_attachments(&state, 1, &[src.join("清单.xlsx").to_str().unwrap().into()]).unwrap();
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/attachments/all",
+            &form(&[("dest_dir", dest.to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    let html = body(&resp);
+    assert!(html.contains("已保存 1 个附件"), "应回成功 toast：{html}");
+    assert_eq!(std::fs::read(dest.join("清单.xlsx")).unwrap(), b"XLSX");
+    // 目录不存在：错误 toast，不是 500
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/attachments/all",
+            &form(&[("dest_dir", dir.join("nope").to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 200, "错误应回 toast 而非 500");
+    assert!(body(&resp).contains("目录不存在"));
+    cleanup(&dir);
+}

@@ -113,7 +113,15 @@
 
             {% if email.attachments %}
             <div class="md-attach">
-                <div class="md-attach-title">附件（{{ email.attach_cnt }}，共 {{ email.attach_bytes | fmt_size }}）</div>
+                <div class="md-attach-title">
+                    附件（{{ email.attach_cnt }}，共 {{ email.attach_bytes | fmt_size }}）
+                    {# A4 全部另存：多附件时一键选目录批量落盘（同名自动加序号） #}
+                    {% if email.attach_cnt > 1 %}
+                    <button type="button" class="btn small att-save-all"
+                            onclick="mbxSaveAllAttachments({{ email.id }})"
+                            title="选择目录，把全部附件一次保存（同名文件自动加序号，不覆盖）">全部另存</button>
+                    {% endif %}
+                </div>
                 <ul class="att-list">
                     {% for a in email.attachments %}
                     <li class="att-row">

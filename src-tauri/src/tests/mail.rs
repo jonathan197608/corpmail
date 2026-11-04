@@ -1012,3 +1012,68 @@ fn sort_key_parse_falls_back_to_default() {
     assert_eq!(SortKey::parse(Some("subject_asc")), SortKey::SubjectAsc);
     assert_eq!(SortKey::DateDesc.as_str(), "date_desc");
 }
+
+/// A4 全部另存：多附件落盘、磁盘同名不覆盖（自动加序号）、detached 跳过
+#[test]
+fn save_all_attachments_writes_dir_without_overwrite() {
+    let (state, dir) = temp_state("save-all");
+    let id = save_draft(&state, &draft("附件汇总", "正文")).unwrap();
+    let a = dir.join("src-a");
+    let b = dir.join("src-b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    // 两个同名「报告.pdf」（来自不同目录）+ 一个「数据.xlsx」
+    std::fs::write(a.join("报告.pdf"), b"AAA").unwrap();
+    std::fs::write(b.join("报告.pdf"), b"BBB").unwrap();
+    std::fs::write(a.join("数据.xlsx"), b"CCC").unwrap();
+    add_attachments(
+        &state,
+        id,
+        &[
+            a.join("报告.pdf").to_str().unwrap().into(),
+            b.join("报告.pdf").to_str().unwrap().into(),
+            a.join("数据.xlsx").to_str().unwrap().into(),
+        ],
+    )
+    .unwrap();
+
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    // 目标目录已有同名文件：不得覆盖，新文件改为「报告 (2).pdf」
+    std::fs::write(dest.join("报告.pdf"), b"EXIST").unwrap();
+
+    let (saved, skipped) = save_all_attachments(&state, id, dest.to_str().unwrap()).unwrap();
+    assert_eq!((saved, skipped), (3, 0), "三个附件应全部保存、无跳过");
+    assert_eq!(
+        std::fs::read(dest.join("报告.pdf")).unwrap(),
+        b"EXIST",
+        "已有文件不得覆盖"
+    );
+    assert_eq!(std::fs::read(dest.join("报告 (2).pdf")).unwrap(), b"AAA");
+    assert_eq!(std::fs::read(dest.join("报告 (3).pdf")).unwrap(), b"BBB");
+    assert_eq!(std::fs::read(dest.join("数据.xlsx")).unwrap(), b"CCC");
+
+    // 已清理（detached）的附件跳过，不阻断其他文件
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE attachments SET detached = 1 WHERE filename = '数据.xlsx'",
+            [],
+        )
+        .unwrap();
+    });
+    let (saved2, skipped2) = save_all_attachments(&state, id, dest.to_str().unwrap()).unwrap();
+    assert_eq!((saved2, skipped2), (2, 1), "detached 应计入 skipped");
+    cleanup(&dir);
+}
+
+/// A4 全部另存：目录不存在 / 无附件 的错误路径
+#[test]
+fn save_all_attachments_rejects_missing_dir_and_empty_mail() {
+    let (state, dir) = temp_state("save-all-err");
+    let id = save_draft(&state, &draft("无附件", "正文")).unwrap();
+    let err = save_all_attachments(&state, id, dir.join("missing").to_str().unwrap()).unwrap_err();
+    assert!(err.contains("目录不存在"), "{err}");
+    let err = save_all_attachments(&state, id, dir.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("没有附件"), "{err}");
+    cleanup(&dir);
+}

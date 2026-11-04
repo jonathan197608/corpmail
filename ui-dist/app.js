@@ -83,6 +83,25 @@ async function mbxSaveAttachment(emailId, attachId, filename) {
     }
 }
 
+// 全部另存（A4）：选目录 → 服务端逐附件落盘（同名自动加序号，不覆盖）
+async function mbxSaveAllAttachments(emailId) {
+    if (mbxSaveBusy) return;
+    mbxSaveBusy = true;
+    try {
+        const dir = await window.__TAURI__.dialog.open({ directory: true });
+        if (!dir) return;
+        await htmx.ajax('POST', `/emails/${emailId}/attachments/all`, {
+            target: '#toast',
+            swap: 'innerHTML',
+            values: { dest_dir: dir }
+        });
+    } catch (e) {
+        console.error('[mbx] 全部另存失败', e);
+    } finally {
+        mbxSaveBusy = false;
+    }
+}
+
 // 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
 // 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区。
 // 请求护栏（M5 防抖审计）：弹窗+请求全程只允许一次在途

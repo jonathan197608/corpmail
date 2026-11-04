@@ -2230,6 +2230,98 @@ pub fn save_attachment_to(
     std::fs::write(dest, &bytes).map_err(|err| format!("另存失败：{err}"))
 }
 
+/// 全部另存（A4）：把邮件所有未清理的附件解压落盘到用户选择的目录。
+/// 返回 (saved, skipped)；skipped = 已被策略清理/数据缺失的条数（不阻断其他文件）。
+/// 同名不覆盖：磁盘已存在或本批已用过时追加 “ (2)” 序号，避免静默覆盖用户文件。
+pub fn save_all_attachments(
+    state: &AppState,
+    email_id: i64,
+    dest_dir: &str,
+) -> Result<(usize, usize), String> {
+    let dir = Path::new(dest_dir);
+    if !dir.is_dir() {
+        return Err("目标目录不存在".to_string());
+    }
+    let root = attach_root(state);
+    let rows: Vec<AttachRow> = state
+        .with_conn(|conn| {
+            crate::db::collect_rows(
+                conn,
+                "SELECT filename, COALESCE(mime,'application/octet-stream'), storage,
+                    file_path, data, detached = 1
+             FROM attachments WHERE email_id = ?1 ORDER BY id",
+                &[&email_id],
+                attach_row_from,
+            )
+        })
+        .map_err(e)?;
+    if rows.is_empty() {
+        return Err("该邮件没有附件".to_string());
+    }
+    let mut saved = 0usize;
+    let mut skipped = 0usize;
+    let mut used: Vec<String> = Vec::new();
+    for (filename, _mime, storage, file_path, data, detached) in rows {
+        if detached {
+            skipped += 1;
+            continue;
+        }
+        let gz = match storage.as_str() {
+            "inline" => match data {
+                Some(d) => d,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            },
+            _ => match file_path.and_then(|p| std::fs::read(root.join(p)).ok()) {
+                Some(b) => b,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            },
+        };
+        let Some(bytes) = gunzip(&gz) else {
+            skipped += 1;
+            continue;
+        };
+        // 文件名只取 basename（历史脏数据/恶意名不得穿越目录）
+        let base = Path::new(&filename)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .unwrap_or("attachment");
+        let name = unique_file_name(dir, base, &used);
+        used.push(name.clone());
+        let target = dir.join(&name);
+        guard_sensitive_path(state, &target.to_string_lossy())?;
+        std::fs::write(&target, &bytes).map_err(|err| format!("写入「{name}」失败：{err}"))?;
+        saved += 1;
+    }
+    Ok((saved, skipped))
+}
+
+/// 目录内去重名：`报告.pdf` → `报告 (2).pdf` → `报告 (3).pdf`。
+/// 同时检查磁盘已有文件与本批用过的名字（不静默覆盖）。
+fn unique_file_name(dir: &Path, filename: &str, used: &[String]) -> String {
+    let taken = |name: &str| used.iter().any(|u| u == name) || dir.join(name).exists();
+    if !taken(filename) {
+        return filename.to_string();
+    }
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s, format!(".{e}")),
+        _ => (filename, String::new()),
+    };
+    for n in 2..10_000 {
+        let cand = format!("{stem} ({n}){ext}");
+        if !taken(&cand) {
+            return cand;
+        }
+    }
+    format!("{stem}-{}{ext}", used.len() + 1)
+}
+
 /// 复制源邮件的全部附件到目标邮件（转发用；附件独立成行、独立文件，互不影响）。
 ///
 /// 读取源附件（inline BLOB / 独立文件）→ 解压 → 按目标邮件的上限规则重新入库。

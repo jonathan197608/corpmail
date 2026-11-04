@@ -2531,3 +2531,15 @@ a.btn.link.disabled {
     color: var(--ink-soft);
     font-weight: 600;
 }
+
+
+/* 附件标题行（A4）：标题 + 全部另存按钮同行，按钮靠右 */
+.md-attach-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.md-attach-title .att-save-all {
+    margin-left: auto;
+}

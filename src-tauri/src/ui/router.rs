@@ -466,6 +466,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/contacts") => Some(contacts_page(state, req)),
         ("POST", "/contacts/delete") => Some(contacts_delete(state, req)),
         ("GET", "/side/frame") => Some(side_frame(state, req)),
+        // A4 全部另存：必须在通用 attachments 分支之前（all 不是数字 id）
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/attachments/all") => {
+            Some(attachments_save_all(state, req))
+        }
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
@@ -1941,6 +1945,32 @@ fn attachment_save(state: &AppState, req: &Req) -> Resp {
         Ok(()) => Resp::html(format!(
             r#"<div id="toast" class="toast ok" hx-swap-oob="true">已另存到 {}</div>"#,
             html_escape(&dest)
+        )),
+        Err(e) => Resp::html(format!(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
+            html_escape(&e)
+        )),
+    }
+}
+
+/// 全部另存（A4，POST /emails/{id}/attachments/all）：前端选目录后逐附件落盘，
+/// 同名自动加序号不覆盖；部分附件已清理时在提示里报告跳过数。
+fn attachments_save_all(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    let form = parse_form(&req.body);
+    let Some(dir) = trimmed_field(&form, "dest_dir") else {
+        return Resp::html(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存目录</div>"#.into(),
+        );
+    };
+    match mail::save_all_attachments(state, id, &dir) {
+        Ok((saved, 0)) => Resp::html(format!(
+            r#"<div id="toast" class="toast ok" hx-swap-oob="true">已保存 {saved} 个附件</div>"#
+        )),
+        Ok((saved, skipped)) => Resp::html(format!(
+            r#"<div id="toast" class="toast ok" hx-swap-oob="true">已保存 {saved} 个附件（{skipped} 个已清理/缺失，跳过）</div>"#
         )),
         Err(e) => Resp::html(format!(
             r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
