@@ -3689,6 +3689,11 @@ fn dump_smoke_html() {
         "compose-forward.html",
         get_url(&format!("/compose?forward_from={}", inbox_id + 1)),
     );
+    // B6 作为附件转发素材：原主题预填 + .eml 携带提示
+    dump(
+        "compose-attach-eml.html",
+        get_url(&format!("/compose?attach_eml={}", inbox_id + 1)),
+    );
     // M7 回复全部：发件人 + 收件人 + 抄送（去自己）
     dump(
         "compose-reply-all.html",
