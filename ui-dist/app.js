@@ -514,6 +514,15 @@ function mbxComposeForm(evtElt) {
     return evtElt.closest('form');
 }
 
+// wangEditor 输出的 <table> 无 border 属性（slate 模型不存边框）。
+// 外发到企业客户端（Outlook/Foxmail）按属性画线，内联 style 可能被剥或
+// 忽略——统一补 border="1"（HTML 属性形态兼容性最广）；已有 border 属性
+// 则不动（转发场景源邮件的自带宽度/间距样式保持原样）。
+// 净化器已放行 table 的 border 属性（ec3441b），此处补的属性可安全过净化
+function mbxEnsureTableBorders(html) {
+    return html.replace(/<table(?![^>]*\bborder\s*=)/gi, '<table border="1"');
+}
+
 document.body.addEventListener('htmx:configRequest', function (ev) {
     var detail = ev.detail || {};
     var form = mbxComposeForm(detail.elt);
@@ -528,8 +537,9 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             var card = document.querySelector('.compose-card');
             if (card) card.insertBefore(note, card.firstChild);
         }
-        // 双保险：hidden.value 同步 + 参数显式覆盖（后者优先生效）
-        hidden.value = mbxEditor.getHtml();
+        // 双保险：hidden.value 同步 + 参数显式覆盖（后者优先生效）。
+        // 外发表格补 border=1（M1-5）：编辑器自建表格在收件方客户端才有分隔线
+        hidden.value = mbxEnsureTableBorders(mbxEditor.getHtml());
         detail.parameters['body_html'] = hidden.value;
     }
 });
