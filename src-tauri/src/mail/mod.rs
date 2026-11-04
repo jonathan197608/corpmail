@@ -490,6 +490,50 @@ fn zoned_of(epoch: i64) -> Option<jiff::Zoned> {
 
 // ---------- 草稿（撰写/存草稿/覆盖，§9） ----------
 
+/// 历史数据修复（主题乱码）：早期收件路径对未编码的原始 GBK/GB2312 主题头
+/// 退 Latin-1，库内主题是"每字节一 U+00xx 字符"的 latin1-mojibake。逆过程：
+/// 把 U+00xx 字符还原为对应字节 → GB18030 解码，命中 CJK 即确认为 GBK 主题
+/// 并写回（同步重算 subject_tokens 保 FTS 检索一致）。西文 latin1 主题（如
+/// é→0xE9）GBK 解码不成 CJK，不误伤；启动后幂等（修完无 U+00xx 字符即空扫）
+pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String> {
+    let mojibake: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, subject FROM emails")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok)
+            .filter(|(_, s)| s.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')))
+            .collect::<Vec<_>>()
+    };
+    if mojibake.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut fixed = 0usize;
+    for (id, s) in mojibake {
+        let bytes: Vec<u8> = s
+            .chars()
+            .filter(|c| (*c as u32) <= 0xff)
+            .map(|c| c as u8)
+            .collect();
+        let (cow, _, _) = encoding_rs::GB18030.decode(&bytes);
+        if cow.chars().any(is_cjk) {
+            let subject = cow.trim();
+            tx.execute(
+                "UPDATE emails SET subject = ?2, subject_tokens = ?3 WHERE id = ?1",
+                rusqlite::params![id, subject, tokenize(subject)],
+            )
+            .map_err(|e| e.to_string())?;
+            fixed += 1;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    eprintln!("[repair] 主题 GBK 乱码修复 {fixed} 封");
+    Ok(())
+}
+
 /// 撰写表单入参（存草稿；发送为 M3）
 pub struct DraftInput {
     /// 覆盖已有草稿的 id（None = 新建）

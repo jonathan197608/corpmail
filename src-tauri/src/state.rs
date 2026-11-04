@@ -199,6 +199,10 @@ impl AppState {
         if let Err(err) = crate::mail::contacts::backfill(&mut conn) {
             eprintln!("[contacts] 历史邮件回填失败（忽略）：{err}");
         }
+        // 历史主题 GBK 乱码一次性修复（幂等，修完无 U+00xx 即空扫）
+        if let Err(err) = crate::mail::repair_gbk_subjects(&mut conn) {
+            eprintln!("[repair] 主题乱码修复失败（忽略）：{err}");
+        }
         let state = Self {
             db: Mutex::new(conn),
             data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),

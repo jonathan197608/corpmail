@@ -69,6 +69,102 @@ fn temp_state(tag: &str) -> (AppState, PathBuf) {
     (AppState::open(&dir), dir)
 }
 
+/// 主题解码（GBK 兜底）：未编码的原始 GBK/GB2312 主题头经 mailparse 会退
+/// Latin-1 变乱码，decode_subject 应以 GB18030 重解码；RFC2047/UTF-8/西文
+/// latin1 主题不受影响
+#[test]
+fn decode_subject_falls_back_to_gbk_for_raw_header() {
+    // 原始 GBK 主题字节（非 RFC2047 编码）
+    let (gbk, _, _) = encoding_rs::GBK.encode("十月佣金结算");
+    let raw = [
+        b"Subject: ".as_slice(),
+        gbk.as_ref(),
+        b"\r\n\r\n".as_slice(),
+    ]
+    .concat();
+    let parsed = mailparse::parse_mail(&raw).unwrap();
+    assert_eq!(
+        header_fields(&parsed).subject,
+        "十月佣金结算",
+        "原始 GBK 主题应被解码为中文"
+    );
+    // RFC2047（=?utf-8?B?SGVsbG8=?= = "Hello"）：get_value 正常解码，不受兜底影响
+    let raw2 = b"Subject: =?utf-8?B?SGVsbG8=?=\r\n\r\n".to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw2).unwrap()).subject,
+        "Hello"
+    );
+    // 纯 UTF-8 直接主题：原样
+    let raw3 = "Subject: 直发中文\r\n\r\n".as_bytes().to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw3).unwrap()).subject,
+        "直发中文"
+    );
+    // 西文 latin1（é = 0xE9 单字节）：GB18030 单前导字节不成 CJK，不误改
+    let raw4 = b"Subject: caf\xE9\r\n\r\n".to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw4).unwrap()).subject,
+        "caf\u{e9}"
+    );
+}
+
+/// 存量主题 GBK 乱码修复：库内 latin1-mojibake（每字节一 U+00xx 字符）应还原，
+/// 且 subject_tokens 同步重算（FTS 检索一致）；西文 latin1 主题不误改
+#[test]
+fn repair_gbk_subjects_restores_mojibake() {
+    let (state, dir) = temp_state("repair-gbk");
+    // 手工构造 mojibake：GBK 字节按 latin1 逐字节映射成 String
+    let (gbk, _, _) = encoding_rs::GBK.encode("配案清单");
+    let mojibake: String = gbk.iter().map(|&b| b as char).collect();
+    // 一封真实乱码邮件（旧路径存库的形态）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn',?1,'','',1)",
+                [&mojibake],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 二次连接跑修复（state 连接在 open 时已跑过一次，但污染行插入在之后）
+    let mut conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    crate::mail::repair_gbk_subjects(&mut conn).unwrap();
+    let (subj, toks): (String, String) = state
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT subject, subject_tokens FROM emails WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!(subj, "配案清单", "mojibake 应还原为中文主题");
+    assert!(toks.contains("配案"), "FTS 分词列应同步重算");
+    // 西文 latin1 主题不误改
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn','caf\u{e9}','cafe',0,2)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let mut c2 = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    crate::mail::repair_gbk_subjects(&mut c2).unwrap();
+    let s: String = state
+        .with_conn(|c| c.query_row("SELECT subject FROM emails WHERE id = 2", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(s, "caf\u{e9}", "西文 latin1 主题不应被误改");
+    cleanup(&dir);
+}
+
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }

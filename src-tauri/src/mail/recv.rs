@@ -775,12 +775,40 @@ fn header_fields(part: &mailparse::ParsedMail) -> HeaderFields {
     let to_addrs = addr_list("To");
     let cc_addrs = addr_list("Cc");
     HeaderFields {
-        subject: header_value("Subject"),
+        subject: decode_subject(&headers),
         from_addr,
         from_name,
         to_addrs,
         cc_addrs,
         message_id: header_value("Message-Id"),
+    }
+}
+
+/// 主题解码（mailparse 的 get_value 对 RFC2047/UTF-8 正确；对**未编码**的
+/// 原始 GBK/GB2312 8 位主题头会退 Latin-1——每字节变一个 U+0080..U+00FF 字符，
+/// 存库后列表/详情/转发全部显示乱码）。检测到高 latin 字节即以原始头字节按
+/// GB18030 重解码，命中 CJK 才采纳（正常西文/UTF-8 头不乱改）。
+fn decode_subject(headers: &mailparse::headers::Headers<'_>) -> String {
+    use mailparse::MailHeaderMap;
+    let Some(h) = headers.get_first_header("Subject") else {
+        return String::new();
+    };
+    let value = h.get_value().trim().to_string();
+    // Latin-1 兜底迹象：出口出现 U+0080..U+00FF（原始字节非 UTF-8）
+    if !value.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')) {
+        return value;
+    }
+    // 原始字节本是合法 UTF-8 → 非 GBK 情形（如 RFC6532 直接 UTF-8），不猜
+    let raw = h.get_value_raw();
+    if std::str::from_utf8(raw).is_ok() {
+        return value;
+    }
+    let (cow, _, _) = encoding_rs::GB18030.decode(raw);
+    let fixed = cow.trim();
+    if fixed.chars().any(is_cjk) {
+        fixed.to_string()
+    } else {
+        value
     }
 }
 
