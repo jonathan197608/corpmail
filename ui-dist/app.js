@@ -803,9 +803,10 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
             if (allLink) allLink.hidden = true;
         } else {
             countEl.textContent = '已选 ' + n + ' 封';
-            // 跨页入口：总命中 > 本页行数 且非检索态
+            // 跨页入口：非检索态即显示「选择全部 N 封」（总命中 = 筛选全集上限；
+            // 单页亦显示——点即全选当前筛选全部，语义确定，用户不需记"有无下一页"）
             if (allLink) {
-                allLink.hidden = isSearch() || stateBox.total <= items().length;
+                allLink.hidden = isSearch();
                 allLink.textContent = '选择全部 ' + stateBox.total + ' 封';
             }
         }

@@ -2124,31 +2124,53 @@ a.btn.link.disabled {
 .mbx-hint { flex: 1; }
 /* 底部操作条：固定浮出在列表容器下缘 */
 .batch-actions {
-    position: sticky;
-    bottom: 10px;
+    /* 悬浮药丸条（M2 批量栏改版）：fixed 贴视口底部居中，列表滚动时恒可见，
+       视觉与 Gmail/Outlook 批量工具条一致；左右分组用 gap 分隔 */
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 16px;
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 9px 14px;
-    margin-top: 4px;
+    gap: 18px;
+    padding: 7px 8px 7px 18px;
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: 999px;
     background: #fff;
-    box-shadow: 0 6px 18px rgba(21, 34, 56, 0.14);
-    z-index: 5;
+    box-shadow: 0 10px 30px rgba(21, 34, 56, 0.18);
+    z-index: 50;
+}
+.batch-actions .ba-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.batch-actions .ba-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
 .batch-actions .ba-count {
     font-weight: 700;
     color: var(--ink);
     white-space: nowrap;
 }
-.batch-actions .ba-sep { color: var(--line); }
 #ba-select-all {
     color: var(--accent);
-    font-size: 12px;
+    font-size: 13px;
+    font-weight: 600;
     white-space: nowrap;
+    padding: 3px 10px;
+border: 1px solid var(--accent);
+    border-radius: 999px;
+    background: #f0f5ff;
+    transition: background 0.12s, color 0.12s;
 }
-#ba-select-all:hover { text-decoration: underline; }
+#ba-select-all:hover {
+    background: var(--accent);
+    color: #fff;
+    text-decoration: none;
+}
 
 /* ---------- 星标（M2-1）：列表行金色★ + 详情页按钮 ---------- */
 /* 列表行星标列：窄列（与复选框同为 flex 0 0 auto），行内垂直居中 */

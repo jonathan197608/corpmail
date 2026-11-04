@@ -102,16 +102,21 @@
     {% endif %}
 </div>
 {# 批量操作条（选中 >0 浮出；js 控制显隐与文案）。
-   total：当前筛选总数（跨页全选上限）；q 状态随检索场景禁用跨页全选。
+   fixed 药丸悬浮条贴视口底部（Gmail 风格），左右分组：
+   左=计数+跨页全选入口，右=操作按钮+取消。
+   total：当前筛选总数（跨页全选上限）；检索态禁用跨页全选。
    hx-confirm 由 app.js 按动作与数量动态设置 #}
 <div class="batch-actions" id="batch-actions" hidden>
-    <span class="ba-count" id="ba-count"></span>
-    <a href="#" id="ba-select-all" hidden>选择全部 {{ total }} 封</a>
-    <span class="ba-sep">|</span>
-    <button type="button" class="btn small" data-batch="read">标已读</button>
-    <button type="button" class="btn small" data-batch="unread">标未读</button>
-    <button type="button" class="btn small danger" data-batch="delete">🗑 删除</button>
-    <button type="button" class="btn small ghost" id="ba-clear">取消</button>
+    <div class="ba-left">
+        <span class="ba-count" id="ba-count"></span>
+        <a href="#" id="ba-select-all" hidden>选择全部 {{ total }} 封</a>
+    </div>
+    <div class="ba-actions">
+        <button type="button" class="btn small" data-batch="read">标已读</button>
+        <button type="button" class="btn small" data-batch="unread">标未读</button>
+        <button type="button" class="btn small danger" data-batch="delete">🗑 删除</button>
+        <button type="button" class="btn small ghost" id="ba-clear">取消</button>
+    </div>
     <input type="hidden" id="ba-folder" value="{{ folder }}">
     <input type="hidden" id="ba-unread" value="{{ '1' if unread_only else '0' }}">
     <input type="hidden" id="ba-external" value="{{ '1' if external_only else '0' }}">
