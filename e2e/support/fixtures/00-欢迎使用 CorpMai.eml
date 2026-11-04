@@ -1,0 +1,11 @@
+From: =?utf-8?b?5byg5Lyf?= <zhangwei@corpmail.test>
+To: e2e@corpmail.test
+Subject: =?utf-8?b?5qyi6L+O5L2/55So?= CorpMail
+Date: Sun, 01 Nov 2026 09:30:00 -0000
+Message-ID: <e2e-0@corpmail.test>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+MIME-Version: 1.0
+
+这是一封用于自动化测试的纯文本邮件。
+第二行内容用于验证正文解析与换行保留。

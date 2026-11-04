@@ -1,0 +1,38 @@
+From: =?utf-8?b?5p2O5aic?= <lina@corpmail.test>
+To: e2e@corpmail.test
+Subject: =?utf-8?b?5a2j5bqm5oql6KGo77yI5ZCr6ZmE5Lu277yJ?=
+Date: Mon, 02 Nov 2026 11:15:00 -0000
+Message-ID: <e2e-1@corpmail.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============2750109440388550989=="
+
+--===============2750109440388550989==
+Content-Type: multipart/alternative;
+ boundary="===============5603292702947150469=="
+
+--===============5603292702947150469==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+附件为本季度示例数据，请查收。
+
+--===============5603292702947150469==
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: base64
+MIME-Version: 1.0
+
+PGh0bWw+PGJvZHk+PGgyPuWto+W6puaKpeihqO+8iOWQq+mZhOS7tu+8iTwvaDI+PHA+6ZmE5Lu2
+5Li65pys5a2j5bqm56S65L6L5pWw5o2u77yM6K+35p+l5pS244CCPC9wPjwvYm9keT48L2h0bWw+
+Cg==
+
+--===============5603292702947150469==--
+
+--===============2750109440388550989==
+Content-Type: text/csv
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="report.csv"
+MIME-Version: 1.0
+
+6YOo6ZeoLOmHkeminQrnoJTlj5EsMTIwMDAwCuW4guWcuiw4MDAwMAo=
+
+--===============2750109440388550989==--

@@ -35,6 +35,8 @@ store-assets/msix/out/
 e2e/node_modules/
 e2e/artifacts/
 e2e/outbox/
+e2e/logs/
+e2e/support/__pycache__/
 
 # 工作区记忆与本地任务数据（WorkBuddy 管理，非源码）
 .workbuddy/
