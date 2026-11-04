@@ -11,6 +11,8 @@
 //! 子模块：`send`（SMTP 发送队列状态机）、`recv`（IMAP 收件与 MIME 解析入库）。
 
 pub mod contacts;
+/// .eml 导出与「作为附件转发」（B4/B6）
+pub mod eml;
 mod recv;
 pub(crate) mod seen;
 mod send;
@@ -2061,6 +2063,50 @@ pub fn add_attachments(
         }
     }
     result
+}
+
+/// 以字节形式添加附件（B6 转发为附件：.eml 在内存生成，不落临时文件）。
+/// 与 add_attachments 共用 insert_attachment/统计同步；失败时回滚已写盘文件。
+pub fn add_attachment_bytes(
+    state: &AppState,
+    email_id: i64,
+    filename: &str,
+    mime: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("附件内容为空".to_string());
+    }
+    let limit = inline_limit(state);
+    let root = attach_root(state);
+    let month = month_dir_of(state, email_id);
+    let name = safe_filename(filename);
+    state.with_conn(|conn| {
+        let tx = conn.transaction().map_err(e)?;
+        let mut written: Vec<PathBuf> = Vec::new();
+        let stored = insert_attachment(
+            &AttachCtx {
+                tx: &tx,
+                root: &root,
+                month: &month,
+                email_id,
+                limit,
+            },
+            &name,
+            mime,
+            data,
+            &mut written,
+        );
+        if let Err(err) = stored {
+            for p in &written {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(err);
+        }
+        sync_attach_stats(&tx, email_id)?;
+        tx.commit().map_err(e)?;
+        Ok(())
+    })
 }
 
 /// 富文本撰写页"超大内嵌图片转附件"策略的载荷形态（前端从 data:image 抽取）

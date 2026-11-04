@@ -102,6 +102,30 @@ async function mbxSaveAllAttachments(emailId) {
     }
 }
 
+// 导出 .eml（B4）：选保存文件 → 服务端按库内字段重建 RFC 5322 报文写盘。
+// 默认文件名为主题清洗结果（服务端已算好；空主题回落 corpmail-{id}.eml）
+let mbxExportBusy = false;
+
+async function mbxExportEml(emailId, filename) {
+    if (mbxExportBusy) return;
+    mbxExportBusy = true;
+    try {
+        const dest = await window.__TAURI__.dialog.save({
+            defaultPath: filename || `corpmail-${emailId}.eml`
+        });
+        if (!dest) return;
+        await htmx.ajax('POST', `/emails/${emailId}/export-eml`, {
+            target: '#toast',
+            swap: 'innerHTML',
+            values: { dest }
+        });
+    } catch (e) {
+        console.error('[mbx] 导出 .eml 失败', e);
+    } finally {
+        mbxExportBusy = false;
+    }
+}
+
 // 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
 // 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区。
 // 请求护栏（M5 防抖审计）：弹窗+请求全程只允许一次在途

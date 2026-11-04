@@ -9,7 +9,7 @@
     <main class="main">
         <div class="topbar">
             <a class="back" href="{{ back_href }}">‹ 返回列表</a>
-            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to and reply_all %}回复全部{% elif in_reply_to %}回复邮件{% elif forward_from %}转发邮件{% else %}撰写新邮件{% endif %}</h1>
+            <h1>{% if draft_id %}编辑草稿{% elif in_reply_to and reply_all %}回复全部{% elif in_reply_to %}回复邮件{% elif attach_eml_from %}作为附件转发{% elif forward_from %}转发邮件{% else %}撰写新邮件{% endif %}</h1>
         </div>
 
         <div class="card compose-card">
@@ -18,11 +18,15 @@
             {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个 0 字节文件（未附加）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
             {% if forward_attach_cnt > 0 %}<div class="compose-note">📎 将携带原邮件 {{ forward_attach_cnt }} 个附件（保存后生效）</div>{% endif %}
+            {% if attach_eml_from %}<div class="compose-note">📎 原邮件将以附件 {{ attach_eml_name }} 加入（保存后生效，可被删除）</div>{% endif %}
 
             <form hx-post="/compose/draft" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button[type=submit]">
                 <input type="hidden" name="draft_id" value="{{ draft_id }}">
                 <input type="hidden" name="in_reply_to" value="{{ in_reply_to }}">
                 <input type="hidden" name="forward_from" value="{{ forward_from }}">
+                {# 作为附件转发（B6）：源邮件 id + .eml 文件名（首次保存时生成并附加） #}
+                <input type="hidden" name="attach_eml_from" value="{{ attach_eml_from }}">
+                <input type="hidden" name="attach_eml_name" value="{{ attach_eml_name }}">
                 <input type="hidden" name="keep_ids" id="keep-ids"
                        value="{{ keep_ids_json }}">
                 <input type="hidden" name="attach_paths" id="attach-paths" value="[]">

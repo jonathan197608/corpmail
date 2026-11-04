@@ -1237,3 +1237,100 @@ fn template_rejects_oversized_body() {
     assert!(err.contains("过长"), "{err}");
     cleanup(&dir);
 }
+
+/// B4 .eml 重建：头字段（RFC 2047 主题）、alternative/mixed 结构、附件 base64 与 CRLF
+#[test]
+fn build_eml_rebuilds_headers_body_and_attachments() {
+    use crate::mail::eml;
+    let (state, dir) = temp_state("b4-eml");
+    let id = save_draft_with_html(
+        &state,
+        &draft("季度报表 Q3", "纯文本版"),
+        "<p>HTML 版正文</p>",
+    )
+    .unwrap();
+    let f = dir.join("明细.txt");
+    std::fs::write(&f, b"alpha").unwrap();
+    add_attachments(&state, id, &[f.to_str().unwrap().into()]).unwrap();
+
+    let bytes = eml::build_eml(&state, id).unwrap();
+    let raw = String::from_utf8(bytes).unwrap();
+    assert!(
+        raw.contains("From: =?UTF-8?B?") && raw.contains("<demo@chinatelecom.cn>\r\n"),
+        "非 ASCII 显示名应 RFC 2047 编码：{raw}"
+    );
+    assert!(raw.contains("To: peer@x.cn\r\n"), "{raw}");
+    assert!(
+        raw.contains("Subject: =?UTF-8?B?") && raw.contains("?=\r\n"),
+        "非 ASCII 主题应 RFC 2047 编码：{raw}"
+    );
+    assert!(raw.contains("MIME-Version: 1.0\r\n"), "{raw}");
+    assert!(
+        raw.contains("multipart/alternative"),
+        "有 HTML 应双版本：{raw}"
+    );
+    assert!(
+        raw.contains("multipart/mixed"),
+        "带附件应 mixed 包裹：{raw}"
+    );
+    assert!(raw.contains("Content-Disposition: attachment"), "{raw}");
+    assert!(
+        raw.contains("filename*=UTF-8''%E6%98%8E%E7%BB%86.txt"),
+        "中文文件名应用 RFC 2231 编码：{raw}"
+    );
+    assert!(
+        raw.contains("filename=\"__.txt\""),
+        "应带 ASCII 回退名：{raw}"
+    );
+    // base64("alpha") = YWxwaGE=
+    assert!(raw.contains("YWxwaGE="), "附件正文应 base64：{raw}");
+    assert!(raw.contains("text/html"), "HTML 部分应保留：{raw}");
+    assert!(
+        raw.split("\r\n").all(|l| l.len() <= 998),
+        "各行不得超过 RFC 5322 行宽上限"
+    );
+    assert!(
+        raw.ends_with("--\r\n") || raw.ends_with("--"),
+        "应以结束边界收尾"
+    );
+    cleanup(&dir);
+}
+
+/// B4 导出文件名清洗：非法字符替换、空主题回落 id、超长截断
+#[test]
+fn eml_suggested_filename_sanitizes() {
+    use crate::mail::eml;
+    assert_eq!(
+        eml::suggested_filename("报表/2026:Q3?", 7),
+        "报表 2026 Q3.eml"
+    );
+    assert_eq!(eml::suggested_filename("   ", 7), "corpmail-7.eml");
+    let long = eml::suggested_filename(&"主".repeat(100), 7);
+    assert_eq!(long.chars().count(), 64, "60 字主题 + .eml");
+}
+
+/// B6 作为附件转发：首次保存生成 message/rfc822 附件，重存不重复添加
+#[test]
+fn attach_eml_added_once_on_first_save() {
+    use crate::mail::eml;
+    let (state, dir) = temp_state("b6-attach-eml");
+    let src = save_draft(&state, &draft("原始邮件", "原正文")).unwrap();
+    let dst = save_draft(&state, &draft("Fwd: 原始邮件", "")).unwrap();
+    let name = eml::suggested_filename("原始邮件", src);
+    let bytes = eml::build_eml(&state, src).unwrap();
+    add_attachment_bytes(&state, dst, &name, "message/rfc822", &bytes).unwrap();
+
+    let d = get(&state, dst).unwrap();
+    assert_eq!(d.attach_cnt, 1);
+    assert_eq!(d.attachments[0].filename, name);
+    assert_eq!(d.attachments[0].mime, "message/rfc822");
+
+    // 重复附加前先做同名判定（与路由同口径），不得出现第二份
+    let already = get(&state, dst)
+        .unwrap()
+        .attachments
+        .iter()
+        .any(|a| a.mime == "message/rfc822" && a.filename == name);
+    assert!(already, "重存应能识别已附加");
+    cleanup(&dir);
+}

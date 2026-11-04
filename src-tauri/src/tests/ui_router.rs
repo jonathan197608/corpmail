@@ -6916,3 +6916,123 @@ fn contact_save_creates_updates_and_validates() {
     assert!(html.contains("保存修改"), "按钮文案切换");
     cleanup(&dir);
 }
+
+/// B4 导出 .eml 路由：写盘成功回成功 toast；空 dest 回错误 toast；不 500
+#[test]
+fn export_eml_route_writes_file() {
+    let (state, dir) = temp_state("b4-export-route");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','导出测试',
+                     '正文','导出 测试','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let dest = dir.join("out.eml");
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/export-eml",
+            &form(&[("dest", dest.to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    let html = body(&resp);
+    assert!(html.contains("已导出到"), "应回成功 toast：{html}");
+    let raw = std::fs::read_to_string(&dest).unwrap();
+    assert!(raw.contains("Subject: =?UTF-8?B?"), "主题应编码：{raw}");
+    assert!(raw.contains("Content-Type: text/plain"), "{raw}");
+
+    // 未选保存位置：错误提示而非 500
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/export-eml", &form(&[])),
+        &tester,
+    );
+    assert!(body(&resp).contains("未选择保存位置"));
+    cleanup(&dir);
+}
+
+/// B6 作为附件转发：首次保存附加 .eml；重存（keep_ids 带回）不重复
+#[test]
+fn compose_attach_eml_saves_once() {
+    let (state, dir) = temp_state("b6-compose");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','源邮件',
+                     '源正文','源 邮件','源正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@189.cn"),
+                ("subject", "Fwd: 源邮件"),
+                ("body_text", "请查收"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                ("attach_eml_from", "1"),
+                ("attach_eml_name", "源邮件.eml"),
+            ]),
+        ),
+        &tester,
+    );
+    assert!(
+        resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+        "首次保存应回撰写页"
+    );
+    let d = mail::get(&state, 2).unwrap();
+    assert_eq!(d.attach_cnt, 1, "应附加一个 .eml");
+    assert_eq!(d.attachments[0].mime, "message/rfc822");
+    assert_eq!(d.attachments[0].filename, "源邮件.eml");
+    let aid = d.attachments[0].id;
+
+    // 重存：页面会带回 keep_ids（含刚附加的 .eml），不得重复添加
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("draft_id", "2"),
+                ("to_addrs", "peer@189.cn"),
+                ("subject", "Fwd: 源邮件"),
+                ("body_text", "请查收（改）"),
+                ("keep_ids", &format!("[{aid}]")),
+                ("attach_paths", "[]"),
+                ("attach_eml_from", "1"),
+                ("attach_eml_name", "源邮件.eml"),
+            ]),
+        ),
+        &tester,
+    );
+    let _ = resp;
+    let d = mail::get(&state, 2).unwrap();
+    assert_eq!(d.attach_cnt, 1, "重存后仍只有一份 .eml");
+    cleanup(&dir);
+}

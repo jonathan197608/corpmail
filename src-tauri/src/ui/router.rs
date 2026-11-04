@@ -270,6 +270,8 @@ struct EmailCtx {
     bcc_chips: Vec<AddrChip>,
     /// 页面轻提示（error query 回显，如重发被拒）
     notice: String,
+    /// B4 导出 .eml 的推荐文件名（主题清洗后 + .eml）
+    export_name: String,
 }
 
 /// 源码页（A5）：排查正文乱码、HTML 表格丢失、投递链路问题。
@@ -341,6 +343,11 @@ struct ComposeCtx {
     undone: bool,
     /// 邮件模板（B2）：正文上方「插入模板」下拉的数据源
     templates: Vec<mail::templates::Template>,
+    /// 作为附件转发（B6）：源邮件 id（0 = 非此模式）；首次保存时把源邮件
+    /// 生成为 .eml 并以 message/rfc822 附件加入草稿
+    attach_eml_from: i64,
+    /// 源邮件主题（页面提示「将携带 xxx.eml」用；空 = 无提示）
+    attach_eml_name: String,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -449,6 +456,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         // A1 撤销发送：窗口内清 scheduled_at 回撰写页；窗口外提示已发出
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/undo-send") => {
             Some(email_undo_send(state, req))
+        }
+        // B4 导出 .eml（前端选保存位置后 POST）
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/export-eml") => {
+            Some(email_export_eml(state, req))
         }
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/resend") => {
             Some(email_resend(state, req))
@@ -843,6 +854,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let bcc_chips = addr_chips(&email.bcc_addrs, &domain);
     let back_href = detail_back_href(req, &folder);
     let list_query = list_query_of(req, &folder);
+    let export_name = mail::eml::suggested_filename(&email.subject, email.id);
     Some(render_html(
         "email.html",
         &EmailCtx {
@@ -855,6 +867,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             cc_chips,
             bcc_chips,
             notice,
+            export_name,
         },
     ))
 }
@@ -978,6 +991,36 @@ fn email_undo_send(state: &AppState, req: &Req) -> Resp {
     } else {
         let msg = urlencode("发送已开始，撤销窗口已过（可在发件箱确认）");
         Resp::hx_redirect(&format!("/emails/{id}?error={msg}"))
+    }
+}
+
+/// 导出 .eml（B4，POST /emails/{id}/export-eml）：前端保存对话框选好 dest 后调用。
+/// 由库内字段重建 RFC 5322 报文（eml::build_eml），写盘失败回错误 toast。
+fn email_export_eml(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    let form = parse_form(&req.body);
+    let Some(dest) = trimmed_field(&form, "dest") else {
+        return Resp::html(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
+        );
+    };
+    let toast = |cls: &str, msg: &str| {
+        Resp::html(format!(
+            r#"<div id="toast" class="toast {cls}" hx-swap-oob="true">{}</div>"#,
+            html_escape(msg)
+        ))
+    };
+    if let Err(e) = mail::guard_sensitive_path(state, &dest) {
+        return toast("err", &e);
+    }
+    match mail::eml::build_eml(state, id) {
+        Ok(bytes) => match std::fs::write(&dest, bytes) {
+            Ok(()) => toast("ok", &format!("已导出到 {dest}")),
+            Err(e) => toast("err", &format!("写入失败：{e}")),
+        },
+        Err(e) => toast("err", &e),
     }
 }
 
@@ -1695,6 +1738,8 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         sched_local: String::new(),
         undone: req.query_param("undone").map(|v| v == "1").unwrap_or(false),
         templates: mail::templates::list(state),
+        attach_eml_from: 0,
+        attach_eml_name: String::new(),
     };
     if let Some(id) = req
         .query_param("draft_id")
@@ -1777,6 +1822,21 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.body_html = mail::unwrap_top_div(&src.body_html);
             ctx.body_text = String::new();
         }
+    } else if let Some(eid) = req
+        .query_param("attach_eml")
+        .and_then(|v| v.parse::<i64>().ok())
+        && let Some(src) = mail::get(state, eid)
+    {
+        // B6 作为附件转发：空白正文 + 原主题；.eml 在首次保存时生成附加
+        ctx.attach_eml_from = eid;
+        ctx.attach_eml_name = mail::eml::suggested_filename(&src.subject, eid);
+        ctx.subject = if src.subject.starts_with("Fwd:") {
+            src.subject.clone()
+        } else {
+            format!("Fwd: {}", src.subject)
+        };
+        ctx.body_mode = "plain".into();
+        ctx.body_text = String::new();
     } else if let Some(fid) = req
         .query_param("forward_from")
         .and_then(|v| v.parse::<i64>().ok())
@@ -1994,6 +2054,30 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
         && let Err(err) = mail::copy_attachments(state, forward_from, id)
     {
         return Err((id, format!("转发附件复制失败：{err}")));
+    }
+    // 作为附件转发（B6）：把源邮件重建为 .eml，以 message/rfc822 附件加入草稿。
+    // 以「已存在同名 message/rfc822 附件」判定是否已附加：既能防重存重复添加，
+    // 也覆盖首次附加失败后重试的场景（此时页面仍带 attach_eml_from）。
+    let attach_eml_from = form_i64(&form, "attach_eml_from").unwrap_or(0);
+    if attach_eml_from > 0 {
+        let name = form
+            .get("attach_eml_name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("corpmail-{attach_eml_from}.eml"));
+        let already = mail::get(state, id)
+            .map(|d| {
+                d.attachments
+                    .iter()
+                    .any(|a| a.mime == "message/rfc822" && a.filename == name)
+            })
+            .unwrap_or(false);
+        if !already {
+            let bytes = mail::eml::build_eml(state, attach_eml_from)
+                .map_err(|e| (id, format!("转发邮件生成失败：{e}")))?;
+            mail::add_attachment_bytes(state, id, &name, "message/rfc822", &bytes)
+                .map_err(|e| (id, format!("转发邮件附加失败：{e}")))?;
+        }
     }
     let mut skipped = 0usize;
     if !paths.is_empty() {
