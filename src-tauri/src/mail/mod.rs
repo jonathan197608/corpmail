@@ -1511,6 +1511,8 @@ pub struct EmailDetail {
     pub scheduled_at: i64,
     /// 定时时刻完整文本 `YYYY-MM-DD HH:MM`（scheduled_at=0 时为空串；模板直接渲染）
     pub scheduled_full: String,
+    /// 原始信头（A5；空串 = 旧版本收取或未保存）：源码页排查投递/编码问题
+    pub raw_headers: String,
     pub attachments: Vec<AttachView>,
 }
 
@@ -1523,7 +1525,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
                         attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
                         COALESCE(received_at, sent_at, created_at), too_large, starred,
-                        scheduled_at
+                        scheduled_at, COALESCE(raw_headers, '')
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -1553,6 +1555,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                             let at = r.get::<_, i64>(19)?;
                             if at > 0 { time_full(at) } else { String::new() }
                         },
+                        raw_headers: r.get(20)?,
                         attachments: Vec::new(),
                     })
                 },
@@ -1636,6 +1639,20 @@ pub fn mark_read(state: &AppState, id: i64) -> bool {
         state.notify_seen();
     }
     flipped
+}
+
+/// 标为未读（A5 配套）：详情页主动留待办。只改本地 unread，
+/// 不写 seen_pending（IMAP 无"反向已读"语义，不存在要回写的操作）。
+/// 返回是否发生翻转（已是未读时为 false，幂等）。
+pub fn mark_unread(state: &AppState, id: i64) -> bool {
+    state.with_conn(|conn| {
+        conn.execute(
+            "UPDATE emails SET unread = 1 WHERE id = ?1 AND unread = 0",
+            [id],
+        )
+        .map(|n| n == 1)
+        .unwrap_or(false)
+    })
 }
 
 /// 单行 CAS 更新：仅当恰好影响 1 行返回 true（0 行 = 条件不满足/重复提交，幂等）

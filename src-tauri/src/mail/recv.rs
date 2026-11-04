@@ -119,6 +119,9 @@ pub struct IncomingMail {
     pub body_kind: String,
     /// 净化后的 HTML 正文（None = 无 HTML 版式，详情页回退纯文本）
     pub body_html: Option<String>,
+    /// 原始信头（A5）：首个空行前的 RFC 5322 头块，UTF-8 lossy + 64KB 上限。
+    /// 源码页排查投递/编码问题用；空串 = 无（解析失败或旧版本行）。
+    pub raw_headers: String,
     pub attachments: Vec<IncomingAttach>,
     /// 超过单封上限：只拉了信头，正文/附件未下载（正文为占位说明）
     pub too_large: bool,
@@ -867,9 +870,25 @@ fn placeholder_mail(
         body_text,
         body_kind: "plain".into(),
         body_html: None,
+        raw_headers: raw_header_block(header),
         attachments: Vec::new(),
         too_large: true,
     }
+}
+
+/// 原始信头提取（A5）：首个空行前的字节块，UTF-8 lossy + 64KB 截断。
+/// 头部结构（Received/Content-Type/charset/SPF）均为 ASCII；非 UTF-8 字节
+/// （如未编码的 GBK 主题）会变替换符，不影响投递链路判断（正文编码看源码页）。
+fn raw_header_block(raw: &[u8]) -> String {
+    const MAX: usize = 64 * 1024;
+    // 先找 \r\n\r\n，再找 \n\n（兼容 LF-only 邮件）
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n"))
+        .unwrap_or(raw.len())
+        .min(MAX);
+    String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
 /// MIME 解析为 IncomingMail（mailparse：主题/地址自动解码 RFC2047，spike 已验证）
@@ -899,8 +918,9 @@ fn parse_incoming(
         to_addrs: fields.to_addrs,
         cc_addrs: fields.cc_addrs,
         body_text,
-        body_kind: if body_html.is_some() { "html" } else { "plain" }.to_string(),
+        body_kind: if body_html.is_some() { "html" } else { "plain" }.into(),
         body_html,
+        raw_headers: raw_header_block(raw),
         attachments,
         too_large: false,
     })
@@ -1132,9 +1152,9 @@ pub fn store_incoming_conn(
                                 cc_addrs, subject, body_text, body_kind, subject_tokens,
                                 body_tokens, attach_cnt, attach_bytes, unread, remote_uid,
                                 message_id, created_at, received_at, sent_at, too_large,
-                                body_html, thread_key)
+                                body_html, thread_key, raw_headers)
              VALUES (?17, ?18, ?19, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?20, ?21, ?22, ?23, ?24)",
+                     ?13, ?14, ?15, ?20, ?21, ?22, ?23, ?24, ?25)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
@@ -1160,6 +1180,7 @@ pub fn store_incoming_conn(
                 m.too_large,
                 m.body_html,
                 tk,
+                m.raw_headers,
             ],
         )
         .map_err(e)?;

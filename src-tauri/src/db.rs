@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -78,6 +78,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         6 => migrate_v7(tx),
         7 => migrate_v8(tx),
         8 => migrate_v9(tx),
+        9 => migrate_v10(tx),
         _ => Ok(()),
     }
 }
@@ -161,6 +162,27 @@ fn migrate_v9(tx: &Connection) -> rusqlite::Result<()> {
          WHERE scheduled_at > 0",
     )?;
     Ok(())
+}
+
+/// v9 → v10：原文排查（A5）+ 撰写页快捷短语（B2）。
+/// - raw_headers：收件时保存的 RFC 5322 原始信头（首个空行前，UTF-8 lossy，
+///   截断 64KB）。排查投递链路/编码/SPF 用（Received 链、Content-Type、charset
+///   均为 ASCII）；存量行为空串，源码页提示「旧版本收取，未保存信头」。
+/// - templates：邮件模板（纯文本 + HTML 双份，撰写页按当前模式插入）。
+fn migrate_v10(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "raw_headers")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN raw_headers TEXT NOT NULL DEFAULT ''")?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS templates (
+           id         INTEGER PRIMARY KEY AUTOINCREMENT,
+           name       TEXT NOT NULL,
+           body_text  TEXT NOT NULL DEFAULT '',
+           body_html  TEXT NOT NULL DEFAULT '',
+           created_at INTEGER NOT NULL DEFAULT 0,
+           updated_at INTEGER NOT NULL DEFAULT 0
+         );",
+    )
 }
 
 /// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁，

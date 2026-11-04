@@ -61,6 +61,16 @@
                 {% endif %}
                 <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↪️ 转发</a>
                 {% endif %}
+                {# A5 源码排查：HTML/纯文本/原始信头（乱码、表格丢失、投递问题） #}
+                <a class="btn" href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
+                   title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">🔎 源码</a>
+                {# A5 配套：收件且已读时可标回未读，留待办 #}
+                {% if email.folder == 'inbox' and not email.unread %}
+                <button type="button" class="btn"
+                        hx-post="/emails/{{ email.id }}/unread{% if list_query %}?{{ list_query }}{% endif %}"
+                        hx-trigger="click throttle:500ms" hx-disabled-elt="this"
+                        title="标为未读并返回列表（留待后续处理）">● 标为未读</button>
+                {% endif %}
                 <button type="button" class="btn danger"
                         hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                         hx-trigger="click throttle:500ms"

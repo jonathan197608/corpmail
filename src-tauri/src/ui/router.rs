@@ -264,6 +264,24 @@ struct EmailCtx {
     notice: String,
 }
 
+/// 源码页（A5）：排查正文乱码、HTML 表格丢失、投递链路问题。
+/// part = html（净化后 HTML 源码）/ text（纯文本）/ headers（RFC 5322 原始信头）。
+#[derive(Serialize)]
+struct SourceCtx {
+    frame: FrameCtx,
+    email_id: i64,
+    subject: String,
+    part: String,
+    /// 当前视图内容（模板内 `<pre>` 转义渲染）
+    content: String,
+    chars: usize,
+    lines: usize,
+    /// 当前视图为空时的说明文案
+    empty_hint: String,
+    back_href: String,
+    list_query: String,
+}
+
 /// 会话详情页（M2-2）：一个 thread_key 归组的往来邮件，时间正序串列
 #[derive(Serialize)]
 struct ThreadCtx {
@@ -428,6 +446,14 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         // M2-1 星标翻转：列表/详情页星标按钮（hs-swap=none，事件驱动后续处理）
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/star") => {
             Some(email_star(state, req))
+        }
+        // A5 源码排查页：必须在详情通配之前（/emails/{id}/source 多段路径）
+        ("GET", p) if p.starts_with("/emails/") && p.ends_with("/source") => {
+            email_source(state, req)
+        }
+        // A5 配套：详情页「标为未读」留待办（跳回列表）
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/unread") => {
+            Some(email_unread(state, req))
         }
         ("POST", "/emails/batch") => Some(emails_batch(state, req)),
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
@@ -699,6 +725,54 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     ))
 }
 
+/// 源码页（GET /emails/{id}/source?part=html|text|headers，A5）。
+/// 只读展示，不改任何状态；切换 tab 保留列表上下文（list_query）。
+fn email_source(state: &AppState, req: &Req) -> Option<Resp> {
+    let id = path_id(&req.path, "/emails/")?;
+    if !state.configured() {
+        return Some(render_html("welcome.html", &()));
+    }
+    mark_read_and_sync_seen(state, id);
+    let email = mail::get(state, id)?;
+    let folder = email.folder.clone();
+    let part = match req.query_param("part").as_deref() {
+        Some("text") => "text",
+        Some("headers") => "headers",
+        _ => "html",
+    };
+    let (content, empty_hint) = match part {
+        "text" => (
+            email.body_text.clone(),
+            "该邮件没有纯文本正文（仅存 HTML 版式）。",
+        ),
+        "headers" => (
+            email.raw_headers.clone(),
+            "该邮件收取于旧版本，未保存原始信头；此后新收的邮件会自动保存。",
+        ),
+        _ => (
+            email.body_html.clone(),
+            "该邮件没有 HTML 版式（纯文本邮件），可查看「纯文本」标签。",
+        ),
+    };
+    let chars = content.chars().count();
+    let lines = content.lines().count();
+    Some(render_html(
+        "source.html",
+        &SourceCtx {
+            frame: frame_ctx(state, &folder),
+            email_id: id,
+            subject: email.subject.clone(),
+            part: part.to_string(),
+            content,
+            chars,
+            lines,
+            empty_hint: empty_hint.to_string(),
+            back_href: detail_back_href(req, &folder),
+            list_query: list_query_of(req, &folder),
+        },
+    ))
+}
+
 /// 会话详情页（GET /threads/{id}，M2-2）：定位 id 所在 thread_key，串列组内往来。
 /// 未配置 → 欢迎页；id 不属于任何会话组 → 404
 fn thread_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
@@ -765,6 +839,21 @@ fn email_read(state: &AppState, req: &Req) -> Resp {
     };
     mark_read_and_sync_seen(state, id);
     Resp::html(String::new())
+}
+
+/// 标为未读（POST /emails/{id}/unread，A5 配套）：详情页主动留待办。
+/// 只改本地 unread（不回写 IMAP \Seen，服务器无"反向已读"语义），
+/// 完成后跳回列表并保持过滤/页码上下文。
+fn email_unread(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    let folder = mail::get(state, id)
+        .map(|d| d.folder)
+        .unwrap_or_else(|| "inbox".into());
+    mail::mark_unread(state, id);
+    state.poke_tray(); // 未读数 +1：刷托盘角标
+    Resp::hx_redirect(&detail_back_href(req, &folder))
 }
 
 /// 星标翻转（POST /emails/{id}/star，M2-1）。返回空体 + mbx:starDone 事件

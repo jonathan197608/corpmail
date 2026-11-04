@@ -787,6 +787,126 @@ fn reply_and_forward_keep_body_kind() {
     cleanup(&dir);
 }
 
+/// A5 源码页：html/text/headers 三视图 + 非法 part 回退 html
+#[test]
+fn source_page_renders_html_text_and_headers() {
+    let (state, dir) = temp_state("a5-source");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, body_html, raw_headers, subject_tokens,
+                                body_tokens, unread, created_at, received_at)
+             VALUES ('in', 'inbox', 'received', 'a@x.cn', '', 'demo@chinatelecom.cn',
+                     '乱码排查', '纯文本正文', '<p>HTML 正文</p>',
+                     'Received: from mx.x.cn\r\nContent-Type: text/html; charset=gbk',
+                     '乱码 排查', '纯 文本 正文', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 默认 html：源码应转义展示（不能当 HTML 再渲染）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1/source", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("&lt;p&gt;HTML 正文&lt;"),
+        "HTML 源码应转义展示：{html}"
+    );
+    assert!(
+        html.contains("HTML 源码") && html.contains("原始信头"),
+        "应有三视图标签：{html}"
+    );
+    // text
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/emails/1/source", "part=text", b""),
+        &tester,
+    ));
+    assert!(html.contains("纯文本正文"));
+    // headers：原始信头原样展示
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/emails/1/source", "part=headers", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("Received: from mx.x.cn"),
+        "原始信头应原样展示：{html}"
+    );
+    // 非法 part 回退 html
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/emails/1/source", "part=bogus", b""),
+        &tester,
+    ));
+    assert!(html.contains("&lt;p&gt;HTML 正文&lt;"));
+    cleanup(&dir);
+}
+
+/// A5 配套：详情页标未读 → unread=1 + 保持列表上下文跳回；重复点击幂等
+#[test]
+fn mark_unread_restores_flag_and_redirects() {
+    let (state, dir) = temp_state("a5-unread");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at)
+             VALUES ('in','inbox','received','a@x.cn','','demo@chinatelecom.cn',
+                     '待办','正文','待办','正文',0,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("POST", "/emails/1/unread", "folder=inbox&page=2", b""),
+        &tester,
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v.contains("folder=inbox") && v.contains("page=2")),
+        "应保持列表上下文跳回：{:?}",
+        resp.extra_headers
+    );
+    let unread: i64 = state.with_conn(|c| {
+        c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(unread, 1, "标未读应置 unread=1");
+    // 幂等：已是未读再点不报错、值不变
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/unread", b""),
+        &tester,
+    );
+    let unread: i64 = state.with_conn(|c| {
+        c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(unread, 1);
+    cleanup(&dir);
+}
+
 #[test]
 fn detail_marks_read_and_delete_redirects() {
     let (state, dir) = temp_state("m2-detail");
@@ -3428,10 +3548,12 @@ fn dump_smoke_html() {
             // 应被净化移除——供浏览器目视核对 HTML 渲染与 XSS 防护
             let sample = r#"<div style="font-family:sans-serif"><h2 style="color:#0057c2">配案清单（HTML 版）</h2><p>各位领导：</p><table border="1" cellpadding="6" style="border-collapse:collapse"><tr><th>客户</th><th>速率</th></tr><tr><td>示例客户 A</td><td>200M</td></tr></table><p><a href="javascript:alert(1)">危险链接</a><script>alert('xss')</script></p></div>"#;
             let safe = mail::sanitize_html(sample);
+            // A5 原始信头种子：源码页三视图冒烟（Received 链 + charset 声明）
+            let headers = "Return-Path: <boss@chinatelecom.cn>\r\nReceived: from mx.chinatelecom.cn (mx.chinatelecom.cn [10.0.0.8])\r\n\tby imap.chinatelecom.cn with ESMTPS id abc123;\r\n\tTue, 03 Nov 2026 09:12:31 +0800 (CST)\r\nFrom: =?utf-8?B?546L5Ymv5oC757un55CG?= <boss@chinatelecom.cn>\r\nTo: demo@chinatelecom.cn\r\nSubject: =?utf-8?B?5r+A5Yqx5riF5Y2V5bey5om55aSN77yM6K+35oyJ5pa55qGI5omn6KGM?=\r\nMessage-Id: <seed-1@chinatelecom.cn>\r\nContent-Type: text/html; charset=utf-8\r\nX-Mailer: CorpMail-Test";
             state.with_conn(|c| {
                 c.execute(
-                    "UPDATE emails SET body_html = ?1, body_kind = 'html' WHERE id = ?2",
-                    rusqlite::params![safe, id],
+                    "UPDATE emails SET body_html = ?1, body_kind = 'html', raw_headers = ?3 WHERE id = ?2",
+                    rusqlite::params![safe, id, headers],
                 )
                 .unwrap();
             });
@@ -3495,6 +3617,19 @@ fn dump_smoke_html() {
     dump("main-all-thread.html", get_url("/?folder=all&mode=thread"));
     dump("thread-detail.html", get(&format!("/threads/{inbox_id}")));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
+    // A5 源码页素材：HTML 源码 / 纯文本 / 原始信头三视图
+    dump(
+        "source-html.html",
+        get(&format!("/emails/{inbox_id}/source")),
+    );
+    dump(
+        "source-text.html",
+        get_url(&format!("/emails/{inbox_id}/source?part=text")),
+    );
+    dump(
+        "source-headers.html",
+        get_url(&format!("/emails/{inbox_id}/source?part=headers")),
+    );
     // M2-1 星标详情页素材（email-inbox.html 为未星标态，两态各有对照）
     dump(
         "email-starred.html",

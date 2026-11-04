@@ -103,6 +103,7 @@ fn incoming(uidvalidity: u32, uid: u32) -> IncomingMail {
         body_text: "正文".into(),
         body_kind: "plain".into(),
         body_html: None,
+        raw_headers: String::new(),
         attachments: Vec::new(),
         too_large: false,
     }

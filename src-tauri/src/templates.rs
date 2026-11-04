@@ -49,6 +49,8 @@ const TEMPLATES: &[(&str, &str)] = &[
         "contacts_area.html",
         include_str!("templates/contacts_area.html"),
     ),
+    // A5 源码排查页（HTML/纯文本/原始信头）
+    ("source.html", include_str!("templates/source.html")),
 ];
 
 /// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义，

@@ -510,3 +510,86 @@ fn migrate_v8_to_v9_adds_scheduled_at_column() {
         .unwrap();
     assert_eq!(cols, 1, "新库应直接含 scheduled_at 列");
 }
+
+/// v9 → v10 增量（A5 原文排查 + B2 邮件模板）：加 raw_headers 列
+/// （NOT NULL DEFAULT ''，存量行为空串）+ 建 templates 表
+#[test]
+fn migrate_v9_to_v10_adds_raw_headers_and_templates() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    // 沿 v2→v9 逐级铺设（DDL 取自各迁移实体）
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         CREATE TABLE contacts (
+           addr TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 1);
+         CREATE INDEX idx_contacts_name ON contacts(name);
+         ALTER TABLE emails ADD COLUMN body_html TEXT;
+         ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT '';
+         ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN thread_key TEXT;
+         CREATE INDEX idx_thread_key ON emails(thread_key);
+         ALTER TABLE emails ADD COLUMN scheduled_at INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_scheduled_due ON emails(scheduled_at) WHERE scheduled_at > 0;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 9i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let cols: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='raw_headers'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "v10 应有 raw_headers 列");
+    let raw: String = conn
+        .query_row("SELECT raw_headers FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw, "", "存量行信头为空串（源码页提示旧版本未保存）");
+    // templates 表可用（B2 后续项依赖）
+    conn.execute(
+        "INSERT INTO templates(name, body_text, body_html, created_at, updated_at)
+         VALUES ('月度报送', '请查收本月清单。', '<p>请查收本月清单。</p>', 1, 1)",
+        [],
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM templates", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "templates 表应可写入");
+    // 新库一步建到 v10（含列与表）
+    let fresh = mem();
+    let cols: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='raw_headers'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "新库应直接含 raw_headers 列");
+    let tbl: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='templates'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tbl, 1, "新库应直接含 templates 表");
+}

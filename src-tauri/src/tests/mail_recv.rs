@@ -184,6 +184,7 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
         body_text: "请查收本月激励清单。".into(),
         body_kind: "plain".into(),
         body_html: None,
+        raw_headers: String::new(),
         attachments: Vec::new(),
         too_large: false,
     }
@@ -462,6 +463,36 @@ fn parse_incoming_extracts_headers_and_body() {
     assert_eq!(mail.message_id, "<abc@x.cn>");
     assert!(!mail.seen);
     assert_eq!(mail.uid, 99);
+    // A5：原始信头块完整保存（含未解码的 RFC2047 原值），且不污染正文
+    assert!(
+        mail.raw_headers
+            .contains("Subject: =?utf-8?B?5pyI5bqm6YWN5qGI?="),
+        "应保存原始信头：{}",
+        mail.raw_headers
+    );
+    assert!(
+        !mail.raw_headers.contains("body line"),
+        "信头块不应包含正文"
+    );
+}
+
+/// A5 原始信头提取：CRLF / LF-only / 无空行 / 超长截断
+#[test]
+fn raw_header_block_handles_line_endings_and_bounds() {
+    assert_eq!(
+        raw_header_block(b"From: a@x.cn\r\nSubject: hi\r\n\r\nbody"),
+        "From: a@x.cn\r\nSubject: hi"
+    );
+    assert_eq!(
+        raw_header_block(b"From: a@x.cn\nSubject: hi\n\nbody"),
+        "From: a@x.cn\nSubject: hi"
+    );
+    // 无空行：整段视为信头
+    assert_eq!(raw_header_block(b"From: a@x.cn"), "From: a@x.cn");
+    // 超长信头截断到 64KB（防恶意巨型头占用内存/撑爆页面）
+    let huge = format!("X-Junk: {}\r\n\r\nbody", "a".repeat(100_000));
+    let out = raw_header_block(huge.as_bytes());
+    assert_eq!(out.len(), 64 * 1024, "超长信头应截断到 64KB");
 }
 
 #[test]

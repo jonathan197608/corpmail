@@ -2439,3 +2439,80 @@ a.btn.link.disabled {
     filter: grayscale(1);
     opacity: 0.55;
 }
+
+/* ============ 源码页（A5：HTML/纯文本/原始信头） ============ */
+.src-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 2px 10px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 12px;
+}
+
+.src-tab {
+    font-size: 13px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding: 5px 12px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+}
+
+.src-tab:hover {
+    background: var(--accent-soft);
+    color: var(--ink);
+}
+
+.src-tab.on {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+    font-weight: 600;
+}
+
+.src-meta {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* 源码块：等宽、保留空白、长行横向滚动（不折行，便于对齐表头/结构） */
+.src-pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: #f7f9fc;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--ink);
+    max-height: calc(100vh - 260px);
+    overflow: auto;
+    white-space: pre;
+    tab-size: 4;
+}
+
+.src-empty {
+    padding: 28px 16px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--muted);
+    background: #f7f9fc;
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+}
+
+.src-tip {
+    margin-top: 12px;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--muted);
+}
+
+.src-tip b {
+    color: var(--ink-soft);
+    font-weight: 600;
+}
