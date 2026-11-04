@@ -1115,6 +1115,46 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
     document.addEventListener('DOMContentLoaded', init);
 })();
 
+// ---------- 邮件模板插入（B2） ----------
+// 纯文本模式：在 textarea 光标处插入 body_text，光标落到末尾；
+// 富文本模式：优先 dangerouslyInsertHtml(body_html)，空则把文本转义为段落；
+// 插入后下拉复位，避免重复选择同一项不触发 change
+(function () {
+    var sel = document.getElementById('tpl-select');
+    if (!sel) return;
+    sel.addEventListener('change', function () {
+        var opt = sel.options[sel.selectedIndex];
+        if (!opt || !opt.value) return;
+        var text = opt.dataset.text || '';
+        var html = opt.dataset.html || '';
+        var mode = document.getElementById('body-mode');
+        var isHtml = mode && mode.value === 'html';
+        if (isHtml && window.mbxEditor) {
+            if (!html.trim()) {
+                html = '<p>' + escapeHtml(text).replace(/\r?\n/g, '<br>') + '</p>';
+            }
+            // 先聚焦再插：wangEditor 未聚焦时 dangerouslyInsertHtml 会落到
+            // 文档末尾（且内部选区不刷新）；focus() 恢复上次光标位置
+            try { window.mbxEditor.focus(); } catch (e) { /* 忽略 */ }
+            if (typeof window.mbxEditor.dangerouslyInsertHtml === 'function') {
+                window.mbxEditor.dangerouslyInsertHtml(html);
+            } else {
+                window.mbxEditor.setHtml((window.mbxEditor.getHtml() || '') + html);
+            }
+        } else {
+            var ta = document.getElementById('body-text');
+            if (ta) {
+                var start = ta.selectionStart || 0;
+                var end = ta.selectionEnd || 0;
+                ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+                ta.selectionStart = ta.selectionEnd = start + text.length;
+                ta.focus();
+            }
+        }
+        sel.selectedIndex = 0;
+    });
+})();
+
 // ---------- 高级检索面板（B1） ----------
 // 搜索框右侧 ⚙ 切换面板；清除筛选清空四项后提交（保留 folder/排序/每页）
 (function () {

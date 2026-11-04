@@ -1,0 +1,68 @@
+{# 设置·邮件模板 pane（B2，上下文：SettingsCtx） #}
+<div class="settings-pane on" id="settings-pane">
+    <div class="card settings-card">
+        <h3>邮件模板</h3>
+        <p class="desc">把常用回复存成模板，撰写邮件时从正文上方的「插入模板」下拉一键插入。
+            纯文本模式插入文本内容；已切换富文本时优先插入 HTML 内容（留空则用文本转段落）。</p>
+        {% if saved %}<span class="test-result ok">✓ 已保存</span>{% endif %}
+        {% if error %}<div class="tpl-error">{{ error }}</div>{% endif %}
+
+        <form class="tpl-form" hx-post="/templates/save" hx-target="#settings-pane" hx-swap="outerHTML">
+            <div class="sfield">
+                <label>名称<small class="hint">最多 60 字，用于下拉选择</small></label>
+                <input type="text" name="name" maxlength="60" required placeholder="如：收到请回复">
+            </div>
+            <div class="sfield">
+                <label>纯文本内容<small class="hint">纯文本模式插入这段；富文本模式作为回退</small></label>
+                <textarea name="body_text" rows="3" placeholder="如：收到，我这边核对后回复您。"></textarea>
+            </div>
+            <div class="sfield">
+                <label>HTML 内容<small class="hint">可选：富文本模式优先插入（如带颜色的表格/列表）</small></label>
+                <textarea name="body_html" rows="2" placeholder="可选，留空则用纯文本"></textarea>
+            </div>
+            <button class="btn primary" type="submit">新增模板</button>
+        </form>
+    </div>
+
+    {% if templates %}
+    <ul class="tpl-list">
+        {% for t in templates %}
+        <li class="tpl-item">
+            <div class="tpl-head">
+                <b class="tpl-title">{{ t.name }}</b>
+                <span class="tpl-preview">{{ t.preview }}</span>
+                <button type="button" class="btn small danger"
+                        hx-post="/templates/delete" hx-vals='{"id": "{{ t.id }}"}'
+                        hx-target="#settings-pane" hx-swap="outerHTML"
+                        hx-trigger="click throttle:500ms" hx-disabled-elt="this"
+                        hx-confirm="删除模板「{{ t.name }}」？删除后不可恢复。">删除</button>
+            </div>
+            <details class="tpl-edit">
+                <summary>编辑</summary>
+                <form hx-post="/templates/save" hx-target="#settings-pane" hx-swap="outerHTML">
+                    <input type="hidden" name="id" value="{{ t.id }}">
+                    <div class="sfield">
+                        <label>名称</label>
+                        <input type="text" name="name" value="{{ t.name }}" maxlength="60" required>
+                    </div>
+                    <div class="sfield">
+                        <label>纯文本内容</label>
+                        <textarea name="body_text" rows="3">{{ t.body_text }}</textarea>
+                    </div>
+                    <div class="sfield">
+                        <label>HTML 内容</label>
+                        <textarea name="body_html" rows="2">{{ t.body_html }}</textarea>
+                    </div>
+                    <button class="btn small primary" type="submit">保存修改</button>
+                </form>
+            </details>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="card empty-state">
+        <div class="empty-mark">📄</div>
+        <p>还没有模板，用上面的表单添加第一条。</p>
+    </div>
+    {% endif %}
+</div>

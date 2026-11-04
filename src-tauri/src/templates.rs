@@ -36,6 +36,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/settings_pane_about.html"),
     ),
     (
+        "settings_pane_templates.html",
+        include_str!("templates/settings_pane_templates.html"),
+    ),
+    (
         "test_result.html",
         include_str!("templates/test_result.html"),
     ),

@@ -3662,6 +3662,19 @@ fn dump_smoke_html() {
         )),
     );
     dump("email-draft.html", get(&format!("/emails/{d1}")));
+    // B2 模板素材：两条模板（纯文本 + HTML），撰写页下拉与设置页列表共用
+    {
+        use crate::mail::templates;
+        templates::save(&state, None, "收到请回复", "收到，我核对后回复您。", "").unwrap();
+        templates::save(
+            &state,
+            None,
+            "月度报送",
+            "各位领导：本月清单见附件，请查收。",
+            "<p>各位领导：</p><p>本月清单见附件，请查收。</p>",
+        )
+        .unwrap();
+    }
     dump("compose.html", get("/compose"));
     dump(
         "compose-reply.html",
@@ -3847,6 +3860,7 @@ fn dump_smoke_html() {
     dump("settings-sync.html", get("/settings/sync"));
     dump("settings-storage.html", get("/settings/storage"));
     dump("settings-about.html", get("/settings/about"));
+    dump("settings-templates.html", get("/settings/templates"));
 
     // M3-3 联系人页素材：smoke 直写 emails 表不经过采集管道，手动补
     // contacts 种子（姓名/最近联系偏移/往来次数各异）后 dump 整页 + 搜索态
@@ -6731,5 +6745,59 @@ fn advanced_search_filters_and_persists() {
         !html.contains("id=\"adv-panel\" method=\"get\" action=\"/\"\n          hidden"),
         "有条件时面板应展开"
     );
+    cleanup(&dir);
+}
+
+/// B2 模板页与保存/删除路由：设置页 tab、片段回显、撰写页下拉
+#[test]
+fn template_settings_and_compose_picker() {
+    let (state, dir) = temp_state("b2-tpl");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 设置页 templates tab 可打开
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/templates", b""),
+        &t,
+    ));
+    assert!(html.contains("邮件模板"), "应渲染模板页：{html}");
+    assert!(html.contains("还没有模板"), "空态提示");
+    // 新增（HTMX 片段）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/templates/save",
+            &form(&[
+                ("name", "收到请回复"),
+                ("body_text", "收到，我核对后回复您。"),
+                ("body_html", ""),
+            ]),
+        ),
+        &t,
+    );
+    let html = body(&resp);
+    assert!(html.contains("✓ 已保存"), "保存成功提示：{html}");
+    assert!(html.contains("收到请回复"), "列表应出现新模板");
+    // 撰写页下拉含模板（HTML 转义后的 data-text）
+    let html = body(&route(&state, &assets(), &req("GET", "/compose", b""), &t));
+    assert!(html.contains("id=\"tpl-select\""), "撰写页应有模板下拉");
+    assert!(html.contains("收到请回复"), "下拉应含模板名");
+    // 删除
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/templates/delete", &form(&[("id", "1")])),
+        &t,
+    );
+    let html = body(&resp);
+    assert!(html.contains("还没有模板"), "删除后回到空态");
     cleanup(&dir);
 }

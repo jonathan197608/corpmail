@@ -14,6 +14,7 @@ pub mod contacts;
 mod recv;
 pub(crate) mod seen;
 mod send;
+pub mod templates;
 
 pub use recv::{
     IncomingMail, LastCursor, MailDest, MailFetcher, RealFetcher, seen_params_of,

@@ -1186,3 +1186,54 @@ fn date_epoch_of_parses_day_bounds() {
         "后一天应更晚"
     );
 }
+
+/// B2 邮件模板 CRUD：新增/更新/删除、校验与预览摘录
+#[test]
+fn template_crud_and_validation() {
+    use crate::mail::templates;
+    let (state, dir) = temp_state("tpl");
+    assert!(templates::list(&state).is_empty(), "初始无模板");
+    let id = templates::save(&state, None, "  收到请回复  ", "收到，我核对后回复您。", "").unwrap();
+    let list = templates::list(&state);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "收到请回复", "名称应 trim");
+    assert!(list[0].preview.contains("收到"));
+    // 更新
+    templates::save(&state, Some(id), "改名", "新内容", "<p>新内容</p>").unwrap();
+    let t = templates::get(&state, id).unwrap();
+    assert_eq!(t.name, "改名");
+    assert_eq!(t.body_html, "<p>新内容</p>");
+    // 校验
+    assert!(
+        templates::save(&state, None, "  ", "x", "").is_err(),
+        "名称必填"
+    );
+    assert!(
+        templates::save(&state, None, "空内容", "", "").is_err(),
+        "内容必填"
+    );
+    assert!(
+        templates::save(&state, None, &"名".repeat(61), "x", "").is_err(),
+        "名称超长"
+    );
+    assert!(
+        templates::save(&state, Some(9999), "不存在", "x", "").is_err(),
+        "更新不存在的 id 应报错"
+    );
+    // 删除幂等
+    templates::delete(&state, id).unwrap();
+    assert!(templates::get(&state, id).is_none());
+    templates::delete(&state, id).unwrap();
+    cleanup(&dir);
+}
+
+/// B2 模板内容上限：单字段 100KB
+#[test]
+fn template_rejects_oversized_body() {
+    use crate::mail::templates;
+    let (state, dir) = temp_state("tpl-big");
+    let big = "x".repeat(100 * 1024 + 1);
+    let err = templates::save(&state, None, "大", &big, "").unwrap_err();
+    assert!(err.contains("过长"), "{err}");
+    cleanup(&dir);
+}

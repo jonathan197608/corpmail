@@ -82,6 +82,8 @@ pub(super) struct SettingsCtx {
     backup_size: String,
     backup_files: u64,
     backup_view: Option<BackupDeleteView>,
+    // 模板 tab（B2）：邮件模板列表（其他 tab 为空）
+    templates: Vec<crate::mail::templates::Template>,
     // 关于 tab
     app_version: String,
     sqlite_version: String,
@@ -252,6 +254,11 @@ pub(super) fn settings_ctx(
         backup_size,
         backup_files,
         backup_view: backup,
+        templates: if tab == "templates" {
+            crate::mail::templates::list(state)
+        } else {
+            Vec::new()
+        },
         app_version: env!("CARGO_PKG_VERSION").into(),
         sqlite_version: state.sqlite_version(),
     }

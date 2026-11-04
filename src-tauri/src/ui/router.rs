@@ -7,9 +7,9 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use super::settings::{
-    settings_account_save, settings_account_test, settings_backup_delete, settings_page,
-    settings_pane_fragment, settings_storage_clean, settings_storage_move, settings_storage_save,
-    settings_sync_refetch, settings_sync_save,
+    settings_account_save, settings_account_test, settings_backup_delete, settings_ctx,
+    settings_page, settings_pane_fragment, settings_storage_clean, settings_storage_move,
+    settings_storage_save, settings_sync_refetch, settings_sync_save,
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
@@ -338,6 +338,8 @@ struct ComposeCtx {
     sched_local: String,
     /// 刚撤销发送（A1）：显示「已撤销，可继续编辑」提示
     undone: bool,
+    /// 邮件模板（B2）：正文上方「插入模板」下拉的数据源
+    templates: Vec<mail::templates::Template>,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -506,6 +508,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/settings/account")
         | ("GET", "/settings/sync")
         | ("GET", "/settings/storage")
+        | ("GET", "/settings/templates")
         | ("GET", "/settings/about") => {
             let tab = req.path.rsplit('/').next().unwrap_or("account");
             Some(settings_page(state, tab))
@@ -514,6 +517,9 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
             let tab = p.strip_prefix("/settings/panes/").unwrap_or("");
             valid_tab(tab).then(|| settings_pane_fragment(state, tab))
         }
+        // B2 邮件模板：保存/删除后回设置页模板片段（htmx 局部刷新）
+        ("POST", "/templates/save") => Some(template_save(state, req)),
+        ("POST", "/templates/delete") => Some(template_delete(state, req)),
         ("POST", "/settings/account/save") => Some(settings_account_save(state, req)),
         ("POST", "/settings/account/test-smtp") => {
             Some(settings_account_test(state, req, tester, false))
@@ -531,8 +537,46 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
     }
 }
 
+/// 邮件模板保存（B2，POST /templates/save）：id 空 = 新增，否则覆盖。
+/// 返回模板 pane 片段（成功 saved 提示 / 失败 error 回显），不整页跳转。
+fn template_save(state: &AppState, req: &Req) -> Resp {
+    let form = parse_form(&req.body);
+    let id = form
+        .get("id")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0);
+    let name = trimmed_field(&form, "name").unwrap_or_default();
+    let body_text = form.get("body_text").cloned().unwrap_or_default();
+    let body_html = form.get("body_html").cloned().unwrap_or_default();
+    let (saved, error) = match mail::templates::save(state, id, &name, &body_text, &body_html) {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, e),
+    };
+    render_html(
+        "settings_pane_templates.html",
+        &settings_ctx(state, "templates", saved, &error, None, None),
+    )
+}
+
+/// 邮件模板删除（B2，POST /templates/delete）：幂等，删除后回 pane 片段
+fn template_delete(state: &AppState, req: &Req) -> Resp {
+    let form = parse_form(&req.body);
+    let id = form
+        .get("id")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let (saved, error) = match mail::templates::delete(state, id) {
+        Ok(()) => (true, String::new()),
+        Err(e) => (false, e),
+    };
+    render_html(
+        "settings_pane_templates.html",
+        &settings_ctx(state, "templates", saved, &error, None, None),
+    )
+}
+
 fn valid_tab(tab: &str) -> bool {
-    matches!(tab, "account" | "sync" | "storage" | "about")
+    matches!(tab, "account" | "sync" | "storage" | "templates" | "about")
 }
 
 // ---------- 页面 ----------
@@ -1569,6 +1613,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         forward_attach_cnt: 0,
         sched_local: String::new(),
         undone: req.query_param("undone").map(|v| v == "1").unwrap_or(false),
+        templates: mail::templates::list(state),
     };
     if let Some(id) = req
         .query_param("draft_id")

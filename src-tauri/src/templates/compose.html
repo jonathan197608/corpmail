@@ -51,6 +51,19 @@
                     {# 无标签栏：正文区全宽（wangEditor 工具栏即视觉分区） #}
                     <input type="hidden" name="body_mode" id="body-mode" value="{{ body_mode }}">
 
+                    {# 邮件模板（B2）：选择后插入正文光标处（纯文本）/ 编辑器光标处（富文本） #}
+                    {% if templates %}
+                    <div class="tpl-bar">
+                        <select id="tpl-select" aria-label="插入模板">
+                            <option value="">📄 插入模板…</option>
+                            {% for t in templates %}
+                            <option value="{{ t.id }}" data-text="{{ t.body_text }}" data-html="{{ t.body_html }}">{{ t.name }}</option>
+                            {% endfor %}
+                        </select>
+                        <span class="tpl-hint">插入到当前光标位置</span>
+                    </div>
+                    {% endif %}
+
                     {# 纯文本区：textarea + 单向升级入口（HTML 不能降级回纯文本） #}
                     <div id="body-plain" {% if body_mode == 'html' %}hidden{% endif %}>
                         <div class="plain-head">

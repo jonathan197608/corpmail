@@ -2622,3 +2622,94 @@ a.btn.link.disabled {
     gap: 5px;
     cursor: pointer;
 }
+
+/* ============ 邮件模板（B2） ============ */
+.tpl-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.tpl-bar select {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 9px;
+    background: var(--panel);
+    cursor: pointer;
+    max-width: 260px;
+}
+
+.tpl-bar select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.tpl-hint {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.tpl-error {
+    margin: 8px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: #fdecec;
+    color: #a12a2a;
+    font-size: 12.5px;
+}
+
+.tpl-list {
+    list-style: none;
+    padding: 0;
+    margin: 14px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.tpl-item {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 10px 12px;
+}
+
+.tpl-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.tpl-title {
+    font-size: 13.5px;
+    color: var(--ink);
+    white-space: nowrap;
+}
+
+.tpl-preview {
+    flex: 1;
+    font-size: 12.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tpl-edit {
+    margin-top: 8px;
+}
+
+.tpl-edit summary {
+    font-size: 12.5px;
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+}
+
+.tpl-edit .sfield {
+    margin-top: 8px;
+}

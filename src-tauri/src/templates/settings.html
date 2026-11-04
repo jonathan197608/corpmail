@@ -15,6 +15,8 @@
                 hx-target="#settings-pane" hx-swap="outerHTML">收件同步</span>
             <span class="stab{% if tab == "storage" %} on{% endif %}" hx-get="/settings/panes/storage"
                 hx-target="#settings-pane" hx-swap="outerHTML">存储管理</span>
+            <span class="stab{% if tab == "templates" %} on{% endif %}" hx-get="/settings/panes/templates"
+                hx-target="#settings-pane" hx-swap="outerHTML">模板</span>
             <span class="stab{% if tab == "about" %} on{% endif %}" hx-get="/settings/panes/about"
                 hx-target="#settings-pane" hx-swap="outerHTML">关于</span>
         </div>
