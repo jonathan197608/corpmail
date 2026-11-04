@@ -10,6 +10,8 @@
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>
     <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">📤 发件箱 <span class="cnt">{{ frame.sent }}</span></a>
     <a class="folder {% if frame.folder == 'draft' %}on{% endif %}" href="/?folder=draft">📝 草稿箱 <span class="cnt">{{ frame.draft }}</span></a>
+    {# 联系人管理（M3-3）：随收/发件自动采集，支持搜索与删除 #}
+    <a class="folder {% if frame.folder == 'contacts' %}on{% endif %}" href="/contacts">👥 联系人</a>
     {# 收件状态条（原全局浮条移入侧栏；空闲态每 8s 低频轮询——否则后台定时收取
        完成时 just_finished 无人消费，前端永不刷新；收取中每 2s） #}
     <div id="fetch-status" class="fetch-status fetch-status-side"

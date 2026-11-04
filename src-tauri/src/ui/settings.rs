@@ -34,6 +34,8 @@ pub(super) struct SettingsCtx {
     /// 域名为 chinatelecom.cn：展示客户端专用密码/拉取范围 OA 指引
     is_ct_domain: bool,
     display_name: String,
+    /// 签名档（M3-2，多行纯文本）：撰写新邮件时预填正文底部
+    signature: String,
     recv_host: String,
     recv_port: String,
     recv_security: String,
@@ -192,6 +194,7 @@ pub(super) fn settings_ctx(
         account_domain: domain,
         is_ct_domain,
         display_name: display,
+        signature: g(keys::SIGNATURE),
         recv_host: g(keys::RECV_HOST),
         recv_port: g(keys::RECV_PORT),
         recv_security: g(keys::RECV_SECURITY),
@@ -402,10 +405,15 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let recv_security = state
         .get_or(keys::RECV_SECURITY, &d)
         .unwrap_or_else(|| state::SECURITY_DEFAULT.to_string());
-    // 可编辑字段：发件显示名 + 密码（留空 = 不变）
+    // 可编辑字段：发件显示名 + 签名档 + 密码（留空 = 不变）
     let display = trimmed_field(&form, "display_name").unwrap_or_default();
+    // 签名档：多行纯文本，不裁首尾以外的内容（replace CRLF 保持跨平台一致）
+    let signature = form
+        .get("signature")
+        .map(|v| v.replace("\r\n", "\n"))
+        .unwrap_or_default();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
-    let pairs = account_pairs(
+    let mut pairs: Vec<(&str, &str)> = account_pairs(
         &prefix,
         &domain,
         &display,
@@ -415,7 +423,10 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         &recv_host,
         &recv_port_s,
         &recv_security,
-    );
+    )
+    .to_vec();
+    // 签名档随账号 tab 一并保存（多行文本，空 = 不启用）
+    pairs.push((keys::SIGNATURE, signature.as_str()));
     // 1) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
         return account_pane(state, false, &format!("保存失败：{e}"));

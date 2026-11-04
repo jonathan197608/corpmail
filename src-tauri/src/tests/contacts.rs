@@ -114,3 +114,54 @@ fn backfill_extracts_from_historical_emails_once() {
     assert_eq!(n as usize, addrs.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 管理页列表（M3-3）：q 空返回全部按最近联系倒序；模糊按姓名/地址；
+/// remove 删除后列表消失，重复删除返回 false
+#[test]
+fn list_rows_filters_and_remove_deletes() {
+    let (state, dir) = temp_state("list-rows");
+    let now = super::super::now_epoch();
+    // 直接 INSERT（upsert_conn 的 hits 固定累加语义，这里要各异的采样值）
+    state
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
+                 ('a@x.cn', '王副总', {a}, 3),
+                 ('b@x.cn', '李静', {b}, 9),
+                 ('wang.p@partner.cn', '合作方小王', {c}, 1)",
+                a = now,
+                b = now - 3600,
+                c = now - 7200
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    // 全部：按 updated_at 倒序（a → b → wang.p）
+    let all = state.with_conn(|c| list_rows(c, "", 500)).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].addr, "a@x.cn");
+    assert_eq!(all[0].name, "王副总");
+    assert_eq!(all[0].hits, 3);
+    // 模糊"王"：命中姓名王副总 + 地址含 wang（两条，按最近联系排序）
+    let w = state.with_conn(|c| list_rows(c, "王", 500)).unwrap();
+    assert_eq!(
+        w.iter().map(|r| r.addr.as_str()).collect::<Vec<_>>(),
+        ["a@x.cn", "wang.p@partner.cn"]
+    );
+    // 模糊"静静"：无命中
+    assert!(
+        state
+            .with_conn(|c| list_rows(c, "静静", 500))
+            .unwrap()
+            .is_empty()
+    );
+    // limit 生效
+    assert_eq!(state.with_conn(|c| list_rows(c, "", 2)).unwrap().len(), 2);
+    // 删除：真删 → 列表缩，重复删 false
+    assert!(state.with_conn(|c| remove(c, "b@x.cn")).unwrap());
+    assert!(!state.with_conn(|c| remove(c, "b@x.cn")).unwrap());
+    let after = state.with_conn(|c| list_rows(c, "", 500)).unwrap();
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().all(|r| r.addr != "b@x.cn"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

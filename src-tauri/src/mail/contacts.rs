@@ -120,6 +120,55 @@ pub fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// 联系人管理页条目（M3-3）：含最近联系时间戳与使用次数
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContactRow {
+    pub addr: String,
+    pub name: String,
+    pub updated_at: i64,
+    pub hits: i64,
+}
+
+/// 联系人管理页列表（M3-3）：q 空返回全部，否则按姓名/地址模糊；
+/// 按最近联系倒序。limit 上限由调用方控制（页面一次展示量级）。
+pub fn list_rows(conn: &Connection, q: &str, limit: usize) -> rusqlite::Result<Vec<ContactRow>> {
+    let limit = limit as i64;
+    let t = q.trim();
+    if t.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT addr, name, updated_at, hits FROM contacts \
+             ORDER BY updated_at DESC, hits DESC LIMIT ?1",
+        )?;
+        return stmt
+            .query_map([limit], contact_row)?
+            .collect::<Result<Vec<_>, _>>();
+    }
+    let pattern = format!("%{}%", escape_like(t));
+    let mut stmt = conn.prepare(
+        "SELECT addr, name, updated_at, hits FROM contacts \
+         WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
+         ORDER BY updated_at DESC, hits DESC LIMIT ?2",
+    )?;
+    stmt.query_map(rusqlite::params![pattern, limit], contact_row)?
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn contact_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRow> {
+    Ok(ContactRow {
+        addr: r.get(0)?,
+        name: r.get(1)?,
+        updated_at: r.get(2)?,
+        hits: r.get(3)?,
+    })
+}
+
+/// 删除联系人（M3-3）。返回是否真的删除（不存在 → false）。
+/// 仅手动删除生效：随收/发件自动采集会在下次往来时重新建档（预期行为）。
+pub fn remove(conn: &Connection, addr: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute("DELETE FROM contacts WHERE addr = ?1", [addr.trim()])?;
+    Ok(n > 0)
+}
+
 /// 回填：contacts 为空且历史邮件存在时，从 emails 一次性提取。
 ///
 /// 幂等：非空即跳过（首启执行一次；之后由收/发件增量采集维护）。

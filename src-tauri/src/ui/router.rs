@@ -409,6 +409,8 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/") => Some(list_root(state, req)),
         ("GET", "/compose") => Some(compose_page(state, req)),
         ("POST", "/compose/draft") => Some(compose_draft_save(state, req)),
+        // M3-1 草稿自动保存：与存草稿同一保存路径，返回轻量 JSON（无跳转）
+        ("POST", "/compose/autosave") => Some(compose_autosave(state, req)),
         ("POST", "/compose/send") => Some(compose_send(state, req)),
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/resend") => {
             Some(email_resend(state, req))
@@ -428,6 +430,9 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
         ("GET", "/proxy/image") => Some(proxy_image(req)),
         ("GET", "/contacts/suggest") => Some(contacts_suggest(state, req)),
+        // M3-3 联系人管理页：整页 + 删除（htmx 片段刷新列表）
+        ("GET", "/contacts") => Some(contacts_page(state, req)),
+        ("POST", "/contacts/delete") => Some(contacts_delete(state, req)),
         ("GET", "/side/frame") => Some(side_frame(state, req)),
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
@@ -872,6 +877,104 @@ fn contacts_suggest(state: &AppState, req: &Req) -> Resp {
     Resp::json(serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()))
 }
 
+/// 联系人管理页（M3-3，GET /contacts）：搜索 + 全量列表（上限 500 条，
+/// 桌面办公联系人量级足够），每条含最近联系时间/使用次数/删除。
+/// htmx 片段（删除后刷新）与整页同构渲染 contacts_area.html
+#[derive(Serialize)]
+struct ContactsCtx {
+    frame: FrameCtx,
+    q: String,
+    total: usize,
+    items: Vec<ContactView>,
+}
+
+/// 联系人条目展示（首字母头像 + 最近联系时间标签）
+#[derive(Serialize)]
+struct ContactView {
+    addr: String,
+    name: String,
+    /// 头像字符（姓名/地址首字符，大写）
+    avatar: String,
+    time_label: String,
+    hits: i64,
+}
+
+/// 联系人列表渲染（整页 contacts.html 与删除后片段 contacts_area.html 共用）
+fn contacts_ctx(state: &AppState, q: &str) -> ContactsCtx {
+    let rows = state
+        .with_conn(|conn| mail::contacts::list_rows(conn, q, 500))
+        .unwrap_or_default();
+    let items = rows
+        .into_iter()
+        .map(|r| ContactView {
+            addr: r.addr.clone(),
+            name: r.name.clone(),
+            avatar: r
+                .name
+                .chars()
+                .next()
+                .or(r.addr.chars().next())
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string(),
+            time_label: if r.updated_at > 0 {
+                mail::time_label(r.updated_at)
+            } else {
+                "—".into()
+            },
+            hits: r.hits,
+        })
+        .collect::<Vec<_>>();
+    let total = items.len();
+    ContactsCtx {
+        frame: frame_ctx(state, "contacts"),
+        q: q.to_string(),
+        total,
+        items,
+    }
+}
+
+fn contacts_page(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let q = req.query_param("q").unwrap_or_default().trim().to_string();
+    let ctx = contacts_ctx(state, &q);
+    if req.is_htmx_request {
+        render_html("contacts_area.html", &ctx)
+    } else {
+        render_html("contacts.html", &ctx)
+    }
+}
+
+/// 删除联系人（M3-3，POST /contacts/delete）：删后返回当前搜索态列表片段
+/// （htmx target=#contacts-area 换入；hx-include 搜索框保过滤）。
+/// 下次与该地址往来时自动采集会重新建档（预期行为，无需提示）。
+fn contacts_delete(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return render_html("welcome.html", &());
+    }
+    let form = parse_form(&req.body);
+    let addr = form
+        .get("addr")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !addr.is_empty() {
+        let _ = state.with_conn(|conn| mail::contacts::remove(conn, &addr));
+    }
+    // 保留搜索词：删除后回到同一过滤视图
+    let q = form
+        .get("q")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let ctx = contacts_ctx(state, &q);
+    render_html("contacts_area.html", &ctx)
+}
+
 /// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
 /// 邮件外部图片代理（GET /proxy/image?url=…）。
 ///
@@ -1308,6 +1411,14 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.body_html = format!("{head}{}", mail::unwrap_top_div(&src.body_html));
             ctx.body_text = String::new();
         }
+    } else {
+        // 全新邮件：预填签名档（M3-2，设置→账号维护；留两行空供正文，
+        // 光标默认在顶部即正文起点）。回复/转发/草稿编辑不插入（避免重复粘贴）。
+        let d = defaults();
+        let signature = state.get_or(keys::SIGNATURE, &d).unwrap_or_default();
+        if !signature.trim().is_empty() {
+            ctx.body_text = format!("\n\n--\n{}", signature.trim_end());
+        }
     }
     render_html("compose.html", &ctx)
 }
@@ -1372,6 +1483,38 @@ fn skipped_suffix(skipped: usize) -> String {
         String::new()
     } else {
         format!("&skipped={skipped}")
+    }
+}
+
+/// 草稿自动保存（M3-1，POST /compose/autosave）：与「存草稿」同一套
+/// save_compose_form，但不跳转——返回轻量 JSON（`{"ok":true,"draft_id":N}`），
+/// 前端静默回填 draft_id 隐藏域并显示「已自动保存 HH:MM」。
+/// 空表单（所有语义字段为空）返回 ok:true 但不落库，避免打开撰写页即生成空草稿。
+fn compose_autosave(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return Resp::json("{\"ok\":false}".into());
+    }
+    let form = parse_form(&req.body);
+    let body_empty = |f: &str| form.get(f).map(|v| v.trim()).unwrap_or("").is_empty();
+    let trivial = [
+        "to_addrs",
+        "cc_addrs",
+        "bcc_addrs",
+        "subject",
+        "body_text",
+        "body_html",
+    ]
+    .iter()
+    .all(|f| body_empty(f));
+    if trivial {
+        return Resp::json("{\"ok\":true,\"draft_id\":0}".into());
+    }
+    match save_compose_form(state, req) {
+        Ok((id, _skipped, _converted)) => {
+            Resp::json(serde_json::json!({ "ok": true, "draft_id": id }).to_string())
+        }
+        // 自动保存失败不打断编辑（下次防抖/手动保存重试），前端只提示静默
+        Err(_) => Resp::json("{\"ok\":false}".into()),
     }
 }
 

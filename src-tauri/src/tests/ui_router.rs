@@ -3254,6 +3254,11 @@ fn dump_smoke_html() {
             (keys::SMTP_PORT, "465"),
             (keys::RECV_HOST, "imap.chinatelecom.cn"),
             (keys::RECV_PORT, "993"),
+            // M3-2 签名档种子：设置页回显 + 新邮件预填冒烟
+            (
+                keys::SIGNATURE,
+                "张伟\n中国电信广州分公司 政企客户部\n电话：020-83820000",
+            ),
         ])
         .unwrap();
 
@@ -3645,6 +3650,31 @@ fn dump_smoke_html() {
     dump("settings-sync.html", get("/settings/sync"));
     dump("settings-storage.html", get("/settings/storage"));
     dump("settings-about.html", get("/settings/about"));
+
+    // M3-3 联系人页素材：smoke 直写 emails 表不经过采集管道，手动补
+    // contacts 种子（姓名/最近联系偏移/往来次数各异）后 dump 整页 + 搜索态
+    {
+        let cnow = mail::now_epoch();
+        state
+            .with_conn(|c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
+                     ('boss@chinatelecom.cn', '王副总经理', {a}, 12),
+                     ('finance@chinatelecom.cn', '财务部-李静', {a}, 3),
+                     ('market@partner.cn', '合作方-智慧园区项目组', {b}, 2),
+                     ('hr@chinatelecom.cn', '人力资源部', {b}, 1)",
+                    a = cnow - 1800,
+                    b = cnow - 3 * 86_400,
+                ))
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+    }
+    dump("contacts.html", get("/contacts"));
+    dump(
+        "contacts-search.html",
+        get_url("/contacts?q=%E7%8E%8B"), // 「王」
+    );
 
     // M5 检索素材："激励"命中收件与草稿（标题 <mark> 高亮）/ 无命中空态
     dump("main-search.html", get_url("/?q=%E6%BF%80%E5%8A%B1"));
@@ -5279,5 +5309,274 @@ fn sync_save_range_change_resets_both_cursors() {
             "重新拉取应清双箱游标 {k}"
         );
     }
+    cleanup(&dir);
+}
+
+// ---------- M3-1 草稿自动保存 ----------
+
+/// autosave 契约：空表单不落库（ok:true, draft_id:0）；有内容创建草稿并回传
+/// draft_id；带 draft_id 再次 autosave 变覆盖（不新增行）
+#[test]
+fn compose_autosave_silent_and_id_reuse() {
+    let (state, dir) = temp_state("m3-autosave");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 空表单：不生成空草稿（打开撰写页几秒即自动保存的场景）
+    let resp = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("to_addrs", ""),
+                ("cc_addrs", ""),
+                ("bcc_addrs", ""),
+                ("subject", ""),
+                ("body_text", ""),
+                ("body_mode", "plain"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(resp.contains("\"ok\":true"), "空表单应返回 ok：{resp}");
+    assert!(
+        resp.contains("\"draft_id\":0"),
+        "空表单不落库（draft_id=0）：{resp}"
+    );
+    let drafts: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(drafts, 0, "空表单不应生成空草稿");
+    // 有内容：创建草稿，返回 draft_id
+    let resp = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "自动保存主题"),
+                ("body_text", "写了一半的正文"),
+                ("body_mode", "plain"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        resp.contains("\"draft_id\":") && !resp.contains("\"draft_id\":0"),
+        "有内容应落库并回传 draft_id：{resp}"
+    );
+    // 再次 autosave（带 draft_id=1，改主题）→ 覆盖不新增
+    let resp = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "改后的主题"),
+                ("body_text", "写完的正文"),
+                ("body_mode", "plain"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(resp.contains("\"draft_id\":1"), "覆盖保存回传原 id：{resp}");
+    let (cnt, subj): (i64, String) = state.with_conn(|c| {
+        c.query_row("SELECT count(*), MAX(subject) FROM emails", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    });
+    assert_eq!(cnt, 1, "重复自动保存应覆盖同一条草稿");
+    assert_eq!(subj, "改后的主题");
+    cleanup(&dir);
+}
+
+// ---------- M3-2 签名档 ----------
+
+/// 新邮件预填签名；编辑已有草稿不重复插入
+#[test]
+fn compose_new_mail_prefills_signature_once() {
+    let (state, dir) = temp_state("m3-signature");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::DISPLAY_NAME, "张伟"),
+            (keys::SIGNATURE, "张伟\n政企客户部"),
+        ])
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/compose", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("政企客户部"), "新邮件应预填签名：{html}");
+    // 存草稿后再进编辑页：正文回显草稿原文，签名不重复（仍只出现一次）
+    body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "带签名草稿"),
+                ("body_text", "\n\n--\n张伟\n政企客户部"),
+                ("body_mode", "plain"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "draft_id=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert_eq!(
+        html.matches("政企客户部").count(),
+        1,
+        "编辑草稿回显原文，不再插入第二份签名"
+    );
+    cleanup(&dir);
+}
+
+/// 设置·账号保存签名档（多行），页面回显
+#[test]
+fn settings_account_save_persists_signature() {
+    let (state, dir) = temp_state("m3-sig-save");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/save",
+            &form(&[("display_name", "张伟"), ("signature", "张伟\r\n电话 123")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("✓ 已保存"), "保存应成功：{html}");
+    assert!(html.contains("张伟\n电话 123"), "CRLF 归一为 LF 后回显");
+    let d = defaults();
+    let saved = state.get_or(keys::SIGNATURE, &d).unwrap_or_default();
+    assert_eq!(saved, "张伟\n电话 123");
+    cleanup(&dir);
+}
+
+// ---------- M3-3 联系人管理页 ----------
+
+/// 联系人页：列表渲染 + 搜索过滤 + 删除（htmx 片段刷新当前过滤态）
+#[test]
+fn contacts_page_lists_searches_and_deletes() {
+    let (state, dir) = temp_state("m3-contacts");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let now = mail::now_epoch();
+    state
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
+                 ('boss@x.cn', '王副总', {a}, 5),
+                 ('li@x.cn', '李静', {b}, 1)",
+                a = now,
+                b = now - 86400
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    // 整页：列表 + 入口
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/contacts", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("boss@x.cn"), "列表应含地址");
+    assert!(html.contains("王副总"), "列表应含姓名");
+    assert!(
+        html.contains("联系人 <span class=\"sub\">2 位"),
+        "计数 {html}"
+    );
+    assert!(html.contains("/contacts/delete"));
+    // 搜索：只留王副总
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "q=%E7%8E%8B", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("王副总"));
+    assert!(!html.contains("li@x.cn"), "搜索应过滤未命中联系人");
+    // 删除（带 q 保过滤）：库删除 + 片段不再含该地址
+    let frag = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/contacts/delete",
+            &form(&[("addr", "boss@x.cn"), ("q", "王")]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(!frag.contains("boss@x.cn"), "删除后列表应移除");
+    let remain: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM contacts WHERE addr='boss@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(remain, 0, "库中应物理删除");
     cleanup(&dir);
 }

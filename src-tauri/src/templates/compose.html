@@ -92,6 +92,8 @@
                 </div>
 
                 <div class="compose-actions">
+                    {# 自动保存指示（M3-1）：停止输入 5s 后静默保存草稿，此处提示最近一次时间 #}
+                    <span class="autosave-hint" id="autosave-hint"></span>
                     <button type="button" class="btn primary big"
                             hx-post="/compose/send" hx-include="closest form"
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this">✉ 发送</button>

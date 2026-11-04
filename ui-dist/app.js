@@ -618,6 +618,78 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     }
 });
 
+// ---------- 撰写页：草稿自动保存（M3-1） ----------
+// 停止输入 5s（防抖）→ 静默 POST /compose/autosave（与存草稿同一条保存路径，
+// 返回轻量 JSON 无跳转）。首个 draft_id 回填隐藏域，此后自动保存变"覆盖"
+// 不会堆积草稿；空表单后端守一道不落库。
+// 请求经 htmx 发出：source=表单 使 htmx:configRequest 的 detail.elt 指向 form，
+// 复用既有 wangEditor body_html/inline_images 注入（与存草稿完全同参形态）；
+// handler 自定义接管响应（htmx 2.x ajax context 支持），无任何 swap 副作用。
+(function () {
+    var DELAY_MS = 5000;
+    var timer = null;
+
+    function composeForm() {
+        var el = document.getElementById('autosave-hint');
+        return el ? el.closest('form') : null;
+    }
+
+    function clock() {
+        var t = new Date();
+        function z(n) { return (n < 10 ? '0' : '') + n; }
+        return z(t.getHours()) + ':' + z(t.getMinutes());
+    }
+
+    function trigger() {
+        var form = composeForm();
+        if (!form || !form.isConnected) return; // 已导航离开撰写页
+        var values = {};
+        try {
+            new FormData(form).forEach(function (v, k) { values[k] = v; });
+        } catch (e) { return; }
+        htmx.ajax('POST', '/compose/autosave', {
+            source: form,
+            values: values,
+            handler: function (_elt, info) {
+                var xhr = info && info.xhr;
+                if (!xhr || xhr.status !== 200) return;
+                var res = null;
+                try { res = JSON.parse(xhr.responseText); } catch (e) { return; }
+                if (!res || !res.ok || res.draft_id <= 0) return;
+                // 只有"本次新创建"才回填（编辑已有草稿时表单本来就有值；
+                // 新建模板渲染 draft_id=0，与未创建等价）
+                var idEl = form.querySelector('input[name="draft_id"]');
+                if (idEl && (!idEl.value || idEl.value === '0')) {
+                    idEl.value = String(res.draft_id);
+                }
+                var hint = document.getElementById('autosave-hint');
+                if (hint) hint.textContent = '✓ 已自动保存 ' + clock();
+            }
+        });
+        // 下轮防抖：保存后再有输入才会触发，不做周期性轮询
+    }
+
+    function schedule() {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function () {
+            timer = null;
+            trigger();
+        }, DELAY_MS);
+    }
+
+    document.body.addEventListener('input', function (ev) {
+        var form = composeForm();
+        if (!form || !form.contains(ev.target)) return;
+        schedule();
+    });
+    // select 等不冒泡 input 的控件兜底
+    document.body.addEventListener('change', function (ev) {
+        var form = composeForm();
+        if (!form || !form.contains(ev.target)) return;
+        schedule();
+    });
+})();
+
 // ---------- 撰写页：发送前预校验（M1-2） ----------
 // 挂 htmx:configRequest、精确匹配发送按钮（存草稿允许不完整内容，不校验）。
 // preventDefault 即取消本次请求（htmx 在全部监听器执行完后统一检查），
@@ -775,7 +847,7 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
     // 当前筛选的检索态：检索场景禁用跨页全选（前后端口径一致）
     function isSearch() { return (val('ba-q') || '').trim() !== ''; }
 
-    function bar() { return document.getElementById('batch-actions'); }
+    function bar() { return document.getElementById('batch-bar'); }
     function items() {
         return Array.prototype.slice.call(document.querySelectorAll('.mbx-item'));
     }
@@ -788,12 +860,13 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
     }
 
     function render() {
-        var barEl = bar();
-        if (!barEl) return;
+        if (!bar()) return;
         var n = selectedCount();
-        barEl.hidden = n === 0;
         var countEl = document.getElementById('ba-count');
         var allLink = document.getElementById('ba-select-all');
+        // 工具栏常驻：按选中数切换按钮禁用态（位置固定不跳动）
+        var btns = document.querySelectorAll('#batch-bar [data-batch], #batch-bar #ba-clear');
+        Array.prototype.forEach.call(btns, function (b) { b.disabled = n === 0; });
         if (!countEl) return;
         if (stateBox.mode === 'all') {
             var ex = stateBox.exclude.length;
@@ -802,11 +875,11 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
                 : '已选全部 ' + stateBox.total + ' 封';
             if (allLink) allLink.hidden = true;
         } else {
-            countEl.textContent = '已选 ' + n + ' 封';
+            countEl.textContent = n > 0 ? '已选 ' + n + ' 封' : '';
             // 跨页入口：非检索态即显示「选择全部 N 封」（总命中 = 筛选全集上限；
             // 单页亦显示——点即全选当前筛选全部，语义确定，用户不需记"有无下一页"）
             if (allLink) {
-                allLink.hidden = isSearch();
+                allLink.hidden = isSearch() || n === 0;
                 allLink.textContent = '选择全部 ' + stateBox.total + ' 封';
             }
         }

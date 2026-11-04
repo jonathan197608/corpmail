@@ -1,0 +1,49 @@
+{# 联系人列表区（M3-3；上下文：ContactsCtx）。
+   整页由 contacts.html 内嵌；删除后 htmx 以 #contacts-area 为目标换入
+   新片段（hx-include 搜索框保过滤）。联系人随收/发件自动采集，
+   此页提供查看、搜索与手动删除。 #}
+<div id="contacts-area">
+    <div class="topbar">
+        <h1>联系人 <span class="sub">{{ total }} 位</span></h1>
+        <form class="search" id="contacts-search" method="get" action="/contacts" title="按姓名或邮件地址搜索">
+            <span>🔍</span>
+            <input type="search" name="q" placeholder="搜索姓名或地址…" value="{{ q }}">
+            {% if q %}<a class="search-clear" href="/contacts" title="清除搜索">×</a>{% endif %}
+        </form>
+    </div>
+    <div class="contacts-list">
+    {% if items %}
+        {% for c in items %}
+        <div class="contact-row">
+            <span class="ct-avatar" aria-hidden="true">{{ c.avatar }}</span>
+            <div class="ct-main">
+                <div class="ct-name">{% if c.name %}{{ c.name }}{% else %}<span class="ct-noname">（未命名）</span>{% endif %}</div>
+                <div class="ct-addr">{{ c.addr }}</div>
+            </div>
+            <div class="ct-meta">
+                <span class="ct-time" title="最近联系时间">{{ c.time_label if c.time_label == '—' else '最近 ' + c.time_label }}</span>
+                <span class="ct-hits" title="往来次数">往来 {{ c.hits }} 次</span>
+            </div>
+            <button type="button" class="btn small danger ct-del"
+                    hx-post="/contacts/delete"
+                    hx-include="#contacts-search" hx-vals='{"addr": {{ c.addr | js_str }}}'
+                    hx-target="#contacts-area" hx-swap="outerHTML"
+                    hx-confirm="删除联系人 {{ c.name }} <{{ c.addr }}>？下次往来时会自动重新采集。"
+                    hx-trigger="click throttle:500ms" hx-disabled-elt="this">删除</button>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="card empty-state">
+            {% if q %}
+            <div class="empty-mark">🔍</div>
+            <h2>没有匹配的联系人</h2>
+            <p>换个关键词试试，支持姓名与邮件地址模糊搜索。</p>
+            {% else %}
+            <div class="empty-mark">👥</div>
+            <h2>还没有联系人</h2>
+            <p>联系人会在收发邮件时自动采集，无需手动添加。</p>
+            {% endif %}
+        </div>
+    {% endif %}
+    </div>
+</div>

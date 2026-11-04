@@ -44,6 +44,11 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/fetch_status.html"),
     ),
     ("thread.html", include_str!("templates/thread.html")),
+    ("contacts.html", include_str!("templates/contacts.html")),
+    (
+        "contacts_area.html",
+        include_str!("templates/contacts_area.html"),
+    ),
 ];
 
 /// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义，

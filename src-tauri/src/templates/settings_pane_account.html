@@ -41,6 +41,13 @@
             <div class="ct-guide">⚠ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</div>
             {% endif %}
 
+            {# 签名档（M3-2）：多行纯文本，撰写新邮件时预填正文底部；空 = 不启用 #}
+            <div class="sfield">
+                <label>签名档<small class="hint">新邮件自动附加到正文底部；回复/转发不附加</small></label>
+                <textarea name="signature" rows="4" id="signature-box"
+                    placeholder="张伟&#10;中国电信广州分公司 政企客户部&#10;电话：020-12345678">{{ signature }}</textarea>
+            </div>
+
             <div class="settings-actions">
                 <button type="button" class="btn" hx-post="/settings/account/test-smtp" hx-target="#smtp-result"
                     hx-swap="innerHTML" hx-disabled-elt="this">测试连接</button>
