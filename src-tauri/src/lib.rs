@@ -40,7 +40,7 @@ const APP_URL: &str = "ui://localhost/";
 
 /// 应用主入口
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // 单实例（首个注册，确保在其他插件初始化前拦截第二实例；
         // 重复启动时聚焦已有主窗口而非新开，避免双实例并发写同一 SQLite/
         // 附件目录（WAL 容许多连接，但收件/清理双线程互踩会互相平白发工作）。
@@ -131,9 +131,30 @@ pub fn run() {
                 .center()
                 .build()?;
             Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("CorpMail 运行失败");
+        });
+
+    // 替代 builder.run(ctx)（其回调为空，无法订阅事件）：build + run 显式
+    // 事件循环，订阅 macOS Reopen。行为与原 .run 一致（Tauri 的 run 内部
+    // 即 build + run(空回调)）
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("CorpMail 构建失败");
+
+    // macOS 点击 Dock 图标 / 系统通知（userReactivated）→ applicationShouldHandleReopen。
+    // 通知点击时系统只激活进程，最小化/被遮挡的主窗口不会自动前置——统一
+    // 唤起聚焦（M1-4，与单实例插件聚焦同模式）。Windows 无对应事件：打包版
+    // toast 点击自带前台激活（AppUserModelID 匹配），dev 下点击经单实例
+    // 插件聚焦，均到达同样效果，无需代码路径
+    // （Windows 侧零改动，无回归风险；真机行为随下次 Windows 发版联动验证）
+    app.run(|_app_handle, _event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event
+            && let Some(win) = _app_handle.get_webview_window("main")
+        {
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+        }
+    });
 }
 
 /// 启动致命错误：原生对话框告知用户（GUI 子系统无控制台，stderr 无人可见），
