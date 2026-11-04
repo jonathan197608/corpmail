@@ -267,6 +267,10 @@ fn search_ranks_matches_and_highlights_subject() {
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
         sort: SortKey::DateDesc,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
     };
     let (items, total) = search(&state, "激励", &q).unwrap().unwrap();
     assert_eq!(total, 1);
@@ -295,6 +299,10 @@ fn search_ranks_matches_and_highlights_subject() {
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
         sort: SortKey::DateDesc,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
     };
     let inbox_result = search(&state, "激励", &q_inbox).unwrap().unwrap();
     assert_eq!(inbox_result.1, 0, "inbox 无邮件");
@@ -366,6 +374,10 @@ fn list_filters_folder_and_pages() {
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
             sort: SortKey::DateDesc,
+            from_filter: String::new(),
+            date_from: 0,
+            date_to: 0,
+            has_attach: false,
         },
     )
     .unwrap();
@@ -380,6 +392,10 @@ fn list_filters_folder_and_pages() {
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
             sort: SortKey::DateDesc,
+            from_filter: String::new(),
+            date_from: 0,
+            date_to: 0,
+            has_attach: false,
         },
     )
     .unwrap();
@@ -394,6 +410,10 @@ fn list_filters_folder_and_pages() {
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
             sort: SortKey::DateDesc,
+            from_filter: String::new(),
+            date_from: 0,
+            date_to: 0,
+            has_attach: false,
         },
     )
     .unwrap();
@@ -409,6 +429,10 @@ fn list_filters_folder_and_pages() {
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
             sort: SortKey::DateDesc,
+            from_filter: String::new(),
+            date_from: 0,
+            date_to: 0,
+            has_attach: false,
         },
     )
     .unwrap();
@@ -864,6 +888,10 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
         sort: SortKey::DateDesc,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
     };
     let (items, total) = list_threads(&state, &q).unwrap();
     // 草稿/发送失败不入会、空主题不归组：只剩「会议(2)」「报价(1)」两组
@@ -887,6 +915,10 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
         sort: SortKey::DateDesc,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
     };
     let (items, total) = list_threads(&state, &inbox).unwrap();
     assert_eq!(total, 2, "inbox 下两组（各 1 封）");
@@ -954,6 +986,10 @@ fn list_orders_by_sort_key() {
         internal_domain: "chinatelecom.cn".into(),
         per: 10,
         sort,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
     };
     // 默认：星标置顶（id1），其余时间倒序（id3 → id2）
     let (items, total) = list(&state, &base(SortKey::DateDesc)).unwrap();
@@ -1076,4 +1112,77 @@ fn save_all_attachments_rejects_missing_dir_and_empty_mail() {
     let err = save_all_attachments(&state, id, dir.to_str().unwrap()).unwrap_err();
     assert!(err.contains("没有附件"), "{err}");
     cleanup(&dir);
+}
+
+/// B1 高级检索：发件人 / 日期区间 / 仅附件，三项可组合
+#[test]
+fn list_filters_by_sender_date_and_attachment() {
+    let (state, dir) = temp_state("adv-filter");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at, attach_cnt, thread_key)
+             VALUES
+             ('in','inbox','received','boss@chinatelecom.cn','王总','demo@chinatelecom.cn',
+              '甲','x','甲','x',1,100,100,0,'甲'),
+             ('in','inbox','received','market@partner.cn','合作方','demo@chinatelecom.cn',
+              '乙','y','乙','y',1,200,200,2,'乙'),
+             ('in','inbox','received','ops@partner.cn','运维','demo@chinatelecom.cn',
+              '丙','z','丙','z',1,300,300,0,'丙')",
+        )
+        .unwrap();
+    });
+    let q = |from: &str, df: i64, dt: i64, att: bool| ListQuery {
+        folder: "inbox".into(),
+        page: 1,
+        unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
+        per: 10,
+        sort: SortKey::DateDesc,
+        from_filter: from.into(),
+        date_from: df,
+        date_to: dt,
+        has_attach: att,
+    };
+    let ids = |q: &ListQuery| {
+        list(&state, q)
+            .unwrap()
+            .0
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>()
+    };
+    // 发件人包含 partner → id2 + id3
+    assert_eq!(ids(&q("partner", 0, 0, false)), vec![3, 2]);
+    // 姓名也参与匹配（「王总」）
+    assert_eq!(ids(&q("王总", 0, 0, false)), vec![1]);
+    // 日期区间 150..250 → id2
+    assert_eq!(ids(&q("", 150, 250, false)), vec![2]);
+    // 仅附件 → id2
+    assert_eq!(ids(&q("", 0, 0, true)), vec![2]);
+    // 组合：partner + 有附件 → id2
+    assert_eq!(ids(&q("partner", 0, 0, true)), vec![2]);
+    // 无命中
+    assert!(ids(&q("nobody", 0, 0, false)).is_empty());
+    cleanup(&dir);
+}
+
+/// B1 日期解析：YYYY-MM-DD → 本地当天 0 点 / 23:59:59；非法输入 None
+#[test]
+fn date_epoch_of_parses_day_bounds() {
+    let start = date_epoch_of("2026-11-04", false).expect("合法日期");
+    let end = date_epoch_of("2026-11-04", true).expect("合法日期");
+    assert_eq!(end - start, 86_399, "结束应到当天 23:59:59");
+    assert!(
+        date_epoch_of("2026-02-30", false).is_none(),
+        "非法日期应 None"
+    );
+    assert!(date_epoch_of("not-a-date", false).is_none());
+    assert!(date_epoch_of("", false).is_none());
+    assert!(
+        date_epoch_of("2026-11-05", false).unwrap() > start,
+        "后一天应更晚"
+    );
 }

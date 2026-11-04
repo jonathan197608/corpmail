@@ -533,6 +533,19 @@ pub fn sched_epoch_of(local: &str) -> Option<i64> {
     Some(z.timestamp().as_second())
 }
 
+/// 高级检索日期（B1）：`YYYY-MM-DD` → 本地时区 epoch 秒。
+/// end_of_day=true 时取 23:59:59（结束日期包含当天全部邮件）。
+pub fn date_epoch_of(date: &str, end_of_day: bool) -> Option<i64> {
+    let d: jiff::civil::Date = date.trim().parse().ok()?;
+    let time = if end_of_day {
+        jiff::civil::Time::new(23, 59, 59, 0).ok()?
+    } else {
+        jiff::civil::Time::new(0, 0, 0, 0).ok()?
+    };
+    let z = d.to_datetime(time).to_zoned(local_tz()).ok()?;
+    Some(z.timestamp().as_second())
+}
+
 /// 时区缓存（zoned_of 在列表/详情高频调用；每次 Zoned::now() 读系统时区是浪费）
 /// 本地时区缓存（jiff TimeZone 为 Arc 包裹，clone 仅引用计数）。
 /// TTL 1 小时：长期驻留的应用在系统时区变更（出差/夏令时）后，
@@ -832,6 +845,14 @@ pub struct ListQuery {
     pub per: i64,
     /// 排序键（A2；不影响命中集，只影响 ORDER BY）
     pub sort: SortKey,
+    /// 高级检索（B1）：发件人包含（地址或姓名，路由层已小写；空 = 不限）
+    pub from_filter: String,
+    /// 高级检索：起始日期 epoch 秒（0 = 不限；按邮件时间）
+    pub date_from: i64,
+    /// 高级检索：结束日期 epoch 秒（0 = 不限；路由已补到当天 23:59:59）
+    pub date_to: i64,
+    /// 高级检索：仅看有附件
+    pub has_attach: bool,
 }
 
 /// 外部发件人判定：域名与内部域相同或为其子域时为内部。
@@ -978,7 +999,19 @@ fn list_filter_sql(q: &ListQuery, alias: &str) -> (String, String) {
     let ext_col = external_col(a, domain);
     // :extf = 0 时整段条件恒真：无需为"是否过滤"拼两套 SQL
     let ext_sql = format!(" AND (:extf = 0 OR {ext_col})");
-    (format!("{folder_sql}{unread_sql}{ext_sql}"), ext_col)
+    // 高级检索（B1）：同样用"常量参数恒在"的写法——SQL 结构固定，绑定参数
+    // 恒为 4 个；未启用时 :fromf='' / :dfrom=0 / :dto=0 / :attf=0 短路
+    let adv_sql = format!(
+        " AND (:fromf = '' OR instr(lower({a}from_addr), :fromf) > 0
+                        OR instr(lower({a}from_name), :fromf) > 0)
+          AND (:dfrom = 0 OR COALESCE({a}received_at, {a}sent_at, {a}created_at) >= :dfrom)
+          AND (:dto = 0 OR COALESCE({a}received_at, {a}sent_at, {a}created_at) <= :dto)
+          AND (:attf = 0 OR {a}attach_cnt > 0)"
+    );
+    (
+        format!("{folder_sql}{unread_sql}{ext_sql}{adv_sql}"),
+        ext_col,
+    )
 }
 
 /// 批量操作目标解析（POST /emails/batch 双模式）：
@@ -1042,6 +1075,10 @@ pub fn batch_apply(
         BatchTarget::SelectAll { exclude, query } => {
             let ext_filter = if query.external_only { 1 } else { 0 };
             let domain = query.internal_domain.trim().to_string();
+            let from_filter = query.from_filter.trim().to_lowercase();
+            let date_from = query.date_from;
+            let date_to = query.date_to;
+            let attach_filter = if query.has_attach { 1 } else { 0 };
             let (filter_sql, _) = list_filter_sql(query, "");
             // NOT IN 空集在 SQLite 恒真（与语义一致），但显式分段防拼接歧义
             let exclude_sql = if exclude.is_empty() {
@@ -1050,7 +1087,16 @@ pub fn batch_apply(
                 let marks = exclude.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 format!(" AND id NOT IN ({marks})")
             };
-            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&ext_filter, &domain];
+            // 顺序必须与 filter_sql 中命名参数首次出现顺序一致：
+            // :extf → :dom → :fromf → :dfrom → :dto → :attf（positional 绑定）
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![
+                &ext_filter,
+                &domain,
+                &from_filter,
+                &date_from,
+                &date_to,
+                &attach_filter,
+            ];
             let owned: Vec<i64> = exclude.to_vec();
             for x in &owned {
                 params.push(x as &dyn rusqlite::ToSql);
@@ -1136,6 +1182,10 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
     let (filter_sql, ext_col) = list_filter_sql(q, "");
     let ext_filter = if q.external_only { 1 } else { 0 };
     let domain = q.internal_domain.trim();
+    let from_filter = q.from_filter.trim().to_lowercase();
+    let date_from = q.date_from;
+    let date_to = q.date_to;
+    let attach_filter = if q.has_attach { 1 } else { 0 };
     let where_sql = format!("WHERE 1=1{filter_sql}");
     let order = order_sql(q.sort, "");
     let page = q.page.max(1);
@@ -1145,7 +1195,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         let total: i64 = conn
             .query_row(
                 &format!("SELECT count(*) FROM emails {where_sql}"),
-                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain },
+                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter },
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -1163,7 +1213,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         let rows = stmt
             .query_map(
                 rusqlite::named_params! {
-                    ":extf": ext_filter, ":dom": domain, ":lim": q.per, ":off": offset
+                    ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter, ":lim": q.per, ":off": offset
                 },
                 |r| summary_from_row(r, None),
             )
@@ -1182,6 +1232,10 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
     let (filter_sql, ext_col) = list_filter_sql(q, "e.");
     let ext_filter = if q.external_only { 1 } else { 0 };
     let domain = q.internal_domain.trim();
+    let from_filter = q.from_filter.trim().to_lowercase();
+    let date_from = q.date_from;
+    let date_to = q.date_to;
+    let attach_filter = if q.has_attach { 1 } else { 0 };
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
     let offset = (page - 1).saturating_mul(q.per);
@@ -1201,7 +1255,7 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
                     "SELECT count(*) FROM (
                         SELECT e.thread_key FROM emails e {where_sql} GROUP BY e.thread_key)"
                 ),
-                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain },
+                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter },
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -1230,7 +1284,7 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
         let rows = stmt
             .query_map(
                 rusqlite::named_params! {
-                    ":extf": ext_filter, ":dom": domain, ":lim": q.per, ":off": offset
+                    ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter, ":lim": q.per, ":off": offset
                 },
                 thread_summary_from_row,
             )
@@ -1430,6 +1484,10 @@ pub fn search(
     let (filter_sql, ext_col) = list_filter_sql(q, "e.");
     let ext_filter = if q.external_only { 1 } else { 0 };
     let domain = q.internal_domain.trim();
+    let from_filter = q.from_filter.trim().to_lowercase();
+    let date_from = q.date_from;
+    let date_to = q.date_to;
+    let attach_filter = if q.has_attach { 1 } else { 0 };
     let page = q.page.max(1);
     let offset = (page - 1).saturating_mul(q.per);
     let words = tokenize_words(input);
@@ -1449,7 +1507,7 @@ pub fn search(
                      FROM email_fts JOIN emails e ON e.id = email_fts.rowid
                      WHERE email_fts MATCH :match{filter_sql}"
                 ),
-                rusqlite::named_params! { ":match": match_expr, ":extf": ext_filter, ":dom": domain },
+                rusqlite::named_params! { ":match": match_expr, ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter },
                 |r| r.get(0),
             )
             .map_err(e)?;
@@ -1468,7 +1526,7 @@ pub fn search(
         let rows = stmt
             .query_map(
                 rusqlite::named_params! {
-                    ":match": match_expr, ":extf": ext_filter, ":dom": domain,
+                    ":match": match_expr, ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter,
                     ":lim": q.per, ":off": offset
                 },
                 |r| summary_from_row(r, Some(&words)),

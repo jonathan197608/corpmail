@@ -236,6 +236,11 @@ struct MainCtx {
     q: String,
     /// 排序键（A2；模板回显下拉，非默认值才进 URL）
     sort: String,
+    /// 高级检索回显（B1）：发件人包含 / 起止日期（YYYY-MM-DD）/ 仅看附件
+    from_filter: String,
+    df: String,
+    dt: String,
+    has_attach: bool,
     items: Vec<EmailSummary>,
     /// 会话视图（M2-2）：mode=thread 时为 true；只在收件箱/全部/搜索下可用
     is_thread: bool,
@@ -575,6 +580,18 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     let internal_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     // 排序（A2）：URL sort 解析，非默认值进 base/list_query；默认不携带保持 URL 干净
     let sort = mail::SortKey::parse(req.query_param("sort").as_deref());
+    // 高级检索（B1）：发件人包含 / 日期区间（YYYY-MM-DD，结束日含当天 23:59:59）/
+    // 仅看附件。非法日期静默忽略（不回错误页，按未填处理）
+    let from_filter = req
+        .query_param("from")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let df_raw = req.query_param("df").unwrap_or_default();
+    let dt_raw = req.query_param("dt").unwrap_or_default();
+    let date_from = mail::date_epoch_of(&df_raw, false).unwrap_or(0);
+    let date_to = mail::date_epoch_of(&dt_raw, true).unwrap_or(0);
+    let has_attach = req.query_param("att").map(|v| v == "1").unwrap_or(false);
     let q = mail::ListQuery {
         folder: folder.clone(),
         page,
@@ -583,6 +600,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         internal_domain,
         per,
         sort,
+        from_filter: from_filter.clone(),
+        date_from,
+        date_to,
+        has_attach,
     };
     // 会话视图（M2-2）：mode=thread 且仅收件箱/全部下可用（草稿/已发保持单封）；
     // 搜索下同样可切会话（命中代表行=最新一封）
@@ -625,6 +646,19 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     }
     if sort != mail::SortKey::DateDesc {
         base = format!("{base}sort={}&", sort.as_str());
+    }
+    // 高级检索条件：翻页/筛选开关/会话切换全部保持（日期只在解析成功时携带）
+    if !from_filter.is_empty() {
+        base = format!("{base}from={}&", urlencode(&from_filter));
+    }
+    if date_from > 0 {
+        base = format!("{base}df={}&", urlencode(&df_raw));
+    }
+    if date_to > 0 {
+        base = format!("{base}dt={}&", urlencode(&dt_raw));
+    }
+    if has_attach {
+        base = format!("{base}att=1&");
     }
     let unread_part = if unread_only { "unread=1&" } else { "" };
     let external_part = if external_only { "external=1&" } else { "" };
@@ -679,6 +713,30 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
         list_query.push_str(&format!("sort={}", sort.as_str()));
     }
+    if !from_filter.is_empty() {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("from={}", urlencode(&from_filter)));
+    }
+    if date_from > 0 {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("df={}", urlencode(&df_raw)));
+    }
+    if date_to > 0 {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("dt={}", urlencode(&dt_raw)));
+    }
+    if has_attach {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str("att=1");
+    }
     if page > 1 {
         if !list_query.is_empty() {
             list_query.push('&');
@@ -701,6 +759,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         page_base,
         q: q_input,
         sort: sort.as_str().to_string(),
+        from_filter,
+        df: if date_from > 0 { df_raw } else { String::new() },
+        dt: if date_to > 0 { dt_raw } else { String::new() },
+        has_attach,
         items,
         is_thread,
         threads,
@@ -954,12 +1016,40 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
             per: PER_MIN,
             // 排序不影响命中集（只影响 ORDER BY），按表单值回填即可
             sort: mail::SortKey::parse(form.get("sort").map(String::as_str)),
+            // 高级检索（B1）：与列表同口径；日期非法按不限处理
+            from_filter: form
+                .get("from")
+                .map(|v| v.trim().to_lowercase())
+                .unwrap_or_default(),
+            date_from: form
+                .get("df")
+                .and_then(|v| mail::date_epoch_of(v, false))
+                .unwrap_or(0),
+            date_to: form
+                .get("dt")
+                .and_then(|v| mail::date_epoch_of(v, true))
+                .unwrap_or(0),
+            has_attach: form.get("att").map(|v| v == "1").unwrap_or(false),
         };
         // q（检索词）仅在非空时参与：批量检索结果全选 = 命中即选中。
         // 检索走 FTS MATCH，与列表检索同源；此处简化为非空时拒绝批量（检索
         // 词场景跨页全选与列表高亮口径不一致的风险高，先用页内 ids 模式覆盖）
-        if form.get("q").map(|v| !v.trim().is_empty()).unwrap_or(false) {
-            return batch_error_fragment("检索结果下暂不支持跨页全选，请使用页内选择");
+        let has_search = form.get("q").map(|v| !v.trim().is_empty()).unwrap_or(false)
+            || form
+                .get("from")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            || form
+                .get("df")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            || form
+                .get("dt")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            || form.get("att").map(|v| v == "1").unwrap_or(false);
+        if has_search {
+            return batch_error_fragment("检索/高级筛选结果下暂不支持跨页全选，请使用页内选择");
         }
         mail::BatchTarget::SelectAll {
             exclude: form_json_i64s(&form, "exclude_ids"),
@@ -1021,6 +1111,25 @@ fn reconstruct_list_req(req: &Req, form: &HashMap<String, String>) -> Req {
         .filter(|v| mail::SortKey::parse(Some(v)) != mail::SortKey::DateDesc)
     {
         qs.push(format!("sort={}", urlencode(s)));
+    }
+    // 高级检索（B1）：批量后重渲列表保持筛选条件
+    if let Some(f) = form.get("from").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        qs.push(format!("from={}", urlencode(f)));
+    }
+    if let Some(d) = form
+        .get("df")
+        .filter(|v| mail::date_epoch_of(v, false).is_some())
+    {
+        qs.push(format!("df={}", urlencode(d)));
+    }
+    if let Some(d) = form
+        .get("dt")
+        .filter(|v| mail::date_epoch_of(v, true).is_some())
+    {
+        qs.push(format!("dt={}", urlencode(d)));
+    }
+    if form.get("att").map(|v| v == "1").unwrap_or(false) {
+        qs.push("att=1".into());
     }
     if let Some(p) = form.get("page").filter(|v| v.parse::<i64>().is_ok()) {
         qs.push(format!("page={p}"));
@@ -2298,6 +2407,10 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let external = get("external");
     let per = get("per");
     let sort = get("sort");
+    let from = get("from");
+    let df = get("df");
+    let dt = get("dt");
+    let att = get("att");
     rebuild_list_query(
         &folder,
         unread.as_deref(),
@@ -2306,6 +2419,10 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
         page.as_deref(),
         per.as_deref(),
         sort.as_deref(),
+        from.as_deref(),
+        df.as_deref(),
+        dt.as_deref(),
+        att.as_deref(),
     )
 }
 
@@ -2323,6 +2440,10 @@ fn rebuild_list_query(
     page: Option<&str>,
     per: Option<&str>,
     sort: Option<&str>,
+    from: Option<&str>,
+    df: Option<&str>,
+    dt: Option<&str>,
+    att: Option<&str>,
 ) -> String {
     let folder = match folder {
         "all" | "sent" | "draft" | "inbox" => folder.to_string(),
@@ -2351,6 +2472,19 @@ fn rebuild_list_query(
     let sort = mail::SortKey::parse(sort);
     if sort != mail::SortKey::DateDesc {
         qs.push(format!("sort={}", sort.as_str()));
+    }
+    // 高级检索（B1）：发件人/日期/附件，非法日期丢弃（与 list_root 同口径）
+    if let Some(f) = from.map(str::trim).filter(|v| !v.is_empty()) {
+        qs.push(format!("from={}", urlencode(f)));
+    }
+    if let Some(d) = df.filter(|v| mail::date_epoch_of(v, false).is_some()) {
+        qs.push(format!("df={}", urlencode(d)));
+    }
+    if let Some(d) = dt.filter(|v| mail::date_epoch_of(v, true).is_some()) {
+        qs.push(format!("dt={}", urlencode(d)));
+    }
+    if att == Some("1") {
+        qs.push("att=1".into());
     }
     let page = clamp_page(page);
     if page > 1 {
@@ -2418,6 +2552,10 @@ fn form_list_query(form: &HashMap<String, String>) -> String {
         pick("page"),
         pick("per"),
         pick("sort"),
+        pick("from"),
+        pick("df"),
+        pick("dt"),
+        pick("att"),
     )
 }
 

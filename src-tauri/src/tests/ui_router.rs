@@ -3611,6 +3611,9 @@ fn dump_smoke_html() {
     dump("main-sort-asc.html", get_url("/?sort=date_asc"));
     dump("main-sort-from.html", get_url("/?sort=from_asc"));
     dump("main-sort-subject.html", get_url("/?sort=subject_asc"));
+    // B1 高级检索素材：发件人 / 仅附件（面板默认展开 + 条件回显）
+    dump("main-adv-from.html", get_url("/?from=partner"));
+    dump("main-adv-att.html", get_url("/?att=1"));
     // M4-2 定时草稿种子：第三个草稿设 2h 后定时——列表 ⏰ 徽标实测
     state
         .with_conn(|c| {
@@ -6632,5 +6635,101 @@ fn undo_send_cancels_window_or_reports_too_late() {
             .unwrap()
     });
     assert_eq!(status, "queued", "拒绝撤销不得改动发送状态");
+    cleanup(&dir);
+}
+
+/// B1 高级检索：URL 条件生效、详情往返保持、非法日期静默忽略
+#[test]
+fn advanced_search_filters_and_persists() {
+    let (state, dir) = temp_state("b1-adv");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let now = mail::now_epoch();
+    let today = mail::sched_local_value(now)[..10].to_string();
+    let yesterday = mail::sched_local_value(now - 86_400)[..10].to_string();
+    state.with_conn(|c| {
+        c.execute_batch(&format!(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at, attach_cnt, thread_key)
+             VALUES
+             ('in','inbox','received','boss@chinatelecom.cn','王总','demo@chinatelecom.cn',
+              '今天的信','x','今天','x',1,{now},{now},0,'今天的信'),
+             ('in','inbox','received','market@partner.cn','合作方','demo@chinatelecom.cn',
+              '昨天的信','y','昨天','y',1,{y1},{y1},2,'昨天的信')",
+            y1 = now - 86_400
+        ))
+        .unwrap();
+    });
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 发件人包含 partner → 只剩昨天的信
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "from=partner", b""),
+        &t,
+    ));
+    assert!(html.contains("昨天的信"), "应按发件人命中：{html}");
+    assert!(!html.contains("今天的信"), "非匹配发件人不应出现");
+    assert!(
+        html.contains("from=partner"),
+        "详情链接应携带发件人条件（往返保持）"
+    );
+    // 仅附件 → 昨天的信（attach_cnt=2）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "att=1", b""),
+        &t,
+    ));
+    assert!(html.contains("昨天的信"));
+    assert!(!html.contains("今天的信"));
+    // 日期区间：今天起 → 只剩今天的信
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", &format!("df={today}"), b""),
+        &t,
+    ));
+    assert!(html.contains("今天的信"), "起始日期应命中今天：{html}");
+    assert!(!html.contains("昨天的信"), "昨天应被日期排除");
+    // 结束日期 = 昨天 → 只剩昨天的信
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", &format!("dt={yesterday}"), b""),
+        &t,
+    ));
+    assert!(html.contains("昨天的信"));
+    assert!(!html.contains("今天的信"));
+    // 非法日期：静默忽略（按未填处理，两封都在）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "df=2026-02-30&dt=abc", b""),
+        &t,
+    ));
+    assert_eq!(
+        html.matches("data-mail-id=").count(),
+        2,
+        "非法日期应忽略：{html}"
+    );
+    // 高级面板在有条件时展开（hidden 不应出现）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "from=partner", b""),
+        &t,
+    ));
+    assert!(
+        html.contains("id=\"adv-panel\" method=\"get\""),
+        "应渲染面板"
+    );
+    assert!(
+        !html.contains("id=\"adv-panel\" method=\"get\" action=\"/\"\n          hidden"),
+        "有条件时面板应展开"
+    );
     cleanup(&dir);
 }

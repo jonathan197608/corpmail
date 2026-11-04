@@ -46,6 +46,10 @@
         <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
             <span>🔍</span>
             <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
+            {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件） #}
+            <button type="button" id="adv-toggle"
+                    class="adv-toggle {% if from_filter or df or dt or has_attach %}on{% endif %}"
+                    title="高级检索：发件人、日期区间、附件" aria-label="高级检索">⚙</button>
             <input type="hidden" name="folder" value="{{ folder }}">
             {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
             {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
@@ -53,6 +57,32 @@
             {% if q %}<a class="search-clear" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索">×</a>{% endif %}
         </form>
     </div>
+
+    {# 高级检索面板（B1）：GET 表单，保留 folder/q/mode/per/sort；
+       有激活条件时默认展开。清除按钮清空四项并提交。 #}
+    <form class="adv-panel" id="adv-panel" method="get" action="/"
+          {% if not (from_filter or df or dt or has_attach) %}hidden{% endif %}>
+        <input type="hidden" name="folder" value="{{ folder }}">
+        {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+        {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
+        {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
+        {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
+        <label class="adv-field">发件人
+            <input type="text" name="from" value="{{ from_filter }}" placeholder="地址或姓名包含">
+        </label>
+        <label class="adv-field">从
+            <input type="date" name="df" value="{{ df }}">
+        </label>
+        <label class="adv-field">到
+            <input type="date" name="dt" value="{{ dt }}">
+        </label>
+        <label class="adv-check">
+            <input type="checkbox" name="att" value="1" {% if has_attach %}checked{% endif %}> 仅看有附件
+        </label>
+        <button class="btn small primary" type="submit">应用筛选</button>
+        <button class="btn small" type="button" id="adv-clear">清除筛选</button>
+    </form>
+
     <div class="mail-list" id="mail-list">
     {% if is_thread %}
         {# 会话视图（M2-2）：一行 = 一个 thread_key 归组。代表行=组内最新一封，
@@ -118,6 +148,10 @@
             <input type="hidden" id="ba-page" value="{{ page }}">
             <input type="hidden" id="ba-per" value="{{ per }}">
             <input type="hidden" id="ba-sort" value="{{ sort }}">
+            <input type="hidden" id="ba-from" value="{{ from_filter }}">
+            <input type="hidden" id="ba-df" value="{{ df }}">
+            <input type="hidden" id="ba-dt" value="{{ dt }}">
+            <input type="hidden" id="ba-att" value="{{ '1' if has_attach else '0' }}">
             <input type="hidden" id="ba-total" value="{{ total }}">
         </div>
         {% for m in items %}

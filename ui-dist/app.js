@@ -1016,6 +1016,14 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         // 排序（A2）：非默认才带，批量后列表片段保持当前排序
         var sort = val('ba-sort');
         if (sort && sort !== 'date_desc') params.set('sort', sort);
+        // 高级检索（B1）：批量后列表片段保持筛选条件
+        var from = (val('ba-from') || '').trim();
+        if (from) params.set('from', from);
+        var df = val('ba-df');
+        if (df) params.set('df', df);
+        var dt = val('ba-dt');
+        if (dt) params.set('dt', dt);
+        if (val('ba-att') === '1') params.set('att', '1');
         if (stateBox.mode === 'all') {
             params.set('select_all', '1');
             params.set('exclude_ids', JSON.stringify(stateBox.exclude));
@@ -1105,6 +1113,34 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         if (ev.detail && ev.detail.target && ev.detail.target.id === 'list-area') init();
     });
     document.addEventListener('DOMContentLoaded', init);
+})();
+
+// ---------- 高级检索面板（B1） ----------
+// 搜索框右侧 ⚙ 切换面板；清除筛选清空四项后提交（保留 folder/排序/每页）
+(function () {
+    var btn = document.getElementById('adv-toggle');
+    var panel = document.getElementById('adv-panel');
+    if (btn && panel) {
+        btn.addEventListener('click', function () {
+            panel.hidden = !panel.hidden;
+            if (!panel.hidden) {
+                var first = panel.querySelector('input[name="from"]');
+                if (first) first.focus();
+            }
+        });
+    }
+    var clear = document.getElementById('adv-clear');
+    if (clear && panel) {
+        clear.addEventListener('click', function () {
+            ['from', 'df', 'dt'].forEach(function (n) {
+                var el = panel.querySelector('input[name="' + n + '"]');
+                if (el) el.value = '';
+            });
+            var att = panel.querySelector('input[name="att"]');
+            if (att) att.checked = false;
+            panel.submit();
+        });
+    }
 })();
 
 // ---------- 键盘快捷键（A3） ----------
