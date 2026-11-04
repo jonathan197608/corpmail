@@ -93,6 +93,9 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
 /// 新邮件通知钩子类型（收件线程完成后调用，参数：本轮开始时刻、本轮新增数）
 pub(crate) type NotifyHook = std::sync::Arc<dyn Fn(i64, i64) + Send + Sync>;
 
+/// 托盘角标刷新钩子类型（未读数变化后调用；测试环境 None 不触发）
+pub(crate) type TrayHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 pub struct AppState {
     db: Mutex<Connection>,
     /// 应用数据目录（库/附件根；设置·存储页展示）。
@@ -112,6 +115,10 @@ pub struct AppState {
     /// 新邮件通知钩子（收件线程完成后调用，参数 (本轮开始时刻, 本轮新增数)）。
     /// None = 未装配（测试环境）；生产由 setup 注入系统通知闭包（notify.rs）
     notify_hook: Mutex<Option<NotifyHook>>,
+    /// 托盘角标刷新钩子（M4-1：未读数变化后由 UI 变更点 poke；生产由 setup
+    /// 注入（lib.rs tray 模块刷新未读角标），发送调度线程每 20s 兑底重刷；
+    /// None = 未装配（测试环境），poke 为空操作）
+    tray_hook: Mutex<Option<TrayHook>>,
     /// 收件状态（M4 §6.2：手动触发防抖/进行中态展示；Arc 供收件线程更新）。
     /// pub(crate)：路由层回归测试需注入运行中态（C5 拒绝重拉）
     pub(crate) fetch_state: std::sync::Arc<Mutex<FetchState>>,
@@ -218,6 +225,7 @@ impl AppState {
             send_tx: Mutex::new(None),
             seen_tx: Mutex::new(None),
             notify_hook: Mutex::new(None),
+            tray_hook: Mutex::new(None),
             fetch_state: std::sync::Arc::new(Mutex::new(FetchState {
                 running: false,
                 new_count: 0,
@@ -634,6 +642,25 @@ impl AppState {
     /// 装配新邮件通知钩子（lib.rs setup：打包 AppHandle 调 notify::on_fetch_finished）
     pub fn set_notify_hook(&self, hook: NotifyHook) {
         *self.notify_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// 装配托盘角标刷新钩子（lib.rs setup：注入 tray::refresh_badge 闭包）
+    pub fn set_tray_hook(&self, hook: TrayHook) {
+        *self.tray_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// 未读数变化后刷新托盘角标（UI 变更点调用；未装配钩子时为空操作）。
+    /// 角标还由发送调度线程每 20s 兑底重刷——missed poke 在一个扫描周期内
+    /// 自动收敛，无需穷举全部未读变更点
+    pub fn poke_tray(&self) {
+        if let Some(hook) = self
+            .tray_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            hook();
+        }
     }
 
     pub fn start_fetch(&self) {

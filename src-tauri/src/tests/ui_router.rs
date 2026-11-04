@@ -178,6 +178,7 @@ fn list_page_shows_drafts_with_sidebar_counts() {
         subject: s.into(),
         body_text: "配案正文预览".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     mail::save_draft(&state, &draft("第一封草稿主题")).unwrap();
     mail::save_draft(&state, &draft("第二封草稿主题")).unwrap();
@@ -215,6 +216,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
         subject: s.into(),
         body_text: "配案正文预览".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     mail::save_draft(&state, &draft("激励配案通知")).unwrap();
     mail::save_draft(&state, &draft("无关主题邮件")).unwrap();
@@ -339,6 +341,7 @@ fn attachment_view_serves_bytes_with_safe_mime() {
             subject: "预览用例".into(),
             body_text: "见附件".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -961,6 +964,7 @@ fn attachment_save_via_post_writes_file() {
             subject: "带附件草稿".into(),
             body_text: "见附件".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -1233,6 +1237,7 @@ fn email_status_endpoint_returns_lightweight_json() {
         subject: "状态查询".into(),
         body_text: "正文".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let id = mail::save_draft(&state, &input).unwrap();
     // queued：发送中
@@ -3278,6 +3283,7 @@ fn dump_smoke_html() {
             subject: "关于宽带提速配案的意见反馈".into(),
             body_text: "各位领导：\n请查阅本月配案清单，重点客户需在月底前完成提速交付。".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -3293,6 +3299,7 @@ fn dump_smoke_html() {
             subject: "Re: 月度激励汇总表".into(),
             body_text: "收到，我这边同步核对一遍数据口径。".into(),
             in_reply_to: Some(d1),
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -3459,7 +3466,22 @@ fn dump_smoke_html() {
 
     dump("main.html", get("/"));
     dump("main-inbox-unread.html", get_url("/?unread=1"));
+    // M4-2 定时草稿种子：第三个草稿设 2h 后定时——列表 ⏰ 徽标实测
+    state
+        .with_conn(|c| {
+            let at = mail::now_epoch() + 7200;
+            c.execute(
+                "UPDATE emails SET scheduled_at = ?1
+                  WHERE folder = 'draft' AND status = 'draft'
+                    AND subject = 'Re: 月度激励汇总表'",
+                [at],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
     dump("main-draft.html", get_url("/?folder=draft"));
+    // 定时草稿详情页（「已定时」状态条）
+    dump("email-scheduled.html", get(&format!("/emails/{d2}")));
     dump("main-all.html", get_url("/?folder=all"));
     // M2-2 会话视图素材：会话列表（inbox/all）+ 会话详情（count=2 归组）
     dump("main-thread.html", get_url("/?mode=thread"));
@@ -5578,5 +5600,325 @@ fn contacts_page_lists_searches_and_deletes() {
         .unwrap()
     });
     assert_eq!(remain, 0, "库中应物理删除");
+    cleanup(&dir);
+}
+
+// ---------- M4-2 定时发送（compose 页 + 详情/列表展示） ----------
+
+/// 定时发送主链路：未来时刻提交 → 草稿落 scheduled_at、不入队 → 跳详情页
+/// 展示「已定时」；past 时刻被拒；立即发送清定时并排队
+#[test]
+fn compose_schedule_send_flow() {
+    let (state, dir) = temp_state("m4-sched-flow");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let future = mail::sched_local_value(mail::now_epoch() + 3600);
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 定时发送：落计划、跳详情
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "定时汇报"),
+                ("body_text", "定时发送的内容"),
+                ("body_mode", "plain"),
+                ("scheduled_at", future.as_str()),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1"),
+        "定时成功应跳草稿详情页：{:?}",
+        resp.extra_headers
+    );
+    let (folder, status, at): (String, String, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT folder, status, scheduled_at FROM emails WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        (folder.as_str(), status.as_str()),
+        ("draft", "draft"),
+        "定时邮件停留草稿"
+    );
+    assert!(at > mail::now_epoch(), "scheduled_at 应为未来时刻");
+    // 详情页渲染「已定时」与完整时刻
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/1", b""), &t));
+    assert!(html.contains("已定时"), "详情应有定时状态条：{html}");
+    assert!(
+        html.contains(mail::time_full(at).as_str()),
+        "定时时刻完整展示"
+    );
+    // 草稿箱列表行 ⏰ 徽标
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "folder=draft", b""),
+        &t,
+    ));
+    assert!(html.contains("⏰"), "草稿行应有定时徽标：{html}");
+    // 撰写页回显控件值（datetime-local）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "draft_id=1", b""),
+        &t,
+    ));
+    assert!(
+        html.contains(&format!("value=\"{future}\"")),
+        "编辑定时草稿应回显控件值：{html}"
+    );
+
+    // 过时刻拒绝：不落库、不产生新草稿
+    let past = mail::sched_local_value(mail::now_epoch() - 3600);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "过时定时"),
+                ("body_text", "x"),
+                ("body_mode", "plain"),
+                ("scheduled_at", past.as_str()),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    let location = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        location.contains("error=") && !location.contains("/emails/"),
+        "过时刻应被拒并带错误回撰写页：{location}"
+    );
+    let total: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(total, 1, "拒绝路径不应生成新草稿");
+
+    // 立即发送定时草稿（scheduled_at 置空）：清计划 + 排队
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("draft_id", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "定时汇报"),
+                ("body_text", "改为立即发"),
+                ("body_mode", "plain"),
+                ("scheduled_at", ""),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    let location = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        location.contains("just_sent=1"),
+        "立即发送应走既有反馈链路：{location}"
+    );
+    let (status, at): (String, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT status, scheduled_at FROM emails WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(status, "queued", "清空定时后立即发送应排队");
+    assert_eq!(at, 0, "发送路径应清除 scheduled_at");
+
+    cleanup(&dir);
+}
+
+/// 定时草稿由调度线程派发（M4-2 E2E 内核）：due 行转 queued——
+/// 与 mail_send::dispatch_due_scheduled 单元测试互补，本测试验证
+/// 「HTTP 定时 → 调度派发」两级衔接（state 无 worker：queued 即终态）
+#[test]
+fn scheduled_draft_is_dispatched_when_due() {
+    let (state, dir) = temp_state("m4-sched-dispatch");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 建定时草稿后手改到点（模拟时间流逝，比构造未来 2 分钟更可控）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "定时到期"),
+                ("body_text", "到点自动发"),
+                ("body_mode", "plain"),
+                (
+                    "scheduled_at",
+                    mail::sched_local_value(mail::now_epoch() + 3600).as_str(),
+                ),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/emails/1")
+    );
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET scheduled_at = ?1 WHERE id = 1",
+                [mail::now_epoch() - 1],
+            )
+            .unwrap();
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+    assert_eq!(mail::dispatch_due_scheduled(&state), 1, "到点草稿应被派发");
+    let status: String = state.with_conn(|c| {
+        c.query_row("SELECT status FROM emails WHERE id = 1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(
+        status, "queued",
+        "派发后进入发送队列（无 worker 时停留，启动补发）"
+    );
+    cleanup(&dir);
+}
+
+/// 存草稿保留/取消定时（M4-2）：定时草稿清空控件后存草稿 → scheduled_at 归零；
+/// 未改控件存草稿 → 计划保留
+#[test]
+fn draft_save_keeps_or_clears_schedule() {
+    let (state, dir) = temp_state("m4-sched-save");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let future = mail::sched_local_value(mail::now_epoch() + 3600);
+    // 建定时草稿（经 HTTP 路径，与 M4-2 计划一致）
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/send",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "计划草稿"),
+                ("body_text", "x"),
+                ("body_mode", "plain"),
+                ("scheduled_at", future.as_str()),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    // 未改控件再存草稿：计划保留
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("draft_id", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "计划草稿"),
+                ("body_text", "改了一下正文"),
+                ("body_mode", "plain"),
+                ("scheduled_at", future.as_str()),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert!(at > 0, "存草稿应保留定时计划");
+    // 清空控件存草稿：取消定时
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("draft_id", "1"),
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "计划草稿"),
+                ("body_text", "再改一下"),
+                ("body_mode", "plain"),
+                ("scheduled_at", ""),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    let (at, status): (i64, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT scheduled_at, status FROM emails WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        (at, status.as_str()),
+        (0, "draft"),
+        "清空控件存草稿应取消定时且保持草稿"
+    );
     cleanup(&dir);
 }

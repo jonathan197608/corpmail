@@ -146,6 +146,7 @@ fn draft(subject: &str, body: &str) -> DraftInput {
         subject: subject.into(),
         body_text: body.into(),
         in_reply_to: None,
+        scheduled_at: 0,
     }
 }
 

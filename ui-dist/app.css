@@ -2280,6 +2280,29 @@ a.btn.link.disabled {
     text-overflow: ellipsis;
 }
 
+/* ---- M4-2 定时发送（撰写页操作区 + 详情页提示） ---- */
+.sched-input {
+    font-size: 13px;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: var(--panel);
+}
+
+.sched-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* 详情页定时说明小字（md-status 下方的操作指引） */
+.sched-tip {
+    margin: -6px 12px 10px;
+    font-size: 12.5px;
+    color: var(--muted);
+}
+
 /* ---- M3-3 联系人管理页 ---- */
 .contacts-list {
     flex: 1;

@@ -298,6 +298,7 @@ fn mark_seen_local_and_delegates_to_fetcher() {
         subject: "本地草稿".into(),
         body_text: "体".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let draft_id = save_draft(&state, &input).unwrap();
     let fetcher3 = FakeFetcher::new();

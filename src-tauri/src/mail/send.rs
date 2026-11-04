@@ -174,15 +174,53 @@ fn split_addrs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 草稿 → 排队（原子 CAS：仅 status='draft' 可入队；重复提交 0 行返回 false，幂等 §7）
+/// 草稿 → 排队（原子 CAS：仅 status='draft' 可入队；重复提交 0 行返回 false，幂等 §7）。
+/// 入队即清 scheduled_at（M4-2）：队列中的邮件不再属于定时计划，
+/// 立即发送路径同时承担"取消定时"语义
 pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
         exec_one(
             conn,
-            "UPDATE emails SET status = 'queued', error = NULL WHERE id = ?1 AND status = 'draft'",
+            "UPDATE emails SET status = 'queued', error = NULL, scheduled_at = 0
+             WHERE id = ?1 AND status = 'draft'",
             id,
         )
     })
+}
+
+/// 定时发送调度（M4-2）：补发/扫描到点草稿。命中 folder/status 均为 draft 且
+/// scheduled_at > 0 且已到点（<= now）的行，逐封入队并唤醒发送 worker，
+/// 返回派发数。由常驻调度线程每 20s 与启动首轮调用；应用关闭期间到点的
+/// 邮件在下次启动立即补发。单个 enqueue 失败仅记日志（下轮重扫自然重试）
+pub fn dispatch_due_scheduled(state: &AppState) -> usize {
+    let now = now_epoch();
+    let due: Vec<i64> = state.with_conn(|conn| {
+        conn.prepare(
+            "SELECT id FROM emails
+              WHERE folder = 'draft' AND status = 'draft'
+                AND scheduled_at > 0 AND scheduled_at <= ?1
+              ORDER BY scheduled_at, id",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([now], |r| r.get::<_, i64>(0))?;
+            Ok(rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_else(|err| {
+            eprintln!("[sched] 定时邮件扫描失败（下轮重试）：{err}");
+            Vec::new()
+        })
+    });
+    let mut dispatched = 0usize;
+    for id in due {
+        if enqueue_draft(state, id) {
+            state.enqueue_send(id);
+            dispatched += 1;
+        }
+    }
+    if dispatched > 0 {
+        eprintln!("[sched] 定时到点派发 {dispatched} 封");
+    }
+    dispatched
 }
 
 /// 崩溃恢复：把残留 `sending` 复位为 `failed`（返回复位行数）。

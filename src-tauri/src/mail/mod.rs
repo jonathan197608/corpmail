@@ -23,7 +23,8 @@ pub use recv::{
 #[cfg(test)]
 pub use recv::{FetchOutcome, store_incoming};
 pub use send::{
-    RealSender, SmtpConfig, dispatch_one, enqueue_draft, recover_interrupted_sends, reopen_failed,
+    RealSender, SmtpConfig, dispatch_due_scheduled, dispatch_one, enqueue_draft,
+    recover_interrupted_sends, reopen_failed,
 };
 
 use crate::err as e;
@@ -501,6 +502,40 @@ pub fn time_full(epoch: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 定时发送时刻（M4-2）：epoch 秒 → datetime-local 控件值 `YYYY-MM-DDTHH:MM`
+/// （compose 页定时选择器回显用；本地时区与控件语义一致）。
+/// 0/负值视为"未定时"返回空串（控件不回显任何值）
+pub fn sched_local_value(epoch: i64) -> String {
+    if epoch <= 0 {
+        return String::new();
+    }
+    zoned_of(epoch)
+        .map(|z| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}",
+                z.year(),
+                z.month() as u32,
+                z.day() as u32,
+                z.hour(),
+                z.minute()
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// 定时发送时刻（M4-2）：datetime-local 控件值 `YYYY-MM-DDTHH:MM` → epoch 秒。
+/// 按本地时区解析（浏览器 datetime-local 不带时区，含义即用户系统时区；
+/// 服务端 jiff 用同一系统时区，两端一致）。空串/非法格式返回 None
+pub fn sched_epoch_of(local: &str) -> Option<i64> {
+    let t = local.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let dt: jiff::civil::DateTime = t.parse().ok()?;
+    let z = dt.to_zoned(local_tz()).ok()?;
+    Some(z.timestamp().as_second())
+}
+
 /// 时区缓存（zoned_of 在列表/详情高频调用；每次 Zoned::now() 读系统时区是浪费）
 /// 本地时区缓存（jiff TimeZone 为 Arc 包裹，clone 仅引用计数）。
 /// TTL 1 小时：长期驻留的应用在系统时区变更（出差/夏令时）后，
@@ -621,6 +656,9 @@ pub struct DraftInput {
     pub body_text: String,
     /// 回复链：指向被回复邮件 id（§3 in_reply_to）
     pub in_reply_to: Option<i64>,
+    /// 定时发送时刻（M4-2，epoch 秒；0 = 非定时。仅草稿有效：存草稿保留，
+    /// 到点调度线程入队发送；发送路径写 0 = 立即发并清除既有定时）
+    pub scheduled_at: i64,
 }
 
 /// 新建/覆盖草稿；返回草稿 id。
@@ -674,7 +712,7 @@ fn save_draft_impl(
                 "UPDATE emails SET from_addr=?2, from_name=?3, to_addrs=?4, cc_addrs=?5,
                         subject=?6, body_text=?7, subject_tokens=?8, body_tokens=?9,
                         in_reply_to=?10, body_kind=?11, body_html=?12, bcc_addrs=?13,
-                        thread_key=?14
+                        thread_key=?14, scheduled_at=?15
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -691,6 +729,7 @@ fn save_draft_impl(
                     body_html,
                     input.bcc_addrs,
                     tk,
+                    input.scheduled_at,
                 ],
             )
             .map_err(e)?;
@@ -701,8 +740,8 @@ fn save_draft_impl(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     cc_addrs, subject, body_text, subject_tokens, body_tokens,
                                     unread, created_at, in_reply_to, body_kind, body_html, bcc_addrs,
-                                    thread_key)
-                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                    thread_key, scheduled_at)
+                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     input.from_addr,
                     input.from_name,
@@ -718,6 +757,7 @@ fn save_draft_impl(
                     body_html,
                     input.bcc_addrs,
                     tk,
+                    input.scheduled_at,
                 ],
             )
             .map_err(e)?;
@@ -811,6 +851,10 @@ pub struct EmailSummary {
     pub subject_html: String,
     /// 悬停预览原始正文（压缩空白 + 300 字符截断 + 省略号，模板 data-tip 属性用）
     pub preview_tip: String,
+    /// 定时发送时刻（M4-2；0 = 非定时，仅草稿行有意义，模板渲染 ⏰ 徽标）
+    pub scheduled_at: i64,
+    /// 定时时刻短标签（同/跨天口径同 time_label；scheduled_at=0 时为空串）
+    pub sched_label: String,
 }
 
 /// 会话视图列表行（M2-2）：一行 = 一个 thread_key 归组（代表行=组内最新一封，
@@ -1040,7 +1084,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
                         COALESCE(received_at, sent_at, created_at) AS t,
-                        {ext_col} AS from_external, starred
+                        {ext_col} AS from_external, starred, scheduled_at
                  FROM emails {where_sql}
                  ORDER BY starred DESC, t DESC, id DESC
                  LIMIT :lim OFFSET :off"
@@ -1177,7 +1221,7 @@ pub fn thread_mails(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
                         COALESCE(received_at, sent_at, created_at) AS t,
-                        {ext_col} AS from_external, starred
+                        {ext_col} AS from_external, starred, scheduled_at
                  FROM emails
                  WHERE thread_key = ?1 AND folder <> 'draft'
                    AND status NOT IN ('draft','failed')
@@ -1210,6 +1254,7 @@ fn summary_from_row(
     let name: String = r.get(5)?;
     let addr: String = r.get(4)?;
     let body: String = r.get(7)?;
+    let scheduled_at = r.get::<_, i64>(13)?;
     Ok(EmailSummary {
         id: r.get(0)?,
         folder: r.get(1)?,
@@ -1226,6 +1271,13 @@ fn summary_from_row(
         subject_html,
         // 列尾追加（列序 12）：list/search 两条 SELECT 同位拼接，缺列即此函数报错
         starred: r.get::<_, i64>(12)? == 1,
+        // 列尾追加（列序 13）：定时发送（仅草稿行 >0；三条 SELECT 同位）
+        scheduled_at,
+        sched_label: if scheduled_at > 0 {
+            time_label(scheduled_at)
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -1326,7 +1378,7 @@ pub fn search(
                 "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                         e.to_addrs, e.body_text, e.attach_cnt, e.unread,
                         COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
-                        {ext_col} AS from_external, e.starred
+                        {ext_col} AS from_external, e.starred, e.scheduled_at
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
                  WHERE email_fts MATCH :match{filter_sql}
                  ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
@@ -1439,6 +1491,10 @@ pub struct EmailDetail {
     pub time_full: String,
     /// 超过单封收件上限：只拉了信头，正文为占位说明（详情页据此显示提示条）
     pub too_large: bool,
+    /// 定时发送时刻（M4-2；0 = 非定时，仅草稿态有意义）
+    pub scheduled_at: i64,
+    /// 定时时刻完整文本 `YYYY-MM-DD HH:MM`（scheduled_at=0 时为空串；模板直接渲染）
+    pub scheduled_full: String,
     pub attachments: Vec<AttachView>,
 }
 
@@ -1450,7 +1506,8 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
                         cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
                         attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
-                        COALESCE(received_at, sent_at, created_at), too_large, starred
+                        COALESCE(received_at, sent_at, created_at), too_large, starred,
+                        scheduled_at
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -1475,6 +1532,11 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         time_full: time_full(r.get(16)?),
                         too_large: r.get::<_, i64>(17)? == 1,
                         starred: r.get::<_, i64>(18)? == 1,
+                        scheduled_at: r.get(19)?,
+                        scheduled_full: {
+                            let at = r.get::<_, i64>(19)?;
+                            if at > 0 { time_full(at) } else { String::new() }
+                        },
                         attachments: Vec::new(),
                     })
                 },

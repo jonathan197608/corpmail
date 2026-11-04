@@ -690,6 +690,58 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     });
 })();
 
+// ---------- 撰写页：定时发送（M4-2） ----------
+// 状态承载：#sched-at 隐藏域存 datetime-local 控件原始值（"YYYY-MM-DDTHH:MM"），
+// 服务端 save_compose_form 统一解析成 epoch。两条发送路径同端点同表单：
+// - 立即发送（button[hx-post="/compose/send"]:not(#sched-send-btn)）→ 点击即清空
+//   hidden（capture 阶段抢在 htmx 收集参数之前）→ 提交 scheduled_at="" = 立即发
+// - 定时发送（#sched-send-btn）→ htmx:configRequest 校验控件非空（空则拦请求
+//   并提示），hidden 已由 change/input 同步为控件值 → 提交 = 定时
+// 存草稿：hidden 原样提交（定时草稿保留计划；清空控件后存草稿 = 取消定时）
+(function () {
+    function hidden() { return document.getElementById('sched-at'); }
+    function picker() { return document.getElementById('sched-input'); }
+    function sync() {
+        var h = hidden(), p = picker();
+        if (h && p) h.value = p.value || '';
+    }
+    // 控件变化即同步隐藏域（change 覆盖清空/重选；input 覆盖手输部分）
+    document.body.addEventListener('input', function (ev) {
+        if (ev.target && ev.target.id === 'sched-input') sync();
+    });
+    document.body.addEventListener('change', function (ev) {
+        if (ev.target && ev.target.id === 'sched-input') sync();
+    });
+    // 立即发送：capture 阶段清空（htmx 用冒泡监听，capture 先行——否则参数已收集）
+    document.body.addEventListener('click', function (ev) {
+        var t = ev.target;
+        if (!t || !t.closest) return;
+        var btn = t.closest('button[hx-post="/compose/send"]');
+        if (btn && btn.id !== 'sched-send-btn') {
+            var h = hidden();
+            if (h) h.value = '';
+        }
+    }, true);
+    // 定时发送：请求前校验控件已选（空则拦下并提示，模式同 M1-2 预校验）
+    document.body.addEventListener('htmx:configRequest', function (ev) {
+        var detail = ev.detail || {};
+        var elt = detail.elt;
+        if (!elt || !elt.matches || !elt.matches('#sched-send-btn')) return;
+        var p = picker();
+        if (!p || !p.value) {
+            ev.preventDefault();
+            var h = hidden();
+            if (h) h.value = '';
+            var note = document.createElement('div');
+            note.className = 'compose-note err';
+            note.textContent = '请先选择定时发送时刻（或点击「发送」立即发送）';
+            var card = document.querySelector('.compose-card');
+            if (card) card.insertBefore(note, card.firstChild);
+            setTimeout(function () { if (note.parentNode) note.remove(); }, 4000);
+        }
+    });
+})();
+
 // ---------- 撰写页：发送前预校验（M1-2） ----------
 // 挂 htmx:configRequest、精确匹配发送按钮（存草稿允许不完整内容，不校验）。
 // preventDefault 即取消本次请求（htmx 在全部监听器执行完后统一检查），

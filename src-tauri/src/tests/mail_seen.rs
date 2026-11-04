@@ -275,6 +275,7 @@ fn local_mail_never_pends() {
             subject: "草稿".into(),
             body_text: "体".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();

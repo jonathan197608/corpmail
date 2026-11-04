@@ -16,6 +16,11 @@
         {% if email.too_large %}
         <div class="md-status sending">⚠ 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
         {% endif %}
+        {# 定时发送（M4-2）：草稿带 scheduled_at 到点由调度线程自动入队。 #}
+        {% if email.status == 'draft' and email.scheduled_at > 0 %}
+        <div class="md-status sending">⏰ 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
+        <div class="sched-tip">修改或取消：编辑草稿并调整定时时间；或清空定时后「发送」立即发出。</div>
+        {% endif %}
         {% if email.status == 'queued' %}
         <div class="md-status sending">⏳ 排队中，即将发送…</div>
         {% elif email.status == 'sending' %}

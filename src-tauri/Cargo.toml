@@ -11,7 +11,10 @@ name = "corpmail_lib"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# 依赖版本约定：约束只到语义化兼容区间（如 "2"/"0.31"，即 ^2/^0.31），
+# 让 cargo update 能自由拿到兼容新版；仅 0.x 预发布库（无 semver 兼容保证，
+# 如 imap alpha）才锁具体版本，并要求注明原因。
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"                                          # 表单 JSON 数组字段（M2 附件 keep_ids/attach_paths）
 minijinja = { version = "3", features = ["serde"] }
@@ -25,7 +28,7 @@ keyring = "4"                                              # OS 凭据保管（�
 aes-gcm = "0.10"                                           # keyfile 回退加密（§5.4）
 base64 = "0.22"                                            # keyfile/密码辅助编码
 lettre = { version = "0.11", features = ["builder", "smtp-transport", "native-tls"] }  # SMTP 测试连接（M3 发送）
-imap = "3.0.0-alpha.15"                                    # IMAP 测试连接（M4 收件；降 2.4.1 见 §13-R2）
+imap = "3.0.0-alpha.15"                                    # IMAP 测试连接（M4 收件；3.0 仅有 alpha 预发布，无 semver 兼容保证故锁具体版；3.x 起 NoSelect 已可用，降 2.4.1 见 §13-R2）
 imap-proto = "0.16"                                          # imap 库未再导出 NameAttribute（发件箱 NoSelect 判定；版本随 imap 传递锁定）
 mailparse = "0.18"                                         # MIME 解析（M4 收件：multipart/附件/RFC2047 解码，spike 已验证）
 jiff = "0.2"                                               # 时间戳格式化（RFC2822/展示）
@@ -33,10 +36,11 @@ jieba-rs = "0.11"                                          # 中文预分词（�
 flate2 = "1"                                               # 附件 gzip（§5.1 两级存储）
 sha2 = "0.10"                                              # 附件指纹（§5.1 sha256 列）
 tauri-plugin-dialog = "2"                                  # 系统文件/保存对话框（M2：附件选择与另存）
-tauri-plugin-single-instance = "2.5.5"
-ammonia = "4.2.4"
+# M4-1 托盘：依赖 tauri tray-icon 特性（Cargo.toml tauri features）
+tauri-plugin-single-instance = "2"
+ammonia = "4"
 ureq = "2"
-tauri-plugin-notification = "2.8.0"
+tauri-plugin-notification = "2"
 
 # --- Windows 交付（设计 §11.2/11.3 v3.4：官方 NSIS 安装器）---
 # 零 vendor：上游 webview2-com-sys 0.39.1 gnu 目标动态链接 WebView2Loader.dll，

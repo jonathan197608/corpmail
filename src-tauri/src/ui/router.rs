@@ -307,6 +307,9 @@ struct ComposeCtx {
     forward_from: i64,
     /// 被转发邮件的附件数（页面提示"保存后携带"用）
     forward_attach_cnt: i64,
+    /// 定时发送时刻（M4-2，datetime-local 控件值 `YYYY-MM-DDTHH:MM`；空 = 非定时）。
+    /// 供控件回显 + 隐藏域初值（提交时服务端同一字符串再解析）
+    sched_local: String,
 }
 
 /// 首启向导·账号配置页（未配置字段为空，预填服务器默认值）
@@ -716,7 +719,10 @@ fn email_delete(state: &AppState, req: &Req) -> Resp {
     let back_href = detail_back_href(req, &folder);
     let list_query = list_query_of(req, &folder);
     match mail::delete(state, id) {
-        Ok(_) => Resp::hx_redirect(&back_href),
+        Ok(_) => {
+            state.poke_tray(); // 删未读邮件会减未读数：刷托盘角标
+            Resp::hx_redirect(&back_href)
+        }
         Err(e) => {
             let mut q = list_query;
             if !q.is_empty() {
@@ -759,6 +765,7 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
 /// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
 fn mark_read_and_sync_seen(state: &AppState, id: i64) {
     mail::mark_read(state, id);
+    state.poke_tray(); // 本地未读数变化：刷托盘角标（M4-1；调度线程兑底兑漏）
 }
 
 /// 批量操作（POST /emails/batch，M1-1）双模式：
@@ -818,6 +825,7 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
     // 删除可能收缩页数 → 页码 clamp 由 list_root 承担（这里直接复用其解析）
     let list_req = reconstruct_list_req(req, &form);
     let resp = list_root(state, &list_req);
+    state.poke_tray(); // 标已读/未读/删除改变未读数：刷托盘角标（M4-1）
     // 改变计数的动作（delete/已读类影响未读角标）附带边栏刷新事件
     resp.with_event("mbx:fetchDone")
 }
@@ -1284,6 +1292,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         skipped,
         forward_from: 0,
         forward_attach_cnt: 0,
+        sched_local: String::new(),
     };
     if let Some(id) = req
         .query_param("draft_id")
@@ -1304,6 +1313,10 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
                 "html".into()
             };
             ctx.attachments = draft.attachments;
+            // 定时发送（M4-2）：草稿的定时时刻回显到 datetime-local 控件
+            if draft.scheduled_at > 0 {
+                ctx.sched_local = mail::sched_local_value(draft.scheduled_at);
+            }
             ctx.keep_ids_json =
                 serde_json::to_string(&ctx.attachments.iter().map(|a| a.id).collect::<Vec<_>>())
                     .unwrap_or_else(|_| "[]".into());
@@ -1518,8 +1531,10 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     }
 }
 
-/// 撰写表单公共保存（存草稿与发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
+/// 撰写表单公共保存（存草稿/自动保存/发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
 /// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回 (邮件 id, 被跳过的空文件数)。
+/// scheduled_at（M4-2）：datetime-local 原始字符串 → epoch 秒；空/非法按 0 处理
+/// （存草稿保留既有定时，清空选择器即取消定时；立即发送路径由调用方写 0）
 fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize), (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
@@ -1533,6 +1548,19 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
     } else {
         (form.get("body_text").cloned().unwrap_or_default(), None)
     };
+    // 定时发送（M4-2）：控件原始字符串解析（空 = 非定时；非法格式丢弃并记日志）
+    let sched_raw = form.get("scheduled_at").cloned().unwrap_or_default();
+    let scheduled_at = if sched_raw.trim().is_empty() {
+        0
+    } else {
+        match mail::sched_epoch_of(&sched_raw) {
+            Some(at) => at,
+            None => {
+                eprintln!("[compose] scheduled_at 解析失败（按非定时处理）：{sched_raw:?}");
+                0
+            }
+        }
+    };
     let input = mail::DraftInput {
         id: draft_id,
         from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
@@ -1543,6 +1571,7 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
         subject: form.get("subject").cloned().unwrap_or_default(),
         body_text,
         in_reply_to: form_i64(&form, "in_reply_to"),
+        scheduled_at,
     };
     let keep_ids = form_json_i64s(&form, "keep_ids");
     let paths = form_json_strings(&form, "attach_paths");
@@ -1587,8 +1616,41 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
     let ctx_qs = form_list_query(&form);
     let mut just_sent = None;
+    // 定时发送（M4-2）：scheduled_at 非空且晚于当前 → 不入队。
+    // 校验前置（保存前）：过时刻拒绝并回撰写页，避免"存下过去时刻的定时 →
+    // 调度线程当轮立即发出"的竞态
+    let sched_raw = form.get("scheduled_at").cloned().unwrap_or_default();
+    let sched_epoch = if sched_raw.trim().is_empty() {
+        None
+    } else {
+        mail::sched_epoch_of(&sched_raw)
+    };
+    if let Some(at) = sched_epoch
+        && at <= mail::now_epoch() + 60
+    {
+        return redirect_compose(
+            form_i64(&form, "draft_id").unwrap_or(0),
+            "定时时间需晚于当前时间 1 分钟以上，请重新选择",
+        );
+    }
     match save_compose_form(state, req) {
         Ok((id, skipped, converted)) => {
+            // 定时（M4-2）：保存已落 scheduled_at（DraftInput），跳过 enqueue；
+            // 回草稿详情页展示「已定时」状态（调度线程到点自动入队发送）
+            if sched_epoch.is_some() {
+                if skipped > 0 {
+                    return redirect_compose(
+                        id,
+                        &format!("已跳过 {skipped} 个 0 字节文件（未附加），请确认附件后再定时"),
+                    );
+                }
+                let mut target = format!("/emails/{id}");
+                if !ctx_qs.is_empty() {
+                    target.push('?');
+                    target.push_str(&ctx_qs);
+                }
+                return Resp::hx_redirect(&target);
+            }
             // 空文件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
             if skipped > 0 {
                 return redirect_compose(

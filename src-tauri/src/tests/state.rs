@@ -114,6 +114,7 @@ fn move_data_dir_snapshots_and_writes_pointer() {
             subject: "迁移用例".into(),
             body_text: "正文".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -258,6 +259,7 @@ fn resolve_start_dir_survives_anchor_db_deletion() {
             subject: "兜底定位用例".into(),
             body_text: "正文".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -438,6 +440,7 @@ fn delete_old_backup_removes_files_but_keeps_config() {
             subject: "备份保留用例".into(),
             body_text: "正文".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -539,6 +542,7 @@ fn auto_clean_keeps_backup_when_old_db_has_mails() {
             subject: "遗留数据".into(),
             body_text: "正文".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();
@@ -996,6 +1000,7 @@ fn switch_data_dir_first_run_refuses_nonempty_store_and_bad_targets() {
             subject: "草稿".into(),
             body_text: "正文".into(),
             in_reply_to: None,
+            scheduled_at: 0,
         },
     )
     .unwrap();

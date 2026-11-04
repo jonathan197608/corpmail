@@ -429,3 +429,84 @@ fn migrate_v7_to_v8_adds_thread_key_column() {
         .unwrap();
     assert_eq!(cols, 1, "新库应直接含 thread_key 列");
 }
+
+/// v8 → v9 增量（M4-2 定时发送）：加 scheduled_at 列（NOT NULL DEFAULT 0）
+/// + idx_scheduled_due 部分索引（只收 scheduled_at > 0 行，服务于调度扫描）
+#[test]
+fn migrate_v8_to_v9_adds_scheduled_at_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    // 沿 v2→v8 逐级铺设（与 v7→v8 测试同法，DDL 取自各迁移实体）
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         CREATE TABLE contacts (
+           addr TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 1);
+         CREATE INDEX idx_contacts_name ON contacts(name);
+         ALTER TABLE emails ADD COLUMN body_html TEXT;
+         ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT '';
+         ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN thread_key TEXT;
+         CREATE INDEX idx_thread_key ON emails(thread_key);",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 8i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('out', 'draft', 'draft', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let cols: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='scheduled_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "v9 应有 scheduled_at 列");
+    let at: i64 = conn
+        .query_row("SELECT scheduled_at FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(at, 0, "存量行默认非定时");
+    // 部分索引：手动写定时值可见于索引；派发态（0）不进索引
+    conn.execute("UPDATE emails SET scheduled_at = 12345", [])
+        .unwrap();
+    let in_idx: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM emails WHERE scheduled_at > 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(in_idx, 1);
+    let idx: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_scheduled_due'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "应建 idx_scheduled_due 部分索引");
+    // 新库一步建到 v9（含列）
+    let fresh = mem();
+    let cols: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='scheduled_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "新库应直接含 scheduled_at 列");
+}

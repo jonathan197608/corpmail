@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -77,6 +77,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         5 => migrate_v6(tx),
         6 => migrate_v7(tx),
         7 => migrate_v8(tx),
+        8 => migrate_v9(tx),
         _ => Ok(()),
     }
 }
@@ -144,6 +145,21 @@ fn migrate_v8(tx: &Connection) -> rusqlite::Result<()> {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN thread_key TEXT")?;
     }
     tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_thread_key ON emails(thread_key)")?;
+    Ok(())
+}
+
+/// v8 → v9：定时发送计划时刻（M4-2）。scheduled_at = epoch 秒，0 = 非定时；
+/// 正值仅对草稿（folder/status = draft）有意义：到点由调度线程 enqueue 发送。
+/// 部分索引只收待发行（scheduled_at 为正），调度扫描每 20s 查询 due 行
+/// （scheduled_at 不晚于 now）不触碰全表
+fn migrate_v9(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "scheduled_at")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN scheduled_at INTEGER NOT NULL DEFAULT 0")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_due ON emails(scheduled_at)
+         WHERE scheduled_at > 0",
+    )?;
     Ok(())
 }
 

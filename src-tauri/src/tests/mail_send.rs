@@ -29,6 +29,7 @@ fn queued_email(state: &AppState, to: &str) -> i64 {
         subject: "月度激励汇总".into(),
         body_text: "请查收汇总表。".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let id = save_draft(state, &input).unwrap();
     assert!(enqueue_draft(state, id));
@@ -46,6 +47,7 @@ fn draft(subject: &str, body: &str) -> DraftInput {
         subject: subject.into(),
         body_text: body.into(),
         in_reply_to: None,
+        scheduled_at: 0,
     }
 }
 
@@ -62,6 +64,7 @@ fn save_draft_with_html_stores_sanitized_html_and_plain_text() {
         subject: "HTML 正文".into(),
         body_text: "你好".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let id = save_draft_with_html(
         &state,
@@ -190,6 +193,7 @@ fn dispatch_carries_bcc_and_pure_bcc_mail_sends() {
         subject: "纯密送".into(),
         body_text: "只给密送人看。".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let id = save_draft(&state, &input).unwrap();
     assert!(enqueue_draft(&state, id));
@@ -320,6 +324,7 @@ fn dispatch_reads_html_body_for_sending() {
         subject: "HTML 发送".into(),
         body_text: "你好".into(),
         in_reply_to: None,
+        scheduled_at: 0,
     };
     let id = save_draft_with_html(&state, &input, "<p>你好</p>").unwrap();
     assert!(enqueue_draft(&state, id));
@@ -699,4 +704,122 @@ fn smtp_config_resolves_security_from_port_and_override() {
     let c = SmtpConfig::from_config(&cfg);
     assert_eq!((c.port, c.security), (465, TlsMode::Implicit));
     assert_eq!(c.host, "smtp.test.cn");
+}
+
+/// 定时发送调度（M4-2）：只派发到点草稿（folder/status=draft 且
+/// scheduled_at>0 且已到）；入队即清 scheduled_at；未到点不动；
+/// 非草稿行（已发送）带 scheduled_at 不受影响
+#[test]
+fn dispatch_due_scheduled_picks_only_due_drafts() {
+    let (state, dir) = temp_state("sched-dispatch");
+    let now = now_epoch();
+    // 到点草稿（60s 前应发）
+    let due = save_draft(
+        &state,
+        &DraftInput {
+            scheduled_at: now - 60,
+            ..draft("到点", "内容")
+        },
+    )
+    .unwrap();
+    // 未到点草稿（1h 后）
+    let future = save_draft(
+        &state,
+        &DraftInput {
+            scheduled_at: now + 3600,
+            ..draft("未到", "内容")
+        },
+    )
+    .unwrap();
+    // 非草稿：已发送行带 scheduled_at（异常残留，调度不应触碰）
+    let sent_row = save_draft(&state, &draft("已发", "内容")).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET folder='sent', status='sent', scheduled_at=?2 WHERE id=?1",
+                rusqlite::params![sent_row, now - 3600],
+            )
+            .unwrap();
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+    let dispatched = dispatch_due_scheduled(&state);
+
+    assert_eq!(dispatched, 1, "只派发到点的那封");
+    let st = |id| {
+        state.with_conn(|c| {
+            c.query_row(
+                "SELECT status, scheduled_at FROM emails WHERE id=?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        })
+    };
+    assert_eq!(st(due), ("queued".into(), 0), "到点入队并清定时标记");
+    assert_eq!(
+        st(future),
+        ("draft".into(), now + 3600),
+        "未到点保持草稿与计划"
+    );
+    assert_eq!(
+        st(sent_row).1,
+        now - 3600,
+        "非草稿行的残留 scheduled_at 不被清"
+    );
+
+    // 幂等：再扫一轮（due 已 queued）不再派发
+    assert_eq!(dispatch_due_scheduled(&state), 0);
+    cleanup(&dir);
+}
+
+/// enqueue 路径清定时（M4-2）：立即发送一个定时草稿 → queued 且 scheduled_at 归零
+#[test]
+fn enqueue_draft_clears_scheduled_at() {
+    let (state, dir) = temp_state("sched-enqueue");
+    let now = now_epoch();
+    let id = save_draft(
+        &state,
+        &DraftInput {
+            scheduled_at: now + 7200,
+            ..draft("定时转立即", "内容")
+        },
+    )
+    .unwrap();
+    assert!(enqueue_draft(&state, id));
+    let (status, at) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT status, scheduled_at FROM emails WHERE id=?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(status, "queued");
+    assert_eq!(at, 0, "入队即清 scheduled_at（取消定时语义）");
+    cleanup(&dir);
+}
+
+/// 定时时刻 ↔ datetime-local 字符串互转（M4-2）：往返一致、空串/非法返回 None
+#[test]
+fn sched_helpers_roundtrip_and_reject_invalid() {
+    let now = now_epoch();
+    // 未来整点：取下一小时边界，保证分钟对齐（datetime-local 精度即分钟）
+    let target = now + 3600;
+    let local = crate::mail::sched_local_value(target);
+    assert_eq!(local.len(), 16, "YYYY-MM-DDTHH:MM 形态：{local}");
+    assert!(local.contains('T'));
+    let back = crate::mail::sched_epoch_of(&local).expect("合法格式应可解析");
+    assert!(
+        (back - target).abs() <= 60,
+        "往返误差应在分钟粒度内：{back} vs {target}"
+    );
+    // 空串/空白/非法 → None
+    assert_eq!(crate::mail::sched_epoch_of(""), None);
+    assert_eq!(crate::mail::sched_epoch_of("   "), None);
+    assert_eq!(crate::mail::sched_epoch_of("not-a-date"), None);
+    assert_eq!(crate::mail::sched_epoch_of("2026-13-40T99:99"), None);
+    // epoch 0 → 空串（未定时不渲染控件值）
+    assert_eq!(crate::mail::sched_local_value(0), "");
 }

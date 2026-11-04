@@ -19,6 +19,7 @@ mod notify;
 mod secrets;
 mod state;
 mod templates;
+mod tray;
 mod ui;
 
 /// 错误转字符串（各模块 `map_err` 适配器共用；避免每个模块各写一份 `fn e`）
@@ -48,6 +49,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.unminimize();
+                let _ = win.show();
                 let _ = win.set_focus();
             }
         }))
@@ -104,15 +106,28 @@ pub fn run() {
             {
                 let handle: tauri::AppHandle = app.handle().clone();
                 let db_path = state.data_dir().join("corpmail.db");
+                let notify_handle = handle.clone();
                 state.set_notify_hook(std::sync::Arc::new(move |since, _added| {
-                    notify::on_fetch_finished(&handle, &db_path, since);
+                    notify::on_fetch_finished(&notify_handle, &db_path, since);
+                    // 收件轮结束未读数必已变化：同步刷新托盘角标
+                    tray::refresh_badge(&notify_handle);
+                }));
+                // 托盘角标刷新钩子（UI 未读变更点 poke；调度线程兑底重刷）
+                state.set_tray_hook(std::sync::Arc::new(move || {
+                    tray::refresh_badge(&handle);
                 }));
             }
             app.manage(state);
 
-            // M4 收件调度 + M5 清理器：常驻线程（每轮重读设置，改参数即时生效）
+            // M4-1 托盘常驻：图标 + 菜单 + 左键唤起 + 未读角标（setup 需在
+            // manage 之后：refresh_badge 读 AppState）
+            tray::setup(app.handle())?;
+
+            // M4 收件调度 + M5 清理器 + M4-2 定时发送调度：常驻线程
+            // （每轮重读设置，改参数即时生效）
             spawn_fetch_scheduler(app.app_handle().clone());
             spawn_clean_scheduler(app.app_handle().clone());
+            spawn_send_scheduler(app.app_handle().clone());
             // 已读回写 worker：合并窗口 + 单次连接批量 STORE（替代每封一次登录）
             spawn_seen_worker(app.app_handle().clone());
 
@@ -131,6 +146,32 @@ pub fn run() {
                 .center()
                 .build()?;
             Ok(())
+        })
+        // M4-1 托盘常驻：关窗 = 隐藏主窗口（后台收件/定时发送继续），
+        // 真退出走托盘菜单「退出」/ Cmd+Q（applicationShouldTerminate 不经
+        // 窗口 CloseRequested，不受 prevent_close 影响）。Windows 无 Dock，
+        // 首次隐藏时发一条引导通知（仅一次，避免打扰）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                #[cfg(windows)]
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static TIPPED: AtomicBool = AtomicBool::new(false);
+                    if !TIPPED.swap(true, Ordering::Relaxed) {
+                        use tauri::Manager;
+                        use tauri_plugin_notification::NotificationExt;
+                        let app = window.app_handle().clone();
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title("CorpMail 仍在运行")
+                            .body("主窗口已隐藏到系统托盘，点击托盘图标可重新打开。")
+                            .show();
+                    }
+                }
+            }
         });
 
     // 替代 builder.run(ctx)（其回调为空，无法订阅事件）：build + run 显式
@@ -296,6 +337,25 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                 eprintln!("[clean] 清理器执行失败：{err}");
             }
             std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        }
+    });
+}
+
+/// 定时发送调度线程（M4-2）：每 20s 扫描到点草稿并派发。
+/// 启动即扫一轮——应用关闭期间到点的定时邮件，下次启动立即补发。
+/// 同一轮兼作托盘角标兑底刷新：missed poke（未穷举的未读变更点）
+/// 至多一个扫描周期内自动收敛
+fn spawn_send_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
+    std::thread::spawn(move || {
+        let dispatched = mail::dispatch_due_scheduled(&handle.state::<state::AppState>());
+        if dispatched > 0 {
+            eprintln!("[sched] 启动补发定时邮件 {dispatched} 封");
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let state = handle.state::<state::AppState>();
+            mail::dispatch_due_scheduled(&state);
+            tray::refresh_badge(&handle);
         }
     });
 }
