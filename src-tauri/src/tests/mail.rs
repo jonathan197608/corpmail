@@ -760,3 +760,67 @@ fn strip_html_decodes_numeric_char_refs() {
     // 截断实体（超过 8 字符扫描窗口）按字面输出
     assert_eq!(strip_html("&#12345678901;"), "&#12345678901;");
 }
+
+/// 会话归组键普通化（M2-2）：剥离回复/转发前缀链 + ASCII 小写折叠 + 去空白
+#[test]
+fn thread_key_of_strips_prefixes_and_normalizes() {
+    // 英文前缀（大小写不敏感）+ 冒号变体 + 序号
+    assert_eq!(thread_key_of("Re: 开会讨论"), "开会讨论");
+    assert_eq!(thread_key_of("RE: meeting"), "meeting");
+    assert_eq!(thread_key_of("Fwd: Budget"), "budget");
+    assert_eq!(thread_key_of("Re[2]: 报价"), "报价");
+    assert_eq!(thread_key_of("re：明天开会"), "明天开会");
+    assert_eq!(thread_key_of("FW: 通知"), "通知");
+    // 中文前缀（含无冒号/中冒号变体）
+    assert_eq!(thread_key_of("回复：明天开会"), "明天开会");
+    assert_eq!(thread_key_of("转发: 会议"), "会议");
+    assert_eq!(thread_key_of("答复 请查收"), "请查收");
+    // 前缀链递归剥离
+    assert_eq!(thread_key_of("Re: Fwd: 会议 纪要"), "会议纪要");
+    // 无前缀：仅去空白 + ASCII 小写
+    assert_eq!(thread_key_of(" 无前缀 主题 "), "无前缀主题");
+    assert_eq!(thread_key_of("Meeting Notes"), "meetingnotes");
+    // 空主题 / 剥空 → 空串（归组查询排除空串行，不串组）
+    assert_eq!(thread_key_of(""), "");
+    assert_eq!(thread_key_of("Re:"), "");
+    assert_eq!(thread_key_of("   "), "");
+}
+
+/// 会话归组键存量回填（M2-2）：只补 NULL 行，已有键不被覆盖；空主题 → 空串
+#[test]
+fn backfill_thread_keys_fills_null_keys() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE emails(
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           subject TEXT NOT NULL DEFAULT '',
+           thread_key TEXT)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO emails(subject, thread_key) VALUES
+         ('Re: 会议', NULL),
+         ('复盘', 'meeting'),
+         ('', NULL)",
+        [],
+    )
+    .unwrap();
+
+    backfill_thread_keys(&mut conn).unwrap();
+
+    let keys: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT subject, thread_key FROM emails ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            ("Re: 会议".to_string(), Some("会议".to_string())),
+            ("复盘".to_string(), Some("meeting".to_string())), // 已有键不覆盖
+            ("".to_string(), Some("".to_string())),            // 空主题 → 空串
+        ]
+    );
+}

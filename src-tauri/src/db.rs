@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -76,6 +76,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         4 => migrate_v5(tx),
         5 => migrate_v6(tx),
         6 => migrate_v7(tx),
+        7 => migrate_v8(tx),
         _ => Ok(()),
     }
 }
@@ -130,6 +131,19 @@ fn migrate_v7(tx: &Connection) -> rusqlite::Result<()> {
     if !emails_has_column(tx, "starred")? {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")?;
     }
+    Ok(())
+}
+
+/// v7 → v8：会话视图归组键（M2-2，方案A）。thread_key = 规范化主题
+/// （剥离 Re:/Fwd:/回复:/转发: 前缀链 + ASCII 小写折叠 + 去空白），同一主题
+/// 往复归一组。可空：NULL=未回填（存量行启动时 backfill_thread_keys 一次性
+/// 补），空串=空主题（归组查询按行独立，不串组）。索引服务于会话模式按
+/// thread_key 分组扫描（新库/升级后均生效）
+fn migrate_v8(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "thread_key")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN thread_key TEXT")?;
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_thread_key ON emails(thread_key)")?;
     Ok(())
 }
 

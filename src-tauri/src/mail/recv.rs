@@ -11,7 +11,7 @@
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
     mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, strip_html,
-    sync_attach_stats, tokenize, zoned_of,
+    sync_attach_stats, thread_key_of, tokenize, zoned_of,
 };
 use crate::net::TlsMode;
 use rusqlite::OptionalExtension;
@@ -1116,6 +1116,7 @@ pub fn store_incoming_conn(
         }
         let st = tokenize(&m.subject);
         let bt = tokenize(&m.body_text);
+        let tk = thread_key_of(&m.subject);
         let now = now_epoch();
         let attach_bytes: i64 = m.attachments.iter().map(|a| a.data.len() as i64).sum();
         let unread = unread_of.unwrap_or(!m.seen);
@@ -1131,9 +1132,9 @@ pub fn store_incoming_conn(
                                 cc_addrs, subject, body_text, body_kind, subject_tokens,
                                 body_tokens, attach_cnt, attach_bytes, unread, remote_uid,
                                 message_id, created_at, received_at, sent_at, too_large,
-                                body_html)
+                                body_html, thread_key)
              VALUES (?17, ?18, ?19, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?20, ?21, ?22, ?23)",
+                     ?13, ?14, ?15, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
@@ -1158,6 +1159,7 @@ pub fn store_incoming_conn(
                 sent_at,
                 m.too_large,
                 m.body_html,
+                tk,
             ],
         )
         .map_err(e)?;

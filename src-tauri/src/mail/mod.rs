@@ -123,6 +123,49 @@ pub fn tokenize(text: &str) -> String {
     tokenize_words(text).join(" ")
 }
 
+/// 会话视图归组键（M2-2，方案A）：剥离回复/转发前缀链 + ASCII 小写折叠 + 去空白。
+/// 同一主题的往复邮件归一组；空主题/剥空 → 空串（归组查询排除空串行，不串组）。
+/// 例：`Re: 会议` → `会议`；`回复：明天开会` → `明天开会`；`Re[2]: Budget` → `budget`。
+pub fn thread_key_of(subject: &str) -> String {
+    let mut cur = subject.trim();
+    loop {
+        let t = cur.trim();
+        match strip_thread_prefix(t) {
+            Some(rest) if rest != t => cur = rest,
+            _ => break,
+        }
+    }
+    cur.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// 尝试剥离单个回复/转发前缀（大小写不敏感），返回剥离后剩余；不匹配返回 None。
+/// 支持英文 re/fwd/fw/reply/r/aw（可带序号如 Re[2]、Re2）与中文 回复/答复/转发。
+fn strip_thread_prefix(subject: &str) -> Option<&str> {
+    let t = subject.trim_start();
+    // 词边界：到空白、英文冒号或中文冒号（：）为止
+    let end = t
+        .find(|c: char| c.is_whitespace() || c == ':' || c == '\u{FF1A}')
+        .unwrap_or(t.len());
+    let (word, rest) = t.split_at(end);
+    // 英文前缀：提取 ASCII 字母段并小写（容忍 Re[2]、Re(2) 等序号后缀）
+    let ascii: String = word
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let is_en = matches!(ascii.as_str(), "re" | "fwd" | "fw" | "reply" | "r" | "aw");
+    // 中文前缀：word 直接命中（reply/转发等无冒号场景）
+    let is_cn = ["回复", "答复", "转发"].iter().any(|k| word.starts_with(k));
+    if is_en || is_cn {
+        Some(rest.trim_start_matches(|c: char| c == ':' || c == '\u{FF1A}' || c.is_whitespace()))
+    } else {
+        None
+    }
+}
+
 /// 当前 epoch 秒
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -534,6 +577,36 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
     Ok(())
 }
 
+/// 会话归组键存量回填（M2-2，v8 升级/首启）：把 NULL 的 thread_key 按 subject
+/// 普通化补齐（空主题 → 空串）。幂等：`WHERE thread_key IS NULL` 只扫待补行，
+/// 补齐后空扫退出；失败不阻断启动（与联系人回填同策略）。应在主题修复后调用，
+/// 使 backfill 基于已修复的 subject 计算归组键。
+pub fn backfill_thread_keys(conn: &mut rusqlite::Connection) -> Result<(), String> {
+    let targets: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, subject FROM emails WHERE thread_key IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (id, subject) in targets {
+        let key = thread_key_of(&subject);
+        tx.execute(
+            "UPDATE emails SET thread_key = ?2 WHERE id = ?1",
+            rusqlite::params![id, key],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 撰写表单入参（存草稿；发送为 M3）
 pub struct DraftInput {
     /// 覆盖已有草稿的 id（None = 新建）
@@ -580,6 +653,7 @@ fn save_draft_impl(
 ) -> Result<i64, String> {
     let st = tokenize(&input.subject);
     let bt = tokenize(&input.body_text);
+    let tk = thread_key_of(&input.subject);
     let now = now_epoch();
     let body_kind = if body_html.is_some() { "html" } else { "plain" };
     state.with_conn(|conn| {
@@ -599,7 +673,8 @@ fn save_draft_impl(
             tx.execute(
                 "UPDATE emails SET from_addr=?2, from_name=?3, to_addrs=?4, cc_addrs=?5,
                         subject=?6, body_text=?7, subject_tokens=?8, body_tokens=?9,
-                        in_reply_to=?10, body_kind=?11, body_html=?12, bcc_addrs=?13
+                        in_reply_to=?10, body_kind=?11, body_html=?12, bcc_addrs=?13,
+                        thread_key=?14
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -615,6 +690,7 @@ fn save_draft_impl(
                     body_kind,
                     body_html,
                     input.bcc_addrs,
+                    tk,
                 ],
             )
             .map_err(e)?;
@@ -624,8 +700,9 @@ fn save_draft_impl(
             tx.execute(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     cc_addrs, subject, body_text, subject_tokens, body_tokens,
-                                    unread, created_at, in_reply_to, body_kind, body_html, bcc_addrs)
-                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13)",
+                                    unread, created_at, in_reply_to, body_kind, body_html, bcc_addrs,
+                                    thread_key)
+                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     input.from_addr,
                     input.from_name,
@@ -640,6 +717,7 @@ fn save_draft_impl(
                     body_kind,
                     body_html,
                     input.bcc_addrs,
+                    tk,
                 ],
             )
             .map_err(e)?;

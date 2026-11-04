@@ -360,3 +360,72 @@ fn migrate_v6_to_v7_adds_starred_column() {
         .unwrap();
     assert_eq!(cols, 1, "新库应直接含 starred 列");
 }
+
+/// v7 → v8 增量（M2-2 会话视图）：加 thread_key 列（TEXT 可空）+ idx_thread_key 索引。
+/// 存量行迁移后默认 NULL（启动时 backfill_thread_keys 补齐）；新库直接建到 v8
+#[test]
+fn migrate_v7_to_v8_adds_thread_key_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         CREATE TABLE contacts (
+           addr TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 1);
+         CREATE INDEX idx_contacts_name ON contacts(name);
+         ALTER TABLE emails ADD COLUMN body_html TEXT;
+         ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT '';
+         ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 7i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', '会议', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    // 存量行迁移后 thread_key 为 NULL（待回填），列存在
+    let cols: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='thread_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "v8 应有 thread_key 列");
+    let key: Option<String> = conn
+        .query_row("SELECT thread_key FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(key, None, "存量行迁移后 thread_key 应为 NULL（待回填）");
+    // 索引存在
+    let idx: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_thread_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "应建 idx_thread_key 索引");
+    // 新库一步建到 v8（含列）
+    let fresh = mem();
+    let cols: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='thread_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "新库应直接含 thread_key 列");
+}

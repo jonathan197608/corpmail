@@ -203,6 +203,10 @@ impl AppState {
         if let Err(err) = crate::mail::repair_gbk_subjects(&mut conn) {
             eprintln!("[repair] 主题乱码修复失败（忽略）：{err}");
         }
+        // 会话归组键存量回填（v8 升级/首启）：在主题修复后执行，基于已修复 subject
+        if let Err(err) = crate::mail::backfill_thread_keys(&mut conn) {
+            eprintln!("[thread] 会话归组键回填失败（忽略）：{err}");
+        }
         let state = Self {
             db: Mutex::new(conn),
             data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
