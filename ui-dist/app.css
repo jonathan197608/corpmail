@@ -2548,3 +2548,9 @@ a.btn.link.disabled {
 .toast .toast-undo {
     margin-left: 10px;
 }
+
+/* 键盘选中行（A3）：内描边不改变行尺寸，避免列表跳动 */
+.mail-row.kb-focus {
+    box-shadow: inset 0 0 0 2px var(--accent);
+    background: var(--accent-soft);
+}

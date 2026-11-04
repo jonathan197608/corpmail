@@ -1106,3 +1106,78 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
     });
     document.addEventListener('DOMContentLoaded', init);
 })();
+
+// ---------- 键盘快捷键（A3） ----------
+// 列表：j / ↓ 下移、k / ↑ 上移、Enter / o 打开选中、/ 聚焦搜索、n 新建邮件
+// 详情：r 回复、f 转发、Esc 返回列表
+// 输入框 / textarea / select / contenteditable 内的按键一律放行（Esc 仅失焦），
+// 不打断打字；附件预览打开时 Esc 归预览模块，避免同时退出两层
+(function () {
+    var inField = function (el) {
+        if (!el) return false;
+        var tag = (el.tagName || '').toLowerCase();
+        return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+    };
+    var focusIdx = -1;
+    var rows = function () {
+        return Array.prototype.slice.call(document.querySelectorAll('#mail-list .mail-row'));
+    };
+    var paint = function () {
+        var list = rows();
+        if (focusIdx >= list.length) focusIdx = list.length - 1;
+        list.forEach(function (r, i) { r.classList.toggle('kb-focus', i === focusIdx); });
+        if (focusIdx >= 0 && list[focusIdx]) {
+            list[focusIdx].scrollIntoView({ block: 'nearest' });
+        }
+    };
+    document.addEventListener('keydown', function (ev) {
+        if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+        if (inField(ev.target)) {
+            if (ev.key === 'Escape') ev.target.blur();
+            return;
+        }
+        var modal = document.getElementById('preview-modal');
+        var previewOpen = modal && !modal.hidden;
+        if (ev.key === 'Escape') {
+            if (previewOpen) return; // 预览层自己处理
+            var back = document.querySelector('.topbar .back');
+            if (back) { ev.preventDefault(); back.click(); }
+            return;
+        }
+        var list = document.getElementById('mail-list');
+        if (list) {
+            var items = rows();
+            if (!items.length) return;
+            if (ev.key === 'j' || ev.key === 'ArrowDown') {
+                ev.preventDefault();
+                focusIdx = Math.min(items.length - 1, focusIdx + 1);
+                paint();
+            } else if (ev.key === 'k' || ev.key === 'ArrowUp') {
+                ev.preventDefault();
+                focusIdx = focusIdx < 0 ? 0 : Math.max(0, focusIdx - 1);
+                paint();
+            } else if (ev.key === 'Enter' || ev.key === 'o') {
+                if (focusIdx < 0) { focusIdx = 0; paint(); return; }
+                var link = items[focusIdx] && items[focusIdx].querySelector('.mr-link');
+                if (link) { ev.preventDefault(); window.location.href = link.href; }
+            } else if (ev.key === '/') {
+                var box = document.querySelector('form.search input[name="q"]');
+                if (box) { ev.preventDefault(); box.focus(); }
+            } else if (ev.key === 'n') {
+                ev.preventDefault();
+                window.location.href = '/compose';
+            }
+            return;
+        }
+        var detail = document.querySelector('.mail-detail');
+        if (detail) {
+            if (ev.key === 'r') {
+                var reply = detail.querySelector('a[href*="reply_to="]');
+                if (reply) { ev.preventDefault(); window.location.href = reply.href; }
+            } else if (ev.key === 'f') {
+                var fwd = detail.querySelector('a[href*="forward_from="]');
+                if (fwd) { ev.preventDefault(); window.location.href = fwd.href; }
+            }
+        }
+    });
+})();
