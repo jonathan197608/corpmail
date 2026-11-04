@@ -172,6 +172,13 @@ pub fn run() {
             }
         });
 
+    // E2E 专用：内嵌 W3C WebDriver 服务端（仅 `--features e2e` 构建）。
+    // macOS 没有 WKWebView 的外部 driver（tauri-driver 只支持 Windows/Linux），
+    // 插件在进程内起 HTTP 端口，由 @wdio/tauri-service 直连驱动 DOM 与截图。
+    // 生产构建不编入该插件（Cargo [features] 默认关闭），无端口、无额外攻击面。
+    #[cfg(feature = "e2e")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
     // 替代 builder.run(ctx)（其回调为空，无法订阅事件）：build + run 显式
     // 事件循环，订阅 macOS Reopen。行为与原 .run 一致（Tauri 的 run 内部
     // 即 build + run(空回调)）

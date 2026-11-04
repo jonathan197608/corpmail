@@ -1,0 +1,17 @@
+{
+  "name": "corpmail-e2e",
+  "private": true,
+  "type": "module",
+  "description": "CorpMail macOS 功能自动化测试（WebdriverIO + Tauri embedded WebDriver）",
+  "scripts": {
+    "test": "wdio run ./wdio.conf.mjs",
+    "test:smoke": "wdio run ./wdio.conf.mjs --spec ./specs/00-smoke.spec.mjs"
+  },
+  "devDependencies": {
+    "@wdio/cli": "^9",
+    "@wdio/local-runner": "^9",
+    "@wdio/mocha-framework": "^9",
+    "@wdio/spec-reporter": "^9",
+    "@wdio/tauri-service": "^1"
+  }
+}

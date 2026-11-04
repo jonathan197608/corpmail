@@ -30,5 +30,11 @@ store-assets/msix/out/
 # 本地环境
 *.local
 .env
+
+# E2E 自动化测试（依赖与运行产物：截图、日志、隔离 HOME）
+e2e/node_modules/
+e2e/artifacts/
+e2e/outbox/
+
 # 工作区记忆与本地任务数据（WorkBuddy 管理，非源码）
 .workbuddy/
