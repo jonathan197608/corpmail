@@ -824,3 +824,88 @@ fn backfill_thread_keys_fills_null_keys() {
         ]
     );
 }
+
+/// 会话列表归组（M2-2）：同 thread_key 合并为一组（thread_count=组内件数），
+/// 代表行=组内最新一封；草稿/发送失败不入会；空主题不归组；组级按最新时间倒序
+#[test]
+fn list_threads_groups_and_excludes_drafts_failed() {
+    let (state, dir) = temp_state("threads");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','a@x.cn','b@x.cn','会议','会议','内容','会议',1,1),
+            ('out','sent','sent','b@x.cn','a@x.cn','Re: 会议','会议','内容','会议',0,2),
+            ('in','inbox','received','a@x.cn','b@x.cn','报价','报价','内容','报价',0,3),
+            ('out','draft','draft','a@x.cn','b@x.cn','会议','会议','内容','会议',0,4),
+            ('out','sent','failed','a@x.cn','b@x.cn','报价','报价','内容','报价',0,5),
+            ('in','inbox','received','a@x.cn','b@x.cn','','','','',0,6)",
+        )
+        .unwrap();
+    });
+    let q = ListQuery {
+        folder: "all".into(),
+        page: 1,
+        unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
+    };
+    let (items, total) = list_threads(&state, &q).unwrap();
+    // 草稿/发送失败不入会、空主题不归组：只剩「会议(2)」「报价(1)」两组
+    assert_eq!(total, 2);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].subject, "报价", "最新一封(3)在前");
+    assert_eq!(items[0].thread_count, 1, "发送失败不算会话往来");
+    assert_eq!(
+        items[1].subject, "Re: 会议",
+        "代表行保留原始主题（最新一封）"
+    );
+    assert_eq!(items[1].thread_count, 2, "草稿不入会，仅 inbox+sent 两封");
+    assert_eq!(items[1].id, 2, "代表行=组内最新一封");
+
+    // inbox 过滤只算收件：会议(1) + 报价(3) 两组
+    let inbox = ListQuery {
+        folder: "inbox".into(),
+        page: 1,
+        unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
+    };
+    let (items, total) = list_threads(&state, &inbox).unwrap();
+    assert_eq!(total, 2, "inbox 下两组（各 1 封）");
+    assert_eq!(items[0].id, 3);
+    assert_eq!(items[1].id, 1);
+    cleanup(&dir);
+}
+
+/// 会话详情（M2-2）：按 id 定位 thread_key，正序串列组内往来；空主题 id → None
+#[test]
+fn thread_mails_returns_chronological_order() {
+    let (state, dir) = temp_state("thread");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','a@x.cn','b@x.cn','会议','会议','会议','会议',1,1),
+            ('out','sent','sent','b@x.cn','a@x.cn','Re: 会议','会议','内容','会议',0,2),
+            ('out','draft','draft','a@x.cn','b@x.cn','会议','会议','内容','会议',0,3),
+            ('in','inbox','received','a@x.cn','b@x.cn','','','','',0,4)",
+        )
+        .unwrap();
+    });
+    // 用组内任一 id（1 或 2）定位
+    let detail = thread_mails(&state, 2, "chinatelecom.cn").unwrap().unwrap();
+    assert_eq!(
+        detail.subject, "Re: 会议",
+        "主题取定位行原始主题（最新一封）"
+    );
+    assert_eq!(detail.thread_key, "会议");
+    assert_eq!(detail.items.len(), 2, "草稿不入会");
+    assert_eq!(detail.items[0].id, 1, "时间正序");
+    assert_eq!(detail.items[1].id, 2);
+    assert!(detail.items[0].unread, "未读保留在摘要上");
+    // 空主题（id=4）不属于任何会话组
+    let none = thread_mails(&state, 4, "chinatelecom.cn").unwrap();
+    assert!(none.is_none(), "空主题组不提供会话详情");
+    cleanup(&dir);
+}

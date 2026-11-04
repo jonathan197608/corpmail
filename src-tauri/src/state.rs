@@ -79,7 +79,7 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
         (keys::MAX_MAIL_MB, MAX_MAIL_MB_DEFAULT),
         (keys::SYNC_ON_START, "true"),
         (keys::SYNC_INTERVAL_MIN, "30"),
-        (keys::FIRST_FETCH_DAYS, "30"),
+        (keys::FIRST_FETCH_DAYS, "0"),
         (keys::INLINE_ATTACH_MAX_MB, "20"),
         (keys::CLEAN_SENT_BULK_DAYS, "365"),
         (keys::KEEP_INBOX_DAYS, "3650"),

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="app on">
+    {% include "side.html" %}
+    <main class="main">
+        <div class="topbar">
+            <a class="back" href="{{ back_href }}">‹ 返回列表</a>
+            <h1 class="md-title">
+                {% if detail.subject %}{{ detail.subject }}{% else %}（无主题）{% endif %}
+                <span class="sub">会话 · {{ detail.items|length }} 封</span>
+            </h1>
+        </div>
+
+        {# 会话详情（M2-2）：该 thread_key 归组的全部往来邮件，时间正序。
+           每封卡片可点进单封详情页看完整正文与附件（HTML 原貌）。 #}
+        <div class="thread-list">
+            {% for m in detail.items %}
+            <a class="thread-mail card" href="/emails/{{ m.id }}">
+                <div class="tm-head">
+                    <span class="tm-who">{{ m.from_display }}</span>
+                    <span class="tm-time">{{ m.time_label }}</span>
+                    {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
+                    {% if m.starred %}<span class="tm-star">★</span>{% endif %}
+                </div>
+                <div class="tm-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</div>
+                <div class="tm-body">{{ m.body_preview }}</div>
+            </a>
+            {% else %}
+            <div class="card empty-state">
+                <div class="empty-mark">💬</div>
+                <h2>会话已空</h2>
+                <p>该主题下的往来邮件已被删除或归档。</p>
+                <a class="btn" href="{{ back_href }}">返回列表</a>
+            </div>
+            {% endfor %}
+        </div>
+    </main>
+</div>
+{% endblock %}

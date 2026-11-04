@@ -9,6 +9,11 @@
         <a class="unread-toggle ext-toggle {% if external_only %}on{% endif %}" href="{{ external_href }}"
            title="只显示发件人为外部域名的邮件"
            {% if folder != 'inbox' %}hidden{% endif %}>{% if external_only %}✓ 显示全部{% else %}🌐 只看外部{% endif %}</a>
+        {# 会话/单封视图切换（M2-2）：仅收件箱/全部启用；保留 folder/unread/external/q，翻页重置 #}
+        {% if folder == 'inbox' or folder == 'all' %}
+        <a class="unread-toggle thread-toggle {% if is_thread %}on{% endif %}" href="{{ thread_href }}"
+           title="按主题归组往来邮件（会话视图）">{% if is_thread %}📄 单封视图{% else %}💬 会话视图{% endif %}</a>
+        {% endif %}
         <button class="sync-btn" type="button" id="fetch-btn"
                 hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
                 hx-trigger="click throttle:3000ms" hx-disabled-elt="this">⟳ 收取新邮件</button>
@@ -20,7 +25,52 @@
         </form>
     </div>
     <div class="mail-list" id="mail-list">
-    {% if items %}
+    {% if is_thread %}
+        {# 会话视图（M2-2）：一行 = 一个 thread_key 归组。代表行=组内最新一封，
+           星标=组内任一；thread_count 徽标显示往来件数。批量操作不介入会话模式 #}
+        {% if threads %}
+        {% for t in threads %}
+        <div class="mail-row {% if t.unread %}unread{% endif %}" data-mail-id="{{ t.id }}" data-mail-unread="{{ 1 if t.unread else 0 }}">
+            {# 星标按钮：置顶组内任一星标（与单封视图同端点）；须在 <a> 链接外 #}
+            <button type="button" class="star-btn {% if t.starred %}on{% endif %}" data-mail-id="{{ t.id }}"
+                    hx-post="/emails/{{ t.id }}/star"
+                    hx-trigger="click throttle:300ms" hx-swap="none" hx-disabled-elt="this"
+                    aria-pressed="{% if t.starred %}true{% else %}false{% endif %}"
+                    title="{% if t.starred %}取消星标（不再置顶）{% else %}星标：置顶本信箱{% endif %}">★</button>
+            <a class="mr-link" href="/threads/{{ t.id }}{% if list_query %}?{{ list_query }}{% endif %}">
+                <div class="mr-side">
+                    <span class="mr-dot" aria-hidden="true"></span>
+                    <span class="mr-who">{{ t.from_display }}</span>
+                    <span class="mr-time">{{ t.time_label }}</span>
+                </div>
+                <div class="mr-main">
+                    <div class="mr-top">
+                        {% if t.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
+                        <span class="mr-subject">{% if t.subject_html %}{{ t.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
+                        <span class="mr-thread" title="会话往来 {{ t.thread_count }} 封">💬 {{ t.thread_count }}</span>
+                        {% if t.attach_cnt > 0 %}<span class="mr-clip" title="{{ t.attach_cnt }} 个附件">📎 {{ t.attach_cnt }}</span>{% endif %}
+                    </div>
+                    <div class="mr-preview">{{ t.body_preview }}</div>
+                </div>
+            </a>
+        </div>
+        {% endfor %}
+        {% if pages > 1 %}
+        <div class="pager">
+            {% if page > 1 %}<a class="pg" href="{{ page_base }}mode=thread&page={{ page - 1 }}">‹ 上一页</a>{% endif %}
+            <span class="pg-cur">{{ page }} / {{ pages }}</span>
+            {% if page < pages %}<a class="pg" href="{{ page_base }}mode=thread&page={{ page + 1 }}">下一页 ›</a>{% endif %}
+        </div>
+        {% endif %}
+        {% else %}
+        <div class="card empty-state">
+            <div class="empty-mark">💬</div>
+            <h2>暂无会话</h2>
+            <p>按主题归组往来邮件，同一主题的多条收发会聚成一条会话。</p>
+            <a class="btn" href="{{ thread_href }}">返回单封视图</a>
+        </div>
+        {% endif %}
+    {% elif items %}
         {# 批量操作：表头三态全选 + 行复选框；选中后底部操作条由 app.js 浮出。
            全选跨页语义由 app.js 维护（ids 页内 / select_all+exclude 跨页），
            batch_state 隐藏域承载提交形态 #}
@@ -56,8 +106,7 @@
                 </div>
                 <div class="mr-main">
                     <div class="mr-top">
-                        {# 外部发件人：醒目标记（按域名后缀判定，见 mail::is_external_addr） #}
-                        {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
+                        {% if m.from_external %}<span class="mr-ext" title="发件人为外部域名">外部</span>{% endif %}
                         <span class="mr-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
                         {% if m.preview_tip %}<span class="mr-tip" aria-hidden="true">{{ m.preview_tip }}</span>{% endif %}
                         {% if m.status == 'draft' %}<span class="mr-flag">草稿</span>{% endif %}
@@ -105,7 +154,9 @@
    fixed 药丸悬浮条贴视口底部（Gmail 风格），左右分组：
    左=计数+跨页全选入口，右=操作按钮+取消。
    total：当前筛选总数（跨页全选上限）；检索态禁用跨页全选。
-   hx-confirm 由 app.js 按动作与数量动态设置 #}
+   hx-confirm 由 app.js 按动作与数量动态设置。
+   会话视图（M2-2）不介入批量操作，整条不渲染 #}
+{% if not is_thread %}
 <div class="batch-actions" id="batch-actions" hidden>
     <div class="ba-left">
         <span class="ba-count" id="ba-count"></span>
@@ -124,4 +175,5 @@
     <input type="hidden" id="ba-page" value="{{ page }}">
     <input type="hidden" id="ba-total" value="{{ total }}">
 </div>
+{% endif %}
 </div>

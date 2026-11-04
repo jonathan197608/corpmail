@@ -3384,10 +3384,21 @@ fn dump_smoke_html() {
             c.execute(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                         subject, body_text, subject_tokens, body_tokens, attach_cnt,
-                                        unread, created_at, received_at)
+                                        unread, created_at, received_at, thread_key)
                      VALUES ('in', 'inbox', 'received', ?1, ?2, 'demo@chinatelecom.cn',
-                             ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                rusqlite::params![faddr, fname, subj, body, stok, btok, att, *unread as i64, t],
+                             ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+                rusqlite::params![
+                    faddr,
+                    fname,
+                    subj,
+                    body,
+                    stok,
+                    btok,
+                    att,
+                    *unread as i64,
+                    t,
+                    mail::thread_key_of(subj)
+                ],
             )
             .unwrap();
         });
@@ -3409,6 +3420,26 @@ fn dump_smoke_html() {
     }
     let inbox_id = inbox_first_id;
 
+    // M2-2 会话归组冒烟：发一封与首封收件同主题的回复（sent），
+    // thread_key 与首封收件一致 → 会话视图出现 count=2 的会话组
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                        subject, subject_tokens, body_text, body_tokens,
+                                        unread, created_at, sent_at, thread_key)
+                     VALUES ('out', 'sent', 'sent', 'demo@chinatelecom.cn', '张伟',
+                             'boss@chinatelecom.cn', 'Re: 激励清单已批复，请按方案执行',
+                             '激励 清单 已 批复 请 按 方案 执行',
+                             '收到，我按方案推进并同步进度。', '收到 我 按 方案 推进 并 同步 进度',
+                             0, ?1, ?1, ?2)",
+                rusqlite::params![now, mail::thread_key_of("Re: 激励清单已批复，请按方案执行")],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
     // M2-1 星标素材：第二封收件打上星标——列表页金色★且置顶（跨时间序）
     state
         .with_conn(|c| {
@@ -3425,6 +3456,10 @@ fn dump_smoke_html() {
     dump("main-inbox-unread.html", get_url("/?unread=1"));
     dump("main-draft.html", get_url("/?folder=draft"));
     dump("main-all.html", get_url("/?folder=all"));
+    // M2-2 会话视图素材：会话列表（inbox/all）+ 会话详情（count=2 归组）
+    dump("main-thread.html", get_url("/?mode=thread"));
+    dump("main-all-thread.html", get_url("/?folder=all&mode=thread"));
+    dump("thread-detail.html", get(&format!("/threads/{inbox_id}")));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
     // M2-1 星标详情页素材（email-inbox.html 为未星标态，两态各有对照）
     dump(
@@ -4736,8 +4771,8 @@ fn sync_pane_refetch_entry_hidden_until_range_changes() {
         "重新拉取入口应默认隐藏：{html}"
     );
     assert!(
-        html.contains("data-first-fetch-initial=\"30\""),
-        "应携带已保存范围作比对基准（默认 30）：{html}"
+        html.contains("data-first-fetch-initial=\"0\""),
+        "应携带已保存范围作比对基准（默认 0 = 全部）：{html}"
     );
 
     // 保存新范围 → 返回片段的基准同步为新值，按钮保持隐藏（无变化）

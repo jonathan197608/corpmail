@@ -234,6 +234,12 @@ struct MainCtx {
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
     items: Vec<EmailSummary>,
+    /// 会话视图（M2-2）：mode=thread 时为 true；只在收件箱/全部/搜索下可用
+    is_thread: bool,
+    /// 会话列表行（is_thread 时渲染，否则为空）
+    threads: Vec<mail::ThreadSummary>,
+    /// 会话/单封视图切换链接（保留 folder/unread/external/q，翻页重置）
+    thread_href: String,
 }
 
 /// 邮件详情页
@@ -255,6 +261,16 @@ struct EmailCtx {
     bcc_chips: Vec<AddrChip>,
     /// 页面轻提示（error query 回显，如重发被拒）
     notice: String,
+}
+
+/// 会话详情页（M2-2）：一个 thread_key 归组的往来邮件，时间正序串列
+#[derive(Serialize)]
+struct ThreadCtx {
+    frame: FrameCtx,
+    detail: mail::ThreadDetail,
+    /// 所属文件夹（取组内最新一封；frame 侧栏高亮 + 返回列表目标）
+    folder: String,
+    back_href: String,
 }
 
 /// 撰写页（新邮件 / 回复预填 / 草稿编辑共用）
@@ -428,6 +444,8 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
             Some(email_status(state, req))
         }
         ("GET", p) if p.starts_with("/emails/") => email_detail_page(state, req),
+        // M2-2 会话详情（GET /threads/{id}）：按组内任一邮件 id 定位 thread_key 串列
+        ("GET", p) if p.starts_with("/threads/") => thread_detail_page(state, req),
         ("GET", "/welcome") => Some(render_html("welcome.html", &())),
         ("GET", "/welcome/setup") => Some(wizard_setup_page(state)),
         ("POST", "/welcome/setup/save") => Some(wizard_save(state, req, tester)),
@@ -504,14 +522,29 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         external_only,
         internal_domain,
     };
-    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词/检索异常回退普通列表
-    let (items, total) = if q_input.is_empty() {
-        mail::list(state, &q).unwrap_or_default()
+    // 会话视图（M2-2）：mode=thread 且仅收件箱/全部下可用（草稿/已发保持单封）；
+    // 搜索下同样可切会话（命中代表行=最新一封）
+    let threadable = matches!(folder.as_str(), "inbox" | "all");
+    let is_thread = threadable
+        && req
+            .query_param("mode")
+            .map(|v| v == "thread")
+            .unwrap_or(false);
+    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词/检索异常回退普通列表。
+    // 会话模式按 thread_key 归组取代表行（list_threads），单封语义不变
+    let (items, threads, total) = if is_thread {
+        let (threads, total) = mail::list_threads(state, &q).unwrap_or_default();
+        (Vec::new(), threads, total)
     } else {
-        match mail::search(state, &q_input, &q) {
-            Ok(Some(res)) => res,
-            Ok(None) | Err(_) => mail::list(state, &q).unwrap_or_default(),
-        }
+        let (items, total) = if q_input.is_empty() {
+            mail::list(state, &q).unwrap_or_default()
+        } else {
+            match mail::search(state, &q_input, &q) {
+                Ok(Some(res)) => res,
+                Ok(None) | Err(_) => mail::list(state, &q).unwrap_or_default(),
+            }
+        };
+        (items, Vec::new(), total)
     };
     let pages = (total + mail::PAGE_SIZE - 1) / mail::PAGE_SIZE;
     // 基址 = folder + q（不含筛选）：两个开关各自"取反自己、保留对方"，
@@ -538,6 +571,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     } else {
         format!("{base}external=1&{unread_part}page=1")
     };
+    // 会话/单封视图切换链接：保留 folder/unread/external/q，翻页重置（两种视图行数不同）
+    // 目标 = 当前态取反 mode；仅 threadable（收件箱/全部）时渲染切换按钮
+    let mode_part = if is_thread { "" } else { "mode=thread&" };
+    let thread_href = format!("{base}{mode_part}{unread_part}{external_part}page=1");
     // 列表完整查询串（详情往返携带；folder=inbox 且无筛选时为空 → 链接保持简洁）
     let mut list_query = String::new();
     if folder != "inbox" {
@@ -582,6 +619,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         page_base,
         q: q_input,
         items,
+        is_thread,
+        threads,
+        thread_href,
     };
     if req.is_htmx_request {
         render_html("mail_list.html", &ctx)
@@ -623,6 +663,38 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             cc_chips,
             bcc_chips,
             notice,
+        },
+    ))
+}
+
+/// 会话详情页（GET /threads/{id}，M2-2）：定位 id 所在 thread_key，串列组内往来。
+/// 未配置 → 欢迎页；id 不属于任何会话组 → 404
+fn thread_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
+    let id = path_id(&req.path, "/threads/")?;
+    if !state.configured() {
+        return Some(render_html("welcome.html", &()));
+    }
+    let d = defaults();
+    let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
+    let detail = mail::thread_mails(state, id, &domain).ok().flatten()?;
+    // 所属文件夹取组内最新一封（正序末项；frame 高亮 + 返回列表）
+    let folder = detail
+        .items
+        .last()
+        .map(|m| m.folder.clone())
+        .unwrap_or_else(|| "inbox".to_string());
+    let back_href = if folder == "inbox" {
+        "/".to_string()
+    } else {
+        format!("/?folder={folder}")
+    };
+    Some(render_html(
+        "thread.html",
+        &ThreadCtx {
+            frame: frame_ctx(state, &folder),
+            detail,
+            folder,
+            back_href,
         },
     ))
 }

@@ -43,6 +43,7 @@ const TEMPLATES: &[(&str, &str)] = &[
         "fetch_status.html",
         include_str!("templates/fetch_status.html"),
     ),
+    ("thread.html", include_str!("templates/thread.html")),
 ];
 
 /// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义，

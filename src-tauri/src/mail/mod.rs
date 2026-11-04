@@ -813,6 +813,41 @@ pub struct EmailSummary {
     pub preview_tip: String,
 }
 
+/// 会话视图列表行（M2-2）：一行 = 一个 thread_key 归组（代表行=组内最新一封，
+/// 星标置顶取组内任一有星标；thread_count = 组内往来邮件数）。
+/// 只纳入已收/已发（草稿、发送失败不入会话）；空主题（thread_key=''）不归组
+#[derive(Serialize)]
+pub struct ThreadSummary {
+    /// 代表邮件 id（进会话详情 /threads/{id} 用）
+    pub id: i64,
+    pub folder: String,
+    pub status: String,
+    pub subject: String,
+    pub from_display: String,
+    pub body_preview: String,
+    pub attach_cnt: i64,
+    pub unread: bool,
+    /// 组内任一邮件星标即置顶 + 金★（与单封视图置顶语义一致）
+    pub starred: bool,
+    pub from_external: bool,
+    pub time_label: String,
+    /// 组内往来邮件数（会话徽标）
+    pub thread_count: i64,
+    /// 标题安全 HTML（列表为转义原文，检索命中时带 <mark> 高亮）
+    pub subject_html: String,
+    pub preview_tip: String,
+}
+
+/// 会话详情页数据（M2-2）：该 thread_key 归组的全部往来邮件，时间正序
+#[derive(Serialize)]
+pub struct ThreadDetail {
+    /// 组主题（代表邮件原主题，展示用）
+    pub subject: String,
+    pub thread_key: String,
+    /// 组内邮件摘要（已排除草稿/失败；正序 = 会话内从早到晚）
+    pub items: Vec<EmailSummary>,
+}
+
 /// folder 白名单校验（未知值按 all 处理；SQL 内插前必须过白名单）
 fn folder_of(raw: &str) -> &str {
     match raw {
@@ -1022,6 +1057,143 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
         let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         Ok((items, total))
     })
+}
+
+/// 会话视图列表（M2-2）：按 thread_key 归组，每组取代表行（组内最新一封，
+/// 星标优先）。复用 list_filter_sql 的行级过滤，但 unread/external/搜索仅作用于
+/// 代表行（"最新一封未读/来自外部/命中的会话"），口径与单封视图一致、实现干净。
+/// 额外排除草稿与发送失败（folder='draft' / status draft/failed 不入会话），
+/// 并排除空主题（thread_key 为空串，按行独立不归组）
+pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummary>, i64), String> {
+    let (filter_sql, ext_col) = list_filter_sql(q, "e.");
+    let ext_filter = if q.external_only { 1 } else { 0 };
+    let domain = q.internal_domain.trim();
+    let page = q.page.max(1);
+    // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
+    let offset = (page - 1).saturating_mul(PAGE_SIZE);
+    // where_sql 作用于子查询内行（e 别名）：组级过滤沿用行级（代表行口径）
+    let where_sql = format!(
+        "WHERE 1=1{filter_sql}
+         AND e.thread_key IS NOT NULL AND e.thread_key != ''
+         AND e.folder <> 'draft' AND e.status NOT IN ('draft','failed')"
+    );
+    state.with_conn(|conn| {
+        // 会话组总数 = 满足条件的 distinct thread_key 数
+        let total: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM (
+                        SELECT e.thread_key FROM emails e {where_sql} GROUP BY e.thread_key)"
+                ),
+                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain },
+                |r| r.get(0),
+            )
+            .map_err(e)?;
+        // 每组取 rn=1 的代表行（组内最新 + 星标优先），thread_count = 组内件数
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
+                        attach_cnt, unread, t, thread_count, from_external, starred
+                 FROM (
+                    SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
+                           e.to_addrs, e.body_text, e.attach_cnt, e.unread,
+                           COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
+                           COUNT(*) OVER (PARTITION BY e.thread_key) AS thread_count,
+                           ROW_NUMBER() OVER (PARTITION BY e.thread_key
+                               ORDER BY e.starred DESC,
+                                        COALESCE(e.received_at, e.sent_at, e.created_at) DESC,
+                                        e.id DESC) AS rn,
+                           {ext_col} AS from_external, e.starred
+                    FROM emails e {where_sql}
+                 )
+                 WHERE rn = 1
+                 ORDER BY t DESC, starred DESC, id DESC
+                 LIMIT :lim OFFSET :off"
+            ))
+            .map_err(e)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::named_params! {
+                    ":extf": ext_filter, ":dom": domain, ":lim": PAGE_SIZE, ":off": offset
+                },
+                thread_summary_from_row,
+            )
+            .map_err(e)?;
+        let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+        Ok((items, total))
+    })
+}
+
+/// 会话列表行映射（列序：id,folder,status,subject,from_addr,from_name,to_addrs,
+/// body_text,attach_cnt,unread,t,thread_count,from_external,starred）
+fn thread_summary_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
+    let subject: String = r.get(3)?;
+    let name: String = r.get(5)?;
+    let addr: String = r.get(4)?;
+    let body: String = r.get(7)?;
+    Ok(ThreadSummary {
+        id: r.get(0)?,
+        folder: r.get(1)?,
+        status: r.get(2)?,
+        subject: subject.clone(),
+        from_display: if name.is_empty() { addr } else { name },
+        body_preview: preview(&body),
+        preview_tip: preview_tip(&body),
+        attach_cnt: r.get(8)?,
+        unread: r.get::<_, i64>(9)? == 1,
+        starred: r.get::<_, i64>(13)? == 1,
+        from_external: r.get::<_, i64>(12)? == 1,
+        time_label: time_label(r.get(10)?),
+        thread_count: r.get::<_, i64>(11)?,
+        subject_html: html_escape(&subject),
+    })
+}
+
+/// 会话详情（M2-2）：按组内任一邮件 id 定位 thread_key，返回该归组全部往来邮件
+/// （时间正序；草稿/失败不入）。Ok(None) = id 不存在或不属于任何会话组
+pub fn thread_mails(
+    state: &AppState,
+    rep_id: i64,
+    internal_domain: &str,
+) -> Result<Option<ThreadDetail>, String> {
+    let meta: Option<(String, String)> = state.with_conn(|conn| {
+        conn.query_row(
+            "SELECT thread_key, subject FROM emails
+             WHERE id = ?1 AND thread_key IS NOT NULL AND thread_key != ''",
+            [rep_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(e)
+    })?;
+    let Some((thread_key, subject)) = meta else {
+        return Ok(None);
+    };
+    let domain = internal_domain.trim();
+    let ext_col = external_col("", domain);
+    let items = state.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
+                        attach_cnt, unread,
+                        COALESCE(received_at, sent_at, created_at) AS t,
+                        {ext_col} AS from_external, starred
+                 FROM emails
+                 WHERE thread_key = ?1 AND folder <> 'draft'
+                   AND status NOT IN ('draft','failed')
+                 ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC"
+            ))
+            .map_err(e)?;
+        let rows = stmt
+            .query_map([&thread_key], |r| summary_from_row(r, None))
+            .map_err(e)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(e)
+    })?;
+    Ok(Some(ThreadDetail {
+        subject,
+        thread_key,
+        items,
+    }))
 }
 
 /// 列表行映射（list/search 共用；列序：id,folder,status,subject,from_addr,from_name,
