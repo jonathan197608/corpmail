@@ -271,6 +271,7 @@ fn local_mail_never_pends() {
             from_name: "张伟".into(),
             to_addrs: "peer@x.cn".into(),
             cc_addrs: String::new(),
+            bcc_addrs: String::new(),
             subject: "草稿".into(),
             body_text: "体".into(),
             in_reply_to: None,

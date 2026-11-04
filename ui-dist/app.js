@@ -564,10 +564,10 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
         }
         ev.preventDefault();
     };
-    // 1) 收件人：to + cc 均空——SMTP 必拒，前端即时拦下，避免
-    //    "存进草稿→入队→异步发失败"一轮往返才见错误
-    if (!field('to_addrs') && !field('cc_addrs')) {
-        fail('请填写收件人或抄送人后再发送');
+    // 1) 收件人：to + cc + bcc 均空——SMTP 必拒，前端即时拦下，避免
+    //    "存进草稿→入队→异步发失败"一轮往返才见错误（纯密送是合法形态）
+    if (!field('to_addrs') && !field('cc_addrs') && !field('bcc_addrs')) {
+        fail('请填写收件人、抄送或密送后再发送');
         return;
     }
     // 2) 正文：按当前模式取值。HTML 模式以 DOM 探针判定——wangEditor

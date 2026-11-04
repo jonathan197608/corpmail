@@ -498,6 +498,8 @@ pub struct DraftInput {
     pub from_name: String,
     pub to_addrs: String,
     pub cc_addrs: String,
+    /// 密送（逗号分隔）；存库含发件存档，MIME 头不携带（lettre drop_bcc）
+    pub bcc_addrs: String,
     pub subject: String,
     pub body_text: String,
     /// 回复链：指向被回复邮件 id（§3 in_reply_to）
@@ -553,7 +555,7 @@ fn save_draft_impl(
             tx.execute(
                 "UPDATE emails SET from_addr=?2, from_name=?3, to_addrs=?4, cc_addrs=?5,
                         subject=?6, body_text=?7, subject_tokens=?8, body_tokens=?9,
-                        in_reply_to=?10, body_kind=?11, body_html=?12
+                        in_reply_to=?10, body_kind=?11, body_html=?12, bcc_addrs=?13
                  WHERE id = ?1",
                 rusqlite::params![
                     id,
@@ -568,6 +570,7 @@ fn save_draft_impl(
                     input.in_reply_to,
                     body_kind,
                     body_html,
+                    input.bcc_addrs,
                 ],
             )
             .map_err(e)?;
@@ -577,8 +580,8 @@ fn save_draft_impl(
             tx.execute(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     cc_addrs, subject, body_text, subject_tokens, body_tokens,
-                                    unread, created_at, in_reply_to, body_kind, body_html)
-                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)",
+                                    unread, created_at, in_reply_to, body_kind, body_html, bcc_addrs)
+                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     input.from_addr,
                     input.from_name,
@@ -592,6 +595,7 @@ fn save_draft_impl(
                     input.in_reply_to,
                     body_kind,
                     body_html,
+                    input.bcc_addrs,
                 ],
             )
             .map_err(e)?;
@@ -1122,6 +1126,8 @@ pub struct EmailDetail {
     pub from_name: String,
     pub to_addrs: String,
     pub cc_addrs: String,
+    /// 密送地址（逗号分隔）；仅自己发出的邮件有值，收件恒空（MIME 头不含 Bcc）
+    pub bcc_addrs: String,
     pub body_text: String,
     /// 净化后的 HTML 正文（空串 = 无 HTML 版式，详情页回退纯文本）
     pub body_html: String,
@@ -1142,8 +1148,8 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
         let row = conn
             .query_row(
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
-                        cc_addrs, body_text, COALESCE(body_html, ''), attach_cnt, attach_bytes,
-                        unread, in_reply_to, COALESCE(error, ''),
+                        cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
+                        attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
                         COALESCE(received_at, sent_at, created_at), too_large
                  FROM emails WHERE id = ?1",
                 [id],
@@ -1158,15 +1164,16 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         from_name: r.get(5)?,
                         to_addrs: r.get(6)?,
                         cc_addrs: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                        body_text: r.get(8)?,
-                        body_html: r.get(9)?,
-                        attach_cnt: r.get(10)?,
-                        attach_bytes: r.get(11)?,
-                        unread: r.get::<_, i64>(12)? == 1,
-                        in_reply_to: r.get(13)?,
-                        error: r.get(14)?,
-                        time_full: time_full(r.get(15)?),
-                        too_large: r.get::<_, i64>(16)? == 1,
+                        bcc_addrs: r.get(8)?,
+                        body_text: r.get(9)?,
+                        body_html: r.get(10)?,
+                        attach_cnt: r.get(11)?,
+                        attach_bytes: r.get(12)?,
+                        unread: r.get::<_, i64>(13)? == 1,
+                        in_reply_to: r.get(14)?,
+                        error: r.get(15)?,
+                        time_full: time_full(r.get(16)?),
+                        too_large: r.get::<_, i64>(17)? == 1,
                         attachments: Vec::new(),
                     })
                 },

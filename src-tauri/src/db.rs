@@ -26,7 +26,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -74,6 +74,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         2 => migrate_v3(tx),
         3 => migrate_v4(tx),
         4 => migrate_v5(tx),
+        5 => migrate_v6(tx),
         _ => Ok(()),
     }
 }
@@ -115,6 +116,16 @@ fn emails_has_column(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
 fn migrate_v5(tx: &Connection) -> rusqlite::Result<()> {
     if !emails_has_column(tx, "body_html")? {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN body_html TEXT")?;
+    }
+    Ok(())
+}
+
+/// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁），
+/// 与 cc 同为逗号分隔纯地址；发出的 MIME 头不含 Bcc（lettre drop_bcc 语义），
+/// 收到的邮件恒为空（IMAP 同步副本无 Bcc 头），展示层有值才渲染。
+fn migrate_v6(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "bcc_addrs")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
 }

@@ -25,6 +25,7 @@ fn queued_email(state: &AppState, to: &str) -> i64 {
         from_name: "张伟".into(),
         to_addrs: to.into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: "月度激励汇总".into(),
         body_text: "请查收汇总表。".into(),
         in_reply_to: None,
@@ -41,6 +42,7 @@ fn draft(subject: &str, body: &str) -> DraftInput {
         from_name: "单测用户".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: subject.into(),
         body_text: body.into(),
         in_reply_to: None,
@@ -56,6 +58,7 @@ fn save_draft_with_html_stores_sanitized_html_and_plain_text() {
         from_name: "张伟".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: "HTML 正文".into(),
         body_text: "你好".into(),
         in_reply_to: None,
@@ -135,6 +138,98 @@ fn split_addrs_parses_comma_and_semicolon() {
             "c@x.cn".to_string()
         ]
     );
+}
+
+/// BCC 语义护栏（M1-3）：builder.bcc 后 lettre 的默认行为——
+/// 信封 RCPT TO 含密送人（密送人能收到），MIME 头不含 Bcc（其他收件人看不到）。
+/// 升级 lettre 若此测试变红，说明默认 drop_bcc 语义不再成立，
+/// 真实外发将向全部收件人泄露密送名单——必须立即修复而非删断言。
+#[test]
+fn lettre_bcc_goes_to_envelope_not_mime_headers() {
+    let msg = lettre::Message::builder()
+        .from("demo@chinatelecom.cn".parse().unwrap())
+        .to("peer@x.cn".parse().unwrap())
+        .cc("cc@x.cn".parse().unwrap())
+        .bcc("hidden@x.cn".parse().unwrap())
+        .subject(String::from("密送语义护栏"))
+        .body("体".to_string())
+        .unwrap();
+    assert!(
+        msg.headers()
+            .get::<lettre::message::header::Bcc>()
+            .is_none(),
+        "MIME 头不得含 Bcc（外发即泄露名单）"
+    );
+    let rcpts: Vec<String> = msg.envelope().to().iter().map(|a| a.to_string()).collect();
+    for expect in ["peer@x.cn", "cc@x.cn", "hidden@x.cn"] {
+        assert!(
+            rcpts.iter().any(|r| r.eq_ignore_ascii_case(expect)),
+            "信封 RCPT TO 应含 {expect}：{rcpts:?}"
+        );
+    }
+}
+
+/// 出站链路（M1-3）：库内 bcc_addrs → OutgoingMessage.bcc_addrs → 联系人采集；
+/// 纯密送（To/Cc 空、仅 Bcc）是合法形态，不被"收件人为空"误拦；存档保留密送名单
+#[test]
+fn dispatch_carries_bcc_and_pure_bcc_mail_sends() {
+    let (state, dir) = temp_state("m1-bcc-dispatch");
+    state
+        .set_batch(&[(keys::SMTP_HOST, "smtp.test.cn")])
+        .unwrap();
+    state
+        .store_password("demo@chinatelecom.cn", "pw-bcc")
+        .unwrap();
+    let input = DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: String::new(),
+        cc_addrs: String::new(),
+        bcc_addrs: "hidden@x.cn, b2@x.cn".into(),
+        subject: "纯密送".into(),
+        body_text: "只给密送人看。".into(),
+        in_reply_to: None,
+    };
+    let id = save_draft(&state, &input).unwrap();
+    assert!(enqueue_draft(&state, id));
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let result = state.with_conn(|c| {
+        dispatch_one(
+            c,
+            &sender,
+            id,
+            &smtp,
+            &dir.join("attachments"),
+            &state.key_file(),
+        )
+    });
+    assert_eq!(result.unwrap(), "sent", "纯密送应正常发出");
+    let seen = sender.seen.lock().unwrap();
+    let msg = &seen[0].3;
+    assert_eq!(
+        msg.bcc_addrs,
+        vec!["hidden@x.cn".to_string(), "b2@x.cn".to_string()],
+        "OutgoingMessage 应携带密送名单"
+    );
+    assert!(msg.to_addrs.is_empty() && msg.cc_addrs.is_empty());
+    // 存档保留：已发送行的 bcc_addrs 原样（提醒自己密送过谁）
+    let d = get(&state, id).unwrap();
+    assert_eq!(d.bcc_addrs, "hidden@x.cn, b2@x.cn");
+    // 联系人采集：密送人也进联系人库
+    let collected: i64 = state
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM contacts WHERE addr = 'hidden@x.cn'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(collected, 1, "密送人应进联系人库");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
 }
 
 #[test]
@@ -221,6 +316,7 @@ fn dispatch_reads_html_body_for_sending() {
         from_name: "张伟".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: "HTML 发送".into(),
         body_text: "你好".into(),
         in_reply_to: None,

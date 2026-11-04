@@ -174,6 +174,7 @@ fn list_page_shows_drafts_with_sidebar_counts() {
         from_name: "张伟".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: s.into(),
         body_text: "配案正文预览".into(),
         in_reply_to: None,
@@ -210,6 +211,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
         from_name: "张伟".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: s.into(),
         body_text: "配案正文预览".into(),
         in_reply_to: None,
@@ -333,6 +335,7 @@ fn attachment_view_serves_bytes_with_safe_mime() {
             from_name: "张伟".into(),
             to_addrs: "peer@x.cn".into(),
             cc_addrs: String::new(),
+            bcc_addrs: String::new(),
             subject: "预览用例".into(),
             body_text: "见附件".into(),
             in_reply_to: None,
@@ -954,6 +957,7 @@ fn attachment_save_via_post_writes_file() {
             from_name: "张伟".into(),
             to_addrs: "peer@x.cn".into(),
             cc_addrs: String::new(),
+            bcc_addrs: String::new(),
             subject: "带附件草稿".into(),
             body_text: "见附件".into(),
             in_reply_to: None,
@@ -1274,6 +1278,91 @@ fn compose_send_redirect_keeps_list_context() {
             .lines()
             .find(|l| l.contains("class=\"back\""))
             .unwrap_or("(未找到)")
+    );
+    cleanup(&dir);
+}
+
+/// M1-3 密送 UI 全链路：草稿保存 bcc → 编辑页密送框回填 → 详情页渲染密送行
+#[test]
+fn compose_and_detail_render_bcc_round_trip() {
+    let (state, dir) = temp_state("m1-bcc-ui");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "chinatelecom.cn"),
+            (keys::DISPLAY_NAME, "张伟"),
+        ])
+        .unwrap();
+    // 存草稿（带密送）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("cc_addrs", ""),
+                ("bcc_addrs", "hidden@x.cn, b2@x.cn"),
+                ("subject", "密送 UI"),
+                ("body_text", "正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                ("list_query", ""),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/compose?draft_id=1&saved=1")),
+        "存草稿应跳转草稿编辑页：{:?}",
+        resp.extra_headers
+    );
+    let id: i64 = state
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT id FROM emails WHERE bcc_addrs LIKE 'hidden%'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    // 编辑页：密送框存在且回填
+    let page = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", &format!("draft_id={id}"), b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        page.contains(r#"name="bcc_addrs""#),
+        "撰写/编辑页应有密送输入框"
+    );
+    assert!(
+        page.contains(r#"value="hidden@x.cn, b2@x.cn""#),
+        "编辑页密送名单应回填"
+    );
+    // 详情页：密送行渲染（草稿详情同 email.html 模板）
+    let detail = body(&route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/{id}"), b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        detail.contains("密送") && detail.contains("hidden@x.cn"),
+        "详情页应渲染密送行与名单"
     );
     cleanup(&dir);
 }
@@ -2943,6 +3032,7 @@ fn dump_smoke_html() {
             from_name: "张伟".into(),
             to_addrs: "peer@x.cn".into(),
             cc_addrs: String::new(),
+            bcc_addrs: String::new(),
             subject: "关于宽带提速配案的意见反馈".into(),
             body_text: "各位领导：\n请查阅本月配案清单，重点客户需在月底前完成提速交付。".into(),
             in_reply_to: None,
@@ -2957,6 +3047,7 @@ fn dump_smoke_html() {
             from_name: "张伟".into(),
             to_addrs: "ops@x.cn".into(),
             cc_addrs: String::new(),
+            bcc_addrs: String::new(),
             subject: "Re: 月度激励汇总表".into(),
             body_text: "收到，我这边同步核对一遍数据口径。".into(),
             in_reply_to: Some(d1),

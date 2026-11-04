@@ -240,9 +240,11 @@ struct EmailCtx {
     list_query: String,
     /// 发件人是否外部（详情页发件人旁「外部」标记）
     from_external: bool,
-    /// 收件人/抄送按地址拆开，外部地址逐个标注
+    /// 收件人/抄送/密送按地址拆开，外部地址逐个标注
     to_chips: Vec<AddrChip>,
     cc_chips: Vec<AddrChip>,
+    /// 密送 chips（仅自己发出的邮件有值；收件恒空不渲染）
+    bcc_chips: Vec<AddrChip>,
     /// 页面轻提示（error query 回显，如重发被拒）
     notice: String,
 }
@@ -257,6 +259,8 @@ struct ComposeCtx {
     reply_all: bool,
     to_addrs: String,
     cc_addrs: String,
+    /// 密送（草稿/重新编辑回填；回复/转发不继承——原邮件的密送方本就不可知）
+    bcc_addrs: String,
     subject: String,
     body_text: String,
     /// HTML 编辑模式的正文源码（草稿回填用；仅 body_mode=="html" 时提交）
@@ -586,6 +590,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let from_external = mail::is_external_addr(&email.from_addr, &domain);
     let to_chips = addr_chips(&email.to_addrs, &domain);
     let cc_chips = addr_chips(&email.cc_addrs, &domain);
+    let bcc_chips = addr_chips(&email.bcc_addrs, &domain);
     let back_href = detail_back_href(req, &folder);
     let list_query = list_query_of(req, &folder);
     Some(render_html(
@@ -598,6 +603,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             from_external,
             to_chips,
             cc_chips,
+            bcc_chips,
             notice,
         },
     ))
@@ -1040,6 +1046,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         reply_all: false,
         to_addrs: String::new(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: String::new(),
         body_text: String::new(),
         body_html: String::new(),
@@ -1078,6 +1085,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.in_reply_to = draft.in_reply_to.unwrap_or(0);
             ctx.to_addrs = draft.to_addrs;
             ctx.cc_addrs = draft.cc_addrs;
+            ctx.bcc_addrs = draft.bcc_addrs;
             ctx.subject = draft.subject;
             ctx.body_text = draft.body_text;
             ctx.body_html = mail::unwrap_top_div(&draft.body_html);
@@ -1135,6 +1143,7 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         ctx.forward_attach_cnt = src.attach_cnt;
         ctx.to_addrs = src.to_addrs.clone();
         ctx.cc_addrs = src.cc_addrs.clone();
+        ctx.bcc_addrs = src.bcc_addrs.clone();
         ctx.subject = src.subject.clone();
         if src.body_html.trim().is_empty() {
             ctx.body_mode = "plain".into();
@@ -1281,6 +1290,7 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
         from_name: g(keys::DISPLAY_NAME),
         to_addrs: trimmed_field(&form, "to_addrs").unwrap_or_default(),
         cc_addrs: trimmed_field(&form, "cc_addrs").unwrap_or_default(),
+        bcc_addrs: trimmed_field(&form, "bcc_addrs").unwrap_or_default(),
         subject: form.get("subject").cloned().unwrap_or_default(),
         body_text,
         in_reply_to: form_i64(&form, "in_reply_to"),

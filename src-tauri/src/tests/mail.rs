@@ -142,6 +142,7 @@ fn draft(subject: &str, body: &str) -> DraftInput {
         from_name: "单测用户".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: subject.into(),
         body_text: body.into(),
         in_reply_to: None,

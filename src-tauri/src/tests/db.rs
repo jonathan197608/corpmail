@@ -254,3 +254,52 @@ fn migrate_v2_to_v3_adds_receive_columns() {
     // 幂等：版本已达标，再调用直接返回
     migrate(&mut conn).unwrap();
 }
+
+/// v5 → v6 增量（M1-3 密送）：加 bcc_addrs 列，存量邮件默认空串
+/// （收到的邮件恒无密送）；v5 库结构 = v1+MIGRATIONS[0]+v3/v4/v5 各列
+#[test]
+fn migrate_v5_to_v6_adds_bcc_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         CREATE TABLE contacts (
+           addr TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 1);
+         CREATE INDEX idx_contacts_name ON contacts(name);
+         ALTER TABLE emails ADD COLUMN body_html TEXT;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 5i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let bcc: String = conn
+        .query_row("SELECT bcc_addrs FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bcc, "", "存量邮件密送默认空串");
+    // 新库亦一步建到 v6（含列）
+    let fresh = mem();
+    let cols: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('emails') WHERE name='bcc_addrs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cols, 1, "新库应直接含 bcc_addrs 列");
+}

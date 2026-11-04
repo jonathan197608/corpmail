@@ -14,6 +14,9 @@ pub struct OutgoingMessage {
     pub from_name: String,
     pub to_addrs: Vec<String>,
     pub cc_addrs: Vec<String>,
+    /// 密送：仅进 SMTP 信封（RCPT TO），MIME 头不含 Bcc（lettre 默认 drop_bcc：
+    /// envelope 先从 headers 提取，再剥 Bcc 头——收件人永远看不到谁被密送）
+    pub bcc_addrs: Vec<String>,
     pub subject: String,
     pub body_text: String,
     /// HTML 正文（净化后；Some = 以 text/html 发送，纯文本作为 alternative 回退）
@@ -68,6 +71,11 @@ impl MailSender for RealSender {
         }
         for c in &msg.cc_addrs {
             builder = builder.cc(parse_mailbox(c, "")?);
+        }
+        // 信封含 bcc（Envelope::try_from 提取 To+Cc+Bcc 进 forward_path），
+        // build() 后默认剥除 Bcc 头——密送对外不可见
+        for b in &msg.bcc_addrs {
+            builder = builder.bcc(parse_mailbox(b, "")?);
         }
         let builder = builder
             .message_id(Some(msg.message_id.clone()))
@@ -274,21 +282,23 @@ pub fn dispatch_one(
     };
     let row = conn.query_row(
         "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''),
-                subject, body_text, COALESCE(body_html,'')
+                COALESCE(bcc_addrs,''), subject, body_text, COALESCE(body_html,'')
          FROM emails WHERE id = ?1",
         [id],
         |r| {
             let to_raw: String = r.get(2)?;
             let cc_raw: String = r.get(3)?;
-            let body_html: String = r.get(6)?;
+            let bcc_raw: String = r.get(4)?;
+            let body_html: String = r.get(7)?;
             Ok((
                 OutgoingMessage {
                     from_addr: r.get(0)?,
                     from_name: r.get(1)?,
                     to_addrs: split_addrs(&to_raw),
                     cc_addrs: split_addrs(&cc_raw),
-                    subject: r.get(4)?,
-                    body_text: r.get(5)?,
+                    bcc_addrs: split_addrs(&bcc_raw),
+                    subject: r.get(5)?,
+                    body_text: r.get(6)?,
                     body_html: if body_html.trim().is_empty() {
                         None
                     } else {
@@ -299,6 +309,7 @@ pub fn dispatch_one(
                 },
                 to_raw,
                 cc_raw,
+                bcc_raw,
             ))
         },
     );
@@ -310,7 +321,7 @@ pub fn dispatch_one(
             eprintln!("[send] 邮件 {id} 落定 failed 失败：{err}");
         }
     };
-    let (mut msg, to_raw, cc_raw) = match row {
+    let (mut msg, to_raw, cc_raw, bcc_raw) = match row {
         Ok(m) => m,
         Err(err) => {
             fail_or_log(&format!("读取待发邮件失败：{err}"));
@@ -318,7 +329,8 @@ pub fn dispatch_one(
         }
     };
     msg.message_id = new_message_id(&msg.from_addr);
-    if msg.to_addrs.is_empty() {
+    // 纯密送是合法形态（仅 To/Cc 空但 Bcc 有收件人，lettre envelope 照常投递）
+    if msg.to_addrs.is_empty() && msg.cc_addrs.is_empty() && msg.bcc_addrs.is_empty() {
         fail_or_log("收件人为空");
         return Ok("failed");
     }
@@ -369,7 +381,7 @@ pub fn dispatch_one(
             if let Err(err) = mark("sent", None) {
                 eprintln!("[send] 邮件 {id} 落定 sent 失败：{err}");
             }
-            // 回写 Message-ID（发件箱同步按它与服务端副本去重）+ 联系人采集（To/Cc）
+            // 回写 Message-ID（发件箱同步按它与服务端副本去重）+ 联系人采集（To/Cc/Bcc）
             if let Err(err) = conn.execute(
                 "UPDATE emails SET message_id = ?2 WHERE id = ?1",
                 rusqlite::params![id, sent_message_id],
@@ -377,7 +389,7 @@ pub fn dispatch_one(
                 eprintln!("[send] 邮件 {id} 回写 Message-ID 失败：{err}");
             }
             let now = now_epoch();
-            for raw in [&to_raw, &cc_raw] {
+            for raw in [&to_raw, &cc_raw, &bcc_raw] {
                 for (addr, name) in super::contacts::parse_addr_list(raw) {
                     if let Err(err) = super::contacts::upsert_conn(conn, &addr, &name, now) {
                         eprintln!("[send] 联系人采集失败（{addr}）：{err}");

@@ -73,6 +73,12 @@
                     {% for c in cc_chips %}<span class="md-addr-item{% if c.external %} ext{% endif %}">{{ c.text }}{% if c.external %}<span class="ext-badge">外部</span>{% endif %}</span>{{ ", " if not loop.last else "" }}{% endfor %}
                 </span></div>
                 {% endif %}
+                {% if bcc_chips %}
+                {# 仅自己发出的邮件有值（收件邮件无 Bcc 头）；提醒密送过谁 #}
+                <div class="md-row"><span class="k">密送</span><span class="md-addr">
+                    {% for c in bcc_chips %}<span class="md-addr-item{% if c.external %} ext{% endif %}">{{ c.text }}{% if c.external %}<span class="ext-badge">外部</span>{% endif %}</span>{{ ", " if not loop.last else "" }}{% endfor %}
+                </span></div>
+                {% endif %}
                 {% if email.status == 'failed' and email.error %}
                 <div class="md-row"><span class="k">失败原因</span><span class="md-error">{{ email.error }}</span></div>
                 {% endif %}

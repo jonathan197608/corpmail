@@ -198,6 +198,7 @@ fn mark_seen_local_and_delegates_to_fetcher() {
         from_name: "张伟".into(),
         to_addrs: "peer@x.cn".into(),
         cc_addrs: String::new(),
+        bcc_addrs: String::new(),
         subject: "本地草稿".into(),
         body_text: "体".into(),
         in_reply_to: None,
