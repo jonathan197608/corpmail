@@ -2161,6 +2161,19 @@ a.btn.link.disabled {
 #ba-select-all:hover {
     text-decoration: underline;
 }
+/* 批量星标按钮（M2-1 进批量栏）：金色调呼应行内星标 */
+.btn.small.star-op {
+    color: #b97e10;
+}
+.btn.small.star-op:hover {
+    border-color: #f0d9ab;
+    background: #fdf6e7;
+    color: #b97e10;
+}
+.btn.small.star-op[disabled] {
+    color: #b97e10;
+    opacity: 0.45;
+}
 
 /* ---------- 星标（M2-1）：列表行金色★ + 详情页按钮 ---------- */
 /* 列表行星标列：窄列（与复选框同为 flex 0 0 auto），行内垂直居中 */

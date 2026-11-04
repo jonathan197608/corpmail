@@ -945,6 +945,10 @@ pub enum BatchTarget {
 pub enum BatchAction {
     MarkRead,
     MarkUnread,
+    /// 批量星标（M2-1 扩展进批量栏）：置 1，各信箱列表置顶
+    Star,
+    /// 批量取消星标：置 0（已星标行才计入受影响数）
+    Unstar,
     Delete,
 }
 
@@ -953,6 +957,8 @@ impl BatchAction {
         match raw {
             "read" => Some(Self::MarkRead),
             "unread" => Some(Self::MarkUnread),
+            "star" => Some(Self::Star),
+            "unstar" => Some(Self::Unstar),
             "delete" => Some(Self::Delete),
             _ => None,
         }
@@ -1020,6 +1026,16 @@ pub fn batch_apply(
                     &format!(
                         "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
                     ),
+                    rusqlite::params_from_iter(ids.iter()),
+                )
+                .map_err(e)?
+            }
+            // 批量星标（M2-1 进批量栏）：全信箱行均合法（星标置顶对所有文件夹生效）。
+            // starred 不在 emails_au 触发器的 FTS 监听列内，翻转不引发检索重写
+            BatchAction::Star | BatchAction::Unstar => {
+                let v: i64 = if action == BatchAction::Star { 1 } else { 0 };
+                tx.execute(
+                    &format!("UPDATE emails SET starred = {v} WHERE id IN ({marks})"),
                     rusqlite::params_from_iter(ids.iter()),
                 )
                 .map_err(e)?

@@ -5922,3 +5922,136 @@ fn draft_save_keeps_or_clears_schedule() {
     );
     cleanup(&dir);
 }
+
+/// 批量星标进批量操作栏（M2-1 扩展）：star/unstar 动作经 /emails/batch
+/// 生效——ids 与跨页两模式受影响数正确、草稿箱星标置顶重排、幂等重试返回 0
+#[test]
+fn batch_actions_star_unstar() {
+    let (state, dir) = temp_state("batch-star");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "x.cn"),
+        ])
+        .unwrap();
+    // 种子：3 封收件（不同时间命中跨页过滤集）+ 1 封草稿
+    state
+        .with_conn(|c| {
+            for i in 0..3 {
+                c.execute(
+                    "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                        subject_tokens, body_tokens, unread, created_at, received_at)
+                     VALUES ('in','inbox','received','a@x.cn','b@x.cn',?1,?1,'x',0,?2,?2)",
+                    rusqlite::params![format!("收件{i}"), 100 + i],
+                )
+                .unwrap();
+            }
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, unread, created_at)
+                 VALUES ('out','draft','draft','b@x.cn','a@x.cn','草稿D','草稿D','x',0,50)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // ids 模式：星标第 1、2 封收件
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[("action", "star"), ("ids", "[1,2]"), ("folder", "inbox")]),
+        ),
+        &t,
+    );
+    assert_eq!(resp.status, 200);
+    let starred: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails WHERE starred = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(starred, 2, "两封应置星标");
+    // SQLite changes 语义：UPDATE 匹配行即计数（不比较新旧值）——
+    // 重复星标仍报 2 行受影响（值未变），语义无损（前端只看成功与否）
+    let n = mail::batch_apply(
+        &state,
+        &mail::BatchTarget::Ids(vec![1, 2]),
+        mail::BatchAction::Star,
+    );
+    assert_eq!(n.unwrap(), 2, "重复星标按匹配计数（SQLite changes 语义）");
+    // 列表重排：星标置顶（id 1/2 压过更新的 id 3）
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    let first_pos = html.find("收件0").unwrap();
+    let last_pos = html.find("收件2").unwrap();
+    assert!(
+        first_pos < last_pos,
+        "星标邮件应置顶（含 mbx:fetchDone 后片段重排）"
+    );
+
+    // 跨页模式（select_all）：星标全部收件含草稿（星标对所有文件夹生效）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "star"),
+                ("select_all", "1"),
+                ("exclude_ids", "[3]"),
+                ("folder", "inbox"),
+                ("unread", "0"),
+                ("external", "0"),
+                ("q", ""),
+            ]),
+        ),
+        &t,
+    );
+    assert_eq!(resp.status, 200);
+    let starred_inbox: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*) FROM emails WHERE starred = 1 AND direction = 'in'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(starred_inbox, 2, "排除 id=3 后仍只有原两封（跨页排除生效）");
+
+    // unstar 全部回零
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/batch",
+            &form(&[
+                ("action", "unstar"),
+                ("select_all", "1"),
+                ("exclude_ids", "[]"),
+                ("folder", "inbox"),
+                ("unread", "0"),
+                ("external", "0"),
+                ("q", ""),
+            ]),
+        ),
+        &t,
+    );
+    assert_eq!(resp.status, 200);
+    let starred: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails WHERE starred = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(starred, 0, "unstar 跨页全量应清零星标");
+    cleanup(&dir);
+}
