@@ -270,15 +270,30 @@ body {
 .topbar {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 12px;
+    row-gap: 8px;
     padding: 10px 16px;
     background: var(--panel);
     border-bottom: 1px solid var(--line);
 }
 
+/* 顶栏元素默认不参与压缩：窗口变窄时宁可换行，也不要把标题/下拉挤成
+   几十像素宽的碎片（A2 加排序下拉后暴露；search 例外，允许缩到 170px，
+   再窄则由 flex-wrap 换到第二行） */
+.topbar > * {
+    flex-shrink: 0;
+}
+
+.topbar > .search {
+    flex-shrink: 1;
+    min-width: 170px;
+}
+
 .topbar h1 {
     font-size: 16px;
     font-weight: 700;
+    white-space: nowrap;
 }
 
 .topbar .sub {

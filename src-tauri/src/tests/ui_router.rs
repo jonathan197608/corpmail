@@ -3595,6 +3595,10 @@ fn dump_smoke_html() {
 
     dump("main.html", get("/"));
     dump("main-inbox-unread.html", get_url("/?unread=1"));
+    // A2 排序素材：时间正序 / 发件人升序（对照默认最新优先）
+    dump("main-sort-asc.html", get_url("/?sort=date_asc"));
+    dump("main-sort-from.html", get_url("/?sort=from_asc"));
+    dump("main-sort-subject.html", get_url("/?sort=subject_asc"));
     // M4-2 定时草稿种子：第三个草稿设 2h 后定时——列表 ⏰ 徽标实测
     state
         .with_conn(|c| {
@@ -6383,6 +6387,72 @@ fn side_settings_entry_in_folder_list_and_no_folder_title() {
         html.contains("folder settings-entry on"),
         "设置页侧栏设置行应高亮：{}",
         html.lines().nth(30).unwrap_or("?")
+    );
+    cleanup(&dir);
+}
+
+/// A2 列表排序：URL sort 生效、非默认值进入详情往返上下文、非法值回退默认
+#[test]
+fn list_sort_applies_and_persists_in_list_query() {
+    let (state, dir) = temp_state("a2-sort");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at, thread_key)
+             VALUES
+             ('in','inbox','received','a@x.cn','甲','demo@chinatelecom.cn',
+              '第一封','正文一','第一封','正文 一',1,100,100,'第一封'),
+             ('in','inbox','received','b@x.cn','乙','demo@chinatelecom.cn',
+              '第二封','正文二','第二封','正文 二',1,200,200,'第二封')",
+        )
+        .unwrap();
+    });
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 时间正序：第一封（id=1）应排在第二封（id=2）之前
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "sort=date_asc", b""),
+        &tester,
+    ));
+    let p1 = html.find("data-mail-id=\"1\"").expect("应渲染第一封");
+    let p2 = html.find("data-mail-id=\"2\"").expect("应渲染第二封");
+    assert!(p1 < p2, "时间正序应 id1 在前：{p1} vs {p2}");
+    assert!(
+        html.contains("sort=date_asc"),
+        "详情链接应携带排序参数（往返保持）"
+    );
+    // 默认（时间倒序）：id2 在前
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &tester));
+    let p1 = html.find("data-mail-id=\"1\"").unwrap();
+    let p2 = html.find("data-mail-id=\"2\"").unwrap();
+    assert!(p2 < p1, "默认时间倒序应 id2 在前");
+    // 非法值回退默认：URL 不残留 sort=bogus
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "sort=bogus", b""),
+        &tester,
+    ));
+    assert!(!html.contains("sort=bogus"), "非法排序值不应透传");
+    let p1 = html.find("data-mail-id=\"1\"").unwrap();
+    let p2 = html.find("data-mail-id=\"2\"").unwrap();
+    assert!(p2 < p1, "非法排序值应按默认时间倒序");
+    // 详情页返回列表链接保留 sort
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/emails/1", "sort=date_asc", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("sort=date_asc"),
+        "详情页返回链接应保留排序参数"
     );
     cleanup(&dir);
 }

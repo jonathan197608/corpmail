@@ -234,6 +234,8 @@ struct MainCtx {
     page_base: String,
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
+    /// 排序键（A2；模板回显下拉，非默认值才进 URL）
+    sort: String,
     items: Vec<EmailSummary>,
     /// 会话视图（M2-2）：mode=thread 时为 true；只在收件箱/全部/搜索下可用
     is_thread: bool,
@@ -561,6 +563,8 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     // 内部域取账号域名（默认 chinatelecom.cn）：判定外部发件人的唯一口径
     let d = defaults();
     let internal_domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
+    // 排序（A2）：URL sort 解析，非默认值进 base/list_query；默认不携带保持 URL 干净
+    let sort = mail::SortKey::parse(req.query_param("sort").as_deref());
     let q = mail::ListQuery {
         folder: folder.clone(),
         page,
@@ -568,6 +572,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         external_only,
         internal_domain,
         per,
+        sort,
     };
     // 会话视图（M2-2）：mode=thread 且仅收件箱/全部下可用（草稿/已发保持单封）；
     // 搜索下同样可切会话（命中代表行=最新一封）
@@ -607,6 +612,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     }
     if per != PER_MIN {
         base = format!("{base}per={per}&");
+    }
+    if sort != mail::SortKey::DateDesc {
+        base = format!("{base}sort={}&", sort.as_str());
     }
     let unread_part = if unread_only { "unread=1&" } else { "" };
     let external_part = if external_only { "external=1&" } else { "" };
@@ -655,6 +663,12 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
         list_query.push_str(&format!("per={per}"));
     }
+    if sort != mail::SortKey::DateDesc {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str(&format!("sort={}", sort.as_str()));
+    }
     if page > 1 {
         if !list_query.is_empty() {
             list_query.push('&');
@@ -676,6 +690,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         per,
         page_base,
         q: q_input,
+        sort: sort.as_str().to_string(),
         items,
         is_thread,
         threads,
@@ -912,6 +927,8 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
             external_only: form.get("external").map(|v| v == "1").unwrap_or(false),
             internal_domain: g(keys::ACCOUNT_DOMAIN),
             per: PER_MIN,
+            // 排序不影响命中集（只影响 ORDER BY），按表单值回填即可
+            sort: mail::SortKey::parse(form.get("sort").map(String::as_str)),
         };
         // q（检索词）仅在非空时参与：批量检索结果全选 = 命中即选中。
         // 检索走 FTS MATCH，与列表检索同源；此处简化为非空时拒绝批量（检索
@@ -969,6 +986,16 @@ fn reconstruct_list_req(req: &Req, form: &HashMap<String, String>) -> Req {
     }
     if let Some(q) = form.get("q").filter(|v| !v.trim().is_empty()) {
         qs.push(format!("q={}", urlencode(q)));
+    }
+    // 每页条数与排序：批量后重渲列表片段需保持用户选择（否则回退默认视感突兀）
+    if let Some(p) = form.get("per").filter(|v| v.parse::<i64>().is_ok()) {
+        qs.push(format!("per={p}"));
+    }
+    if let Some(s) = form
+        .get("sort")
+        .filter(|v| mail::SortKey::parse(Some(v)) != mail::SortKey::DateDesc)
+    {
+        qs.push(format!("sort={}", urlencode(s)));
     }
     if let Some(p) = form.get("page").filter(|v| v.parse::<i64>().is_ok()) {
         qs.push(format!("page={p}"));
@@ -2219,6 +2246,7 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let unread = get("unread");
     let external = get("external");
     let per = get("per");
+    let sort = get("sort");
     rebuild_list_query(
         &folder,
         unread.as_deref(),
@@ -2226,12 +2254,13 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
         q.as_deref(),
         page.as_deref(),
         per.as_deref(),
+        sort.as_deref(),
     )
 }
 
 /// 列表上下文查询串还原（详情页「返回列表」/撰写页回跳/批量操作重建列表
-/// 请求共用）：folder 恒带，unread/external/q 按需；per 仅非默认时携带
-/// （默认 10 时 URL 保持干净，详见 list_root per 解析注释）。
+/// 请求共用）：folder 恒带，unread/external/q/sort 按需；per/sort 仅非默认
+/// 时携带（默认 10 条/时间倒序时 URL 保持干净，详见 list_root per 解析注释）。
 /// 入口有三：Req 查询串（list_query_of）、表单隐藏域（发送/存草稿回跳）。
 /// 表单值客户端可控，重新过滤防注入畸形查询串
 #[allow(clippy::too_many_arguments)]
@@ -2242,6 +2271,7 @@ fn rebuild_list_query(
     q: Option<&str>,
     page: Option<&str>,
     per: Option<&str>,
+    sort: Option<&str>,
 ) -> String {
     let folder = match folder {
         "all" | "sent" | "draft" | "inbox" => folder.to_string(),
@@ -2265,6 +2295,11 @@ fn rebuild_list_query(
         && p != PER_MIN
     {
         qs.push(format!("per={p}"));
+    }
+    // 排序：仅非默认值携带（默认 date_desc 不污染 URL）
+    let sort = mail::SortKey::parse(sort);
+    if sort != mail::SortKey::DateDesc {
+        qs.push(format!("sort={}", sort.as_str()));
     }
     let page = clamp_page(page);
     if page > 1 {
@@ -2327,6 +2362,7 @@ fn form_list_query(form: &HashMap<String, String>) -> String {
         pick("q"),
         pick("page"),
         pick("per"),
+        pick("sort"),
     )
 }
 

@@ -266,6 +266,7 @@ fn search_ranks_matches_and_highlights_subject() {
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
+        sort: SortKey::DateDesc,
     };
     let (items, total) = search(&state, "激励", &q).unwrap().unwrap();
     assert_eq!(total, 1);
@@ -293,6 +294,7 @@ fn search_ranks_matches_and_highlights_subject() {
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
+        sort: SortKey::DateDesc,
     };
     let inbox_result = search(&state, "激励", &q_inbox).unwrap().unwrap();
     assert_eq!(inbox_result.1, 0, "inbox 无邮件");
@@ -363,6 +365,7 @@ fn list_filters_folder_and_pages() {
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
+            sort: SortKey::DateDesc,
         },
     )
     .unwrap();
@@ -376,6 +379,7 @@ fn list_filters_folder_and_pages() {
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
+            sort: SortKey::DateDesc,
         },
     )
     .unwrap();
@@ -389,6 +393,7 @@ fn list_filters_folder_and_pages() {
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
+            sort: SortKey::DateDesc,
         },
     )
     .unwrap();
@@ -403,6 +408,7 @@ fn list_filters_folder_and_pages() {
             external_only: false,
             internal_domain: "chinatelecom.cn".into(),
             per: 10,
+            sort: SortKey::DateDesc,
         },
     )
     .unwrap();
@@ -857,6 +863,7 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
+        sort: SortKey::DateDesc,
     };
     let (items, total) = list_threads(&state, &q).unwrap();
     // 草稿/发送失败不入会、空主题不归组：只剩「会议(2)」「报价(1)」两组
@@ -879,6 +886,7 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         external_only: false,
         internal_domain: "chinatelecom.cn".into(),
         per: 50,
+        sort: SortKey::DateDesc,
     };
     let (items, total) = list_threads(&state, &inbox).unwrap();
     assert_eq!(total, 2, "inbox 下两组（各 1 封）");
@@ -917,4 +925,90 @@ fn thread_mails_returns_chronological_order() {
     let none = thread_mails(&state, 4, "chinatelecom.cn").unwrap();
     assert!(none.is_none(), "空主题组不提供会话详情");
     cleanup(&dir);
+}
+
+/// A2 列表排序：四种排序键的 ORDER BY 行为 + 星标只在默认态置顶
+#[test]
+fn list_orders_by_sort_key() {
+    let (state, dir) = temp_state("sort");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, subject_tokens, body_tokens, unread,
+                                created_at, received_at, starred, thread_key)
+             VALUES
+             ('in','inbox','received','zeta@x.cn','Zoe','demo@chinatelecom.cn',
+              'Bravo 主题','正文一','Bravo 主题','正文 一',1,100,100,1,'Bravo 主题'),
+             ('in','inbox','received','alpha@x.cn','Alice','demo@chinatelecom.cn',
+              'Alpha 主题','正文二','Alpha 主题','正文 二',1,200,200,0,'Alpha 主题'),
+             ('in','inbox','received','beta@x.cn','Bob','demo@chinatelecom.cn',
+              'Charlie 主题','正文三','Charlie 主题','正文 三',1,300,300,0,'Charlie 主题')",
+        )
+        .unwrap();
+    });
+    let base = |sort| ListQuery {
+        folder: "inbox".into(),
+        page: 1,
+        unread_only: false,
+        external_only: false,
+        internal_domain: "chinatelecom.cn".into(),
+        per: 10,
+        sort,
+    };
+    // 默认：星标置顶（id1），其余时间倒序（id3 → id2）
+    let (items, total) = list(&state, &base(SortKey::DateDesc)).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(
+        items.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![1, 3, 2],
+        "默认排序应星标置顶 + 时间倒序"
+    );
+    // 时间正序：放弃置顶，id1 → id2 → id3
+    let (items, _) = list(&state, &base(SortKey::DateAsc)).unwrap();
+    assert_eq!(
+        items.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "时间正序应按时间升序且不置顶"
+    );
+    // 发件人升序：Alice(id2) → Bob(id3) → Zoe(id1)
+    let (items, _) = list(&state, &base(SortKey::FromAsc)).unwrap();
+    assert_eq!(
+        items.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![2, 3, 1],
+        "发件人排序应按姓名升序"
+    );
+    // 主题升序：Alpha(id2) → Bravo(id1) → Charlie(id3)
+    let (items, _) = list(&state, &base(SortKey::SubjectAsc)).unwrap();
+    assert_eq!(
+        items.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![2, 1, 3],
+        "主题排序应按主题升序"
+    );
+    // 搜索 + 非默认排序：按所选排序而非 BM25 相关度
+    let (items, _) = search(&state, "主题", &base(SortKey::DateAsc))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        items.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "检索 + 时间正序应按时间排序"
+    );
+    // 搜索 + 默认排序：保持 BM25（此处无显式断言顺序，只验证有结果）
+    let (items, _) = search(&state, "主题", &base(SortKey::DateDesc))
+        .unwrap()
+        .unwrap();
+    assert_eq!(items.len(), 3);
+    cleanup(&dir);
+}
+
+/// A2 排序键解析：未知/缺省回退默认，大小写与空白容错
+#[test]
+fn sort_key_parse_falls_back_to_default() {
+    assert_eq!(SortKey::parse(None), SortKey::DateDesc);
+    assert_eq!(SortKey::parse(Some("")), SortKey::DateDesc);
+    assert_eq!(SortKey::parse(Some("bogus")), SortKey::DateDesc);
+    assert_eq!(SortKey::parse(Some(" date_asc ")), SortKey::DateAsc);
+    assert_eq!(SortKey::parse(Some("from_asc")), SortKey::FromAsc);
+    assert_eq!(SortKey::parse(Some("subject_asc")), SortKey::SubjectAsc);
+    assert_eq!(SortKey::DateDesc.as_str(), "date_desc");
 }

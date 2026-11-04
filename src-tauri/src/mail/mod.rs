@@ -767,6 +767,57 @@ fn save_draft_impl(
 
 // ---------- 列表与详情（§8.3/§9） ----------
 
+/// 列表排序键（A2）：默认星标置顶 + 时间倒序；其余选项放弃置顶，
+/// 保证排序语义纯粹（选「时间正序」却把星标邮件顶在最前会很困惑）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortKey {
+    /// 星标置顶 → 时间倒序 → id 倒序（默认，与旧行为一致）
+    #[default]
+    DateDesc,
+    /// 纯时间正序（最早在前）
+    DateAsc,
+    /// 发件人（无姓名时用地址）不区分大小写升序，同人按时间倒序
+    FromAsc,
+    /// 主题不区分大小写升序，同主题按时间倒序
+    SubjectAsc,
+}
+
+impl SortKey {
+    /// URL/表单解析：未知值一律回退默认（客户端可控参数，不报错）
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("date_asc") => Self::DateAsc,
+            Some("from_asc") => Self::FromAsc,
+            Some("subject_asc") => Self::SubjectAsc,
+            _ => Self::DateDesc,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DateDesc => "date_desc",
+            Self::DateAsc => "date_asc",
+            Self::FromAsc => "from_asc",
+            Self::SubjectAsc => "subject_asc",
+        }
+    }
+}
+
+/// 排序 SQL（alias 为空或 "e."）。时间列 t 是 SELECT 别名（AS t），
+/// SQLite 不允许别名带表前缀（e.t 报 no such column），故 t 始终裸写；
+/// starred/from_*/subject 是真实列，随 alias 前缀走
+fn order_sql(sort: SortKey, alias: &str) -> String {
+    let a = alias;
+    match sort {
+        SortKey::DateDesc => format!("{a}starred DESC, t DESC, {a}id DESC"),
+        SortKey::DateAsc => format!("t ASC, {a}id ASC"),
+        SortKey::FromAsc => {
+            format!("{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, t DESC")
+        }
+        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, t DESC"),
+    }
+}
+
 /// 列表查询（folder：inbox|sent|draft|all；unread 仅 inbox 有意义；page 从 1 起）
 pub struct ListQuery {
     pub folder: String,
@@ -779,6 +830,8 @@ pub struct ListQuery {
     /// 每页条数（路由层从 settings/URL 解析并钳制；list/search/list_threads
     /// 统一以本字段作 LIMIT，不再用全局常量）
     pub per: i64,
+    /// 排序键（A2；不影响命中集，只影响 ORDER BY）
+    pub sort: SortKey,
 }
 
 /// 外部发件人判定：域名与内部域相同或为其子域时为内部。
@@ -1084,6 +1137,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
     let ext_filter = if q.external_only { 1 } else { 0 };
     let domain = q.internal_domain.trim();
     let where_sql = format!("WHERE 1=1{filter_sql}");
+    let order = order_sql(q.sort, "");
     let page = q.page.max(1);
     // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
     let offset = (page - 1).saturating_mul(q.per);
@@ -1102,7 +1156,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
                         COALESCE(received_at, sent_at, created_at) AS t,
                         {ext_col} AS from_external, starred, scheduled_at
                  FROM emails {where_sql}
-                 ORDER BY starred DESC, t DESC, id DESC
+                 ORDER BY {order}
                  LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;
@@ -1137,6 +1191,8 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
          AND e.thread_key IS NOT NULL AND e.thread_key != ''
          AND e.folder <> 'draft' AND e.status NOT IN ('draft','failed')"
     );
+    // 外层排序列（代表行字段）：会话按组内最新时间/最新发件人排序
+    let order = order_sql(q.sort, "");
     state.with_conn(|conn| {
         // 会话组总数 = 满足条件的 distinct thread_key 数
         let total: i64 = conn
@@ -1167,7 +1223,7 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
                     FROM emails e {where_sql}
                  )
                  WHERE rn = 1
-                 ORDER BY t DESC, starred DESC, id DESC
+                 ORDER BY {order}
                  LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;
@@ -1377,6 +1433,14 @@ pub fn search(
     let page = q.page.max(1);
     let offset = (page - 1).saturating_mul(q.per);
     let words = tokenize_words(input);
+    // 排序：默认（无显式排序）保持 BM25 相关度优先；用户选了具体排序键
+    // （时间/发件人/主题）则按所选排序——否则「选时间正序 + 搜索」时
+    // 结果仍按相关度排，控件会显得失效
+    let order = if q.sort == SortKey::DateDesc {
+        "bm25(email_fts, 5.0, 1.0), e.id DESC".to_string()
+    } else {
+        order_sql(q.sort, "e.")
+    };
     state.with_conn(|conn| {
         let total: i64 = conn
             .query_row(
@@ -1397,7 +1461,7 @@ pub fn search(
                         {ext_col} AS from_external, e.starred, e.scheduled_at
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
                  WHERE email_fts MATCH :match{filter_sql}
-                 ORDER BY bm25(email_fts, 5.0, 1.0), e.id DESC
+                 ORDER BY {order}
                  LIMIT :lim OFFSET :off"
             ))
             .map_err(e)?;

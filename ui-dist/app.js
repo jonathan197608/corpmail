@@ -967,6 +967,9 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         // 每页条数（M4/紧凑化）：批量后回列表片段保持用户的分页规格
         var per = val('ba-per');
         if (per && per !== '10') params.set('per', per);
+        // 排序（A2）：非默认才带，批量后列表片段保持当前排序
+        var sort = val('ba-sort');
+        if (sort && sort !== 'date_desc') params.set('sort', sort);
         if (stateBox.mode === 'all') {
             params.set('select_all', '1');
             params.set('exclude_ids', JSON.stringify(stateBox.exclude));
