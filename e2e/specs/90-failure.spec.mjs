@@ -57,7 +57,10 @@ describe('90 失败链路', () => {
   it('F3 迁移失败：空目标 / 同当前目录 / 目标已有库，均报错不切换', async () => {
     await goto('/settings/storage')
     await waitBoot()
-    const cur = await $('.dir-path').getAttribute('title')
+    // 两个 .dir-path：[0]=「数据目录」（pending 目标，迁移后重启前显示旧值
+    // 之外的新目录），[1]=「当前使用」。move_data_dir 的「相同」判定以
+    // data_dir() 快照（=「当前使用」）为准，必须取后者
+    const cur = await (await $$('.dir-path')).at(-1).getAttribute('title')
     expect(cur).toBeTruthy()
 
     // 目标已有库（与单测 ui_router.rs:556 同场景）
@@ -73,8 +76,10 @@ describe('90 失败链路', () => {
 
     res = await htmxAjax('POST', '/settings/storage/move', { dest: occupied }, '#settings-pane')
     expect(res.text).toContain('corpmail.db')
-    // 当前目录不变（仍指向 cur，未被非法目标污染）
-    expect(await $('.dir-path').getAttribute('title')).toBe(cur)
+    // 当前使用与 pending 目标均未被非法目标污染
+    const after = await $$('.dir-path')
+    expect(await after.at(-1).getAttribute('title')).toBe(cur)
+    expect(await after[0].getAttribute('title')).not.toBe(occupied)
     await shot('失败-迁移三连拒')
   })
 
