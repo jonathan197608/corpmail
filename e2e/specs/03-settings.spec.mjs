@@ -1,7 +1,9 @@
 import { browser, $, expect } from '@wdio/globals'
-import { goto, shot, waitBoot } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, waitText, htmxAjax, runDir } from '../support/helpers.mjs'
+import path from 'node:path'
+import fs from 'node:fs'
 
-// 03：设置四个页签 + 收件状态条（后台刷新链路的 UI 侧证据）
+// 03：设置页签 + 收件状态条 + 连接测试 + 数据目录迁移（E1–E5 / A6 / F1）
 describe('03 设置与收件状态', () => {
   it('账号页签：显示当前账号与凭据保管状态', async () => {
     await goto('/settings')
@@ -22,6 +24,54 @@ describe('03 设置与收件状态', () => {
     expect(text).toContain('数据与附件')
     expect(await $('.dir-path').isExisting()).toBe(true)
     await shot('设置-存储管理')
+  })
+
+  it('E3 连接测试按钮：SMTP/IMAP 双通道打真 mock 显示结果', async () => {
+    await goto('/settings/account')
+    const smtpBtn = await $('button[hx-post="/settings/account/test-smtp"]')
+    await smtpBtn.click()
+    await browser.waitUntil(
+      async () => {
+        const t = await $('#smtp-result').getText()
+        return t.length > 0
+      },
+      { timeout: 30000, timeoutMsg: 'SMTP 测试结果未返回' },
+    )
+    const smtpText = await $('#smtp-result').getText()
+    expect(smtpText).toContain('发信通道')
+    expect(smtpText).not.toContain('失败')
+    await shot('设置-SMTP测试通过')
+
+    await $('button[hx-post="/settings/account/test-imap"]').click()
+    await browser.waitUntil(
+      async () => (await $('#imap-result').getText()).length > 0,
+      { timeout: 30000, timeoutMsg: 'IMAP 测试结果未返回' },
+    )
+    const imapText = await $('#imap-result').getText()
+    expect(imapText).toContain('收信通道')
+    expect(imapText).not.toContain('失败')
+    await shot('设置-IMAP测试通过')
+  })
+
+  it('E2b 同步间隔保存回显：改 5 分钟提交 → pane 回显 5', async () => {
+    await goto('/settings/sync')
+    await $('input[name="sync_interval_min"]').setValue('5')
+    await $('form button[type="submit"]').click()
+    await browser.waitUntil(
+      async () => (await $('input[name="sync_interval_min"]').getValue()) === '5',
+      { timeout: 15000, timeoutMsg: '保存后间隔未回显新值' },
+    )
+    await shot('设置-同步间隔已保存')
+  })
+
+  it('A6 数据目录迁移：POST move → 待生效目录 + 重启徽标', async () => {
+    await goto('/settings/storage')
+    const dest = path.join(runDir(), 'moved-data')
+    fs.mkdirSync(dest, { recursive: true })
+    const res = await htmxAjax('POST', '/settings/storage/move', { dest }, '#settings-pane')
+    expect(res.text).toContain('待生效')
+    await waitText('#settings-pane', '重启')
+    await shot('设置-数据目录待生效')
   })
 
   it('关于页签', async () => {

@@ -50,6 +50,40 @@ export async function waitText(selector, text, timeout = 20000) {
   )
 }
 
+/** 本次运行的产物目录（mock outbox、导出落盘都在这里） */
+export const runDir = () => process.env.E2E_RUN_DIR || path.resolve('artifacts', 'adhoc')
+
+/**
+ * 页面侧 htmx.ajax。用于绕过原生目录/文件对话框：保存类接口
+ * （导出 .eml / 附件另存 / 数据目录迁移）本来由前端先弹 Tauri 对话框
+ * 选 dest 再 POST，自动化里直接 POST dest 表单值，返回 {status, text}。
+ */
+export async function htmxAjax(method, url, values, target = '#toast') {
+  return browser.execute(
+    async (m, u, v, t) =>
+      new Promise((resolve) => {
+        htmx.ajax(m, u, {
+          values: v,
+          target: t,
+          swap: 'outerHTML',
+          handler: (_elt, info) =>
+            resolve({ status: info.xhr ? info.xhr.status : 0, text: info.xhr ? info.xhr.responseText : '' }),
+        })
+      }),
+    method,
+    url,
+    values,
+    target,
+  )
+}
+
+/** 把 window.confirm 一律放行（hx-confirm / 批量删除确认框） */
+export async function autoConfirm() {
+  await browser.execute(() => {
+    window.confirm = () => true
+  })
+}
+
 /**
  * 跳转到应用内路径。
  * 页面跑在自定义协议上（macOS: ui://localhost/，Windows: http://ui.localhost/），
