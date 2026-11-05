@@ -102,9 +102,16 @@ describe('05 撰写与发送', () => {
     )
     const mail = sentMails().at(-1)
     expect(mail.raw).toContain('To: dest@corpmail.test')
-    // 中文主题走 RFC 2047 编码，解开比对
-    const m = mail.raw.match(/=\?utf-8\?B\?([^?]+)\?=/)
-    expect(m && Buffer.from(m[1], 'base64').toString('utf8')).toContain('E2E 发送链路验证')
+    // 中文主题走 RFC 2047（lettre 只编码非 ASCII 段、编码词用大写 B 小写 b
+    // 均合法，实际落盘是 `Subject: E2E =?utf-8?b?...?=`）：把 Subject 整行的
+    // 编码词逐个解码、拼上明文段，再比全文
+    const subjLine = mail.raw.match(/^Subject: (.*(?:\r?\n[ \t].*)*)/m)
+    expect(subjLine).not.toBeNull()
+    const subject = subjLine[1]
+      .replace(/=\?utf-?8\?[bB]\?([^?]*)\?=/g, (_, b64) =>
+        Buffer.from(b64, 'base64').toString('utf8'))
+      .replace(/\r?\n[ \t]+/g, '')
+    expect(subject).toContain('E2E 发送链路验证')
     fs.writeFileSync(path.join(runDir(), 'outbox-last.eml'), mail.raw)
 
     await goto('/?folder=sent')
