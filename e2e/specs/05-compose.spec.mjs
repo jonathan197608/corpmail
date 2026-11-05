@@ -26,11 +26,29 @@ async function openRowBySubject(text) {
 
 describe('05 撰写与发送', () => {
   it('D1 撰写页初始态：标题、模板下拉、空表单', async () => {
+    // 前置造一条模板：compose 的 #tpl-select 只在用户有模板时渲染
+    // （compose.html `{% if templates %}`），独立 HOME 初始为空表。
+    // 走 settings·模板 pane 的真实表单路径，顺带覆盖 B2 的新增入口。
+    await goto('/settings/templates')
+    await waitText('#settings-pane', '邮件模板')
+    await $('.tpl-form input[name="name"]').setValue('E2E 模板')
+    await $('.tpl-form textarea[name="body_text"]').setValue('收到，我这边核对后回复您。')
+    await $('.tpl-form button[type="submit"]').click()
+    await waitText('#settings-pane', '✓ 已保存')
+    await waitText('#settings-pane', 'E2E 模板')
+    await shot('设置-新增模板成功')
+
     await goto('/compose')
     await waitText('h1', '撰写新邮件')
     await expect($('input[name="to_addrs"]')).toHaveValue('')
     await expect($('#tpl-select')).toBeExisting()
-    await shot('撰写-初始态')
+    // 下拉里应有刚建的模板（DOM 状态用 execute 读， WKWebView 下 select
+    // 文本抽取不可靠）
+    const opts = await browser.execute(() =>
+      [...document.querySelectorAll('#tpl-select option')].map((o) => o.textContent),
+    )
+    expect(opts.some((t) => t.includes('E2E 模板'))).toBe(true)
+    await shot('撰写-初始态含模板下拉')
   })
 
   it('D2 草稿自动保存：停止输入 5s 后 hint 显示「已自动保存」', async () => {
