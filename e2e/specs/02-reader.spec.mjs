@@ -18,7 +18,8 @@ describe('02 读信与检索', () => {
     expect(opened).toBe(true)
 
     await browser.waitUntil(
-      async () => (await browser.getUrl()).includes('/threads/'),
+      // 默认列表为单封模式（/emails/{id}）；mode=thread 才是会话视图（/threads/）
+      async () => /\/(threads|emails)\//.test(await browser.getUrl()),
       { timeout: 15000, timeoutMsg: '未进入读信页' },
     )
     await waitBoot()
