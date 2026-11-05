@@ -2352,9 +2352,13 @@ a.btn.link.disabled {
     padding-right: 2px;
 }
 .mail-row .mbx-check input,
-.mbx-row .mbx-check input {
+.mbx-row .mbx-check input,
+.mbx-row .mbx-all input {
     width: 15px;
     height: 15px;
+    margin: 0;
+    flex: none;
+    vertical-align: middle;
     accent-color: var(--accent);
     cursor: pointer;
 }
@@ -2742,11 +2746,15 @@ a.btn.link.disabled {
     border: none;
     background: transparent;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1;
     padding: 2px 4px;
     cursor: pointer;
     border-radius: 6px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
 }
 
 .adv-toggle:hover {
