@@ -42,6 +42,16 @@ export async function waitBoot() {
   )
 }
 
+/** 读附件预览模态的开合状态（app.js 只切 hidden 属性）。
+ *  不用 isDisplayed：内嵌驱动下其 checkVisibility/W3C 算法不可靠
+ *  （实测模态已关仍返回 true），execute 通道已被 htmx.ajax/selectValue 实测可用。 */
+export function modalOpen() {
+  return browser.execute(() => {
+    const m = document.getElementById('preview-modal')
+    return !!m && !m.hidden
+  })
+}
+
 /** 等到某段文本出现在页面上（htmx 局部刷新后的断言基础） */
 export async function waitText(selector, text, timeout = 20000) {
   await browser.waitUntil(

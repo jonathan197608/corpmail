@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, waitText, modalOpen } from '../support/helpers.mjs'
 
 // 02：读信、附件、中文检索、已读切换。
 // 数据来自 mock 的 3 封 fixture（含一封 HTML + CSV 附件）。
@@ -33,13 +33,13 @@ describe('02 读信与检索', () => {
 
   it('点击附件名打开预览模态（CSV 走文本预览）', async () => {
     await $('.att-name.clickable').click()
-    await browser.waitUntil(
-      async () => (await $('#preview-modal')).isDisplayed(),
-      { timeout: 10000, timeoutMsg: '预览模态未打开' },
-    )
+    await browser.waitUntil(async () => modalOpen() === true, {
+      timeout: 10000,
+      timeoutMsg: '预览模态未打开',
+    })
     await shot('读信-附件预览')
     await $('.pm-close').click()
-    await browser.waitUntil(async () => !(await $('#preview-modal')).isDisplayed(), {
+    await browser.waitUntil(async () => modalOpen() === false, {
       timeout: 5000,
       timeoutMsg: '预览模态未关闭',
     })
