@@ -46,10 +46,10 @@
         <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
             <span>🔍</span>
             <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
-            {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件）；⚙ 配"高级"文案 #}
+            {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件）；🎛️ 配"高级"文案（贴合筛选语义） #}
             <button type="button" id="adv-toggle"
                     class="adv-toggle {% if from_filter or df or dt or has_attach %}on{% endif %}"
-                    title="高级检索：发件人、日期区间、附件" aria-label="高级检索">⚙ 高级</button>
+                    title="高级检索：发件人、日期区间、附件" aria-label="高级检索">🎛️ 高级</button>
             <input type="hidden" name="folder" value="{{ folder }}">
             {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
             {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
