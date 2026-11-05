@@ -67,7 +67,12 @@ export async function htmxAjax(method, url, values, target = '#toast') {
           target: t,
           swap: 'outerHTML',
           handler: (_elt, info) =>
-            resolve({ status: info.xhr ? info.xhr.status : 0, text: info.xhr ? info.xhr.responseText : '' }),
+            resolve({
+              status: info.xhr ? info.xhr.status : 0,
+              text: info.xhr ? info.xhr.responseText : '',
+              // 失败链路要断言「没有跳转」：HX-Redirect 在响应头里，不在正文
+              redirect: info.xhr ? info.xhr.getResponseHeader('HX-Redirect') : null,
+            }),
         })
       }),
     method,

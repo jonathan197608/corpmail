@@ -345,8 +345,14 @@ class SmtpHandler(socketserver.StreamRequestHandler):
                 self.rcpts = []
                 self.send("250 2.1.0 OK")
             elif up.startswith("RCPT TO"):
-                self.rcpts.append(line)
-                self.send("250 2.1.5 OK")
+                addr = line.split("<", 1)[1].split(">", 1)[0] if "<" in line else ""
+                # 失败链路注入：fail@ 开头的收件人一律 550 拒收，发送端走完整
+                # 的 failed 状态机（不污染配置、不依赖停机）。成功链路不受影响。
+                if addr.lower().startswith("fail"):
+                    self.send("550 5.1.1 mailbox unavailable（E2E 注入失败链路）")
+                else:
+                    self.rcpts.append(line)
+                    self.send("250 2.1.5 OK")
             elif up == "DATA":
                 self.send("354 End data with <CR><LF>.<CR><LF>")
                 chunks = []
