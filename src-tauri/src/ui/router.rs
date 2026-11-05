@@ -699,7 +699,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     if !q_input.is_empty() {
         base = format!("{base}q={}&", urlencode(&q_input));
     }
-    if per != PER_MIN {
+    if per != PER_DEFAULT {
         base = format!("{base}per={per}&");
     }
     if sort != mail::SortKey::DateDesc {
@@ -1103,7 +1103,9 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
             unread_only: form.get("unread").map(|v| v == "1").unwrap_or(false),
             external_only: form.get("external").map(|v| v == "1").unwrap_or(false),
             internal_domain: g(keys::ACCOUNT_DOMAIN),
-            per: PER_MIN,
+            // 不被 SelectAll 目标解析消费（batch_apply 只用过滤条件），取默认值
+            // 防未来误用成 LIMIT 1
+            per: PER_DEFAULT,
             // 排序不影响命中集（只影响 ORDER BY），按表单值回填即可
             sort: mail::SortKey::parse(form.get("sort").map(String::as_str)),
             // 高级检索（B1）：与列表同口径；日期非法按不限处理
@@ -2685,7 +2687,7 @@ fn rebuild_list_query(
         qs.push(format!("q={}", urlencode(q)));
     }
     if let Some(p) = clamp_per(per)
-        && p != PER_MIN
+        && p != PER_DEFAULT
     {
         qs.push(format!("per={p}"));
     }
@@ -2724,10 +2726,14 @@ fn clamp_page(raw: Option<&str>) -> i64 {
         .clamp(1, 100_000)
 }
 
-/// 每页条数下限（再少无意义）与上限（防恶意大值一次拉全表）。
-/// 合法选项 10/20/50/100，clamp 而非白名单：直链任意值也能得到合理表现
-const PER_MIN: i64 = 10;
+/// 每页条数下限（1 = 分页功能的最小可验证粒度，E2E B8 用 per=1 测翻页）
+/// 与上限（防恶意大值一次拉全表）。合法选项 10/20/50/100，clamp 而非白名单：
+/// 直链任意值也能得到合理表现
+const PER_MIN: i64 = 1;
 const PER_MAX: i64 = 100;
+/// 默认每页条数（settings 缺省值；URL 洁净阈值——per 等于默认值时不进
+/// 查询串，与 mail_list.html 的 `{% if per != 10 %}` 保持同一口径）
+const PER_DEFAULT: i64 = 10;
 
 /// 撤销发送窗口（A1）：点发送后先等这么多秒才真正入队，
 /// 窗口内 toast 提供「撤销发送」。与 app.js 的倒计时保持一致。
@@ -2745,7 +2751,7 @@ fn per_from_settings(state: &AppState) -> i64 {
     state
         .get_or(keys::PAGE_SIZE, &d)
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(PER_MIN)
+        .unwrap_or(PER_DEFAULT)
         .clamp(PER_MIN, PER_MAX)
 }
 

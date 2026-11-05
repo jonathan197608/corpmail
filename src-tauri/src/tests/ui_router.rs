@@ -3322,6 +3322,20 @@ fn clamp_page_unifies_range() {
     assert_eq!(clamp_page(Some("+3")), 3, "带符号合法值解析");
 }
 
+/// per 参数归一：下限 1（E2E B8 用 per=1 测翻页）、上限 100；非法/缺省 → None
+#[test]
+fn clamp_per_allows_single_page() {
+    assert_eq!(clamp_per(None), None, "缺省 → None（回退 settings）");
+    assert_eq!(clamp_per(Some("")), None, "空串非法 → None");
+    assert_eq!(clamp_per(Some("abc")), None, "非数字 → None");
+    assert_eq!(clamp_per(Some("0")), Some(1), "0 → 下限 1");
+    assert_eq!(clamp_per(Some("1")), Some(1), "per=1 原样（分页最小粒度）");
+    assert_eq!(clamp_per(Some("10")), Some(10), "合法默认值原样");
+    assert_eq!(clamp_per(Some("100")), Some(100), "恰好上限原样");
+    assert_eq!(clamp_per(Some("200")), Some(100), "超上限钳到 100");
+    assert_eq!(clamp_per(Some("-7")), Some(1), "负数 → 下限 1");
+}
+
 /// 大页码钳到 100000 后列表页正常渲染（有数据时该页为空态而非崩溃）
 #[test]
 fn clamped_beyond_data_page_renders_empty_state() {
