@@ -39,7 +39,8 @@ describe('07 原文视图与导出', () => {
     await goto('/')
     await waitBoot()
     await openRowBySubject('会议纪要')
-    await $('a[href$="/source"]').click()
+    // href 含 list_query 后缀（/emails/{id}/source?folder=...），不能用 $= 锚定结尾
+    await $('a[href*="/source"]').click()
     await browser.waitUntil(
       async () => (await browser.getUrl()).includes('/source'),
       { timeoutMsg: '未进入原文页' },
