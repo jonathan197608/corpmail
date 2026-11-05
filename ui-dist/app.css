@@ -1493,7 +1493,12 @@ a.btn.link.disabled {
 
 .mail-row.unread {
     border-left-color: var(--accent);   /* 状态脊线：未读蓝脊 */
-    background: #fbfdff;
+    /* 批次二：未读行浅蓝底更醒目（原 #fbfdff 太淡），hover 蓝更实 */
+    background: #eef4fc;
+}
+
+.mail-row.unread:hover {
+    background: #e5eefa;
 }
 
 .mail-row.unread .mr-subject,
@@ -1550,6 +1555,10 @@ a.btn.link.disabled {
 .mr-time {
     font-size: 12px;
     color: var(--muted);
+    white-space: nowrap;
+    /* 时间右置（批次二）：贴顶行右端，不参与换行 */
+    flex: none;
+    margin-left: auto;
 }
 
 .mr-main {
@@ -1636,6 +1645,8 @@ a.btn.link.disabled {
     font-size: 11px;
     color: var(--muted);
     white-space: nowrap;
+    /* 批次二：附件徽标与时间同列右端（主题 flex:1 撑起左段） */
+    flex: none;
 }
 
 .mr-preview {

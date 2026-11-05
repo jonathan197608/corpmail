@@ -94,7 +94,6 @@
             <a class="mr-link" href="/threads/{{ t.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="mr-side">
                     <span class="mr-who-row"><span class="mr-dot" aria-hidden="true"></span><span class="mr-who">{{ t.from_display }}</span></span>
-                    <span class="mr-time">{{ t.time_label }}</span>
                 </div>
                 <div class="mr-main">
                     <div class="mr-top">
@@ -102,6 +101,7 @@
                         <span class="mr-subject">{% if t.subject_html %}{{ t.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
                         <span class="mr-thread" title="会话往来 {{ t.thread_count }} 封">💬 {{ t.thread_count }}</span>
                         {% if t.attach_cnt > 0 %}<span class="mr-clip" title="{{ t.attach_cnt }} 个附件">📎 {{ t.attach_cnt }}</span>{% endif %}
+                        <span class="mr-time">{{ t.time_label }}</span>
                     </div>
                     <div class="mr-preview">{{ t.body_preview }}</div>
                 </div>
@@ -169,7 +169,6 @@
             <a class="mr-link" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="mr-side">
                     <span class="mr-who-row"><span class="mr-dot" aria-hidden="true"></span><span class="mr-who">{{ m.from_display }}</span></span>
-                    <span class="mr-time">{{ m.time_label }}</span>
                 </div>
                 <div class="mr-main">
                     <div class="mr-top">
@@ -181,6 +180,7 @@
                         {% if m.status == 'failed' %}<span class="mr-flag fail">发送失败</span>{% endif %}
                         {% if m.status == 'queued' or m.status == 'sending' %}<span class="mr-flag send">发送中</span>{% endif %}
                         {% if m.attach_cnt > 0 %}<span class="mr-clip" title="{{ m.attach_cnt }} 个附件">📎 {{ m.attach_cnt }}</span>{% endif %}
+                        <span class="mr-time">{{ m.time_label }}</span>
                     </div>
                     <div class="mr-preview">{{ m.body_preview }}</div>
                 </div>
