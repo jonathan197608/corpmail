@@ -20,9 +20,24 @@
     --ok-soft: #e2f3ec;
     --danger: #c93131;
     --danger-soft: #fbe9e9;
+    --warn: #b3621a;
+    --warn-soft: #fdf0e0;
     --draft: #8a94a8;
     --inbox: #7fb0e8;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+
+    /* ---- 文字层级（G1）：标题 > 次级 > 弱提示 > 辅助说明 ---- */
+    --t1: #152238;
+    --t2: #3d4a63;
+    --t3: #61708b;
+    --t-hint: #8a94ab;
+
+    /* ---- 按钮组（R1）：组内间距固定，不随窗口宽度变化 ---- */
+    --gap-btn: 8px;
+    --gap-btn-lg: 12px;
+
+    /* 焦点环（G2 统一 focus） */
+    --focus-ring: 0 0 0 3px rgba(0, 87, 194, 0.16);
 }
 
 * {
@@ -561,6 +576,8 @@ body {
 }
 
 /* ============ 通用元件 ============ */
+/* 按钮分级（G4）：primary=主、默认=次、danger=危险、ghost/link=文字型。
+   交互态：hover 加深、active 下压、focus-visible 焦点环、disabled 降饱和。 */
 .btn {
     display: inline-flex;
     align-items: center;
@@ -572,11 +589,21 @@ body {
     padding: 8px 16px;
     background: #e9edf5;
     color: var(--ink);
-    transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+    white-space: nowrap;
+    transition: background 0.12s, color 0.12s, box-shadow 0.12s, transform 0.06s;
 }
 
 .btn:hover {
     background: #dfe5f1;
+}
+
+.btn:active {
+    transform: translateY(1px);
+}
+
+.btn:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
 }
 
 .btn.primary {
@@ -590,27 +617,31 @@ body {
 }
 
 .btn.danger {
-    color: var(--danger);
-    background: #f6ecf0;
+    /* 实心红：强警示（G4），删除/清理等破坏性操作专属 */
+    background: var(--danger);
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(201, 49, 49, 0.22);
 }
 
 .btn.danger:hover {
-    background: var(--danger-soft);
+    background: #b02626;
 }
 
+.btn.ghost,
 .btn.link {
     background: transparent;
     color: var(--muted);
     padding: 8px 10px;
 }
 
+.btn.ghost:hover,
 .btn.link:hover {
     color: var(--ink);
     background: var(--bg);
 }
 
 .btn.big {
-    padding: 12px;
+    padding: 12px 18px;
     font-size: 14.5px;
 }
 
@@ -618,6 +649,44 @@ body {
     opacity: 0.55;
     cursor: not-allowed;
     box-shadow: none;
+}
+
+.btn[disabled]:active {
+    transform: none;
+}
+
+/* 按钮组（R1）：组内间距固定（--gap-btn），整组不随窗口宽度拉伸；
+   组内禁止各自 auto-margin（那会让间距随剩余空间漂移）。
+   换行按组为单位（flex-wrap 时整组走），组内按钮永不拆散。 */
+.btn-group {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--gap-btn);
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.btn-group > .btn {
+    margin: 0;
+}
+
+.btn-group + .btn-group {
+    margin-left: 2px;
+}
+
+/* 组间语义分隔线（普通操作 与 危险操作之间用） */
+.btn-group .btn-sep {
+    width: 1px;
+    height: 16px;
+    align-self: center;
+    margin: 0 4px;
+    background: var(--line);
+}
+
+/* 组外推尾：单个占位（spacer 或 .btn-group{ margin-left:auto }）负责把整组推到端，
+   由容器层决定，禁止每个按钮各自 margin-left:auto。 */
+.btn-group.push-right {
+    margin-left: auto;
 }
 
 .card {
@@ -1966,42 +2035,65 @@ a.btn.link.disabled {
     display: none;
 }
 
+/* 轻提示（G3）：语义色实心底 + 白字，提升对比度；滑入动效 */
+@keyframes mbx-toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
 .toast {
     position: fixed;
-    right: 18px;
-    bottom: 18px;
+    right: 20px;
+    bottom: 20px;
     max-width: 420px;
     border-radius: 10px;
-    padding: 10px 16px;
-    font-size: 13px;
-    box-shadow: 0 6px 22px rgba(21, 34, 56, 0.18);
+    padding: 12px 18px;
+    font-size: 13.5px;
+    box-shadow: 0 8px 26px rgba(21, 34, 56, 0.24);
     word-break: break-all;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    animation: mbx-toast-in 0.18s ease-out;
 }
 
 .toast.ok {
-    background: var(--ok-soft);
-    color: var(--ok);
-    border: 1px solid #bfe5d5;
+    background: var(--ok);
+    color: #fff;
 }
 
 .toast.err {
-    background: #f9eef1;
-    color: var(--danger);
-    border: 1px solid #f0dbe0;
+    background: var(--danger);
+    color: #fff;
 }
 
-/* 发送中反馈（M1-6）：中性蓝灰——还无终态，既非成功绿也非失败红 */
 .toast.busy {
-    background: #eef2f8;
-    color: var(--ink, #35527a);
-    border: 1px solid #dbe4f0;
+    background: #35527a;
+    color: #fff;
+}
+
+.toast .btn,
+.toast button {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.16);
+    border: 1px solid rgba(255, 255, 255, 0.42);
+    box-shadow: none;
+}
+
+.toast .btn:hover {
+    background: rgba(255, 255, 255, 0.26);
 }
 
 .btn.small {
     font-size: 12px;
     padding: 4px 10px;
     border-radius: 7px;
-    margin-left: auto;
 }
 
 .att-row .btn.small {
@@ -2546,7 +2638,7 @@ a.btn.link.disabled {
 
 /* 撤销发送 toast（A1）：文案 + 按钮同行，按钮不撑高 toast */
 .toast .toast-undo {
-    margin-left: 10px;
+    white-space: nowrap;
 }
 
 /* 键盘选中行（A3）：内描边不改变行尺寸，避免列表跳动 */
