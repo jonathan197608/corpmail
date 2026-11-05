@@ -46,6 +46,14 @@ describe('07 原文视图与导出', () => {
       { timeoutMsg: '未进入原文页' },
     )
     await waitBoot()
+    // 默认 tab 是「HTML 源码」，纯文本邮件（会议纪要）显示空态——Message-ID
+    // 与收发头在「原始信头」tab（?part=headers）
+    await $('a[href*="part=headers"]').click()
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).includes('part=headers'),
+      { timeoutMsg: '未切到原始信头 tab' },
+    )
+    await waitBoot()
     const text = await $('body').getText()
     expect(text).toMatch(/e2e-\d+@corpmail\.test/) // fixture Message-ID
     expect(text).toContain('wangqiang@corpmail.test')
