@@ -59,9 +59,8 @@
     </div>
 
     {# 高级检索面板（B1）：GET 表单，保留 folder/q/mode/per/sort；
-       有激活条件时默认展开。清除按钮清空四项并提交。 #}
-    <form class="adv-panel" id="adv-panel" method="get" action="/"
-          {% if not (from_filter or df or dt or has_attach) %}hidden{% endif %}>
+       默认收起（2026-11-05：即使有激活筛选也收起，点 ⚙ 展开查看/修改条件） #}
+    <form class="adv-panel" id="adv-panel" method="get" action="/" hidden>
         <input type="hidden" name="folder" value="{{ folder }}">
         {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
         {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}

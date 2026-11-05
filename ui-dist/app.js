@@ -1030,8 +1030,7 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         var n = selectedCount();
         var countEl = document.getElementById('ba-count');
         var allLink = document.getElementById('ba-select-all');
-        // 批次二：未选时整条收起（有选中再出现），不再常驻禁用态
-        bar().hidden = n === 0;
+        // 工具栏常驻：按选中数切换按钮禁用态（位置固定不跳动）
         var btns = document.querySelectorAll('#batch-bar [data-batch], #batch-bar #ba-clear');
         Array.prototype.forEach.call(btns, function (b) { b.disabled = n === 0; });
         if (!countEl) return;
@@ -1225,32 +1224,32 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
 })();
 
 // ---------- 高级检索面板（B1） ----------
-// 搜索框右侧 ⚙ 切换面板；清除筛选清空四项后提交（保留 folder/排序/每页）
-(function () {
-    var btn = document.getElementById('adv-toggle');
+// 搜索框右侧 ⚙ 切换面板；清除筛选清空四项后提交（保留 folder/排序/每页）。
+// 用事件委托：htmx 局部换入 topbar/adv-panel 后新元素仍生效（2026-11-05 修复点击失效）
+document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || !t.closest) return;
     var panel = document.getElementById('adv-panel');
-    if (btn && panel) {
-        btn.addEventListener('click', function () {
-            panel.hidden = !panel.hidden;
-            if (!panel.hidden) {
-                var first = panel.querySelector('input[name="from"]');
-                if (first) first.focus();
-            }
-        });
+    var toggle = t.closest('#adv-toggle');
+    if (toggle && panel) {
+        panel.hidden = !panel.hidden;
+        if (!panel.hidden) {
+            var first = panel.querySelector('input[name="from"]');
+            if (first) first.focus();
+        }
+        return;
     }
-    var clear = document.getElementById('adv-clear');
+    var clear = t.closest('#adv-clear');
     if (clear && panel) {
-        clear.addEventListener('click', function () {
-            ['from', 'df', 'dt'].forEach(function (n) {
-                var el = panel.querySelector('input[name="' + n + '"]');
-                if (el) el.value = '';
-            });
-            var att = panel.querySelector('input[name="att"]');
-            if (att) att.checked = false;
-            panel.submit();
+        ['from', 'df', 'dt'].forEach(function (n) {
+            var el = panel.querySelector('input[name="' + n + '"]');
+            if (el) el.value = '';
         });
+        var att = panel.querySelector('input[name="att"]');
+        if (att) att.checked = false;
+        panel.submit();
     }
-})();
+});
 
 // ---------- 键盘快捷键（A3） ----------
 // 列表：j / ↓ 下移、k / ↑ 上移、Enter / o 打开选中、/ 聚焦搜索、n 新建邮件

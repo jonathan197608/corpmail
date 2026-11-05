@@ -332,7 +332,8 @@ body {
     border: 1px solid var(--line);
     background: var(--panel);
     border-radius: 9px;
-    padding: 7px 13px;
+    padding: 0 13px;
+    height: 34px;
     font-size: 12.5px;
     color: var(--ink-soft);
     cursor: pointer;
@@ -377,8 +378,9 @@ body {
     font-size: 12.5px;
     color: var(--ink-soft);
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 5px 8px;
+    border-radius: 9px;
+    padding: 0 10px;
+    height: 34px;
     background: var(--panel);
     cursor: pointer;
 }
@@ -405,7 +407,8 @@ body {
     align-items: center;
     gap: 8px;
     width: 240px;
-    padding: 8px 12px;
+    padding: 0 12px;
+    height: 34px;
     border: 1px solid var(--line);
     border-radius: 9px;
     background: var(--bg);
@@ -1695,8 +1698,11 @@ a.btn.link.disabled {
     font-size: 12.5px;
     color: var(--muted);
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 5px 10px;
+    border-radius: 9px;
+    padding: 0 10px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
     white-space: nowrap;
 }
 
@@ -2378,52 +2384,6 @@ a.btn.link.disabled {
     font-size: 12px;
 }
 
-/* 批次二：未选时整条收起（flex 需显式 display:none 盖掉） */
-.mbx-row[hidden] {
-    display: none;
-}
-/* 「本页全选」label：复选框与文字同行 */
-.mbx-all {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    cursor: pointer;
-    color: var(--ink-soft);
-    font-weight: 500;
-    white-space: nowrap;
-    user-select: none;
-}
-/* 已选计数（选中 >0 时由 js 写入） */
-.mbx-row .ba-count {
-    font-weight: 700;
-    color: var(--ink);
-    white-space: nowrap;
-}
-/* 弹性占位：把操作按钮组推到行尾 */
-.ba-spacer { flex: 1; }
-/* 跨页全选入口（非检索态且有选中时显示）：轻量链接式 */
-#ba-select-all {
-    color: var(--accent);
-    font-weight: 600;
-    white-space: nowrap;
-    text-decoration: none;
-}
-#ba-select-all:hover {
-    text-decoration: underline;
-}
-/* 批量星标按钮（M2-1 进批量栏）：金色调呼应行内星标 */
-.btn.small.star-op {
-    color: #b97e10;
-}
-.btn.small.star-op:hover {
-    border-color: #f0d9ab;
-    background: #fdf6e7;
-    color: #b97e10;
-}
-.btn.small.star-op[disabled] {
-    color: #b97e10;
-    opacity: 0.45;
-}
 
 /* ---------- 星标（M2-1→紧凑化改版）：列表行金色左脊线 + 详情页按钮 ----------
    列表不再有行内星标按钮（省列宽、去视觉噪声）：星标行以金色脊线区分，
@@ -2799,7 +2759,7 @@ a.btn.link.disabled {
     background: var(--accent-soft);
 }
 
-/* 面板：顶栏下方独立一行，含条件时默认展开 */
+/* 面板：顶栏下方独立一行，默认收起（hidden），点 ⚙ 展开 */
 .adv-panel {
     display: flex;
     align-items: center;
@@ -2810,6 +2770,10 @@ a.btn.link.disabled {
     border-bottom: 1px solid var(--line);
     font-size: 12.5px;
     color: var(--ink-soft);
+}
+
+.adv-panel[hidden] {
+    display: none;
 }
 
 .adv-field {

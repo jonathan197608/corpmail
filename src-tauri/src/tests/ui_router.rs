@@ -6784,7 +6784,7 @@ fn advanced_search_filters_and_persists() {
         2,
         "非法日期应忽略：{html}"
     );
-    // 高级面板在有条件时展开（hidden 不应出现）
+    // 高级面板默认收起（2026-11-05：即使有筛选条件也收起，点 ⚙ 展开查看）
     let html = body(&route(
         &state,
         &assets(),
@@ -6792,12 +6792,8 @@ fn advanced_search_filters_and_persists() {
         &t,
     ));
     assert!(
-        html.contains("id=\"adv-panel\" method=\"get\""),
-        "应渲染面板"
-    );
-    assert!(
-        !html.contains("id=\"adv-panel\" method=\"get\" action=\"/\"\n          hidden"),
-        "有条件时面板应展开"
+        html.contains("id=\"adv-panel\" method=\"get\" action=\"/\" hidden"),
+        "面板应渲染且默认收起（hidden）：{html}"
     );
     cleanup(&dir);
 }
