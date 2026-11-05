@@ -33,13 +33,13 @@ describe('02 读信与检索', () => {
 
   it('点击附件名打开预览模态（CSV 走文本预览）', async () => {
     await $('.att-name.clickable').click()
-    await browser.waitUntil(async () => modalOpen() === true, {
+    await browser.waitUntil(async () => (await modalOpen()) === true, {
       timeout: 10000,
       timeoutMsg: '预览模态未打开',
     })
     await shot('读信-附件预览')
     await $('.pm-close').click()
-    await browser.waitUntil(async () => modalOpen() === false, {
+    await browser.waitUntil(async () => (await modalOpen()) === false, {
       timeout: 5000,
       timeoutMsg: '预览模态未关闭',
     })
