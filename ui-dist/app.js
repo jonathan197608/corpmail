@@ -1030,7 +1030,8 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         var n = selectedCount();
         var countEl = document.getElementById('ba-count');
         var allLink = document.getElementById('ba-select-all');
-        // 工具栏常驻：按选中数切换按钮禁用态（位置固定不跳动）
+        // 批次二：未选时整条收起（有选中再出现），不再常驻禁用态
+        bar().hidden = n === 0;
         var btns = document.querySelectorAll('#batch-bar [data-batch], #batch-bar #ba-clear');
         Array.prototype.forEach.call(btns, function (b) { b.disabled = n === 0; });
         if (!countEl) return;
