@@ -64,27 +64,48 @@ export async function waitText(selector, text, timeout = 20000) {
 export const runDir = () => process.env.E2E_RUN_DIR || path.resolve('artifacts', 'adhoc')
 
 /**
- * 页面侧 htmx.ajax。用于绕过原生目录/文件对话框：保存类接口
- * （导出 .eml / 附件另存 / 数据目录迁移）本来由前端先弹 Tauri 对话框
- * 选 dest 再 POST，自动化里直接 POST dest 表单值，返回 {status, text}。
+ * 保存类接口的自动化驱动（导出 .eml / 附件另存 / 数据目录迁移等
+ * 本来由前端先弹 Tauri 对话框选 dest 再 POST 的接口）。
+ *
+ * 不用 htmx.ajax + config.handler：htmx 把自定义 handler 当作
+ * 「替代默认 swap handler」调用（源码 const M = i.handler||jn，onload
+ * 里 M(elt,info) 即 swap 本身）——handler 只捕获响应则 DOM 永不更新，
+ * swap 后的断言必然超时。改为 fetch + 手动替换目标节点：
+ * 返回 {status, text, redirect, swapped}，语义与真实前端一致。
  */
 export async function htmxAjax(method, url, values, target = '#toast') {
   return browser.execute(
-    async (m, u, v, t) =>
-      new Promise((resolve) => {
-        htmx.ajax(m, u, {
-          values: v,
-          target: t,
-          swap: 'outerHTML',
-          handler: (_elt, info) =>
-            resolve({
-              status: info.xhr ? info.xhr.status : 0,
-              text: info.xhr ? info.xhr.responseText : '',
-              // 失败链路要断言「没有跳转」：HX-Redirect 在响应头里，不在正文
-              redirect: info.xhr ? info.xhr.getResponseHeader('HX-Redirect') : null,
-            }),
-        })
-      }),
+    async (m, u, v, t) => {
+      const body = Object.entries(v || {})
+        .map(([k, val]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(val))}`)
+        .join('&')
+      const resp = await fetch(u, {
+        method: m,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      })
+      const text = await resp.text()
+      const elt = document.querySelector(t)
+      let swapped = false
+      if (elt) {
+        const tmp = document.createElement('div')
+        tmp.innerHTML = text
+        const frag = tmp.firstElementChild
+        if (frag && frag.id && frag.id === elt.id) {
+          elt.replaceWith(frag)
+        } else {
+          elt.outerHTML = text
+        }
+        swapped = true
+      }
+      return {
+        status: resp.status,
+        text,
+        // 失败链路要断言「没有跳转」：HX-Redirect 在响应头里，不在正文
+        redirect: resp.headers.get('HX-Redirect'),
+        swapped,
+      }
+    },
     method,
     url,
     values,
