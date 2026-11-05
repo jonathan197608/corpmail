@@ -192,6 +192,12 @@ body {
     background: var(--accent-soft);
     color: var(--accent-deep);
     font-weight: 600;
+    /* 批次二：选中项加蓝色左脊线（与邮件行未读脊线同语言），
+       左侧圆角让位成直切，脊线贴成导航轨 */
+    border-left: 3px solid var(--accent);
+    border-top-left-radius: 2px;
+    border-bottom-left-radius: 2px;
+    padding-left: 7px;
 }
 
 .folder .cnt {
