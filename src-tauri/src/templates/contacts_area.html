@@ -31,6 +31,13 @@
 
     <div class="contacts-list">
     {% if items %}
+        {# 批次二：表头行——姓名/邮箱、最近联系、操作；仅在有数据时显示 #}
+        <div class="contacts-head" aria-hidden="true">
+            <span class="ch-avatar"></span>
+            <span class="ch-name">姓名 / 邮箱</span>
+            <span class="ch-meta">最近联系 · 往来</span>
+            <span class="ch-op">操作</span>
+        </div>
         {% for c in items %}
         <div class="contact-row">
             <span class="ct-avatar" aria-hidden="true">{{ c.avatar }}</span>

@@ -2548,6 +2548,38 @@ a.btn.link.disabled {
     padding: 8px 10px;
 }
 
+/* 批次二：联系人表头行（与 .contact-row 同栅格：占位头像 + 姓名列 + 元信息 + 操作） */
+.contacts-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    user-select: none;
+}
+
+.contacts-head .ch-avatar {
+    flex: 0 0 32px;
+}
+
+.contacts-head .ch-name {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.contacts-head .ch-meta {
+    flex: 0 0 160px;
+    text-align: right;
+}
+
+.contacts-head .ch-op {
+    flex: 0 0 96px;
+    text-align: right;
+}
+
 .contact-row {
     display: flex;
     align-items: center;
@@ -2611,9 +2643,10 @@ a.btn.link.disabled {
 
 /* 右侧元信息 + 删除按钮（窄列，不参与挤压） */
 .ct-meta {
-    flex: 0 0 auto;
+    flex: 0 0 160px;
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 12px;
 }
 
