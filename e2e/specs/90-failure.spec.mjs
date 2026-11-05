@@ -81,16 +81,19 @@ describe('90 失败链路', () => {
   it('F4 发送失败链路：fail@ 550 拒收 → failed 状态 → 重发回撰写页', async () => {
     await goto('/compose')
     await waitBoot()
-    await $('input[name="to_addrs"]').setValue('fail@corpmail.test')
-    await $('input[name="subject"]').setValue('E2E 发送失败注入')
-    await $('#body-text').setValue('mock SMTP 对该收件人返回 550，应走完整 failed 状态机。')
-    await $('button.btn.primary.big').click()
-    await browser.waitUntil(
-      async () => (await browser.getUrl()).includes('just_sent='),
-      { timeoutMsg: '未回列表（校验失败会停在撰写页）' },
-    )
-    await waitBoot()
-    const id = new URL(await browser.getUrl()).searchParams.get('just_sent')
+    // 发送走 htmxAjax 而非点按钮：跳回列表后 app.js 首帧 replaceState 清掉
+    // just_sent（防刷新重复提示），URL 里取不到 id；htmxAjax 直接读响应头
+    // HX-Redirect（在任何前端清理之前），确定性拿到邮件 id
+    const res = await htmxAjax('POST', '/compose/send', {
+      to_addrs: 'fail@corpmail.test',
+      subject: 'E2E 发送失败注入',
+      body_text: 'mock SMTP 对该收件人返回 550，应走完整 failed 状态机。',
+      body_mode: 'plain',
+      scheduled_at: '',
+    })
+    expect(res.status).toBe(200)
+    expect(res.redirect).toContain('just_sent=')
+    const id = new URL(res.redirect, 'http://x/').searchParams.get('just_sent')
     expect(id).toBeTruthy()
     await shot('失败-已入队撤销窗')
 

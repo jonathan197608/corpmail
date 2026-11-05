@@ -87,12 +87,13 @@ describe('05 撰写与发送', () => {
     await shot('撰写-待发送')
     await $('button.btn.primary.big').click() // 📨 发送
 
-    // 回列表并带 just_sent（撤销窗口 toast）；8s 后调度线程真正派发 SMTP
+    // 跳回列表后 app.js 首帧立即 replaceState 清掉 just_sent（防刷新重复提示），
+    // URL 断言是竞态必挂——撤销窗口 toast 出现才是「已排入队列」的可靠证据
     await browser.waitUntil(
-      async () => (await browser.getUrl()).includes('just_sent='),
-      { timeoutMsg: '发送后未回列表（可能校验失败停在撰写页）' },
+      async () => (await $('.toast.busy').isExisting()),
+      { timeoutMsg: '发送后未出现撤销窗口 toast（可能校验失败停在撰写页）' },
     )
-    await waitBoot()
+    await waitText('.toast', '发送队列')
     await shot('发送-撤销窗口toast')
 
     await browser.waitUntil(
@@ -118,9 +119,10 @@ describe('05 撰写与发送', () => {
     await $(COMPOSE.subject).setValue('E2E 撤销窗口验证')
     await $(COMPOSE.body).setValue('发出后立即撤销。')
     await $('button.btn.primary.big').click()
+    // 等 toast（URL just_sent 已被 app.js replaceState 清掉，见 D4 注释）
     await browser.waitUntil(
-      async () => (await browser.getUrl()).includes('just_sent='),
-      { timeoutMsg: '未回列表' },
+      async () => (await $('.toast.busy').isExisting()),
+      { timeoutMsg: '未回列表/撤销 toast 未出现' },
     )
     await waitBoot()
 
