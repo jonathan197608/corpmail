@@ -7175,6 +7175,22 @@ fn office_preview_routes_serve_clean_bytes_and_text() {
     let text = String::from_utf8(resp.body).unwrap();
     assert!(text.contains("宽带提速配案季度汇报"), "{text}");
 
+    // 附件 id 不存在（或跨邮件）：404，不暴露任何字节
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1/attachments/999/office", b""),
+        &tester,
+    );
+    assert_eq!(resp.status, 404);
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/2/attachments/999/office", b""),
+        &tester,
+    );
+    assert_eq!(resp.status, 404, "跨邮件/不存在的邮件同样 404");
+
     // 原 /view 仍按下载处理（Office 不做内联 MIME）
     let resp = route(
         &state,

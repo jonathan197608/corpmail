@@ -125,6 +125,7 @@ fn sanitize_removes_macros_embeddings_and_external_relationships() {
     let raw = zip_of(&[
         ("[Content_Types].xml", b"<Types/>"),
         ("word/document.xml", b"<w:document/>"),
+        ("word/media/image1.png", b"PNGDATA"),
         ("word/vbaProject.bin", b"macro"),
         ("word/embeddings/oleObject1.bin", b"ole"),
         ("word/_rels/document.xml.rels", rels),
@@ -135,6 +136,10 @@ fn sanitize_removes_macros_embeddings_and_external_relationships() {
         .map(|i| archive.by_index_raw(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.iter().any(|n| n == "word/document.xml"));
+    assert!(
+        names.iter().any(|n| n == "word/media/image1.png"),
+        "内部图片应保留：{names:?}"
+    );
     assert!(
         !names.iter().any(|n| n.contains("vbaProject")),
         "宏应移除：{names:?}"
@@ -218,4 +223,37 @@ fn preview_limit_reads_setting_and_clamps() {
         .unwrap();
     assert_eq!(preview_max_bytes(&state), 200 * 1024 * 1024, "上限 200MB");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn detect_reports_damaged_zip_for_ooxml_extension() {
+    // 有 ZIP 魔数但目录损坏：按扩展名报 422 损坏，而不是当成普通文件下载提示
+    let broken = b"PK\x03\x04garbage".to_vec();
+    assert!(matches!(
+        detect("", "坏.docx", &broken),
+        Err(OfficeError::Damaged(_))
+    ));
+    assert!(matches!(
+        detect("", "坏.xlsx", &broken),
+        Err(OfficeError::Damaged(_))
+    ));
+}
+
+#[test]
+fn extract_text_docx_truncates_over_limit() {
+    let big = "宽带提速配案执行情况汇报。".repeat(40_000);
+    let xml = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{big}</w:t></w:r></w:p></w:body></w:document>"#
+    );
+    let docx = zip_of(&[
+        ("[Content_Types].xml", b"<Types/>"),
+        ("word/document.xml", xml.as_bytes()),
+    ]);
+    let text = extract_text(&docx, OfficeKind::Docx).unwrap();
+    assert!(
+        text.contains("已截断"),
+        "超限应截断：前 80 字 {}",
+        &text[..80]
+    );
+    assert!(text.chars().count() <= MAX_TEXT_CHARS + 20);
 }
