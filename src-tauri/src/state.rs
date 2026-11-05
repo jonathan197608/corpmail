@@ -31,6 +31,8 @@ pub mod keys {
     pub const SYNC_INTERVAL_MIN: &str = "sync_interval_min";
     pub const FIRST_FETCH_DAYS: &str = "first_fetch_days";
     pub const INLINE_ATTACH_MAX_MB: &str = "inline_attach_max_mb";
+    /// 单文件 Office 预览上限（MB，默认 20）
+    pub const OFFICE_PREVIEW_MAX_MB: &str = "office_preview_max_mb";
     pub const CLEAN_SENT_BULK_DAYS: &str = "clean_sent_bulk_days";
     pub const KEEP_INBOX_DAYS: &str = "keep_inbox_days";
     pub const KEEP_SENT_DAYS: &str = "keep_sent_days";

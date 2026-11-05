@@ -2862,3 +2862,148 @@ a.btn.link.disabled {
         text-decoration: none !important;
     }
 }
+
+/* ============ B8 Office 附件预览 ============ */
+/* 宽版面板：Word/Excel/PPT 需要比图片预览更大的画布 */
+.pm-panel.office {
+    width: min(94vw, 1280px);
+    height: min(90vh, 900px);
+}
+
+.pm-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    background: var(--bg);
+    min-height: 38px;
+    flex-wrap: wrap;
+}
+
+.pm-toolbar[hidden] {
+    display: none;
+}
+
+.pm-tools-left,
+.pm-tools-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.pm-tools-right {
+    margin-left: auto;
+}
+
+.pm-tools-label {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.pm-tools-note {
+    font-size: 11.5px;
+    color: #a63b0a;
+    background: #fdece0;
+    border-radius: 5px;
+    padding: 1px 6px;
+}
+
+.pm-sheet-tab {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--ink-soft);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pm-sheet-tab:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.pm-sheet-tab.on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.pm-body.office {
+    overflow: hidden;
+    padding: 0;
+    background: #fff;
+}
+
+.pm-body.office iframe {
+    width: 100%;
+    height: 100%;
+    display: block;
+    border: none;
+    background: #fff;
+}
+
+.pm-loading {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.pm-loading i {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 3px solid #d3dbe8;
+    border-top-color: var(--accent);
+    display: inline-block;
+    animation: bootspin 0.8s linear infinite;
+}
+
+.pm-error {
+    max-width: 620px;
+    margin: 8vh auto 0;
+    padding: 0 24px;
+    text-align: center;
+}
+
+.pm-error-title {
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 10px;
+}
+
+.pm-error-msg {
+    font-size: 13px;
+    line-height: 1.8;
+    color: var(--muted);
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.pm-error-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+}
+
+.pm-fallback-note {
+    padding: 8px 16px;
+    background: #fff8e6;
+    color: #8a5a00;
+    border-bottom: 1px solid #f0dfae;
+    font-size: 12.5px;
+}

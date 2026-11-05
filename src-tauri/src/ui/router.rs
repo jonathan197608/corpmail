@@ -500,6 +500,22 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", p) if p.starts_with("/emails/") && p.contains("/attachments/") => {
             Some(attachment_save(state, req))
         }
+        // B8 Office 预览：安全清洗后的字节与纯文本兜底。
+        // 必须在通用 /view 分支之前（同为多段 GET 路径）
+        ("GET", p)
+            if p.starts_with("/emails/")
+                && p.contains("/attachments/")
+                && p.ends_with("/office-text") =>
+        {
+            Some(attachment_office_text(state, req))
+        }
+        ("GET", p)
+            if p.starts_with("/emails/")
+                && p.contains("/attachments/")
+                && p.ends_with("/office") =>
+        {
+            Some(attachment_office(state, req))
+        }
         ("GET", p)
             if p.starts_with("/emails/") && p.contains("/attachments/") && p.ends_with("/view") =>
         {
@@ -2227,6 +2243,98 @@ fn redirect_compose_ctx(draft_id: i64, error: &str, ctx_qs: &str) -> Resp {
         "/compose?draft_id={draft_id}&error={}&{ctx_qs}",
         urlencode(error)
     ))
+}
+
+/// Office 预览（B8，GET /emails/{id}/attachments/{aid}/office）：
+/// 大小检查 → 格式判定 → 清理宏/OLE/外部关系后回清洗副本（前端本地渲染）。
+fn attachment_office(state: &AppState, req: &Req) -> Resp {
+    let Some((email_id, aid)) = path_attach(&req.path) else {
+        return Resp::not_found();
+    };
+    let Some((view, bytes)) = mail::attachment_bytes(state, email_id, aid) else {
+        return Resp::not_found();
+    };
+    let max = mail::office::preview_max_bytes(state);
+    if bytes.len() as u64 > max {
+        return office_error_resp(
+            413,
+            &format!(
+                "文件大小 {:.1}MB 超过预览上限 {}MB；请下载后用系统应用打开。",
+                bytes.len() as f64 / 1024.0 / 1024.0,
+                max / 1024 / 1024
+            ),
+        );
+    }
+    match mail::office::detect(&view.mime, &view.filename, &bytes) {
+        Ok(kind) => match mail::office::sanitize_for_preview(&bytes, kind) {
+            Ok(clean) => Resp {
+                status: 200,
+                content_type: "application/octet-stream".into(),
+                cache_control: "no-store",
+                body: clean,
+                extra_headers: vec![
+                    ("X-Content-Type-Options".into(), "nosniff".into()),
+                    ("Content-Disposition".into(), "inline".into()),
+                ],
+            },
+            Err(e) => office_error_resp(e.http_status(), &e.message()),
+        },
+        Err(e) => office_error_resp(e.http_status(), &e.message()),
+    }
+}
+
+/// Office 纯文本兜底（B8，GET /emails/{id}/attachments/{aid}/office-text）：
+/// DOCX/XLSX/XLS 抽取正文；PPTX 按产品要求不降级（前端提示下载）。
+fn attachment_office_text(state: &AppState, req: &Req) -> Resp {
+    let Some((email_id, aid)) = path_attach(&req.path) else {
+        return Resp::not_found();
+    };
+    let Some((view, bytes)) = mail::attachment_bytes(state, email_id, aid) else {
+        return Resp::not_found();
+    };
+    let max = mail::office::preview_max_bytes(state);
+    if bytes.len() as u64 > max {
+        return office_error_resp(
+            413,
+            &format!(
+                "文件大小 {:.1}MB 超过预览上限 {}MB；请下载后用系统应用打开。",
+                bytes.len() as f64 / 1024.0 / 1024.0,
+                max / 1024 / 1024
+            ),
+        );
+    }
+    let kind = match mail::office::detect(&view.mime, &view.filename, &bytes) {
+        Ok(k) => k,
+        Err(e) => return office_error_resp(e.http_status(), &e.message()),
+    };
+    if kind == mail::office::OfficeKind::Pptx {
+        return office_error_resp(
+            415,
+            "PPTX 不提供文本预览；请下载后用 Microsoft PowerPoint 打开。",
+        );
+    }
+    match mail::office::extract_text(&bytes, kind) {
+        Ok(text) if !text.trim().is_empty() => Resp {
+            status: 200,
+            content_type: "text/plain; charset=utf-8".into(),
+            cache_control: "no-store",
+            body: text.into_bytes(),
+            extra_headers: vec![("X-Content-Type-Options".into(), "nosniff".into())],
+        },
+        Ok(_) => office_error_resp(422, "未能从文件中提取到可预览的文本。"),
+        Err(e) => office_error_resp(e.http_status(), &e.message()),
+    }
+}
+
+/// 预览错误统一为 text/plain，前端直接展示 body
+fn office_error_resp(status: u16, message: &str) -> Resp {
+    Resp {
+        status,
+        content_type: "text/plain; charset=utf-8".into(),
+        cache_control: "no-store",
+        body: message.as_bytes().to_vec(),
+        extra_headers: vec![("X-Content-Type-Options".into(), "nosniff".into())],
+    }
 }
 
 /// 附件预览（GET /emails/{id}/attachments/{aid}/view，M5）：解压后按原始 MIME 内联返回。

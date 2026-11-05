@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="/app.css">
     <script src="/htmx.min.js" defer></script>
     <script src="/app.js" defer></script>
+    <script src="/office-preview.js" defer></script>
     <style>
         /* 启动引导动画（M5）：内联样式不依赖 app.css，首帧即显；
            app.js 执行时移除（覆盖 HTML 注入到脚本就绪的间隙） */
@@ -57,6 +58,7 @@
                 <span id="pm-name" class="pm-name"></span>
                 <button type="button" class="pm-close" onclick="mbxClosePreview()" title="关闭预览">✕</button>
             </div>
+            <div id="pm-toolbar" class="pm-toolbar" hidden></div>
             <div id="pm-body" class="pm-body"></div>
         </div>
     </div>
