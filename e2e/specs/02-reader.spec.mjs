@@ -49,7 +49,10 @@ describe('02 读信与检索', () => {
     await goto('/')
     const input = await $('form.search input')
     await input.setValue('季度')
-    await browser.keys('Enter')
+    // 插件对合成 Enter 只模拟换行/编辑副作用，不模拟「文本框回车隐式提交表单」
+    // （key_input.rs line_break_js），browser.keys('Enter') 永远不导航。
+    // 用 requestSubmit 触发真实 GET 导航。
+    await browser.execute(() => document.querySelector('form.search').requestSubmit())
     await browser.waitUntil(
       async () => (await browser.getUrl()).includes('q='),
       { timeout: 15000, timeoutMsg: '搜索未提交' },

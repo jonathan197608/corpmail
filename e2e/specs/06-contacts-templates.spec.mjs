@@ -20,7 +20,8 @@ describe('06 联系人与模板', () => {
     await goto('/contacts')
     await waitBoot()
     await $('#contacts-search input[name="q"]').setValue('李娜')
-    await browser.keys('Enter')
+    // 同 02：合成 Enter 不触发隐式表单提交，用 requestSubmit
+    await browser.execute(() => document.getElementById('contacts-search').requestSubmit())
     await browser.waitUntil(
       async () => (await browser.getUrl()).includes('q='),
       { timeoutMsg: '联系人搜索未提交' },
