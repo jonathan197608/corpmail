@@ -2362,6 +2362,17 @@ a.btn.link.disabled {
     accent-color: var(--accent);
     cursor: pointer;
 }
+/* 「本页全选」label：复选框与文字成组，flex 居中 + 留出空隙 */
+.mbx-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    color: var(--ink-soft);
+    font-weight: 500;
+    white-space: nowrap;
+    user-select: none;
+}
 /* 内容区链接（复选框在链接外）：吃掉剩余 flex 空间，视觉与旧行一致 */
 .mail-row .mr-link {
     display: flex;
