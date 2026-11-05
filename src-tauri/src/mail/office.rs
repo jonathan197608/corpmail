@@ -459,7 +459,8 @@ fn xml_text(data: &[u8], mode: XmlMode) -> String {
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
-        if out.chars().count() >= MAX_TEXT_CHARS {
+        // 用字节上限粗判（UTF-8 最多 4 字节/字符），避免逐事件数 chars 的 O(n²)
+        if out.len() >= MAX_TEXT_CHARS * 4 {
             break;
         }
         buf.clear();
@@ -496,11 +497,11 @@ fn xls_text(bytes: &[u8]) -> Result<String, OfficeError> {
                 out.push_str(line.trim_end());
                 out.push('\n');
             }
-            if out.chars().count() >= MAX_TEXT_CHARS {
+            if out.len() >= MAX_TEXT_CHARS * 4 {
                 break;
             }
         }
-        if out.chars().count() >= MAX_TEXT_CHARS {
+        if out.len() >= MAX_TEXT_CHARS * 4 {
             break;
         }
         out.push('\n');

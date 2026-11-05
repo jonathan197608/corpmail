@@ -69,6 +69,16 @@ fn detect_flags_encrypted_and_legacy_binary() {
         detect("application/vnd.ms-excel", "old.xls", &cfb).unwrap(),
         OfficeKind::Xls
     );
+    let xls = fixture("summary.xls");
+    assert_eq!(
+        detect("application/vnd.ms-excel", "summary.xls", &xls).unwrap(),
+        OfficeKind::Xls
+    );
+    assert_eq!(
+        sanitize_for_preview(&xls, OfficeKind::Xls).unwrap(),
+        xls,
+        "旧版 xls 不做 ZIP 清洗，原样返回"
+    );
     assert!(matches!(
         detect("", "old.doc", &cfb),
         Err(OfficeError::Unsupported(_))
@@ -168,6 +178,14 @@ fn extract_text_xlsx_reads_sheets_and_values() {
     // 文本兜底不读取单元格样式：完成率以原始值 0.931 呈现（视觉预览由前端负责）
     assert!(text.contains("0.931"), "{text}");
     assert!(text.contains("【工作表：明细】"), "{text}");
+}
+
+#[test]
+fn extract_text_xls_legacy_reads_values() {
+    let bytes = fixture("summary.xls");
+    let text = extract_text(&bytes, OfficeKind::Xls).unwrap();
+    assert!(text.contains("【工作表：汇总】"), "{text}");
+    assert!(text.contains("宽带提速配案汇总"), "{text}");
 }
 
 #[test]

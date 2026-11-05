@@ -175,8 +175,19 @@ function mbxPreviewAttachment(url, kind, name) {
     const body = document.getElementById('pm-body');
     const nameEl = document.getElementById('pm-name');
     if (!modal || !body) return;
+    // 每次打开先复位 Office 专用状态（宽版面板/工具栏/渲染实例）
+    if (window.mbxOfficeReset) window.mbxOfficeReset();
     if (nameEl) nameEl.textContent = name;
     body.innerHTML = '';
+    if (kind === 'docx' || kind === 'xlsx' || kind === 'pptx' || kind === 'xls') {
+        if (window.mbxPreviewOffice) {
+            window.mbxPreviewOffice(url, kind, name);
+        } else {
+            body.textContent = '预览组件未加载，请重启应用后重试。';
+        }
+        modal.hidden = false;
+        return;
+    }
     if (kind === 'img') {
         const img = document.createElement('img');
         img.src = url;
@@ -212,6 +223,7 @@ function mbxPreviewAttachment(url, kind, name) {
 function mbxClosePreview() {
     const modal = document.getElementById('preview-modal');
     if (!modal) return;
+    if (window.mbxOfficeReset) window.mbxOfficeReset();
     modal.hidden = true;
     const body = document.getElementById('pm-body');
     if (body) body.innerHTML = '';  // 释放 img/iframe 资源
