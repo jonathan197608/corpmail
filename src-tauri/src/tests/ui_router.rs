@@ -3076,6 +3076,40 @@ fn wizard_save_first_run_custom_dir_switches_immediately() {
 }
 
 #[test]
+fn wizard_save_prefilled_current_dir_redirects() {
+    // 回归：向导 data_dir 预填当前目录（与存储页同源回显），用户不动它直接
+    // 提交 = 不更换，不得送进直切校验（validate_data_dir 拒绝同路径）。
+    // 曾导致首配必失败：返回「数据目录设置失败」片段且不跳转 done 页，
+    // E2E 01-wizard 等 /welcome/done 无限轮询getUrl。
+    let (state, dir) = temp_state("wiz-prefilled");
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("data_dir", dir.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "预填当前目录（不更换）应正常跳转完成页"
+    );
+    assert!(state.configured(), "配置应已落库");
+    assert_eq!(
+        state.data_dir(),
+        dir,
+        "不动目录时数据目录应保持不变"
+    );
+    state.clear_password("unit.router@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+#[test]
 fn settings_account_ignores_readonly_submissions() {
     // 需求：账号页仅密码与发件显示名可修改。账号/域名/双通道服务器/加密方式
     // 一律取已存值——即使客户端绕过禁用态提交了这些字段也不得生效

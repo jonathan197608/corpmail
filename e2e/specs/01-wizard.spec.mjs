@@ -46,8 +46,17 @@ describe('01 首启向导与首次收件', () => {
     await shot('向导-已填写本地服务器')
 
     await $('button[type="submit"]').click()
+    // 提交后要么整页跳转 done，要么表单区出现错误片段——出现错误立即快速失败，
+    // 把错误文本带进超时信息（否则只能干等 60s 后对着 getUrl 轮询日志猜）
     await browser.waitUntil(
-      async () => (await browser.getUrl()).includes('/welcome/done'),
+      async () => {
+        if ((await browser.getUrl()).includes('/welcome/done')) return true
+        const text = await $('body').getText()
+        if (/未保存|设置失败|保存失败|密码保存失败/.test(text)) {
+          throw new Error(`向导提交失败：${text.match(/[^。]{0,120}(失败[^。]{0,80})/)?.[0] ?? text.slice(0, 120)}`)
+        }
+        return false
+      },
       { timeout: 60000, timeoutMsg: '双通道测试未通过或未跳转完成页' },
     )
     await waitBoot()

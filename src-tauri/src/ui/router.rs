@@ -2502,8 +2502,19 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         // "先保存后快照"互补，空库没有可快照的内容）。
         let first_run_fresh = !state.configured() && state.store_is_empty();
         let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
+        // 向导把 data_dir 预填成当前目录（与存储页同源回显）：用户不动它 =
+        // 不更换，不得送进直切校验——validate_data_dir 拒绝同路径，
+        // 曾导致首配不动目录直接提交必然失败且不跳转 done 页。
+        // 归一化方式与下方迁移路径的 want/cur 比较保持一致。
+        let data_dir_unchanged = !data_dir_input.is_empty()
+            && data_dir_input.trim().trim_end_matches(['/', '\\'])
+                == state
+                    .data_dir()
+                    .to_string_lossy()
+                    .trim_end_matches(['/', '\\']);
         if first_run_fresh
             && !data_dir_input.is_empty()
+            && !data_dir_unchanged
             && let Err(e) = state.switch_data_dir_first_run(&data_dir_input)
         {
             return test_fragment(
