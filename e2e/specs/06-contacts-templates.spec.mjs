@@ -3,6 +3,20 @@ import { goto, shot, waitBoot, waitText, autoConfirm } from '../support/helpers.
 
 // 06：联系人（自动采集/搜索/新增/删除/补全接口）与邮件模板（F2–F5）。
 // 联系人数据来自 01 首拉时采集的 3 位发件人。
+// 模板名「E2E 模板」专属于本 spec（05 D1 用「E2E 撰写页预置模板」）：
+// templates 表无唯一约束，同名并存会让存在性断言假绿。
+const TPL_NAME = 'E2E 模板'
+
+/** 精确按名称统计模板条目数（.tpl-title 是列表里的模板名） */
+async function countTemplates(name) {
+  const titles = await $$('.tpl-title')
+  let n = 0
+  for (const t of titles) {
+    if ((await t.getText()).trim() === name) n += 1
+  }
+  return n
+}
+
 describe('06 联系人与模板', () => {
   it('F2 联系人自动采集：3 位发件人在列且带姓名', async () => {
     await goto('/contacts')
@@ -71,19 +85,16 @@ describe('06 联系人与模板', () => {
   it('F5a 模板新增：保存后列表出现', async () => {
     await goto('/settings/templates')
     await waitBoot()
-    // 面板第一张带「添加联系人」按钮的表单是新增模板表单（按钮文案「添加模板」
-    // 可能随版本调整，这里按 name 输入框顺序兜底：第一个 name 框 = 新增区）
-    const nameInputs = await $$('input[name="name"]')
-    await nameInputs[0].setValue('E2E 模板')
-    const bodyInputs = await $$('textarea[name="body_text"]')
-    await bodyInputs[0].setValue('收到，稍后回复您。')
-    await nameInputs[0].$('..').$('..').$('button[type="submit"]').click()
+    const before = await countTemplates(TPL_NAME)
+    // 新增表单是 pane 里的 .tpl-form（列表项的编辑表单在 details 内，不带
+    // .tpl-form 类），按类定位避免与前序 spec 留下的模板混淆
+    await $('.tpl-form input[name="name"]').setValue(TPL_NAME)
+    await $('.tpl-form textarea[name="body_text"]').setValue('收到，稍后回复您。')
+    await $('.tpl-form button[type="submit"]').click()
+    // 计数 +1 才算真的新增（只判「存在同名」会被前序数据蒙混过关）
     await browser.waitUntil(
-      async () =>
-        (await $$('input[name="name"]')).some(
-          async (i) => (await i.getValue()) === 'E2E 模板',
-        ),
-      { timeoutMsg: '模板保存后未出现在列表' },
+      async () => (await countTemplates(TPL_NAME)) === before + 1,
+      { timeoutMsg: '模板保存后列表未新增该模板' },
     )
     await shot('模板-新增成功')
   })
@@ -91,10 +102,11 @@ describe('06 联系人与模板', () => {
   it('F5b 撰写页模板下拉包含新模板', async () => {
     await goto('/compose')
     await waitBoot()
-    const options = await $$('#tpl-select option')
-    const texts = []
-    for (const o of options) texts.push(await o.getText())
-    expect(texts.join('|')).toContain('E2E 模板')
+    // option 文本用 execute 读：WKWebView 下 option.getText 不可靠（同 05 D1）
+    const texts = await browser.execute(() =>
+      [...document.querySelectorAll('#tpl-select option')].map((o) => o.textContent.trim()),
+    )
+    expect(texts).toContain(TPL_NAME) // 全等，避免子串蒙混
     await shot('模板-撰写页下拉')
   })
 
@@ -102,22 +114,23 @@ describe('06 联系人与模板', () => {
     await goto('/settings/templates')
     await waitBoot()
     await autoConfirm()
-    const before = (await $$('textarea[name="body_text"]')).length
-    // 找到包含「E2E 模板」的模板表单里的删除按钮（hx-post=/templates/delete）
-    const forms = await $$('form')
+    const before = await countTemplates(TPL_NAME)
+    expect(before).toBeGreaterThanOrEqual(1)
+    // 删除按钮在 .tpl-head 里（与 details > form 平级，不在编辑表单内），
+    // 必须从 .tpl-item 作用域找，不能从 form 里找
+    const items = await $$('.tpl-item')
     let clicked = false
-    for (const f of forms) {
-      const nameVal = await f.$('input[name="name"]')
-      if (nameVal.isExisting() && (await nameVal.getValue()) === 'E2E 模板') {
-        const del = await f.$('button[hx-post*="templates/delete"]')
-        await del.click()
+    for (const it of items) {
+      const title = await it.$('.tpl-title')
+      if ((await title.getText()).trim() === TPL_NAME) {
+        await it.$('button[hx-post*="templates/delete"]').click()
         clicked = true
         break
       }
     }
     expect(clicked).toBe(true)
     await browser.waitUntil(
-      async () => (await $$('textarea[name="body_text"]')).length === before - 1,
+      async () => (await countTemplates(TPL_NAME)) === before - 1,
       { timeoutMsg: '模板删除后列表未减少' },
     )
     await shot('模板-删除成功')

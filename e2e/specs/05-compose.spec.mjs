@@ -31,11 +31,13 @@ describe('05 撰写与发送', () => {
     // 走 settings·模板 pane 的真实表单路径，顺带覆盖 B2 的新增入口。
     await goto('/settings/templates')
     await waitText('#settings-pane', '邮件模板')
-    await $('.tpl-form input[name="name"]').setValue('E2E 模板')
+    // 名字与 06 F5 的「E2E 模板」区分开：templates 表无唯一约束，
+    // 同名并存会让 06 的存在性断言假绿
+    await $('.tpl-form input[name="name"]').setValue('E2E 撰写页预置模板')
     await $('.tpl-form textarea[name="body_text"]').setValue('收到，我这边核对后回复您。')
     await $('.tpl-form button[type="submit"]').click()
     await waitText('#settings-pane', '✓ 已保存')
-    await waitText('#settings-pane', 'E2E 模板')
+    await waitText('#settings-pane', 'E2E 撰写页预置模板')
     await shot('设置-新增模板成功')
 
     await goto('/compose')
@@ -47,7 +49,7 @@ describe('05 撰写与发送', () => {
     const opts = await browser.execute(() =>
       [...document.querySelectorAll('#tpl-select option')].map((o) => o.textContent),
     )
-    expect(opts.some((t) => t.includes('E2E 模板'))).toBe(true)
+    expect(opts.some((t) => t.includes('E2E 撰写页预置模板'))).toBe(true)
     await shot('撰写-初始态含模板下拉')
   })
 
