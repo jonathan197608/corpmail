@@ -35,6 +35,9 @@ jiff = "0.2"                                               # 时间戳格式化�
 jieba-rs = "0.11"                                          # 中文预分词（§4：写入影子列，FTS 索引源；M2 写入侧）
 flate2 = "1"                                               # 附件 gzip（§5.1 两级存储）
 sha2 = "0.10"                                              # 附件指纹（§5.1 sha256 列）
+zip = "9"                                                  # Office 附件 ZIP 检查/清洗（预览安全预处理）
+quick-xml = "0.42"                                         # DOCX/PPTX 文本抽取与关系文件过滤
+calamine = "0.38"                                          # XLSX/XLS 文本兜底（前端渲染失败时）
 tauri-plugin-dialog = "2"                                  # 系统文件/保存对话框（M2：附件选择与另存）
 # M4-1 托盘：依赖 tauri tray-icon 特性（Cargo.toml tauri features）
 tauri-plugin-single-instance = "2"

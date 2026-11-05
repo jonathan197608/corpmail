@@ -3100,11 +3100,7 @@ fn wizard_save_prefilled_current_dir_redirects() {
         "预填当前目录（不更换）应正常跳转完成页"
     );
     assert!(state.configured(), "配置应已落库");
-    assert_eq!(
-        state.data_dir(),
-        dir,
-        "不动目录时数据目录应保持不变"
-    );
+    assert_eq!(state.data_dir(), dir, "不动目录时数据目录应保持不变");
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
@@ -7105,5 +7101,197 @@ fn detail_page_has_print_action() {
         "详情页应有打印按钮：{html}"
     );
     assert!(html.contains("🖨 打印"), "打印按钮文案：{html}");
+    cleanup(&dir);
+}
+
+fn office_fixture(name: &str) -> Vec<u8> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/office")
+        .join(name);
+    std::fs::read(&p).unwrap_or_else(|e| panic!("读取样例 {} 失败：{e}", p.display()))
+}
+
+/// B8 Office 预览路由：清洗副本 + 纯文本兜底 + 原 /view 下载语义不变
+#[test]
+fn office_preview_routes_serve_clean_bytes_and_text() {
+    let (state, dir) = temp_state("b8-office");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','带 Word',
+                     '正文','带 word','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let bytes = office_fixture("report.docx");
+    mail::add_attachment_bytes(
+        &state,
+        1,
+        "季度汇报.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        &bytes,
+    )
+    .unwrap();
+    let aid = mail::get(&state, 1).unwrap().attachments[0].id;
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/1/attachments/{aid}/office"), b""),
+        &tester,
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.content_type, "application/octet-stream");
+    assert!(resp.body.starts_with(b"PK"), "应回清洗后的 ZIP");
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "X-Content-Type-Options" && v == "nosniff")
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "Content-Disposition" && v == "inline")
+    );
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "GET",
+            &format!("/emails/1/attachments/{aid}/office-text"),
+            b"",
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 200);
+    let text = String::from_utf8(resp.body).unwrap();
+    assert!(text.contains("宽带提速配案季度汇报"), "{text}");
+
+    // 原 /view 仍按下载处理（Office 不做内联 MIME）
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", &format!("/emails/1/attachments/{aid}/view"), b""),
+        &tester,
+    );
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "Content-Disposition" && v == "attachment")
+    );
+    cleanup(&dir);
+}
+
+/// B8 错误分支：加密 422 / 旧版 doc 415 / 超限 413 / PPTX 文本 415
+#[test]
+fn office_preview_routes_report_expected_errors() {
+    let (state, dir) = temp_state("b8-office-err");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','错误分支',
+                     '正文','错误 分支','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let cfb = [0xD0, 0xCF, 0x11, 0xE0, 0, 0, 0, 0];
+    mail::add_attachment_bytes(&state, 1, "secret.docx", "application/octet-stream", &cfb).unwrap();
+    mail::add_attachment_bytes(&state, 1, "old.doc", "application/msword", &cfb).unwrap();
+    mail::add_attachment_bytes(
+        &state,
+        1,
+        "big.docx",
+        "application/octet-stream",
+        &[b'x'; 2 * 1024 * 1024],
+    )
+    .unwrap();
+    let deck = office_fixture("deck.pptx");
+    mail::add_attachment_bytes(
+        &state,
+        1,
+        "deck.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        &deck,
+    )
+    .unwrap();
+    let ids: Vec<i64> = mail::get(&state, 1)
+        .unwrap()
+        .attachments
+        .iter()
+        .map(|a| a.id)
+        .collect();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "GET",
+            &format!("/emails/1/attachments/{}/office", ids[0]),
+            b"",
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 422);
+    assert!(String::from_utf8_lossy(&resp.body).contains("加密"));
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "GET",
+            &format!("/emails/1/attachments/{}/office", ids[1]),
+            b"",
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 415);
+    assert!(String::from_utf8_lossy(&resp.body).contains("不支持"));
+
+    // 预览上限 1MB：2MB 文件直接 413（在格式判定之前）
+    state
+        .set_batch(&[(keys::OFFICE_PREVIEW_MAX_MB, "1")])
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "GET",
+            &format!("/emails/1/attachments/{}/office", ids[2]),
+            b"",
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 413);
+    assert!(String::from_utf8_lossy(&resp.body).contains("超过预览上限"));
+
+    // PPTX 不提供文本降级
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "GET",
+            &format!("/emails/1/attachments/{}/office-text", ids[3]),
+            b"",
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 415);
+    assert!(String::from_utf8_lossy(&resp.body).contains("PPTX"));
     cleanup(&dir);
 }

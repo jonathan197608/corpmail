@@ -13,6 +13,8 @@
 pub mod contacts;
 /// .eml 导出与「作为附件转发」（B4/B6）
 pub mod eml;
+/// Office 附件预览安全预处理与文本兜底（B8）
+pub mod office;
 mod recv;
 pub(crate) mod seen;
 mod send;
@@ -1589,6 +1591,11 @@ fn preview_kind_of(mime: &str, filename: &str) -> &'static str {
             "pdf" => "pdf",
             "txt" | "csv" | "log" | "json" | "xml" | "md" | "yml" | "yaml" | "ini" | "conf"
             | "sql" | "toml" | "ts" | "js" | "css" => "text",
+            // Office 预览（B8）：docx/xlsx/pptx 视觉渲染，xls 由 SheetJS 解析
+            "docx" | "docm" => "docx",
+            "xlsx" | "xlsm" => "xlsx",
+            "pptx" | "pptm" => "pptx",
+            "xls" => "xls",
             _ => "",
         };
     }
@@ -1602,7 +1609,16 @@ fn preview_kind_of(mime: &str, filename: &str) -> &'static str {
     if m.starts_with("image/") && m != "image/svg+xml" {
         return "img";
     }
-    "" // 明确不支持的类型，不再兜底
+    match m.as_str() {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/vnd.ms-word.document.macroenabled.12" => "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        | "application/vnd.ms-excel.sheet.macroenabled.12" => "xlsx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        | "application/vnd.ms-powerpoint.presentation.macroenabled.12" => "pptx",
+        "application/vnd.ms-excel" => "xls",
+        _ => "",
+    }
 }
 
 /// 邮件详情（全部展示字段 + 附件列表）

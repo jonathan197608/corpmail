@@ -230,6 +230,30 @@ fn preview_kind_falls_back_to_extension_for_octet_stream() {
     assert_eq!(preview_kind_of("image/svg+xml", "图.svg"), "");
     assert_eq!(preview_kind_of("", "图.svg"), "");
     assert_eq!(preview_kind_of("application/octet-stream", "图.svg"), "");
+    // B8 Office 扩展名/MIME
+    assert_eq!(
+        preview_kind_of("application/octet-stream", "报告.docx"),
+        "docx"
+    );
+    assert_eq!(
+        preview_kind_of("application/octet-stream", "报表.xlsm"),
+        "xlsx"
+    );
+    assert_eq!(
+        preview_kind_of("application/octet-stream", "方案.pptm"),
+        "pptx"
+    );
+    assert_eq!(
+        preview_kind_of("application/vnd.ms-excel", "旧表.xls"),
+        "xls"
+    );
+    assert_eq!(
+        preview_kind_of(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "无扩展名"
+        ),
+        "docx"
+    );
 }
 
 #[test]
