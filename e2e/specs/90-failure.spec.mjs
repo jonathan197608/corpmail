@@ -102,16 +102,20 @@ describe('90 失败链路', () => {
     expect(id).toBeTruthy()
     await shot('失败-已入队撤销窗')
 
-    // 撤销窗 8s + 调度线程派发 + SMTP 550 → status=failed，error 落库
+    // 撤销窗 8s + 调度线程派发 + SMTP 550 → status=failed，error 落库。
+    // 注意不能用 body.getText().includes('发送失败')：该驱动 getText 会把
+    // <script> 文本一并返回（app.js:382 toast 文案含「发送失败」），任何页面
+    // 都立刻误命中。用 execute 查状态条 DOM。
     await browser.waitUntil(
       async () => {
         await goto(`/emails/${id}`)
-        return (await $('body').getText()).includes('发送失败')
+        return browser.execute(() => !!document.querySelector('.md-status.failed'))
       },
       { timeout: 45000, interval: 3000, timeoutMsg: '45s 内未进入 failed 状态（查 send worker 派发）' },
     )
-    await waitBoot()
-    const status = await $('.md-status.failed').getText()
+    const status = await browser.execute(
+      () => document.querySelector('.md-status.failed')?.textContent ?? '',
+    )
     expect(status).toContain('发送失败')
     await shot('失败-详情页failed状态')
 
