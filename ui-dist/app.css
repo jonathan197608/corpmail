@@ -1911,10 +1911,85 @@ a.btn.link.disabled {
 
 .md-actions {
     display: flex;
-    gap: 10px;
+    align-items: center;
+    gap: 8px;
     border-top: 1px solid var(--line-soft);
     padding-top: 14px;
     margin-top: 6px;
+    flex-wrap: wrap;
+}
+
+/* 操作按钮置顶：分隔线下移、去掉上边距，贴住卡片头之上 */
+.md-actions.md-actions-top {
+    flex-wrap: wrap;
+    border-top: none;
+    padding: 0 0 12px;
+    margin: 0 0 14px;
+    border-bottom: 1px solid var(--line-soft);
+}
+
+/* ---- 读信页：回复▾ split 与 ⋯ 低频菜单（R4：回复=唯一 primary） ---- */
+.md-actions .split {
+    position: relative;
+    display: inline-flex;
+    align-items: stretch;
+}
+
+.md-actions .split .caret {
+    padding: 8px 10px;
+    border-left: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 0 9px 9px 0;
+}
+
+.md-actions .split > .btn:first-child {
+    border-radius: 9px 0 0 9px;
+}
+
+.md-actions .split-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 42;
+    min-width: 158px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(21, 34, 56, 0.16);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+}
+
+.md-actions .split-menu[hidden] {
+    display: none;
+}
+
+.md-actions .split-menu a,
+.md-actions .split-menu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    font-size: 13px;
+    color: var(--ink);
+    text-align: left;
+    cursor: pointer;
+}
+
+.md-actions .split-menu a:hover,
+.md-actions .split-menu button:hover {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.md-actions .split-menu .btn-sep {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--line-soft);
 }
 
 /* 操作按钮置顶：分隔线下移、去掉上边距，贴住卡片头之上 */

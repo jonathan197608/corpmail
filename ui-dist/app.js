@@ -234,6 +234,33 @@ document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
 
+// 读信页操作下拉（R2/批次二）：回复▾ split 与 ⋯ 菜单
+// 事件委托：点 ▾/⋯ 切换菜单；点菜单项后收起；Esc/点击外部关闭
+document.addEventListener('click', ev => {
+    const toggle = ev.target.closest('[data-split-toggle]');
+    if (toggle) {
+        const split = toggle.closest('.split');
+        const menu = split && split.querySelector('.split-menu');
+        if (menu) menu.hidden = !menu.hidden;
+        ev.stopPropagation();
+        return;
+    }
+    // 点击菜单项（链接/按钮）后收起当前打开的菜单
+    if (ev.target.closest('.split-menu a, .split-menu button')) {
+        const menu = ev.target.closest('.split-menu');
+        if (menu) menu.hidden = true;
+    } else {
+        document.querySelectorAll('.split-menu:not([hidden])').forEach(m => { m.hidden = true; });
+    }
+});
+
+// Esc 同时收起展开中的操作菜单
+document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') {
+        document.querySelectorAll('.split-menu:not([hidden])').forEach(m => { m.hidden = true; });
+    }
+});
+
 // ---------- 收取状态：按钮/设置入口禁用 + 完成后局部刷新 ----------
 // 状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；后台收取结束时服务端
 // 下发一次 HX-Trigger 事件 mbx:fetchDone，由此按当前页面做定向局部刷新。

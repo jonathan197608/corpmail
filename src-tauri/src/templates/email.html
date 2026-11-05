@@ -58,36 +58,63 @@
                         aria-pressed="{% if email.starred %}true{% else %}false{% endif %}"
                         title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}⭐ 已星标{% else %}<span class="dim">⭐</span> 星标{% endif %}</button>
                 {% if email.folder == 'draft' %}
+                {# 草稿箱：唯一主操作 = 编辑 #}
                 <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
                    title="打开草稿继续编辑">✏️ 编辑</a>
+                <div class="split">
+                    <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
+                    <div class="split-menu" hidden>
+                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
+                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
+                    </div>
+                </div>
                 {% elif email.folder == 'sent' %}
+                {# 发件箱：唯一主操作 = 重新编辑 #}
                 <a class="btn primary" href="/compose?edit_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
                    title="载入该邮件内容到撰写页，修改后重新发送">✏️ 重新编辑</a>
+                <div class="split">
+                    <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
+                    <div class="split-menu" hidden>
+                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
+                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
+                    </div>
+                </div>
                 {% else %}
                 {% if email.direction == 'in' %}
-                <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✏️ 回复</a>
-                <a class="btn primary" href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">✏️ 回复全部</a>
-                {% endif %}
+                {# 收件箱：回复 = 唯一 primary（回复全部收进 split 次级菜单） #}
                 <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↪️ 转发</a>
-                {# B6 作为附件转发：整封邮件重建为 .eml 后附加，保留原始结构 #}
-                <a class="btn" href="/compose?attach_eml={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                   title="把整封邮件打包为 .eml 附件发送（保留原始结构）">📎 作为附件转发</a>
+                <div class="split">
+                    <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                       title="回复发件人">✏️ 回复</a>
+                    <button type="button" class="btn primary caret" data-split-toggle aria-label="回复选项">▾</button>
+                    <div class="split-menu" hidden>
+                        <a href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                           title="回复发件人 + 原收件人 + 抄送">↪️ 回复全部</a>
+                        <a href="/compose?attach_eml={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                           title="把整封邮件打包为 .eml 附件发送（保留原始结构）">📎 作为附件转发</a>
+                    </div>
+                </div>
+                <div class="split">
+                    <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
+                    <div class="split-menu" hidden>
+                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
+                                title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxPrintEmail()"
+                                title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">🖨 打印</button>
+                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
+                           title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">🔎 源码</a>
+                        {% if not email.unread %}
+                        <div class="btn-sep"></div>
+                        <button type="button"
+                                hx-post="/emails/{{ email.id }}/unread{% if list_query %}?{{ list_query }}{% endif %}"
+                                hx-trigger="click throttle:500ms" hx-disabled-elt="this"
+                                title="标为未读并返回列表（留待后续处理）">● 标为未读</button>
+                        {% endif %}
+                    </div>
+                </div>
                 {% endif %}
-                {# B4 导出 .eml：选保存位置后由服务端重建报文写盘 #}
-                <button type="button" class="btn" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
-                        title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">💾 导出 .eml</button>
-                {# B5 打印：系统打印对话框，@media print 只输出邮件内容（无侧栏/按钮） #}
-                <button type="button" class="btn" onclick="mbxPrintEmail()"
-                        title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">🖨 打印</button>
-                {# A5 源码排查：HTML/纯文本/原始信头（乱码、表格丢失、投递问题） #}
-                <a class="btn" href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
-                   title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">🔎 源码</a>
-                {# A5 配套：收件且已读时可标回未读，留待办 #}
-                {% if email.folder == 'inbox' and not email.unread %}
-                <button type="button" class="btn"
-                        hx-post="/emails/{{ email.id }}/unread{% if list_query %}?{{ list_query }}{% endif %}"
-                        hx-trigger="click throttle:500ms" hx-disabled-elt="this"
-                        title="标为未读并返回列表（留待后续处理）">● 标为未读</button>
                 {% endif %}
                 <button type="button" class="btn danger"
                         hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
