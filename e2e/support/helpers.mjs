@@ -85,6 +85,24 @@ export async function autoConfirm() {
 }
 
 /**
+ * 设置 <select> 的值。selectByAttribute 在 WKWebView 内嵌驱动下对
+ * <option> 的模拟点击不生效（值不变），改用 JS 直改 + 派发 change：
+ * htmx 表单序列化读的是 DOM 值，change 事件供监听方刷新联动。
+ */
+export async function selectValue(selector, value) {
+  await browser.execute(
+    (s, v) => {
+      const sel = document.querySelector(s)
+      if (!sel) throw new Error(`selectValue: 找不到 ${s}`)
+      sel.value = v
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+    },
+    selector,
+    value,
+  )
+}
+
+/**
  * 跳转到应用内路径。
  * 页面跑在自定义协议上（macOS: ui://localhost/，Windows: http://ui.localhost/），
  * 不能用相对路径直接 browser.url()，需保留 origin。

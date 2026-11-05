@@ -62,7 +62,11 @@ export const config = {
 
   framework: 'mocha',
   reporters: ['spec'],
-  mochaOpts: { ui: 'bdd', timeout: 120000 },
+  // 首败即停：bail=1 第一个 spec 失败就中止整套；mochaOpts.bail 同一文件内
+  // 第一个 it 失败即停。后续 spec 依赖前序（配置→首拉→列表→撰写），级联
+  // 失败只会刷一屏噪音 + 烧时间（曾出现向导失败后 5 个 spec 全在欢迎页空轮询）
+  bail: 1,
+  mochaOpts: { ui: 'bdd', timeout: 120000, bail: true },
 
   // 每个 worker 独立会话：进入后静默焦点管理（否则每条 $/查询白等 5s 超时）
   before: async function () {

@@ -69,8 +69,9 @@ describe('03 设置与收件状态', () => {
     const dest = path.join(runDir(), 'moved-data')
     fs.mkdirSync(dest, { recursive: true })
     const res = await htmxAjax('POST', '/settings/storage/move', { dest }, '#settings-pane')
-    expect(res.text).toContain('待生效')
-    await waitText('#settings-pane', '重启')
+    // 单测钉过的文案（ui_router.rs:530）：徽标为「重启后生效」+ 旧目录「当前使用」注记
+    expect(res.text).toContain('重启后生效')
+    await waitText('#settings-pane', '当前使用')
     await shot('设置-数据目录待生效')
   })
 

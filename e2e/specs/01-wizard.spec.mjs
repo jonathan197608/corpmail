@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { shot, waitBoot, waitText } from '../support/helpers.mjs'
+import { shot, waitBoot, waitText, selectValue } from '../support/helpers.mjs'
 
 const IMAP_PORT = process.env.E2E_IMAP_PORT
 const SMTP_PORT = process.env.E2E_SMTP_PORT
@@ -39,10 +39,10 @@ describe('01 首启向导与首次收件', () => {
 
     await $('input[name="smtp_host"]').setValue('127.0.0.1')
     await $('input[name="smtp_port"]').setValue(SMTP_PORT)
-    await $('select[name="smtp_security"]').selectByAttribute('value', 'plain')
+    await selectValue('select[name="smtp_security"]', 'plain')
     await $('input[name="recv_host"]').setValue('127.0.0.1')
     await $('input[name="recv_port"]').setValue(IMAP_PORT)
-    await $('select[name="recv_security"]').selectByAttribute('value', 'plain')
+    await selectValue('select[name="recv_security"]', 'plain')
     await shot('向导-已填写本地服务器')
 
     await $('button[type="submit"]').click()
