@@ -301,7 +301,7 @@ fn unread_toggle_restores_full_list() {
     // 恢复链接不带 unread 参数（minijinja 按规范将 / 转义为 &#x2f;，浏览器解码后
     // 即 /?page=1；断言按渲染原文精确匹配）
     assert!(
-        unread.contains(r#"class="unread-toggle on" href="&#x2f;?page=1""#),
+        unread.contains(r#"class="tb-item on" href="&#x2f;?page=1""#),
         "恢复链接不得再携带 unread 参数：{unread}"
     );
     // 外部筛选按钮须保留未读筛选（两个开关互不吞掉对方）
@@ -5844,6 +5844,85 @@ fn contacts_page_lists_searches_and_deletes() {
         .unwrap()
     });
     assert_eq!(remain, 0, "库中应物理删除");
+    cleanup(&dir);
+}
+
+/// 联系人分页：默认每页 10、per 持久化、page 越界钳回；翻页链接带 q/per
+#[test]
+fn contacts_page_pagination_slices_and_defaults() {
+    let (state, dir) = temp_state("m3-contacts-page");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let now = mail::now_epoch();
+    // 3 条，updated_at 倒序（c0 最新 … c2 最旧）
+    state
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
+                 ('c0@x.cn', '甲', {a}, 1),
+                 ('c1@x.cn', '乙', {b}, 1),
+                 ('c2@x.cn', '丙', {c}, 1)",
+                a = now,
+                b = now - 3600,
+                c = now - 7200
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 默认每页 10：3 条全在一页，无翻页器，下拉 10 选中
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/contacts", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("c0@x.cn") && html.contains("c2@x.cn"),
+        "默认应全量: {html}"
+    );
+    assert!(!html.contains("class=\"pager\""), "不足一页不应有翻页器");
+    assert!(html.contains("每页 10 人"), "应提供每页下拉");
+    // per=2&page=2：只含最旧 c2；翻页器 2 / 2，无下一页
+    let html2 = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "per=2&page=2", b""),
+        &tester,
+    ));
+    assert!(html2.contains("c2@x.cn"), "第二页应含最旧: {html2}");
+    assert!(
+        !html2.contains("c0@x.cn") && !html2.contains("c1@x.cn"),
+        "第二页不应含前两页"
+    );
+    assert!(html2.contains(">2 / 2"), "页次应 2 / 2");
+    assert!(html2.contains("上一页"), "第 2 页应有上一页");
+    assert!(!html2.contains("下一页"), "末页不应有下一页");
+    // page 越界钳回：page=99 → 仍 2 / 2
+    let html3 = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "per=2&page=99", b""),
+        &tester,
+    ));
+    assert!(html3.contains(">2 / 2"), "越界应钳回末页: {html3}");
+    // per 持久化：/contacts?per=5 后 settings.PAGE_SIZE=5
+    let _ = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "per=5", b""),
+        &tester,
+    ));
+    let d = defaults();
+    assert_eq!(
+        state.get_or(keys::PAGE_SIZE, &d).unwrap_or_default(),
+        "5",
+        "per=5 应持久化"
+    );
     cleanup(&dir);
 }
 

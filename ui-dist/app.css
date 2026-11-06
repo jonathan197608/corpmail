@@ -421,6 +421,92 @@ body {
     cursor: not-allowed;
 }
 
+/* 顶栏 ⋯ 下拉（批次四）：低频筛选/收取收进菜单，顶栏保持单行。
+   菜单样式与读信页 .md-actions .split-menu 同构（浅色面板 + hover 主题色） */
+.topbar .split {
+    position: relative;
+    display: inline-flex;
+    align-items: stretch;
+}
+
+.tb-more-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 34px;
+    min-width: 36px;
+    padding: 0 11px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--panel);
+    font-size: 15px;
+    line-height: 1;
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+
+.tb-more-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.topbar .split-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 42;
+    min-width: 170px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(21, 34, 56, 0.16);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+}
+
+.topbar .split-menu[hidden] {
+    display: none;
+}
+
+.topbar .split-menu a,
+.topbar .split-menu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    font-size: 13px;
+    color: var(--ink);
+    text-align: left;
+    cursor: pointer;
+}
+
+.topbar .split-menu a:hover,
+.topbar .split-menu button:hover {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.topbar .split-menu .tb-item.on {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.topbar .split-menu .btn-sep {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--line-soft);
+}
+
+.topbar .split-menu button[disabled] {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 .search {
     margin-left: auto;
     display: flex;
@@ -1230,8 +1316,8 @@ a.btn.link.disabled {
 }
 
 .settings-card {
-    max-width: 920px;
-    margin: 0 auto 8px;
+    max-width: none;
+    margin: 0 0 8px;
     padding: 11px 16px;
 }
 
@@ -2091,6 +2177,22 @@ a.btn.link.disabled {
     border-bottom: 1px solid var(--line-soft);
 }
 
+/* 读信页动作并入顶栏（批次四）：整行右对齐，按钮 34px 与列表顶栏一致 */
+.topbar .md-actions.tb-actions {
+    margin-left: auto;
+    border: none;
+    padding: 0;
+    margin-top: 0;
+    margin-bottom: 0;
+    flex-wrap: nowrap;
+}
+
+.topbar .md-actions.tb-actions .btn {
+    height: 34px;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
 /* ---------- 撰写页 ---------- */
 .compose-card {
     margin: 4px 12px 12px;
@@ -2601,6 +2703,7 @@ a.btn.link.disabled {
     align-items: center;
     gap: 12px;
     padding: 6px 12px;
+    border-left: 3px solid transparent;
     font-size: 11.5px;
     color: var(--muted);
     font-weight: 600;
@@ -2631,17 +2734,24 @@ a.btn.link.disabled {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 8px 12px;
+    padding: 6px 12px;
     border: 1px solid var(--line-soft);
+    border-left: 3px solid transparent;
     border-radius: 10px;
-    margin-bottom: 6px;
+    margin-bottom: 0;
     background: var(--panel);
-    transition: border-color 0.12s, background 0.12s;
+    transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
+}
+
+/* 与邮件列表一致：表格式堆叠，相邻行只保留一条分隔线 */
+.contact-row + .contact-row {
+    border-top-color: transparent;
 }
 
 .contact-row:hover {
     border-color: var(--line);
     background: #f8fafd;
+    box-shadow: 0 1px 6px rgba(21, 34, 56, 0.06);
 }
 
 .ct-avatar {

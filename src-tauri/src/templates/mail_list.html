@@ -4,19 +4,26 @@
 <div id="list-area">
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
-        <a class="unread-toggle {% if unread_only %}on{% endif %}" href="{{ unread_href }}"
-           {% if folder != 'inbox' %}hidden{% endif %}>{% if unread_only %}✓ 显示全部{% else %}● 只看未读{% endif %}</a>
-        <a class="unread-toggle ext-toggle {% if external_only %}on{% endif %}" href="{{ external_href }}"
-           title="只显示发件人为外部域名的邮件"
-           {% if folder != 'inbox' %}hidden{% endif %}>{% if external_only %}✓ 显示全部{% else %}🌐 只看外部{% endif %}</a>
-        {# 会话/单封视图切换（M2-2）：仅收件箱/全部启用；保留 folder/unread/external/q，翻页重置 #}
-        {% if folder == 'inbox' or folder == 'all' %}
-        <a class="unread-toggle thread-toggle {% if is_thread %}on{% endif %}" href="{{ thread_href }}"
-           title="按主题归组往来邮件（会话视图）">{% if is_thread %}🗒️ 单封视图{% else %}💬 会话视图{% endif %}</a>
-        {% endif %}
-        <button class="sync-btn" type="button" id="fetch-btn"
-                hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
-                hx-trigger="click throttle:3000ms" hx-disabled-elt="this"><span class="ico">🔄</span>收取新邮件</button>
+        {# 顶栏 ⋯ 下拉（批次四）：筛选（只看未读/只看外部/会话视图）与收取新邮件
+           是低频操作，收进下拉，顶栏保持单行；高频的每页/排序/搜索常驻 #}
+        <div class="split tb-more">
+            <button type="button" class="tb-more-btn" data-split-toggle aria-label="更多：筛选、视图与收取" title="更多：筛选、视图与收取">⋯</button>
+            <div class="split-menu" hidden>
+                {% if folder == 'inbox' or folder == 'all' %}
+                <a class="tb-item {% if is_thread %}on{% endif %}" href="{{ thread_href }}"
+                   title="按主题归组往来邮件（会话视图）">{% if is_thread %}🗒️ 单封视图{% else %}💬 会话视图{% endif %}</a>
+                {% endif %}
+                {% if folder == 'inbox' %}
+                <a class="tb-item {% if unread_only %}on{% endif %}" href="{{ unread_href }}">{% if unread_only %}✓ 显示全部{% else %}● 只看未读{% endif %}</a>
+                <a class="tb-item {% if external_only %}on{% endif %}" href="{{ external_href }}"
+                   title="只显示发件人为外部域名的邮件">{% if external_only %}✓ 显示全部{% else %}🌐 只看外部{% endif %}</a>
+                {% endif %}
+                <div class="btn-sep"></div>
+                <button type="button" class="tb-item" id="fetch-btn"
+                        hx-get="/emails/fetch" hx-target="#fetch-status" hx-swap="outerHTML"
+                        hx-trigger="click throttle:3000ms" hx-disabled-elt="this">🔄 收取新邮件</button>
+            </div>
+        </div>
         {# 每页条数（默认 10）+ 排序（A2，默认最新优先）：选择即提交回当前列表，
            页码重置，其余筛选/视图保持。per 持久化到 settings；sort 不持久化
            （默认最新优先，避免用户遗忘排序导致“邮件顺序怪”）。 #}

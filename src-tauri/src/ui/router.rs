@@ -1277,6 +1277,14 @@ struct ContactsCtx {
     q: String,
     total: usize,
     items: Vec<ContactView>,
+    /// 每页条数（当前生效值：URL/表单 per 或 settings，默认 10）
+    per: i64,
+    /// 当前页（1 起；越界钳回有效区间）
+    page: i64,
+    /// 总页数（>=1）
+    pages: i64,
+    /// 翻页链接前缀（含 per/q；模板拼 page=N）
+    page_base: String,
     /// 手动保存结果（B3；空串 = 无提示）
     notice: String,
     error: String,
@@ -1300,18 +1308,52 @@ struct ContactView {
 }
 
 /// 联系人列表渲染（整页 contacts.html 与删除/保存后片段 contacts_area.html 共用）
-fn contacts_ctx(state: &AppState, q: &str) -> ContactsCtx {
-    contacts_ctx_full(state, q, "", "", "")
+fn contacts_ctx(state: &AppState, q: &str, per: i64, page: i64) -> ContactsCtx {
+    contacts_ctx_full(state, q, per, page, "", "", "")
 }
 
-fn contacts_ctx_with(state: &AppState, q: &str, notice: &str, error: &str) -> ContactsCtx {
-    contacts_ctx_full(state, q, "", notice, error)
+fn contacts_ctx_with(
+    state: &AppState,
+    q: &str,
+    per: i64,
+    page: i64,
+    notice: &str,
+    error: &str,
+) -> ContactsCtx {
+    contacts_ctx_full(state, q, per, page, "", notice, error)
+}
+
+/// 联系人分页解析：per 与 mail list 同口径（URL/表单 per 优先，缺省用 settings，
+/// 非默认值顺手持久化到 PAGE_SIZE）；page 越界钳回有效区间
+fn contact_paging(state: &AppState, per_raw: Option<&str>, page_raw: Option<&str>) -> (i64, i64) {
+    let per_url = clamp_per(per_raw);
+    let settings_per = per_from_settings(state);
+    let per = per_url.unwrap_or(settings_per);
+    if let Some(p) = per_url
+        && p != settings_per
+    {
+        let _ = state.set_batch(&[(keys::PAGE_SIZE, p.to_string().as_str())]);
+    }
+    let page = clamp_page(page_raw);
+    (per, page)
+}
+
+/// 联系人翻页链接前缀：per 恒带，q 非空追加；模板拼 &page=N
+fn contact_page_base(q: &str, per: i64) -> String {
+    let mut base = format!("/contacts?per={per}");
+    if !q.is_empty() {
+        base.push('&');
+        base.push_str(&format!("q={}", urlencode(q)));
+    }
+    base
 }
 
 /// 编辑态取姓名（地址不存在则退化为新增表单，不报错）
 fn contacts_ctx_full(
     state: &AppState,
     q: &str,
+    per: i64,
+    page: i64,
     edit_addr: &str,
     notice: &str,
     error: &str,
@@ -1319,7 +1361,17 @@ fn contacts_ctx_full(
     let rows = state
         .with_conn(|conn| mail::contacts::list_rows(conn, q, 500))
         .unwrap_or_default();
-    let items = rows
+    let total = rows.len();
+    let per = per.max(1);
+    let pages = ((total as i64) + per - 1) / per;
+    let page = page.clamp(1, pages.max(1));
+    let start = ((page - 1) as usize) * (per as usize);
+    let page_rows = rows
+        .into_iter()
+        .skip(start)
+        .take(per as usize)
+        .collect::<Vec<_>>();
+    let items = page_rows
         .into_iter()
         .map(|r| ContactView {
             addr: r.addr.clone(),
@@ -1341,12 +1393,15 @@ fn contacts_ctx_full(
             hits: r.hits,
         })
         .collect::<Vec<_>>();
-    let total = items.len();
     ContactsCtx {
         frame: frame_ctx(state, "contacts"),
         q: q.to_string(),
         total,
         items,
+        per,
+        page,
+        pages,
+        page_base: contact_page_base(q, per),
         notice: notice.to_string(),
         error: error.to_string(),
         edit_name: if edit_addr.is_empty() {
@@ -1376,7 +1431,12 @@ fn contacts_page(state: &AppState, req: &Req) -> Resp {
     }
     let q = req.query_param("q").unwrap_or_default().trim().to_string();
     let edit = req.query_param("edit").unwrap_or_default();
-    let ctx = contacts_ctx_full(state, &q, edit.trim(), "", "");
+    let (per, page) = contact_paging(
+        state,
+        req.query_param("per").as_deref(),
+        req.query_param("page").as_deref(),
+    );
+    let ctx = contacts_ctx_full(state, &q, per, page, edit.trim(), "", "");
     if req.is_htmx_request {
         render_html("contacts_area.html", &ctx)
     } else {
@@ -1412,7 +1472,12 @@ fn contacts_save(state: &AppState, req: &Req) -> Resp {
         }
         Err(e) => (String::new(), e),
     };
-    let ctx = contacts_ctx_with(state, &q, &notice, &error);
+    let (per, page) = contact_paging(
+        state,
+        form.get("per").map(|s| s.as_str()),
+        form.get("page").map(|s| s.as_str()),
+    );
+    let ctx = contacts_ctx_with(state, &q, per, page, &notice, &error);
     render_html("contacts_area.html", &ctx)
 }
 
@@ -1440,7 +1505,12 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let ctx = contacts_ctx(state, &q);
+    let (per, page) = contact_paging(
+        state,
+        form.get("per").map(|s| s.as_str()),
+        form.get("page").map(|s| s.as_str()),
+    );
+    let ctx = contacts_ctx(state, &q, per, page);
     render_html("contacts_area.html", &ctx)
 }
 
