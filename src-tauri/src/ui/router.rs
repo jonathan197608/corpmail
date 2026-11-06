@@ -1283,8 +1283,10 @@ struct ContactsCtx {
     page: i64,
     /// 总页数（>=1）
     pages: i64,
-    /// 翻页链接前缀（含 per/q；模板拼 page=N）
+    /// 翻页链接前缀（含 per/q/sort；模板拼 page=N）
     page_base: String,
+    /// 排序键回显（recent/hits/name；模板选中态比较）
+    sort: String,
     /// 手动保存结果（B3；空串 = 无提示）
     notice: String,
     error: String,
@@ -1307,20 +1309,27 @@ struct ContactView {
     edit_qs: String,
 }
 
+/// 联系人页当前列表状态（搜索/分页/排序；URL 态与 POST 保存/删除带回共用）：
+/// 字段收敛为结构体，避免渲染函数参数膨胀
+struct ContactListOpts<'a> {
+    q: &'a str,
+    per: i64,
+    page: i64,
+    sort: &'a str,
+}
+
 /// 联系人列表渲染（整页 contacts.html 与删除/保存后片段 contacts_area.html 共用）
-fn contacts_ctx(state: &AppState, q: &str, per: i64, page: i64) -> ContactsCtx {
-    contacts_ctx_full(state, q, per, page, "", "", "")
+fn contacts_ctx(state: &AppState, opts: &ContactListOpts<'_>) -> ContactsCtx {
+    contacts_ctx_full(state, opts, "", "", "")
 }
 
 fn contacts_ctx_with(
     state: &AppState,
-    q: &str,
-    per: i64,
-    page: i64,
+    opts: &ContactListOpts<'_>,
     notice: &str,
     error: &str,
 ) -> ContactsCtx {
-    contacts_ctx_full(state, q, per, page, "", notice, error)
+    contacts_ctx_full(state, opts, "", notice, error)
 }
 
 /// 联系人分页解析：per 与 mail list 同口径（URL/表单 per 优先，缺省用 settings，
@@ -1338,12 +1347,16 @@ fn contact_paging(state: &AppState, per_raw: Option<&str>, page_raw: Option<&str
     (per, page)
 }
 
-/// 联系人翻页链接前缀：per 恒带，q 非空追加；模板拼 &page=N
-fn contact_page_base(q: &str, per: i64) -> String {
+/// 联系人翻页链接前缀：per 恒带，q 非空追加；sort 非默认追加（与
+/// mail list 的「默认不携带保持 URL 干净」同一口径）；模板拼 &page=N
+fn contact_page_base(q: &str, per: i64, sort: &str) -> String {
     let mut base = format!("/contacts?per={per}");
     if !q.is_empty() {
         base.push('&');
         base.push_str(&format!("q={}", urlencode(q)));
+    }
+    if sort != "recent" {
+        base.push_str(&format!("&sort={sort}"));
     }
     base
 }
@@ -1351,20 +1364,19 @@ fn contact_page_base(q: &str, per: i64) -> String {
 /// 编辑态取姓名（地址不存在则退化为新增表单，不报错）
 fn contacts_ctx_full(
     state: &AppState,
-    q: &str,
-    per: i64,
-    page: i64,
+    opts: &ContactListOpts<'_>,
     edit_addr: &str,
     notice: &str,
     error: &str,
 ) -> ContactsCtx {
+    let sort = mail::contacts::ContactsSort::parse(Some(opts.sort));
     let rows = state
-        .with_conn(|conn| mail::contacts::list_rows(conn, q, 500))
+        .with_conn(|conn| mail::contacts::list_rows(conn, opts.q, 500, sort))
         .unwrap_or_default();
     let total = rows.len();
-    let per = per.max(1);
+    let per = opts.per.max(1);
     let pages = ((total as i64) + per - 1) / per;
-    let page = page.clamp(1, pages.max(1));
+    let page = opts.page.clamp(1, pages.max(1));
     let start = ((page - 1) as usize) * (per as usize);
     let page_rows = rows
         .into_iter()
@@ -1395,13 +1407,14 @@ fn contacts_ctx_full(
         .collect::<Vec<_>>();
     ContactsCtx {
         frame: frame_ctx(state, "contacts"),
-        q: q.to_string(),
+        q: opts.q.to_string(),
         total,
         items,
         per,
         page,
         pages,
-        page_base: contact_page_base(q, per),
+        page_base: contact_page_base(opts.q, per, sort.key()),
+        sort: sort.key().to_string(),
         notice: notice.to_string(),
         error: error.to_string(),
         edit_name: if edit_addr.is_empty() {
@@ -1436,7 +1449,14 @@ fn contacts_page(state: &AppState, req: &Req) -> Resp {
         req.query_param("per").as_deref(),
         req.query_param("page").as_deref(),
     );
-    let ctx = contacts_ctx_full(state, &q, per, page, edit.trim(), "", "");
+    let sort = req.query_param("sort").unwrap_or_default();
+    let opts = ContactListOpts {
+        q: &q,
+        per,
+        page,
+        sort: sort.trim(),
+    };
+    let ctx = contacts_ctx_full(state, &opts, edit.trim(), "", "");
     if req.is_htmx_request {
         render_html("contacts_area.html", &ctx)
     } else {
@@ -1477,7 +1497,14 @@ fn contacts_save(state: &AppState, req: &Req) -> Resp {
         form.get("per").map(|s| s.as_str()),
         form.get("page").map(|s| s.as_str()),
     );
-    let ctx = contacts_ctx_with(state, &q, per, page, &notice, &error);
+    let sort = form.get("sort").cloned().unwrap_or_default();
+    let opts = ContactListOpts {
+        q: &q,
+        per,
+        page,
+        sort: sort.trim(),
+    };
+    let ctx = contacts_ctx_with(state, &opts, &notice, &error);
     render_html("contacts_area.html", &ctx)
 }
 
@@ -1510,7 +1537,14 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
         form.get("per").map(|s| s.as_str()),
         form.get("page").map(|s| s.as_str()),
     );
-    let ctx = contacts_ctx(state, &q, per, page);
+    let sort = form.get("sort").cloned().unwrap_or_default();
+    let opts = ContactListOpts {
+        q: &q,
+        per,
+        page,
+        sort: sort.trim(),
+    };
+    let ctx = contacts_ctx(state, &opts);
     render_html("contacts_area.html", &ctx)
 }
 

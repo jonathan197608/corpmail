@@ -129,26 +129,70 @@ pub struct ContactRow {
     pub hits: i64,
 }
 
+/// 联系人排序键（批次四，与邮件列表排序下拉对齐）：
+/// Recent = 最近联系优先（默认）、Hits = 联系最多、Name = 姓名。
+/// ORDER BY 为静态字符串（枚举驱动，无注入面）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactsSort {
+    Recent,
+    Hits,
+    Name,
+}
+
+impl ContactsSort {
+    /// URL/表单值归一：未知/缺省 → Recent（与 mail::SortKey::parse 同口径）
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("hits") => Self::Hits,
+            Some("name") => Self::Name,
+            _ => Self::Recent,
+        }
+    }
+
+    /// 模板回显用的键名（选中态比较）
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Hits => "hits",
+            Self::Name => "name",
+        }
+    }
+
+    fn order_by(self) -> &'static str {
+        match self {
+            Self::Recent => "updated_at DESC, hits DESC",
+            Self::Hits => "hits DESC, updated_at DESC",
+            Self::Name => "name ASC, addr ASC",
+        }
+    }
+}
+
 /// 联系人管理页列表（M3-3）：q 空返回全部，否则按姓名/地址模糊；
-/// 按最近联系倒序。limit 上限由调用方控制（页面一次展示量级）。
-pub fn list_rows(conn: &Connection, q: &str, limit: usize) -> rusqlite::Result<Vec<ContactRow>> {
+/// 排序由 ContactsSort 决定（默认最近联系倒序）。limit 上限由调用方控制。
+pub fn list_rows(
+    conn: &Connection,
+    q: &str,
+    limit: usize,
+    sort: ContactsSort,
+) -> rusqlite::Result<Vec<ContactRow>> {
     let limit = limit as i64;
+    let order = sort.order_by();
     let t = q.trim();
     if t.is_empty() {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT addr, name, updated_at, hits FROM contacts \
-             ORDER BY updated_at DESC, hits DESC LIMIT ?1",
-        )?;
+             ORDER BY {order} LIMIT ?1"
+        ))?;
         return stmt
             .query_map([limit], contact_row)?
             .collect::<Result<Vec<_>, _>>();
     }
     let pattern = format!("%{}%", escape_like(t));
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT addr, name, updated_at, hits FROM contacts \
          WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
-         ORDER BY updated_at DESC, hits DESC LIMIT ?2",
-    )?;
+         ORDER BY {order} LIMIT ?2"
+    ))?;
     stmt.query_map(rusqlite::params![pattern, limit], contact_row)?
         .collect::<Result<Vec<_>, _>>()
 }

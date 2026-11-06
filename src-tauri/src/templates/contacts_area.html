@@ -16,14 +16,22 @@
                     <option value="100" {% if per == 100 %}selected{% endif %}>每页 100 人</option>
                 </select>
             </label>
+            <label class="per-page" title="列表排序">
+                <select class="per-select" name="sort" aria-label="列表排序" onchange="this.form.submit()">
+                    <option value="recent" {% if sort == 'recent' %}selected{% endif %}>最近联系</option>
+                    <option value="hits" {% if sort == 'hits' %}selected{% endif %}>联系最多</option>
+                    <option value="name" {% if sort == 'name' %}selected{% endif %}>姓名</option>
+                </select>
+            </label>
         </form>
         <form class="search" id="contacts-search" method="get" action="/contacts" title="按姓名或邮件地址搜索">
             <span>🔍</span>
             <input type="search" name="q" placeholder="搜索姓名或地址…" value="{{ q }}">
             {% if q %}<a class="search-clear" href="/contacts" title="清除搜索">×</a>{% endif %}
-            {# 隐藏 per/page：POST 保存/删除经 hx-include 保持分页态 #}
+            {# 隐藏 per/page/sort：POST 保存/删除经 hx-include 保持分页与排序态 #}
             <input type="hidden" name="per" value="{{ per }}">
             <input type="hidden" name="page" value="{{ page }}">
+            <input type="hidden" name="sort" value="{{ sort }}">
         </form>
     </div>
 

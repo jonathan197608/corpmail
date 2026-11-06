@@ -5926,6 +5926,90 @@ fn contacts_page_pagination_slices_and_defaults() {
     cleanup(&dir);
 }
 
+/// 联系人排序：默认最近联系；sort=hits 联系最多、sort=name 姓名（SQLite
+/// BINARY 序即 UTF-8 字节序，非拼音）；排序下拉与邮件列表同构，非默认进翻页链接
+#[test]
+fn contacts_page_sort_orders_and_preserves() {
+    let (state, dir) = temp_state("m3-contacts-sort");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let now = mail::now_epoch();
+    // c0 最新但联系最少；c1 最旧但联系最多；姓名字节序 李(c2)<王(c0)<陈(c1)
+    state
+        .with_conn(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
+                 ('c0@x.cn', '王五', {a}, 1),
+                 ('c1@x.cn', '陈一', {b}, 9),
+                 ('c2@x.cn', '李三', {c}, 5)",
+                a = now,
+                b = now - 7200,
+                c = now - 3600
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 默认：最近联系倒序（c0 → c2 → c1）+ 排序下拉选项齐全
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/contacts", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("最近联系") && html.contains("联系最多") && html.contains("姓名"),
+        "排序下拉选项应齐全：{html}"
+    );
+    let (i0, i2, i1) = (
+        html.find("c0@x.cn").unwrap(),
+        html.find("c2@x.cn").unwrap(),
+        html.find("c1@x.cn").unwrap(),
+    );
+    assert!(i0 < i2 && i2 < i1, "默认应按最近联系倒序");
+    // sort=hits：联系次数降序（c1 → c2 → c0，默认每页全量）
+    let html = body(&route(&state, &assets(), &req_q("GET", "/contacts", "sort=hits", b""), &tester));
+    let (h0, h1, h2) = (
+        html.find("c0@x.cn").unwrap(),
+        html.find("c1@x.cn").unwrap(),
+        html.find("c2@x.cn").unwrap(),
+    );
+    assert!(h1 < h2 && h2 < h0, "sort=hits 应按联系次数降序");
+    assert!(
+        html.contains(r#"<option value="hits" selected"#),
+        "hits 应选中：{html}"
+    );
+    // 翻页链接保留排序：per=2 第 1 页的「下一页」应带 sort=hits&page=2
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "sort=hits&per=2", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains("sort=hits&page=2") && html.contains("下一页"),
+        "翻页链接应保留排序：{html}"
+    );
+    // sort=name：姓名升序（字节序：李 → 王 → 陈）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "sort=name&per=10", b""),
+        &tester,
+    ));
+    let (n0, n1, n2) = (
+        html.find("c0@x.cn").unwrap(),
+        html.find("c1@x.cn").unwrap(),
+        html.find("c2@x.cn").unwrap(),
+    );
+    assert!(n2 < n0 && n0 < n1, "sort=name 应按姓名升序（UTF-8 字节序）");
+    cleanup(&dir);
+}
+
 // ---------- M4-2 定时发送（compose 页 + 详情/列表展示） ----------
 
 /// 定时发送主链路：未来时刻提交 → 草稿落 scheduled_at、不入队 → 跳详情页
