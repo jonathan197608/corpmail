@@ -1397,8 +1397,11 @@ document.addEventListener('click', function (ev) {
         var d = ev.detail || {};
         var reqPath = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
         var xhr = d.xhr;
+        // 仅显式「存草稿」(/compose/draft) 成功才清除未保存标记；
+        // 静默自动保存(/compose/autosave)不计入——有编辑时离开始终提醒，
+        // 直到用户显式存草稿或发送（否则自动保存会提前把提醒"吃掉"）
         if (xhr && xhr.status >= 200 && xhr.status < 300 &&
-            (reqPath.indexOf('/compose/autosave') >= 0 || reqPath.indexOf('/compose/draft') >= 0)) {
+            reqPath.indexOf('/compose/draft') >= 0) {
             edited = false;
         }
     });
