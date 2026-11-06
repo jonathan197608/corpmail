@@ -1,6 +1,37 @@
 // CorpMail 前端辅助（M2：附件选择/另存，__TAURI__.dialog；设计 §2/§5.1）
 // 全局 500ms 防抖由 htmx 触发器表达式承担（hx-trigger="... once:500ms"，设计 §7）
 
+// 通用离开确认模态：Tauri 的 macOS WKWebView（wry）未实现 JS confirm 的 UI 代理，
+// window.confirm 只会返回 false 且不弹窗，故改用页面内模态（跨平台一致）。
+// message 支持换行（CSS white-space: pre-line）；onLeave 在用户点「放弃并离开」时调用。
+function mbxConfirmLeave(message, onLeave) {
+    var old = document.getElementById('mbx-leave-confirm');
+    if (old) old.remove();
+    var mask = document.createElement('div');
+    mask.id = 'mbx-leave-confirm';
+    mask.className = 'mbx-leave-mask';
+    mask.innerHTML = '<div class="mbx-leave-card" role="alertdialog" aria-modal="true">'
+        + '<p></p>'
+        + '<div class="mbx-leave-actions">'
+        + '<button type="button" class="btn" data-leave-cancel>继续编辑</button>'
+        + '<button type="button" class="btn danger" data-leave-ok>放弃并离开</button>'
+        + '</div></div>';
+    mask.querySelector('p').textContent = message;
+    document.body.appendChild(mask);
+    function close() { if (mask.parentNode) mask.remove(); }
+    mask.addEventListener('click', function (ev) {
+        if (ev.target === mask) { close(); return; } // 点遮罩 = 取消
+        if (ev.target.closest('[data-leave-cancel]')) { close(); return; }
+        if (ev.target.closest('[data-leave-ok]')) { close(); if (onLeave) onLeave(); return; }
+    });
+    // Esc = 取消
+    mask.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { ev.stopPropagation(); close(); }
+    });
+    var ok = mask.querySelector('[data-leave-ok]');
+    if (ok) ok.focus();
+}
+
 // 启动引导动画移除（M5：base.html 内联 #boot，脚本就绪即撤）
 (function removeBoot() {
     const boot = document.getElementById('boot');
@@ -1327,10 +1358,9 @@ document.addEventListener('click', function (ev) {
 })();
 
 // ---------- 撰写页：离开前未保存确认 ----------
-// 编辑邮件时若已改动但尚未保存/发送，点「返回列表」、侧栏导航等任何链接离开，
-// 或刷新/关闭页面，均弹窗确认，避免误操作丢失正在写的内容。
-// 脏判定 = 当前表单快照（含富文本 getHtml）!= 加载基线；自动保存/存草稿/发送成功后
-// 重置基线（此时已落库，不再提示）。
+// 编辑过但未保存/发送时，点链接离开弹页面内确认模态（Tauri 的 macOS WKWebView
+// 不支持 window.confirm，故用 mbxConfirmLeave）。edited 标记由输入事件置位，
+// 自动保存/存草稿成功后清零（已落库不再提示）。
 (function () {
     function composeForm() {
         var el = document.getElementById('autosave-hint');
@@ -1338,80 +1368,144 @@ document.addEventListener('click', function (ev) {
     }
     if (!composeForm()) return; // 非撰写页，不启用
 
-    function snap() {
-        var f = composeForm();
-        if (!f) return '';
-        var parts = [];
-        try {
-            new FormData(f).forEach(function (v, k) { parts.push(k + '=' + v); });
-        } catch (e) { /* ignore */ }
-        if (window.mbxEditor && window.mbxEditor.getHtml) {
-            try { parts.push('__html=' + window.mbxEditor.getHtml()); } catch (e) { /* ignore */ }
-        }
-        return parts.sort().join('&');
-    }
-
-    var baseline = null;
-    function ensureBaseline() { if (baseline === null) baseline = snap(); }
-    // 等编辑器挂载完成（DOMContentLoaded 同步构建）后再抓基线，避免初始内容误判
+    var edited = false;
+    var leaving = false;
+    var bypass = false;
+    var ready = false;
+    // 编辑器挂载后启用编辑标记（DOMContentLoaded 同步构建，稍延迟确保就绪）
+    function arm() { ready = true; }
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function () { setTimeout(ensureBaseline, 0); });
+        document.addEventListener('DOMContentLoaded', function () { setTimeout(arm, 0); });
     } else {
-        setTimeout(ensureBaseline, 0);
+        setTimeout(arm, 0);
     }
+    function isDirty() { return edited; }
 
-    function isDirty() {
-        if (baseline === null) return false;
-        return snap() !== baseline;
-    }
-    function resetBaseline() { baseline = snap(); }
-
-    // 有改动即在自动保存提示区显示「● 未保存」，保存/自动保存后由既有提示刷新
-    function markDirtyHint(ev) {
-        if (baseline === null) return;
+    function markEdited(ev) {
         var f = composeForm();
         if (!f || !f.contains(ev.target)) return;
+        if (!ready) return;
+        edited = true;
         var hint = document.getElementById('autosave-hint');
         if (hint) hint.textContent = '● 未保存';
     }
-    document.body.addEventListener('input', markDirtyHint, true);
-    document.body.addEventListener('change', markDirtyHint, true);
+    document.body.addEventListener('input', markEdited, true);
+    document.body.addEventListener('change', markEdited, true);
 
-    // 保存/自动保存成功 → 已落库，重置基线
+    // 保存/自动保存成功 → 已落库，清除未保存标记
     document.body.addEventListener('htmx:afterRequest', function (ev) {
         var d = ev.detail || {};
         var reqPath = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
         var xhr = d.xhr;
         if (xhr && xhr.status >= 200 && xhr.status < 300 &&
             (reqPath.indexOf('/compose/autosave') >= 0 || reqPath.indexOf('/compose/draft') >= 0)) {
-            setTimeout(resetBaseline, 0);
+            edited = false;
         }
     });
 
-    // 拦截离开撰写页的链接导航（返回列表 / 侧栏 / 撰写其他邮件等）
-    // leaving：用户已确认离开或点了发送/存草稿 → 放行 beforeunload，避免二次弹窗
-    var leaving = false;
-    document.addEventListener('click', function (ev) {
-        var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
-        if (!a) return;
-        var href = a.getAttribute('href') || '';
-        if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 || a.target === '_blank') return;
-        if (!isDirty()) return;
-        if (!window.confirm('邮件尚未保存或发送，离开将丢失未保存的内容。\n\n确定离开？（可先点「存草稿」保存）')) {
-            ev.preventDefault();
-            ev.stopPropagation();
-        } else {
-            leaving = true; // 已确认离开：导航前的 beforeunload 不再二次询问
-        }
-    }, true);
-
-    // 发送/存草稿按钮点击 → 视为已保存意图，放行后续导航（避免成功后跳转误触 beforeunload）
+    // 发送/存草稿按钮 → 已保存意图，放行后续导航
     document.addEventListener('click', function (ev) {
         var b = ev.target && ev.target.closest ? ev.target.closest('button[hx-post="/compose/send"], button[type="submit"]') : null;
         if (b) leaving = true;
     }, true);
 
-    // 刷新 / 关闭页面兜底
+    // 链接离开 → 自定义模态确认（确认后跳转，避免二次拦截）
+    document.addEventListener('click', function (ev) {
+        if (bypass) return;
+        var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        if (!a) return;
+        var href = a.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 || a.target === '_blank') return;
+        if (!isDirty()) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var dest = a.href;
+        mbxConfirmLeave('邮件尚未保存或发送，离开将丢失未保存的内容。\n可先点「存草稿」保存。', function () {
+            leaving = true;
+            bypass = true;
+            window.location.href = dest;
+        });
+    }, true);
+
+    window.addEventListener('beforeunload', function (ev) {
+        if (leaving) return;
+        if (isDirty()) {
+            ev.preventDefault();
+            ev.returnValue = '';
+            return '';
+        }
+    });
+})();
+
+// ---------- 设置页：离开前未保存确认 ----------
+// 覆盖：切换 tab（hx-get 替换 #settings-pane）、点侧栏/其他链接离开、刷新/关闭。
+// Tauri WKWebView 不支持 window.confirm，统一用页面内模态 mbxConfirmLeave；
+// edited 标记由 pane 内输入事件置位，保存/切换后（afterSwap）清零。
+(function () {
+    function paneRoot() { return document.getElementById('settings-pane'); }
+    if (!paneRoot()) return; // 非设置页
+
+    var edited = false;
+    var leaving = false;
+    var bypass = false;
+
+    function paneEdited(ev) {
+        var p = paneRoot();
+        if (!p || !p.contains(ev.target)) return;
+        edited = true;
+    }
+    document.body.addEventListener('input', paneEdited, true);
+    document.body.addEventListener('change', paneEdited, true);
+    function isDirty() { return edited; }
+    function clearEdited() { edited = false; }
+
+    // 切换 tab（span.stab：hx-get 替换 pane）——有未保存修改先确认
+    document.addEventListener('click', function (ev) {
+        if (bypass) return;
+        var tab = ev.target && ev.target.closest ? ev.target.closest('.settings-tabs .stab') : null;
+        if (!tab) return;
+        if (!isDirty()) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+        mbxConfirmLeave('设置尚未保存，切换后将丢失未保存的修改。', function () {
+            leaving = true;
+            bypass = true;
+            tab.click();
+            setTimeout(function () { bypass = false; }, 0);
+        });
+    }, true);
+
+    // 离开设置页的链接导航（侧栏 / 返回等）
+    document.addEventListener('click', function (ev) {
+        if (bypass) return;
+        var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        if (!a) return;
+        var href = a.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 || a.target === '_blank') return;
+        if (!isDirty()) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var dest = a.href;
+        mbxConfirmLeave('设置尚未保存，离开将丢失未保存的修改。', function () {
+            leaving = true;
+            bypass = true;
+            window.location.href = dest;
+        });
+    }, true);
+
+    // 保存按钮点击 → 已保存意图，放行
+    document.addEventListener('click', function (ev) {
+        var b = ev.target && ev.target.closest ? ev.target.closest('button[hx-post*="/save"], button[type="submit"]') : null;
+        if (b) leaving = true;
+    }, true);
+
+    // 保存成功 / 切换 tab 后 pane 被替换 → 清除未保存标记
+    document.body.addEventListener('htmx:afterSwap', function (ev) {
+        var t = ev.detail && ev.detail.target;
+        if (t && t.id === 'settings-pane') { clearEdited(); leaving = false; bypass = false; }
+    });
+
     window.addEventListener('beforeunload', function (ev) {
         if (leaving) return;
         if (isDirty()) {

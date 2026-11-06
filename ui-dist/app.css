@@ -3251,3 +3251,37 @@ a.btn.link.disabled {
     border-bottom: 1px solid #f0dfae;
     font-size: 12.5px;
 }
+
+/* ============ 离开确认模态（撰写/设置未保存，跨平台，不依赖 window.confirm） ============ */
+.mbx-leave-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 120;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 23, 42, 0.45);
+}
+
+.mbx-leave-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px 22px;
+    width: min(90vw, 420px);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.mbx-leave-card p {
+    margin: 0 0 16px;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--ink);
+    white-space: pre-line;
+}
+
+.mbx-leave-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--gap-btn);
+}
