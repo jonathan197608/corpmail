@@ -16,10 +16,14 @@
             <a class="src-tab {% if part == 'headers' %}on{% endif %}"
                href="/emails/{{ email_id }}/source?part=headers{% if list_query %}&{{ list_query }}{% endif %}">原始信头</a>
             <span class="src-meta">{{ chars }} 字符 · {{ lines }} 行</span>
+            <button type="button" class="btn small ghost src-copy" title="复制当前视图全部内容">复制</button>
         </div>
 
         {% if content %}
-        <pre class="src-pre">{{ content }}</pre>
+        <div class="src-wrap">
+            <pre class="src-gutter" aria-hidden="true"></pre>
+            <pre class="src-pre" id="src-content">{{ content }}</pre>
+        </div>
         {% else %}
         <div class="src-empty">{{ empty_hint }}</div>
         {% endif %}

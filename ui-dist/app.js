@@ -1518,3 +1518,61 @@ document.addEventListener('click', function (ev) {
         }
     });
 })();
+
+// ---------- 源码页（A3）：行号 + 一键复制 ----------
+// 源码页为整页导航（非 htmx 局部替换），DOMContentLoaded 一次构建即可。
+function mbBuildSourceGutter(wrap) {
+    var pre = wrap.querySelector('.src-pre');
+    var gutter = wrap.querySelector('.src-gutter');
+    if (!pre || !gutter) return;
+    var text = pre.textContent || '';
+    var n = text.split('\n').length;
+    if (text.charCodeAt(text.length - 1) === 10) n -= 1; // 尾随换行不占空行
+    var nums = [];
+    for (var i = 1; i <= n; i++) nums.push(String(i));
+    gutter.textContent = nums.join('\n');
+}
+
+function mbCopyTextFallback(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) { /* 忽略 */ }
+    document.body.removeChild(ta);
+}
+
+function mbSourceCopy(pre) {
+    var btn = document.querySelector('.src-copy');
+    if (!pre) return;
+    var text = pre.textContent || '';
+    var original = btn ? (btn.dataset.label || '复制') : '复制';
+    function settle(label) {
+        if (!btn) return;
+        btn.dataset.label = original;
+        btn.textContent = label;
+        setTimeout(function () { btn.textContent = original; }, 1500);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+            function () { settle('✓ 已复制'); },
+            function () { mbCopyTextFallback(text); settle('✓ 已复制'); }
+        );
+    } else {
+        mbCopyTextFallback(text);
+        settle('✓ 已复制');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.src-wrap').forEach(mbBuildSourceGutter);
+});
+
+document.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.src-copy') : null;
+    if (!btn) return;
+    var pre = document.getElementById('src-content');
+    if (pre) mbSourceCopy(pre);
+});

@@ -587,9 +587,26 @@ body {
     padding: 28px 24px;
 }
 
-.empty-mark {
-    font-size: 34px;
-    margin-bottom: 10px;
+/* 空态插画（B5-2）：浅色渐变圆底 + 主题色线条插图，替代 emoji；
+   内联 SVG 无二进制资源，stroke 用 currentColor 随主题着色。 */
+.empty-art {
+    width: 96px;
+    height: 96px;
+    margin: 0 auto 12px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(160deg,
+        color-mix(in srgb, var(--accent) 14%, transparent),
+        color-mix(in srgb, var(--accent) 3%, transparent));
+    color: var(--accent);
+}
+
+.empty-art svg {
+    width: 46px;
+    height: 46px;
+    display: block;
 }
 
 .empty-state h2 {
@@ -870,8 +887,12 @@ body {
 }
 
 .step-arrow {
-    color: #c3c9d8;
-    font-size: 11px;
+    flex: none;
+    width: 34px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--line);
+    font-size: 0;
 }
 
 .setup-card {
@@ -1175,6 +1196,7 @@ a.btn.link.disabled {
     border-bottom: 2px solid transparent;
     margin-bottom: -1px;
     user-select: none;
+    transition: color 0.15s, border-bottom-color 0.15s;
 }
 
 .settings-tabs .stab:hover {
@@ -1199,6 +1221,12 @@ a.btn.link.disabled {
 
 .settings-pane.on {
     display: block;
+    animation: mbx-pane-in 0.16s ease-out;
+}
+
+@keyframes mbx-pane-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
 }
 
 .settings-card {
@@ -2708,6 +2736,7 @@ a.btn.link.disabled {
     padding: 5px 12px;
     border-radius: 8px;
     border: 1px solid transparent;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
 .src-tab:hover {
@@ -2729,19 +2758,50 @@ a.btn.link.disabled {
     font-variant-numeric: tabular-nums;
 }
 
-/* 源码块：等宽、保留空白、长行横向滚动（不折行，便于对齐表头/结构） */
-.src-pre {
-    margin: 0;
-    padding: 14px 16px;
+.src-copy {
+    flex: none;
+}
+
+/* 源码块：等宽、保留空白、长行横向滚动（不折行，便于对齐表头/结构）。
+   外层 .src-wrap 统一承载纵向/横向滚动，左侧 .src-gutter 行号 sticky 钉住，
+   水平滚动时行号不跟随；.src-pre 不再自设滚动与描边（交回 wrap）。 */
+.src-wrap {
+    display: flex;
+    align-items: stretch;
+    max-height: calc(100vh - 260px);
+    overflow: auto;
     background: #f7f9fc;
     border: 1px solid var(--line);
     border-radius: 10px;
+}
+
+.src-gutter {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    flex: none;
+    margin: 0;
+    padding: 14px 10px 14px 14px;
+    text-align: right;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: #b6bfce;
+    background: #f0f3f8;
+    border-right: 1px solid var(--line);
+    white-space: pre;
+    tab-size: 4;
+    user-select: none;
+}
+
+.src-pre {
+    flex: 1;
+    margin: 0;
+    padding: 14px 16px;
     font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     font-size: 12.5px;
     line-height: 1.6;
     color: var(--ink);
-    max-height: calc(100vh - 260px);
-    overflow: auto;
     white-space: pre;
     tab-size: 4;
 }

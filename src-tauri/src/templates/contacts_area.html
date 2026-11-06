@@ -63,13 +63,14 @@
     {% else %}
         <div class="card empty-state">
             {% if q %}
-            <div class="empty-mark">🔍</div>
+            <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
             <h2>没有匹配的联系人</h2>
             <p>换个关键词试试，支持姓名与邮件地址模糊搜索。</p>
             {% else %}
-            <div class="empty-mark">👥</div>
+            <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17.5" cy="9.5" r="2.5"/><path d="M15.5 15.5a6 6 0 0 1 6 4.5"/></svg></div>
             <h2>还没有联系人</h2>
             <p>联系人会在收发邮件时自动采集，无需手动添加。</p>
+            <a class="btn" href="/">去收件箱看看</a>
             {% endif %}
         </div>
     {% endif %}
