@@ -380,8 +380,16 @@ body {
     border: 1px solid var(--line);
     border-radius: 9px;
     padding: 0 10px;
+    padding-right: 26px;
     height: 34px;
-    background: var(--panel);
+    /* 自定义下拉箭头：原生箭头贴右缘不美观，改用 SVG 箭头并距右缘 10px */
+    background-color: var(--panel);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 5 6.5 8 3.5' fill='none' stroke='%235b7280' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 10px 10px;
+    appearance: none;
+    -webkit-appearance: none;
     cursor: pointer;
 }
 
@@ -389,6 +397,18 @@ body {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* 每页条数 + 排序两个下拉拼接为 split：连接处直角（去内侧圆角），
+   中间保留单线边框作分隔（margin-left 合并重叠边框） */
+.per-form .per-page + .per-page .per-select {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    margin-left: -1px;
+}
+.per-form .per-page:first-of-type .per-select {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
 }
 
 .sync-btn:hover:not([disabled]) {

@@ -28,10 +28,10 @@
             {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
             <label class="per-page" title="每页显示条数">
                 <select class="per-select" name="per" aria-label="每页显示条数" onchange="this.form.submit()">
-                    <option value="10" {% if per == 10 %}selected{% endif %}>10 封</option>
-                    <option value="20" {% if per == 20 %}selected{% endif %}>20 封</option>
-                    <option value="50" {% if per == 50 %}selected{% endif %}>50 封</option>
-                    <option value="100" {% if per == 100 %}selected{% endif %}>100 封</option>
+                    <option value="10" {% if per == 10 %}selected{% endif %}>每页 10 封</option>
+                    <option value="20" {% if per == 20 %}selected{% endif %}>每页 20 封</option>
+                    <option value="50" {% if per == 50 %}selected{% endif %}>每页 50 封</option>
+                    <option value="100" {% if per == 100 %}selected{% endif %}>每页 100 封</option>
                 </select>
             </label>
             <label class="per-page" title="列表排序">
