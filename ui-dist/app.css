@@ -1762,6 +1762,12 @@ a.btn.link.disabled {
     white-space: nowrap;
 }
 
+/* 顶栏标题允许收缩（覆盖 .topbar>* 的 flex-shrink:0）：超长单行省略不溢出卡片 */
+.topbar > .md-title {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
 .mail-detail {
     margin: 4px 12px 12px;
     padding: 18px 22px;

@@ -536,9 +536,13 @@
 
     // 预览样式：iframe 内部基础排版（不含任何外部资源）
     const DOCX_CSS = `
-        html, body { height: 100%; }
-        body { margin: 0; background: #eef2f7; font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
-        .docx-wrapper { background: #eef2f7; padding: 16px 0; }
+        html { height: 100%; }
+        body { min-height: 100%; margin: 0; background: #eef2f7;
+               display: flex; flex-direction: column;
+               font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+        /* 垂直居中：内容不足一屏时上下 margin:auto 居中；多页超视口时
+           margin 归 0 自然从顶部排列、可滚动（安全居中，不裁切首屏） */
+        .docx-wrapper { background: #eef2f7; padding: 16px 0; margin: auto 0; width: 100%; }
         .docx-wrapper > section.docx { box-shadow: 0 1px 4px rgba(15,23,42,.12); margin-bottom: 16px; }
         img { max-width: 100%; }
     `;
