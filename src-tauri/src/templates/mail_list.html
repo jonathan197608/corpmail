@@ -4,6 +4,42 @@
 <div id="list-area">
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
+        {% if not is_thread and items %}
+        {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）；
+           本页全选/已选计数/删除/取消常驻，低频动作（标已读/标未读/星标/
+           取消星标）收进「批量⋯」下拉节省横向空间；按钮禁用态随选中数切换 #}
+        <div class="mbx-inline" id="batch-bar">
+            <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">全选</label>
+            <span class="ba-count" id="ba-count"></span>
+            <button type="button" class="btn small danger" data-batch="delete">🗑️ 删除</button>
+            <div class="split ba-more">
+                <button type="button" class="btn small" data-split-toggle aria-label="更多批量操作">批量⋯</button>
+                <div class="split-menu" hidden>
+                    {# 跨页全选入口放菜单内：选中后文案较长，留在行内会把顶栏挤换行 #}
+                    <a href="#" id="ba-select-all" hidden></a>
+                    <button type="button" data-batch="read">标已读</button>
+                    <button type="button" data-batch="unread">标未读</button>
+                    <button type="button" data-batch="star">⭐ 星标</button>
+                    <button type="button" data-batch="unstar">✩ 取消星标</button>
+                </div>
+            </div>
+            <button type="button" class="btn small" id="ba-clear">取消</button>
+            <input type="hidden" id="batch-mode" value="ids">
+            <input type="hidden" id="batch-exclude" value="[]">
+            <input type="hidden" id="ba-folder" value="{{ folder }}">
+            <input type="hidden" id="ba-unread" value="{{ '1' if unread_only else '0' }}">
+            <input type="hidden" id="ba-external" value="{{ '1' if external_only else '0' }}">
+            <input type="hidden" id="ba-q" value="{{ q }}">
+            <input type="hidden" id="ba-page" value="{{ page }}">
+            <input type="hidden" id="ba-per" value="{{ per }}">
+            <input type="hidden" id="ba-sort" value="{{ sort }}">
+            <input type="hidden" id="ba-from" value="{{ from_filter }}">
+            <input type="hidden" id="ba-df" value="{{ df }}">
+            <input type="hidden" id="ba-dt" value="{{ dt }}">
+            <input type="hidden" id="ba-att" value="{{ '1' if has_attach else '0' }}">
+            <input type="hidden" id="ba-total" value="{{ total }}">
+        </div>
+        {% endif %}
         {# 顶栏 ⋯ 下拉（批次四）：筛选（只看未读/只看外部/会话视图）与收取新邮件
            是低频操作，收进下拉，顶栏保持单行；高频的每页/排序/搜索常驻 #}
         <div class="split tb-more">
@@ -130,36 +166,6 @@
         </div>
         {% endif %}
     {% elif items %}
-        {# 批量操作工具栏（页顶一行）：本页全选 + 已选计数 + 跨页全选入口 + 操作按钮。
-           常驻不隐藏（按钮禁用态随选中数切换，位置固定不跳动）；
-           全选跨页语义由 app.js 维护（ids 页内 / select_all+exclude 跨页），
-           batch_state 隐藏域承载提交形态 #}
-        <div class="mbx-row mbx-head" id="batch-bar">
-            <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">本页全选</label>
-            <span class="ba-count" id="ba-count"></span>
-            <a href="#" id="ba-select-all" hidden></a>
-            <span class="ba-spacer"></span>
-            <button type="button" class="btn small" data-batch="read">标已读</button>
-            <button type="button" class="btn small" data-batch="unread">标未读</button>
-            <button type="button" class="btn small star-op" data-batch="star">⭐ 星标</button>
-            <button type="button" class="btn small star-op" data-batch="unstar">✩ 取消星标</button>
-            <button type="button" class="btn small danger" data-batch="delete">🗑️ 删除</button>
-            <button type="button" class="btn small" id="ba-clear">取消</button>
-            <input type="hidden" id="batch-mode" value="ids">
-            <input type="hidden" id="batch-exclude" value="[]">
-            <input type="hidden" id="ba-folder" value="{{ folder }}">
-            <input type="hidden" id="ba-unread" value="{{ '1' if unread_only else '0' }}">
-            <input type="hidden" id="ba-external" value="{{ '1' if external_only else '0' }}">
-            <input type="hidden" id="ba-q" value="{{ q }}">
-            <input type="hidden" id="ba-page" value="{{ page }}">
-            <input type="hidden" id="ba-per" value="{{ per }}">
-            <input type="hidden" id="ba-sort" value="{{ sort }}">
-            <input type="hidden" id="ba-from" value="{{ from_filter }}">
-            <input type="hidden" id="ba-df" value="{{ df }}">
-            <input type="hidden" id="ba-dt" value="{{ dt }}">
-            <input type="hidden" id="ba-att" value="{{ '1' if has_attach else '0' }}">
-            <input type="hidden" id="ba-total" value="{{ total }}">
-        </div>
         {% for m in items %}
         {# 行 = div（复选框区）+ a（内容区链接）。复选框在链接**外**：
             两者天然各管各的默认行为，无需任何 click 拦截（2026-11-03 实测）。

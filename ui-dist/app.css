@@ -2521,8 +2521,7 @@ a.btn.link.disabled {
     padding-right: 2px;
 }
 .mail-row .mbx-check input,
-.mbx-row .mbx-check input,
-.mbx-row .mbx-all input {
+.mbx-inline .mbx-all input {
     width: 15px;
     height: 15px;
     margin: 0;
@@ -2552,20 +2551,37 @@ a.btn.link.disabled {
     color: inherit;
     text-decoration: none;
 }
-/* 表头批量工具栏（与 mail-row 视觉同层但更轻）：常驻一行
-   （本页全选 + 计数 + 跨页入口 + spacer + 操作按钮） */
-.mbx-row {
+/* 批量操作组（批次五）：并入列表顶栏单行，不再独占一行。
+   本页全选 + 已选计数 + 删除 + 批量⋯ + 取消；按钮 34px 与顶栏其他控件齐高 */
+.mbx-inline {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
     gap: 8px;
-    padding: 5px 12px;
-    margin-bottom: 5px;
-    border: 1px dashed var(--line-soft);
-    border-radius: 10px;
-    background: var(--panel);
-    color: var(--muted);
+    flex-shrink: 0;
+}
+
+.mbx-inline .btn.small {
+    height: 34px;
+    padding-top: 0;
+    padding-bottom: 0;
+    font-size: 12.5px;
+}
+
+.mbx-inline .ba-count {
     font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.mbx-inline #ba-select-all {
+    font-size: 12px;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.mbx-inline #ba-select-all:hover {
+    text-decoration: underline;
 }
 
 
