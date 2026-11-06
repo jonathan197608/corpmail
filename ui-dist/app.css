@@ -1984,7 +1984,9 @@ a.btn.link.disabled {
     border-radius: 0 9px 9px 0;
 }
 
-.md-actions .split > .btn:first-child {
+/* 仅"主按钮 + caret"组合的 split 去首按钮右圆角（衔接 ▾ caret）；
+   纯 ⋯ 按钮 split（无 caret）不受影响，保持四角圆角 */
+.md-actions .split:has(.caret) > .btn:first-child {
     border-radius: 9px 0 0 9px;
 }
 
