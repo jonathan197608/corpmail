@@ -576,8 +576,18 @@ fn template_save(state: &AppState, req: &Req) -> Resp {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v > 0);
     let name = trimmed_field(&form, "name").unwrap_or_default();
-    let body_text = form.get("body_text").cloned().unwrap_or_default();
-    let body_html = form.get("body_html").cloned().unwrap_or_default();
+    // 完全套用邮件正文逻辑：html 模式按 body_html 生成纯文本版（列表预览/撰写页
+    // 纯文本插入回退），plain 模式直接用 body_text；不再把两个字段各自独立提交
+    let body_mode = form.get("body_mode").map(String::as_str).unwrap_or("plain");
+    let (body_text, body_html) = if body_mode == "html" {
+        let raw = form.get("body_html").cloned().unwrap_or_default();
+        (mail::strip_html(&raw), raw)
+    } else {
+        (
+            form.get("body_text").cloned().unwrap_or_default(),
+            String::new(),
+        )
+    };
     let (saved, error) = match mail::templates::save(state, id, &name, &body_text, &body_html) {
         Ok(_) => (true, String::new()),
         Err(e) => (false, e),

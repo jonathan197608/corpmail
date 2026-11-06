@@ -1606,10 +1606,11 @@ document.addEventListener('click', function (e) {
 });
 
 // ---------- 设置·模板富文本编辑器（批次五） ----------
-// HTML 内容默认富文本（与撰写页同款 wangEditor）；「HTML 源码」双向切换
-// 源码编辑；「转为纯文本」把 HTML 降级为纯文本（模板场景纯文本是一等回退，
-// 与撰写页"只可单向升级"不同，这里允许降级）。
-// 编辑表单藏在 <details> 里，编辑器惰性挂载（首次展开时建），避免一页挂 N 个。
+// 与撰写页正文逻辑完全一致：单一「内容」字段，纯文本可单向切换为富文本
+// （同款 wangEditor），切换后不可降级回纯文本；提交时 body_mode 由切换状态
+// 决定，后端 html 模式从 body_html 派生纯文本版（预览/纯文本插入回退）。
+// 编辑表单藏在 <details> 里，编辑器惰性挂载（html 模式首次可见时才建），
+// 避免一页挂 N 个。
 var MBX_TPL_SEQ = 0;
 
 // HTML → 纯文本：块级元素与 <br> 转换行，去标签留文本
@@ -1676,8 +1677,8 @@ function mbxTplBuild(st) {
     st.ed.on('change', function () {
         if (st.mode !== 'rich') return;
         var h = st.ed.getHtml();
-        // wangEditor 空内容输出 <p><br></p>：归一为空串，否则提交时这段"空段落"
-        // 会让 html 非空、挡住纯文本回退（尤其「转为纯文本」清空后）
+        // wangEditor 空内容输出 <p><br></p>：归一为空串，否则这段"空段落"
+        // 会被当有效 HTML 入库，产生空壳模板
         if (!mbxHtmlToText(h)) h = '';
         st.ta.value = h;
     });
@@ -1708,26 +1709,30 @@ function mbxTplToggleSrc(st) {
     }
 }
 
-function mbxTplDegrade(st) {
-    var html = (st.mode === 'rich' && st.ed) ? st.ed.getHtml() : st.ta.value;
-    var text = mbxHtmlToText(html);
-    if (!text) {
-        // 无可降级内容：直接清空 HTML
-        if (st.ed) st.ed.setHtml('');
-        st.ta.value = '';
-        return;
+// 纯文本 → 富文本：单向升级（与撰写页 mbxUpgradeHtml 一致），内容转为段落，
+// 升级后隐藏纯文本区与升级按钮，body_mode 置 html；HTML 不可再降级回纯文本
+function mbxTplUpgrade(st) {
+    var box = st.plainBox.querySelector('textarea[name="body_text"]');
+    var initial = '';
+    if (box && box.value) {
+        var esc = box.value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        initial = '<p>' + esc.replace(/\r?\n/g, '<br>') + '</p>';
     }
-    mbxConfirmLeave(
-        '将把 HTML 内容转为纯文本，并覆盖「纯文本内容」字段，同时清空 HTML 内容。\n确定继续？',
-        function () {
-            var plain = st.form.querySelector('textarea[name="body_text"]');
-            if (plain) plain.value = text;
-            if (st.ed) st.ed.setHtml('');
-            st.ta.value = '';
-        },
-        '转为纯文本',
-        '取消'
-    );
+    st.ta.value = initial;
+    mbxTplBuild(st);
+    if (st.plainHead) st.plainHead.hidden = true;
+    st.plainBox.hidden = true;
+    st.htmlField.hidden = false;
+    if (st.modeInput) st.modeInput.value = 'html';
+}
+
+// html 模式才需要编辑器（plain 模式升级时按需建）——供惰性挂载判定
+function mbxTplMaybeBuild(st) {
+    if (st.ed) return;
+    if (st.modeInput && st.modeInput.value === 'html') mbxTplBuild(st);
 }
 
 function mbxTplInitField(field) {
@@ -1736,35 +1741,39 @@ function mbxTplInitField(field) {
     var st = {
         mode: 'src',
         ed: null,
-        form: field.closest('form'),
+        modeInput: field.querySelector('[data-tpl-mode]'),
+        plainHead: field.querySelector('[data-tpl-plain-head]'),
+        plainBox: field.querySelector('[data-tpl-plain]'),
+        htmlField: field.querySelector('[data-tpl-html-field]'),
         bar: field.querySelector('[data-tpl-tb]'),
         area: field.querySelector('[data-tpl-area]'),
         ta: field.querySelector('[data-tpl-html]'),
         srcBtn: field.querySelector('[data-tpl-src-toggle]'),
-        degradeBtn: field.querySelector('[data-tpl-degrade]')
+        upgradeBtn: field.querySelector('[data-tpl-upgrade]')
     };
-    if (!st.form || !st.ta || !st.bar || !st.area) return;
+    if (!st.plainBox || !st.htmlField || !st.ta || !st.bar || !st.area) return;
     if (st.srcBtn) st.srcBtn.addEventListener('click', function () { mbxTplToggleSrc(st); });
-    if (st.degradeBtn) st.degradeBtn.addEventListener('click', function () { mbxTplDegrade(st); });
-    // 编辑表单在 <details> 内：惰性挂载（展开才建），新增表单立即挂
+    if (st.upgradeBtn) st.upgradeBtn.addEventListener('click', function () { mbxTplUpgrade(st); });
+    // 编辑表单在 <details> 内：html 模式展开才建编辑器；新增表单（初始 plain）
+    // 升级时才建——不在页面进入时就挂 N 个编辑器实例
     var det = field.closest('details');
     if (det) {
-        det.addEventListener('toggle', function () { if (det.open) mbxTplBuild(st); });
-        if (det.open) mbxTplBuild(st);
+        det.addEventListener('toggle', function () { if (det.open) mbxTplMaybeBuild(st); });
+        if (det.open) mbxTplMaybeBuild(st);
     } else {
-        mbxTplBuild(st);
+        mbxTplMaybeBuild(st);
     }
 }
 
 function mbxTplInitAll(root) {
-    (root || document).querySelectorAll('[data-tpl-html-field]').forEach(mbxTplInitField);
+    (root || document).querySelectorAll('[data-tpl-field]').forEach(mbxTplInitField);
 }
 
 // 片段重渲染（保存/删除/tab 切换）与整页进入都初始化
 document.addEventListener('DOMContentLoaded', function () { mbxTplInitAll(document); });
 document.body.addEventListener('htmx:afterSwap', function (ev) {
     var t = ev.detail && ev.detail.target;
-    if (t && (t.id === 'settings-pane' || t.querySelector('[data-tpl-html-field]'))) {
+    if (t && (t.id === 'settings-pane' || t.querySelector('[data-tpl-field]'))) {
         mbxTplInitAll(t);
     }
 });

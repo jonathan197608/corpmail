@@ -2265,11 +2265,25 @@ a.btn.link.disabled {
     border-radius: 0 0 9px 9px;
 }
 
-/* 设置·模板富文本编辑器（批次五）：与撰写页同款 wangEditor，容器更矮 */
+/* 设置·模板富文本编辑器（批次五）：与撰写页同款 wangEditor，容器更矮。
+   内容字段与撰写页正文一致：纯文本可单向升级为富文本，不可降级。 */
+.tpl-plain-head {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 6px;
+}
+
 .tpl-editor {
     display: flex;
     flex-direction: column;
     min-width: 0;
+}
+
+/* .tpl-editor 的 display:flex 会压过 UA 的 [hidden]:none，显式补上，
+   否则 plain 模式下富文本区不会被隐藏（同 .adv-panel 的坑） */
+.tpl-plain-head[hidden],
+.tpl-editor[hidden] {
+    display: none;
 }
 
 .tpl-ed-actions {

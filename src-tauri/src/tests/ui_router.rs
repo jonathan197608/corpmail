@@ -7038,6 +7038,96 @@ fn template_settings_and_compose_picker() {
     cleanup(&dir);
 }
 
+/// 模板内容与邮件正文逻辑对齐（批次五修订）：单一内容字段按 body_mode
+/// 单选保存——html 模式后端从 body_html 派生纯文本（预览/纯文本插入回退），
+/// plain 模式只存 body_text；编辑回显时存量有 body_html 直接 html 模式
+/// （不可降级），无则 plain 可单向升级。表单不再有「转为纯文本」入口。
+#[test]
+fn template_body_mode_single_field_semantics() {
+    let (state, dir) = temp_state("b5-tpl-mode");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // html 模式保存：表单 body_text 应被忽略，由 body_html 派生
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/templates/save",
+            &form(&[
+                ("name", "富文本模板"),
+                ("body_mode", "html"),
+                ("body_text", "这段应被忽略"),
+                ("body_html", "<p>各位领导：</p><p>清单见附件。</p>"),
+            ]),
+        ),
+        &t,
+    );
+    let html = body(&resp);
+    assert!(html.contains("✓ 已保存"), "保存成功：{html}");
+    let (text, tpl_html): (String, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT body_text, body_html FROM templates WHERE name = '富文本模板'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(tpl_html, "<p>各位领导：</p><p>清单见附件。</p>");
+    assert!(
+        text.contains("各位领导") && text.contains("清单见附件"),
+        "body_text 应由 body_html 派生：{text}"
+    );
+    assert!(!text.contains("这段应被忽略"), "表单 body_text 应被忽略");
+    // 编辑回显：存量有 body_html → 回 html 模式；无「转为纯文本」，有单向升级
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/templates", b""),
+        &t,
+    ));
+    assert!(
+        html.contains("name=\"body_mode\" value=\"html\""),
+        "存量 html 模板编辑应回 html 模式：{html}"
+    );
+    assert!(html.contains("切换为富文本"), "应保留单向升级入口");
+    assert!(!html.contains("转为纯文本"), "不应再有降级入口");
+    assert!(
+        html.contains("name=\"body_mode\" value=\"plain\""),
+        "新增表单应初始 plain：{html}"
+    );
+    // plain 模式保存：body_html 清空（表单值被忽略）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/templates/save",
+            &form(&[
+                ("name", "纯文本模板"),
+                ("body_mode", "plain"),
+                ("body_text", "收到，我核对后回复您。"),
+                ("body_html", "<p>应被忽略</p>"),
+            ]),
+        ),
+        &t,
+    );
+    assert!(body(&resp).contains("✓ 已保存"));
+    let saved_html: String = state.with_conn(|c| {
+        c.query_row(
+            "SELECT body_html FROM templates WHERE name = '纯文本模板'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(saved_html, "", "plain 模式 body_html 应清空");
+    cleanup(&dir);
+}
+
 /// B3 联系人手动新增/编辑：校验、hits 不因编辑变化、编辑态回显
 #[test]
 fn contact_save_creates_updates_and_validates() {
