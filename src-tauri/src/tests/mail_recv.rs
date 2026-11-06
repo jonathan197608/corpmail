@@ -190,6 +190,36 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
     }
 }
 
+/// 联系人「最近联系」取邮件实际时间（INTERNALDATE），不是入库时刻：
+/// 首次收取历史邮件时不得把联系人时间全部写成今天
+#[test]
+fn store_incoming_uses_mail_date_for_contact_time() {
+    let (state, dir) = temp_state("m4-contact-time");
+    let mails = vec![incoming(1, false, "时间口径", "<m-time@x.cn>")];
+    assert_eq!(store_incoming(&state, &mails).unwrap(), 1);
+    let mil = 1_700_000_000_i64;
+    let (from_at, to_at): (i64, i64) = state.with_conn(|c| {
+        (
+            c.query_row(
+                "SELECT updated_at FROM contacts WHERE addr = 'boss@x.cn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            c.query_row(
+                "SELECT updated_at FROM contacts WHERE addr = 'demo@chinatelecom.cn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        )
+    });
+    assert_eq!(from_at, mil, "发件人联系时间应为邮件实际时间");
+    assert_eq!(to_at, mil, "收件人联系时间应为邮件实际时间");
+    assert_ne!(from_at, now_epoch(), "不得退化为入库时间");
+    cleanup(&dir);
+}
+
 #[test]
 fn store_incoming_dedupes_and_sets_unread() {
     let (state, dir) = temp_state("m4-store");

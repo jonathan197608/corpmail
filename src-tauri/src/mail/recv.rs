@@ -1206,13 +1206,15 @@ pub fn store_incoming_conn(
             sync_attach_stats(&tx, id)
         })();
         let stored = stored.and_then(|()| {
-            // 联系人采集（v4）：From（带姓名）+ To + Cc，与邮件行同事务落库
-            super::contacts::upsert_conn(&tx, &m.from_addr, &m.from_name, now).map_err(e)?;
+            // 联系人采集（v4）：From（带姓名）+ To + Cc，与邮件行同事务落库。
+            // 时间用 ts（INTERNALDATE，邮件实际时间）而非 now（入库瞬间）——
+            // 否则历史邮件首次收取时联系人"最近联系"会全部变成今天。
+            super::contacts::upsert_conn(&tx, &m.from_addr, &m.from_name, ts).map_err(e)?;
             for (addr, name) in super::contacts::parse_addr_list(&m.to_addrs) {
-                super::contacts::upsert_conn(&tx, &addr, &name, now).map_err(e)?;
+                super::contacts::upsert_conn(&tx, &addr, &name, ts).map_err(e)?;
             }
             for (addr, name) in super::contacts::parse_addr_list(&m.cc_addrs) {
-                super::contacts::upsert_conn(&tx, &addr, &name, now).map_err(e)?;
+                super::contacts::upsert_conn(&tx, &addr, &name, ts).map_err(e)?;
             }
             Ok(())
         });

@@ -40,6 +40,9 @@ pub mod keys {
     pub const SIGNATURE: &str = "signature";
     /// 每页显示条数（默认 10，列表页顶栏可选；URL per 参数覆盖）
     pub const PAGE_SIZE: &str = "page_size";
+    /// 联系人统计一次性修复标记（v11）：早期把 updated_at 写成入库时间，
+    /// 启动时按历史邮件重算最近联系时间/往来次数，完成后置 1
+    pub const CONTACTS_STATS_FIXED: &str = "contacts_stats_fixed";
     // 收件状态（M4，设计 §3 schema 注释"状态"节）
     pub const LAST_SYNC_AT: &str = "last_sync_at";
     pub const LAST_UIDVALIDITY: &str = "last_uidvalidity";
@@ -214,6 +217,11 @@ impl AppState {
         if let Err(err) = crate::mail::contacts::backfill(&mut conn) {
             eprintln!("[contacts] 历史邮件回填失败（忽略）：{err}");
         }
+        // 联系人统计存量修复（v11 一次性）：修正早期把 updated_at 写成入库
+        // 时间的问题（最近联系/往来次数按历史邮件重算），幂等，失败不阻断
+        if let Err(err) = crate::mail::contacts::repair_stats(&mut conn) {
+            eprintln!("[contacts] 统计修复失败（忽略）：{err}");
+        }
         // 历史主题 GBK 乱码一次性修复（幂等，修完无 U+00xx 即空扫）
         if let Err(err) = crate::mail::repair_gbk_subjects(&mut conn) {
             eprintln!("[repair] 主题乱码修复失败（忽略）：{err}");
@@ -365,6 +373,9 @@ impl AppState {
             .map_err(|e| format!("新目录数据库创建失败：{e}"))?;
         if let Err(err) = crate::mail::contacts::backfill(&mut new_conn) {
             eprintln!("[contacts] 新目录历史回填失败（忽略）：{err}");
+        }
+        if let Err(err) = crate::mail::contacts::repair_stats(&mut new_conn) {
+            eprintln!("[contacts] 新目录统计修复失败（忽略）：{err}");
         }
         // 指针先行：写失败则删掉刚建的新库文件回滚（此时尚未换连接，旧库仍在用）
         {

@@ -5972,7 +5972,12 @@ fn contacts_page_sort_orders_and_preserves() {
     );
     assert!(i0 < i2 && i2 < i1, "默认应按最近联系倒序");
     // sort=hits：联系次数降序（c1 → c2 → c0，默认每页全量）
-    let html = body(&route(&state, &assets(), &req_q("GET", "/contacts", "sort=hits", b""), &tester));
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "sort=hits", b""),
+        &tester,
+    ));
     let (h0, h1, h2) = (
         html.find("c0@x.cn").unwrap(),
         html.find("c1@x.cn").unwrap(),

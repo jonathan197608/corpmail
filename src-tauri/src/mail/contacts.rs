@@ -51,8 +51,9 @@ pub fn parse_addr_list(raw: &str) -> Vec<(String, String)> {
 /// 写入/合并一条联系人（事务内或独立连接均可）。
 ///
 /// 空地址忽略；已有记录时：新姓名非空才覆盖（避免后续只带地址的邮件清掉姓名），
-/// hits 累加、updated_at 刷新。
-pub fn upsert_conn(conn: &Connection, addr: &str, name: &str, now: i64) -> rusqlite::Result<()> {
+/// hits 累加、updated_at 取新旧最大值——`at` 传入的是**邮件实际往来时间**，
+/// 历史邮件/乱序收取（先收新信后收旧信）不得把"最近联系"往回拨。
+pub fn upsert_conn(conn: &Connection, addr: &str, name: &str, at: i64) -> rusqlite::Result<()> {
     let addr = addr.trim();
     if addr.is_empty() || !addr.contains('@') {
         return Ok(());
@@ -62,9 +63,9 @@ pub fn upsert_conn(conn: &Connection, addr: &str, name: &str, now: i64) -> rusql
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
          ON CONFLICT(addr) DO UPDATE SET
              name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END,
-             updated_at = excluded.updated_at,
+             updated_at = MAX(contacts.updated_at, excluded.updated_at),
              hits = contacts.hits + 1",
-        rusqlite::params![addr, name, now],
+        rusqlite::params![addr, name, at],
     )?;
     Ok(())
 }
@@ -222,28 +223,94 @@ pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
     if count > 0 {
         return Ok(());
     }
-    let rows: Vec<(String, String, String, String)> = crate::db::collect_rows(
+    let rows: Vec<(String, String, String, String, i64)> = crate::db::collect_rows(
         conn,
-        "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,'') FROM emails",
+        "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''), \
+         COALESCE(received_at, sent_at, created_at, 0) FROM emails",
         &[],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     if rows.is_empty() {
         return Ok(());
     }
-    let now = super::now_epoch();
     let tx = conn.transaction()?;
-    for (from_addr, from_name, to_addrs, cc_addrs) in rows {
-        upsert_conn(&tx, &from_addr, &from_name, now)?;
+    for (from_addr, from_name, to_addrs, cc_addrs, at) in rows {
+        upsert_conn(&tx, &from_addr, &from_name, at)?;
         for (addr, name) in parse_addr_list(&to_addrs) {
-            upsert_conn(&tx, &addr, &name, now)?;
+            upsert_conn(&tx, &addr, &name, at)?;
         }
         for (addr, name) in parse_addr_list(&cc_addrs) {
-            upsert_conn(&tx, &addr, &name, now)?;
+            upsert_conn(&tx, &addr, &name, at)?;
         }
     }
     // 回填完成后修正计数：首次出现记为 1 即可，不做历史使用频次统计
     tx.execute("UPDATE contacts SET hits = 1", [])?;
+    tx.commit()
+}
+
+/// 存量统计修复（v11 一次性，幂等）：早期收件采集把联系人 updated_at 写成
+/// 入库时间 now，导致历史邮件首次收取后「最近联系」全部变成今天。
+/// 这里按历史邮件的实际时间（received_at/sent_at，退化 created_at）重算：
+/// updated_at 取该地址所有往来邮件的最大实际时间，hits 取出现邮件数。
+/// contacts 是派生数据，但手动新增/改名的姓名必须保留——只更新能追溯到
+/// 邮件的地址，纯手动联系人原样保留。完成后写 settings 标记避免重复扫描。
+pub fn repair_stats(conn: &mut Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    use std::collections::HashMap;
+
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT v FROM settings WHERE k = ?1",
+            [crate::state::keys::CONTACTS_STATS_FIXED],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if done.as_deref() == Some("1") {
+        return Ok(());
+    }
+    // contacts 为空（新库/首启）无需修复，也不写标记——保持 store_is_empty 语义
+    let n: i64 = conn.query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))?;
+    if n == 0 {
+        return Ok(());
+    }
+    let rows: Vec<(String, String, String, i64)> = crate::db::collect_rows(
+        conn,
+        "SELECT from_addr, to_addrs, COALESCE(cc_addrs,''), \
+         COALESCE(received_at, sent_at, created_at, 0) FROM emails",
+        &[],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    // addr(小写) → (最近往来时间, 往来邮件数)
+    let mut stat: HashMap<String, (i64, i64)> = HashMap::new();
+    let bump = |stat: &mut HashMap<String, (i64, i64)>, addr: &str, at: i64| {
+        let a = addr.trim();
+        if a.is_empty() || !a.contains('@') {
+            return;
+        }
+        let e = stat.entry(a.to_ascii_lowercase()).or_insert((at, 0));
+        e.0 = e.0.max(at);
+        e.1 += 1;
+    };
+    for (from_addr, to_addrs, cc_addrs, at) in rows {
+        bump(&mut stat, &from_addr, at);
+        for (addr, _) in parse_addr_list(&to_addrs) {
+            bump(&mut stat, &addr, at);
+        }
+        for (addr, _) in parse_addr_list(&cc_addrs) {
+            bump(&mut stat, &addr, at);
+        }
+    }
+    let tx = conn.transaction()?;
+    for (addr, (at, hits)) in stat {
+        tx.execute(
+            "UPDATE contacts SET updated_at = ?2, hits = ?3 WHERE addr = ?1",
+            rusqlite::params![addr, at, hits],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO settings(k, v) VALUES (?1, '1') ON CONFLICT(k) DO UPDATE SET v = '1'",
+        [crate::state::keys::CONTACTS_STATS_FIXED],
+    )?;
     tx.commit()
 }
 
@@ -277,11 +344,11 @@ pub fn validate_addr(addr: &str) -> Result<String, String> {
 /// 手动新增/编辑（B3）：已存在时只更新姓名（hits 与往来次数语义无关，
 /// 不因手动编辑而累加）；新增时 hits=1。
 pub fn save_manual(conn: &Connection, addr: &str, name: &str, now: i64) -> rusqlite::Result<()> {
+    // 编辑已有联系人只改姓名，不刷新 updated_at——「最近联系」是邮件往来的
+    // 时间戳，改个名字不应让它变成"今天联系过"
     conn.execute(
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
-         ON CONFLICT(addr) DO UPDATE SET
-             name = excluded.name,
-             updated_at = excluded.updated_at",
+         ON CONFLICT(addr) DO UPDATE SET name = excluded.name",
         rusqlite::params![addr.trim(), name.trim(), now],
     )?;
     Ok(())

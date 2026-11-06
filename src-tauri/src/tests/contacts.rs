@@ -55,6 +55,28 @@ fn upsert_merges_name_and_counts_hits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 乱序收取历史邮件（先新后旧）不得把「最近联系」往回拨
+#[test]
+fn upsert_keeps_latest_contact_time() {
+    let (state, dir) = temp_state("upsert-max");
+    state.with_conn(|c| {
+        upsert_conn(c, "a@x.cn", "", 300).unwrap();
+        upsert_conn(c, "a@x.cn", "", 200).unwrap(); // 旧信后到
+        upsert_conn(c, "a@x.cn", "", 500).unwrap();
+    });
+    let (at, hits): (i64, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT updated_at, hits FROM contacts WHERE addr = 'a@x.cn'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(at, 500, "最近联系应取最大时间");
+    assert_eq!(hits, 3, "命中次数照常累加");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn suggest_matches_name_or_addr_and_orders_exact_first() {
     let (state, dir) = temp_state("suggest");
@@ -106,12 +128,89 @@ fn backfill_extracts_from_historical_emails_once() {
     assert!(addrs.contains(&"boss@x.cn".to_string()));
     assert!(addrs.contains(&"demo@x.cn".to_string()));
     assert!(addrs.contains(&"cc@x.cn".to_string()));
+    // 回填时间取邮件实际时间（created_at=1），不是回填时刻
+    let at: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM contacts WHERE addr = 'boss@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at, 1, "回填应使用邮件实际时间而非回填时刻");
     // 幂等：再次回填不新增
     backfill(&mut conn).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n as usize, addrs.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 存量统计修复：按历史邮件实际时间重算「最近联系/往来次数」，
+/// 保留纯手动联系人；完成后写标记幂等（不再重复扫描）
+#[test]
+fn repair_stats_recomputes_times_and_preserves_manual() {
+    let (state, dir) = temp_state("repair-stats");
+    // 两封历史邮件：实际时间 1000 / 3000，入库时间 9000
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name,
+                                    to_addrs, cc_addrs, created_at, received_at)
+                 VALUES ('in','inbox','received','a@x.cn','甲','demo@x.cn','',9000,1000);
+                 INSERT INTO emails(direction, folder, status, from_addr, from_name,
+                                    to_addrs, cc_addrs, created_at, received_at)
+                 VALUES ('in','inbox','received','a@x.cn','甲','demo@x.cn','',9000,3000);",
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    // 模拟旧版错误数据：自动采集联系人时间被写成入库时间 9000；另有一条纯手动联系人
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO contacts(addr,name,updated_at,hits) VALUES ('a@x.cn','甲',9000,1);
+                 INSERT INTO contacts(addr,name,updated_at,hits) VALUES ('manual@x.cn','手动',9000,1);",
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let mut conn = crate::db::open(&state.data_dir().join("corpmail.db")).unwrap();
+    repair_stats(&mut conn).unwrap();
+    let (at, hits): (i64, i64) = conn
+        .query_row(
+            "SELECT updated_at, hits FROM contacts WHERE addr = 'a@x.cn'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(at, 3000, "应修正为邮件实际最近时间");
+    assert_eq!(hits, 2, "往来次数按出现邮件数重算");
+    let manual_at: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM contacts WHERE addr = 'manual@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(manual_at, 9000, "纯手动联系人不应被改动");
+    // 幂等：标记已写，再次修复不覆盖（人为改值验证）
+    conn.execute(
+        "UPDATE contacts SET updated_at = 9999 WHERE addr = 'a@x.cn'",
+        [],
+    )
+    .unwrap();
+    repair_stats(&mut conn).unwrap();
+    let at2: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM contacts WHERE addr = 'a@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at2, 9999, "修复完成后应幂等跳过");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
