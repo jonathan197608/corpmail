@@ -117,7 +117,7 @@
                        「发送」点击先行清空，「定时发送」校验后才放行） #}
                     <input type="datetime-local" class="sched-input" id="sched-input"
                            value="{{ sched_local }}" title="选择定时发送时刻（留空 = 不定时，清空后存草稿可取消定时）">
-                    <button type="button" class="btn big ghost" id="sched-send-btn"
+                    <button type="button" class="btn big" id="sched-send-btn"
                             hx-post="/compose/send" hx-include="closest form"
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this"
                             title="到定时时刻自动发送（期间驻留草稿箱）">⏰ 定时发送</button>
