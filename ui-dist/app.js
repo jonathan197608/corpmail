@@ -1325,3 +1325,99 @@ document.addEventListener('click', function (ev) {
         }
     });
 })();
+
+// ---------- 撰写页：离开前未保存确认 ----------
+// 编辑邮件时若已改动但尚未保存/发送，点「返回列表」、侧栏导航等任何链接离开，
+// 或刷新/关闭页面，均弹窗确认，避免误操作丢失正在写的内容。
+// 脏判定 = 当前表单快照（含富文本 getHtml）!= 加载基线；自动保存/存草稿/发送成功后
+// 重置基线（此时已落库，不再提示）。
+(function () {
+    function composeForm() {
+        var el = document.getElementById('autosave-hint');
+        return el ? el.closest('form') : null;
+    }
+    if (!composeForm()) return; // 非撰写页，不启用
+
+    function snap() {
+        var f = composeForm();
+        if (!f) return '';
+        var parts = [];
+        try {
+            new FormData(f).forEach(function (v, k) { parts.push(k + '=' + v); });
+        } catch (e) { /* ignore */ }
+        if (window.mbxEditor && window.mbxEditor.getHtml) {
+            try { parts.push('__html=' + window.mbxEditor.getHtml()); } catch (e) { /* ignore */ }
+        }
+        return parts.sort().join('&');
+    }
+
+    var baseline = null;
+    function ensureBaseline() { if (baseline === null) baseline = snap(); }
+    // 等编辑器挂载完成（DOMContentLoaded 同步构建）后再抓基线，避免初始内容误判
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { setTimeout(ensureBaseline, 0); });
+    } else {
+        setTimeout(ensureBaseline, 0);
+    }
+
+    function isDirty() {
+        if (baseline === null) return false;
+        return snap() !== baseline;
+    }
+    function resetBaseline() { baseline = snap(); }
+
+    // 有改动即在自动保存提示区显示「● 未保存」，保存/自动保存后由既有提示刷新
+    function markDirtyHint(ev) {
+        if (baseline === null) return;
+        var f = composeForm();
+        if (!f || !f.contains(ev.target)) return;
+        var hint = document.getElementById('autosave-hint');
+        if (hint) hint.textContent = '● 未保存';
+    }
+    document.body.addEventListener('input', markDirtyHint, true);
+    document.body.addEventListener('change', markDirtyHint, true);
+
+    // 保存/自动保存成功 → 已落库，重置基线
+    document.body.addEventListener('htmx:afterRequest', function (ev) {
+        var d = ev.detail || {};
+        var reqPath = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
+        var xhr = d.xhr;
+        if (xhr && xhr.status >= 200 && xhr.status < 300 &&
+            (reqPath.indexOf('/compose/autosave') >= 0 || reqPath.indexOf('/compose/draft') >= 0)) {
+            setTimeout(resetBaseline, 0);
+        }
+    });
+
+    // 拦截离开撰写页的链接导航（返回列表 / 侧栏 / 撰写其他邮件等）
+    // leaving：用户已确认离开或点了发送/存草稿 → 放行 beforeunload，避免二次弹窗
+    var leaving = false;
+    document.addEventListener('click', function (ev) {
+        var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        if (!a) return;
+        var href = a.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#' || href.indexOf('javascript:') === 0 || a.target === '_blank') return;
+        if (!isDirty()) return;
+        if (!window.confirm('邮件尚未保存或发送，离开将丢失未保存的内容。\n\n确定离开？（可先点「存草稿」保存）')) {
+            ev.preventDefault();
+            ev.stopPropagation();
+        } else {
+            leaving = true; // 已确认离开：导航前的 beforeunload 不再二次询问
+        }
+    }, true);
+
+    // 发送/存草稿按钮点击 → 视为已保存意图，放行后续导航（避免成功后跳转误触 beforeunload）
+    document.addEventListener('click', function (ev) {
+        var b = ev.target && ev.target.closest ? ev.target.closest('button[hx-post="/compose/send"], button[type="submit"]') : null;
+        if (b) leaving = true;
+    }, true);
+
+    // 刷新 / 关闭页面兜底
+    window.addEventListener('beforeunload', function (ev) {
+        if (leaving) return;
+        if (isDirty()) {
+            ev.preventDefault();
+            ev.returnValue = '';
+            return '';
+        }
+    });
+})();
