@@ -1756,16 +1756,27 @@ a.btn.link.disabled {
 }
 
 /* ---------- 详情页 ---------- */
+/* 标题（2026-11-11 重设计）：长标题完整显示，可多行换行、不省略不溢出 */
 .md-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    line-height: 1.35;
 }
 
-/* 顶栏标题允许收缩（覆盖 .topbar>* 的 flex-shrink:0）：超长单行省略不溢出卡片 */
+/* source/thread 页标题在顶栏：允许收缩并换行完整显示（覆盖 .topbar h1 的 nowrap） */
 .topbar > .md-title {
     flex: 1 1 auto;
     min-width: 0;
+    white-space: normal;
+}
+
+/* 邮件详情页：标题移入正文卡片、较大字号醒目，与正文合并展示 */
+.mail-detail .md-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.4;
+    margin: 0 0 6px;
 }
 
 .mail-detail {

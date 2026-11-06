@@ -8,7 +8,6 @@
     <main class="main">
         <div class="topbar">
             <a class="back" href="{{ back_href }}">‹ 返回列表</a>
-            <h1 class="md-title">{% if email.subject %}{{ email.subject }}{% else %}（无主题）{% endif %}</h1>
         </div>
 
         {% if notice %}<div class="compose-note err">{{ notice }}</div>{% endif %}
@@ -46,6 +45,8 @@
         {% endif %}
 
         <div class="mail-detail card">
+            {# 标题与正文合并显示（2026-11-06 重设计）：长标题在卡片内完整换行显示 #}
+            <h1 class="md-title md-detail-title">{% if email.subject %}{{ email.subject }}{% else %}（无主题）{% endif %}</h1>
             {# 操作按钮置顶（原在正文底部）：阅读动作应随手可得；回复全部
                = 收件人 + 原抄送（见 reply_all_parts）。
                按信箱区分：草稿箱=编辑草稿、发件箱=重新编辑（载入撰写页重发），
