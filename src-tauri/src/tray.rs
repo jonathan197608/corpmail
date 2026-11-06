@@ -45,10 +45,29 @@ pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> 
                 show_main(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    // 平台差异化托盘图标：macOS 用黑白模板图（菜单栏单色、44px 对应 22pt，
+    // 与其他菜单栏图标同尺寸）；Windows/Linux 保持彩色 app 图标
+    #[cfg(target_os = "macos")]
+    {
+        // Tauri Image 只接受 RGBA 原始字节：44x44 模板图（黑线 + 透明底，
+        // 对应菜单栏 22pt@2x，与系统/其他应用图标同尺寸）
+        let mac_icon = tauri::image::Image::new(include_bytes!("../icons/tray-mac.rgba"), 44, 44);
+        builder = builder.icon(mac_icon);
     }
-    builder.build(app)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(icon) = app.default_window_icon() {
+            builder = builder.icon(icon.clone());
+        }
+    }
+    let tray = builder.build(app)?;
+    #[cfg(target_os = "macos")]
+    {
+        // 模板图：随菜单栏明暗主题自动反色（macOS 标准做法，黑白按钮）
+        if let Err(err) = tray.set_icon_as_template(true) {
+            eprintln!("[tray] 模板图设置失败（不影响主流程）：{err}");
+        }
+    }
     refresh_badge(app);
     Ok(())
 }
