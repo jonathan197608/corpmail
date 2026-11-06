@@ -305,7 +305,9 @@
             ignoreWidth: false,
             ignoreHeight: false
         });
-        const css = styleHost.innerHTML + DOCX_CSS;
+        // styleHost.innerHTML 含 <style> 标签，直接拼会与外层 <style> 嵌套导致
+        // DOCX_CSS 失效；取 textContent 得纯 CSS 文本，再由 buildSrcdoc 统一包裹
+        const css = styleHost.textContent + DOCX_CSS;
         await showIframe(bodyHost.innerHTML, css);
         const { right } = toolbarLayout();
         const left = toolbarEl().querySelector('.pm-tools-left');
