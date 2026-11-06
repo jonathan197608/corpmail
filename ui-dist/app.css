@@ -2265,6 +2265,44 @@ a.btn.link.disabled {
     border-radius: 0 0 9px 9px;
 }
 
+/* 设置·模板富文本编辑器（批次五）：与撰写页同款 wangEditor，容器更矮 */
+.tpl-editor {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.tpl-ed-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.tpl-ed-toolbar {
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 9px 9px 0 0;
+    z-index: 5;
+}
+
+.tpl-ed-area {
+    min-height: 140px;
+    border: 1px solid var(--line);
+    border-radius: 0 0 9px 9px;
+}
+
+.tpl-ed-area .w-e-text-container {
+    background: #fff;
+    border-radius: 0 0 9px 9px;
+}
+
+/* 纯源码模式（编辑器未挂载/用户切源码）：textarea 直接顶上 */
+[data-tpl-html-field] textarea[data-tpl-html] {
+    width: 100%;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+}
+
 .compose-note {
     border-radius: 9px;
     padding: 8px 12px;

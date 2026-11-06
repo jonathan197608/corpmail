@@ -3,8 +3,9 @@
 
 // 通用离开确认模态：Tauri 的 macOS WKWebView（wry）未实现 JS confirm 的 UI 代理，
 // window.confirm 只会返回 false 且不弹窗，故改用页面内模态（跨平台一致）。
-// message 支持换行（CSS white-space: pre-line）；onLeave 在用户点「放弃并离开」时调用。
-function mbxConfirmLeave(message, onLeave) {
+// message 支持换行（CSS white-space: pre-line）；onLeave 在用户点确认按钮时调用。
+// okLabel/cancelLabel 可选（默认「放弃并离开/继续编辑」，模板降级等场景可换文案）。
+function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
     var old = document.getElementById('mbx-leave-confirm');
     if (old) old.remove();
     var mask = document.createElement('div');
@@ -13,10 +14,12 @@ function mbxConfirmLeave(message, onLeave) {
     mask.innerHTML = '<div class="mbx-leave-card" role="alertdialog" aria-modal="true">'
         + '<p></p>'
         + '<div class="mbx-leave-actions">'
-        + '<button type="button" class="btn" data-leave-cancel>继续编辑</button>'
-        + '<button type="button" class="btn danger" data-leave-ok>放弃并离开</button>'
+        + '<button type="button" class="btn" data-leave-cancel></button>'
+        + '<button type="button" class="btn danger" data-leave-ok></button>'
         + '</div></div>';
     mask.querySelector('p').textContent = message;
+    mask.querySelector('[data-leave-cancel]').textContent = cancelLabel || '继续编辑';
+    mask.querySelector('[data-leave-ok]').textContent = okLabel || '放弃并离开';
     document.body.appendChild(mask);
     function close() { if (mask.parentNode) mask.remove(); }
     mask.addEventListener('click', function (ev) {
@@ -1600,4 +1603,168 @@ document.addEventListener('click', function (e) {
     if (!btn) return;
     var pre = document.getElementById('src-content');
     if (pre) mbSourceCopy(pre);
+});
+
+// ---------- 设置·模板富文本编辑器（批次五） ----------
+// HTML 内容默认富文本（与撰写页同款 wangEditor）；「HTML 源码」双向切换
+// 源码编辑；「转为纯文本」把 HTML 降级为纯文本（模板场景纯文本是一等回退，
+// 与撰写页"只可单向升级"不同，这里允许降级）。
+// 编辑表单藏在 <details> 里，编辑器惰性挂载（首次展开时建），避免一页挂 N 个。
+var MBX_TPL_SEQ = 0;
+
+// HTML → 纯文本：块级元素与 <br> 转换行，去标签留文本
+function mbxHtmlToText(html) {
+    var d = document.createElement('div');
+    d.innerHTML = html || '';
+    d.querySelectorAll('br').forEach(function (el) { el.replaceWith('\n'); });
+    d.querySelectorAll('p,div,li,tr,h1,h2,h3,h4,blockquote').forEach(function (el) {
+        el.insertAdjacentText('afterend', '\n');
+    });
+    return (d.textContent || '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+// wangEditor 的 selector 只接受字符串：给每个字段生成唯一 id
+function mbxTplBuild(st) {
+    if (st.ed) return;
+    if (!window.wangEditor) {
+        // 无编辑器（脚本未加载/异常）：降级为源码 textarea 输入
+        st.mode = 'src';
+        st.bar.hidden = true;
+        st.area.hidden = true;
+        st.ta.hidden = false;
+        if (st.srcBtn) st.srcBtn.disabled = true;
+        return;
+    }
+    st.area.id = st.area.id || 'tpl-ed-area-' + (++MBX_TPL_SEQ);
+    st.bar.id = st.bar.id || 'tpl-ed-tb-' + MBX_TPL_SEQ;
+    try {
+        st.ed = wangEditor.createEditor({
+            selector: '#' + st.area.id,
+            html: st.ta.value,
+            config: {
+                placeholder: '输入模板内容…（表格 / 列表 / 颜色 / 链接）',
+                MENU_CONF: {
+                    uploadImage: {
+                        customUpload: function (file, insertFn) {
+                            var reader = new FileReader();
+                            reader.onload = function () { insertFn(reader.result, file.name, ''); };
+                            reader.readAsDataURL(file);
+                        }
+                    }
+                }
+            },
+            mode: 'default'
+        });
+        wangEditor.createToolbar({
+            selector: '#' + st.bar.id,
+            editor: st.ed,
+            config: { excludeKeys: ['group-video', 'fullScreen'] },
+            mode: 'default'
+        });
+    } catch (e) {
+        console.error('模板编辑器初始化失败', e);
+        st.mode = 'src';
+        st.bar.hidden = true;
+        st.area.hidden = true;
+        st.ta.hidden = false;
+        if (st.srcBtn) st.srcBtn.disabled = true;
+        return;
+    }
+    st.ed.on('change', function () {
+        if (st.mode !== 'rich') return;
+        var h = st.ed.getHtml();
+        // wangEditor 空内容输出 <p><br></p>：归一为空串，否则提交时这段"空段落"
+        // 会让 html 非空、挡住纯文本回退（尤其「转为纯文本」清空后）
+        if (!mbxHtmlToText(h)) h = '';
+        st.ta.value = h;
+    });
+    st.mode = 'rich';
+    st.ta.hidden = true;
+    st.bar.hidden = false;
+    st.area.hidden = false;
+}
+
+function mbxTplToggleSrc(st) {
+    if (st.mode === 'rich') {
+        // 富文本 → 源码：编辑器内容写回 textarea 展示
+        st.ta.value = st.ed ? st.ed.getHtml() : '';
+        st.ta.hidden = false;
+        st.bar.hidden = true;
+        st.area.hidden = true;
+        st.mode = 'src';
+        st.srcBtn.textContent = '✎ 富文本';
+    } else {
+        mbxTplBuild(st);
+        if (!st.ed) return;
+        st.ed.setHtml(st.ta.value);
+        st.ta.hidden = true;
+        st.bar.hidden = false;
+        st.area.hidden = false;
+        st.mode = 'rich';
+        st.srcBtn.textContent = '⌨ HTML 源码';
+    }
+}
+
+function mbxTplDegrade(st) {
+    var html = (st.mode === 'rich' && st.ed) ? st.ed.getHtml() : st.ta.value;
+    var text = mbxHtmlToText(html);
+    if (!text) {
+        // 无可降级内容：直接清空 HTML
+        if (st.ed) st.ed.setHtml('');
+        st.ta.value = '';
+        return;
+    }
+    mbxConfirmLeave(
+        '将把 HTML 内容转为纯文本，并覆盖「纯文本内容」字段，同时清空 HTML 内容。\n确定继续？',
+        function () {
+            var plain = st.form.querySelector('textarea[name="body_text"]');
+            if (plain) plain.value = text;
+            if (st.ed) st.ed.setHtml('');
+            st.ta.value = '';
+        },
+        '转为纯文本',
+        '取消'
+    );
+}
+
+function mbxTplInitField(field) {
+    if (field.__tplInit) return;
+    field.__tplInit = true;
+    var st = {
+        mode: 'src',
+        ed: null,
+        form: field.closest('form'),
+        bar: field.querySelector('[data-tpl-tb]'),
+        area: field.querySelector('[data-tpl-area]'),
+        ta: field.querySelector('[data-tpl-html]'),
+        srcBtn: field.querySelector('[data-tpl-src-toggle]'),
+        degradeBtn: field.querySelector('[data-tpl-degrade]')
+    };
+    if (!st.form || !st.ta || !st.bar || !st.area) return;
+    if (st.srcBtn) st.srcBtn.addEventListener('click', function () { mbxTplToggleSrc(st); });
+    if (st.degradeBtn) st.degradeBtn.addEventListener('click', function () { mbxTplDegrade(st); });
+    // 编辑表单在 <details> 内：惰性挂载（展开才建），新增表单立即挂
+    var det = field.closest('details');
+    if (det) {
+        det.addEventListener('toggle', function () { if (det.open) mbxTplBuild(st); });
+        if (det.open) mbxTplBuild(st);
+    } else {
+        mbxTplBuild(st);
+    }
+}
+
+function mbxTplInitAll(root) {
+    (root || document).querySelectorAll('[data-tpl-html-field]').forEach(mbxTplInitField);
+}
+
+// 片段重渲染（保存/删除/tab 切换）与整页进入都初始化
+document.addEventListener('DOMContentLoaded', function () { mbxTplInitAll(document); });
+document.body.addEventListener('htmx:afterSwap', function (ev) {
+    var t = ev.detail && ev.detail.target;
+    if (t && (t.id === 'settings-pane' || t.querySelector('[data-tpl-html-field]'))) {
+        mbxTplInitAll(t);
+    }
 });

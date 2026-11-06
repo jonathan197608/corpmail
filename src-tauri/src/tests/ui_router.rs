@@ -3370,6 +3370,21 @@ fn clamped_beyond_data_page_renders_empty_state() {
             .find(|l| l.contains("pg-cur"))
             .unwrap_or("(无分页器)")
     );
+    // 首页/末页（批次五）：最后一页有首页、无末页
+    assert!(html.contains("« 首页"), "非首页应有「首页」入口");
+    assert!(!html.contains("末页 »"), "最后一页不应出现「末页」");
+    // 第 1 页：有末页（指向 page=2）、无首页
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "page=1", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("末页 »"), "首页应有「末页」入口");
+    assert!(!html.contains("« 首页"), "首页不应出现「首页」");
     // 页 100001 → 钳 100000：超数据范围为空态（而非 panic 或巨型 OFFSET）
     let html = body(&route(
         &state,
@@ -5902,6 +5917,9 @@ fn contacts_page_pagination_slices_and_defaults() {
     assert!(html2.contains(">2 / 2"), "页次应 2 / 2");
     assert!(html2.contains("上一页"), "第 2 页应有上一页");
     assert!(!html2.contains("下一页"), "末页不应有下一页");
+    // 首页/末页：第 2 页（末页）有「首页」、无「末页」
+    assert!(html2.contains("« 首页"), "非首页应有「首页」入口");
+    assert!(!html2.contains("末页 »"), "最后一页不应出现「末页」");
     // page 越界钳回：page=99 → 仍 2 / 2
     let html3 = body(&route(
         &state,

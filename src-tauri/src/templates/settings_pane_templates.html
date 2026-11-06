@@ -16,9 +16,22 @@
                 <label>纯文本内容<small class="hint">纯文本模式插入这段；富文本模式作为回退</small></label>
                 <textarea name="body_text" rows="3" placeholder="如：收到，我这边核对后回复您。"></textarea>
             </div>
-            <div class="sfield">
-                <label>HTML 内容<small class="hint">可选：富文本模式优先插入（如带颜色的表格/列表）</small></label>
-                <textarea name="body_html" rows="2" placeholder="可选，留空则用纯文本"></textarea>
+            {# HTML 内容（批次五）：富文本编辑（与撰写页同款 wangEditor），
+               可切「HTML 源码」直接写源码；「转为纯文本」把 HTML 降级为纯文本
+               （模板场景允许降级，与撰写页的单向升级不同） #}
+            <div class="sfield" data-tpl-html-field>
+                <label>HTML 内容<small class="hint">富文本编辑；可切换源码；可降级为纯文本</small></label>
+                <div class="tpl-editor">
+                    <div class="tpl-ed-actions">
+                        <button type="button" class="btn small" data-tpl-src-toggle>⌨ HTML 源码</button>
+                        <button type="button" class="btn small" data-tpl-degrade
+                                title="把 HTML 内容转为纯文本并覆盖「纯文本内容」，同时清空 HTML">↓ 转为纯文本</button>
+                    </div>
+                    <div class="tpl-ed-toolbar" data-tpl-tb></div>
+                    <div class="tpl-ed-area" data-tpl-area></div>
+                    <textarea name="body_html" rows="4" data-tpl-html hidden
+                              placeholder="可选，留空则用纯文本"></textarea>
+                </div>
             </div>
             <button class="btn primary" type="submit">新增模板</button>
         </form>
@@ -49,9 +62,18 @@
                         <label>纯文本内容</label>
                         <textarea name="body_text" rows="3">{{ t.body_text }}</textarea>
                     </div>
-                    <div class="sfield">
-                        <label>HTML 内容</label>
-                        <textarea name="body_html" rows="2">{{ t.body_html }}</textarea>
+                    <div class="sfield" data-tpl-html-field>
+                        <label>HTML 内容<small class="hint">富文本编辑；可切换源码；可降级为纯文本</small></label>
+                        <div class="tpl-editor">
+                            <div class="tpl-ed-actions">
+                                <button type="button" class="btn small" data-tpl-src-toggle>⌨ HTML 源码</button>
+                                <button type="button" class="btn small" data-tpl-degrade
+                                        title="把 HTML 内容转为纯文本并覆盖「纯文本内容」，同时清空 HTML">↓ 转为纯文本</button>
+                            </div>
+                            <div class="tpl-ed-toolbar" data-tpl-tb></div>
+                            <div class="tpl-ed-area" data-tpl-area></div>
+                            <textarea name="body_html" rows="4" data-tpl-html hidden>{{ t.body_html }}</textarea>
+                        </div>
                     </div>
                     <button class="btn small primary" type="submit">保存修改</button>
                 </form>

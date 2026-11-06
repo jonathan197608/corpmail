@@ -1,4 +1,9 @@
 {% extends "base.html" %}
+{% block head %}
+{# 模板 tab 的富文本编辑器（批次五）：与撰写页同一 vendored wangEditor #}
+<link rel="stylesheet" href="/vendor/wang-editor/style.css">
+<script src="/vendor/wang-editor/index.js" defer></script>
+{% endblock %}
 {% block body %}
 <div class="app on">
     {% include "side.html" %}
