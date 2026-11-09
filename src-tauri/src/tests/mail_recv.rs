@@ -165,6 +165,79 @@ fn repair_gbk_subjects_restores_mojibake() {
     cleanup(&dir);
 }
 
+/// 存量正文/HTML 乱码修复（UTF-8 被邮件头误标 gb2312 解码入库的“璇—□”类）：
+/// 库内文本按 GB18030 逆推回字节恰为合法 UTF-8 → 还原原文并重算 body_tokens；
+/// 正常中文/西文正文不误改；幂等（二次修复空扫）
+#[test]
+fn repair_mojibake_bodies_restores_misdecoded_utf8() {
+    let (state, dir) = temp_state("repair-body");
+    // 构造乱码：UTF-8 原文被按 GBK 解码的形态（无丢字，可完整逆推）
+    let orig = "申诉已收到，正在核实";
+    let (cow, _, had_errors) = encoding_rs::GBK.decode(orig.as_bytes());
+    assert!(!had_errors, "测试样本须为无丢字乱码");
+    let mangled = cow.into_owned();
+    assert_ne!(&mangled, orig);
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_text, body_tokens, body_html, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn','误判申诉','',
+                        ?1,'',NULL,1),
+                        ('in','inbox','received','a@x.cn','b@x.cn','正常主题','',
+                        '正常中文正文，标点（），OK。','',NULL,2),
+                        ('in','inbox','received','a@x.cn','b@x.cn','西文主题','',
+                        'plain ascii body','',?2,3)",
+                rusqlite::params![mangled, format!("<p>{mangled}</p>")],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 独立连接跑修复（state 连接 open 时已跑过，污染行插入在之后）
+    let mut conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    crate::mail::repair_mojibake_bodies(&mut conn).unwrap();
+    let rows: Vec<(i64, String, String)> = state.with_conn(|c| {
+        c.prepare("SELECT id, body_text, body_tokens FROM emails ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    });
+    assert_eq!(rows[0].1, orig, "乱码正文应还原为 UTF-8 原文");
+    assert!(rows[0].2.contains("核实"), "body_tokens 应同步重算");
+    assert_eq!(
+        rows[1].1, "正常中文正文，标点（），OK。",
+        "正常中文不得误改"
+    );
+    assert_eq!(rows[2].1, "plain ascii body", "西文正文不得误改");
+    let html: Option<String> = state
+        .with_conn(|c| {
+            c.query_row("SELECT body_html FROM emails WHERE id = 3", [], |r| {
+                r.get(0)
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        html.as_deref(),
+        Some("<p>申诉已收到，正在核实</p>"),
+        "乱码 HTML 应同步还原"
+    );
+    // 幂等：二次修复不再改写
+    let mut conn2 = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    crate::mail::repair_mojibake_bodies(&mut conn2).unwrap();
+    let again: String = state
+        .with_conn(|c| {
+            c.query_row("SELECT body_text FROM emails WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+        })
+        .unwrap();
+    assert_eq!(again, orig, "修复后文本应保持稳定（幂等）");
+    cleanup(&dir);
+}
+
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -402,6 +475,28 @@ fn extract_body_keeps_correct_utf8_and_gbk_labeled() {
         extracted2.chars().any(is_cjk),
         "GBK 语义正文应解出中文：{extracted2}"
     );
+}
+
+/// 用户实测场景（2026-11-09 截图）：正文实为 UTF-8 却被声明为 gb2312/gbk，
+/// mailparse 按声明解码出“璇—□”类乱码；应按原始字节直接取 UTF-8 原文
+#[test]
+fn extract_body_repairs_utf8_mislabeled_as_gbk() {
+    let body = "您的申诉已收到，我们正在核实考试记录。";
+    for cs in ["gb2312", "gbk", "gb18030"] {
+        let raw = format!("Content-Type: text/plain; charset={cs}\r\n\r\n{body}");
+        let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        // 前提：按声明解码确实产生乱码（不应恰好等于原文）
+        let d = find_inline_part(&mail, "text/plain")
+            .unwrap()
+            .get_body()
+            .unwrap_or_default();
+        assert_ne!(d, body, "{cs} 声明下原文不应被直接解出：{d}");
+        let (extracted, _) = extract_body(&mail);
+        assert_eq!(
+            extracted, body,
+            "{cs} 误标 UTF-8 应按原始字节还原：实际 {extracted}"
+        );
+    }
 }
 
 #[test]

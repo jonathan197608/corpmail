@@ -207,6 +207,26 @@ fn preview_tip_truncates_long_body_with_ellipsis() {
     );
 }
 
+/// GBK 误解码乱码还原判定：UTF-8 原文被按 GBK 解码后应可逆推还原；
+/// 正常中文/西文/短文本不误改
+#[test]
+fn recover_gbk_mojibake_roundtrip_and_guards() {
+    let orig = "申诉已收到，正在核实";
+    let (cow, _, _) = encoding_rs::GBK.decode(orig.as_bytes());
+    let mangled = cow.into_owned();
+    assert_eq!(recover_gbk_mojibake(&mangled).as_deref(), Some(orig));
+    // 正常中文：GBK 逆推字节不是合法 UTF-8，不改写
+    assert_eq!(recover_gbk_mojibake("正常中文正文，标点（），OK。"), None);
+    // 纯西文 / 高位字符不足 4 个的短文本：不处理
+    assert_eq!(recover_gbk_mojibake("plain ascii text"), None);
+    assert_eq!(recover_gbk_mojibake("浣犲ソ"), None);
+    // 含 U+FFFD（原始字节已丢，不可逆推）：放弃修复
+    assert_eq!(
+        recover_gbk_mojibake("璇\u{FFFD}鍒ょ敵璇\u{FFFD}宸叉敹鍒�"),
+        None
+    );
+}
+
 /// 列表预览乱码修复：命名实体（弯引号/省略号/破折号）与数字实体都要解码；
 /// 未知实体原样保留，避免误吞正文
 #[test]

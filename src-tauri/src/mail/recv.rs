@@ -1019,9 +1019,22 @@ fn fix_gbk_fallback(part: &mailparse::ParsedMail, decoded: &str) -> String {
     }
 }
 
-/// 取正文文本并修复编码问题：mojibake（UTF-8 被误标 latin1/1252）优先，GBK 兜底其次
+/// 取正文文本并修复编码问题（三道防线按序）：
+/// ① 声明 charset 与实际字节不符（实测：声明 gb2312/gbk 实为 UTF-8）——
+///    mailparse 按声明解码出“璇—□”类乱码；原始字节（已解传输编码）为合法
+///    UTF-8 且含高位字节时直接按 UTF-8 取文（真实 GBK 字节几乎不可能是
+///    合法 UTF-8，不会误伤）；
+/// ② mojibake（UTF-8 被误标 latin1/1252，字符落 U+0080-00FF 区）；
+/// ③ 未声明/错声明的 GBK 字节兜底重解码。
 fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
     let decoded = part.get_body().unwrap_or_default();
+    if let Ok(raw) = part.get_body_raw()
+        && let Ok(s) = std::str::from_utf8(&raw)
+        && s.chars().any(|c| (c as u32) >= 0x80)
+        && s != decoded
+    {
+        return s.to_string();
+    }
     if let Some(fixed) = fix_mojibake(&decoded) {
         return fixed;
     }
