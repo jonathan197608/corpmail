@@ -151,13 +151,14 @@ pub struct ContactRow {
 }
 
 /// 联系人排序键（批次四，与邮件列表排序下拉对齐）：
-/// Recent = 最近联系优先（默认）、Hits = 联系最多、Name = 姓名。
+/// Recent = 最近联系优先（默认）、Hits = 联系最多、Name = 姓名、Addr = 地址。
 /// ORDER BY 为静态字符串（枚举驱动，无注入面）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContactsSort {
     Recent,
     Hits,
     Name,
+    Addr,
 }
 
 impl ContactsSort {
@@ -166,6 +167,7 @@ impl ContactsSort {
         match raw {
             Some("hits") => Self::Hits,
             Some("name") => Self::Name,
+            Some("addr") => Self::Addr,
             _ => Self::Recent,
         }
     }
@@ -176,6 +178,7 @@ impl ContactsSort {
             Self::Recent => "recent",
             Self::Hits => "hits",
             Self::Name => "name",
+            Self::Addr => "addr",
         }
     }
 
@@ -184,6 +187,7 @@ impl ContactsSort {
             Self::Recent => "updated_at DESC, hits DESC",
             Self::Hits => "hits DESC, updated_at DESC",
             Self::Name => "name ASC, addr ASC",
+            Self::Addr => "addr ASC",
         }
     }
 }
@@ -198,21 +202,29 @@ pub fn list_rows(
 ) -> rusqlite::Result<Vec<ContactRow>> {
     let limit = limit as i64;
     let order = sort.order_by();
+    // 按姓名排序时排除未命名联系人：它们没有可排的姓名，不应占用列表位置
+    // （其他排序仍保留全部联系人，避免“联系人凭空消失”）
+    let name_only = sort == ContactsSort::Name;
     let t = q.trim();
     if t.is_empty() {
+        let filter = if name_only { "WHERE name <> ''" } else { "" };
         let mut stmt = conn.prepare(&format!(
             "SELECT addr, name, updated_at, hits FROM contacts \
-             ORDER BY {order} LIMIT ?1"
+             {filter} ORDER BY {order} LIMIT ?1"
         ))?;
         return stmt
             .query_map([limit], contact_row)?
             .collect::<Result<Vec<_>, _>>();
     }
     let pattern = format!("%{}%", escape_like(t));
+    let filter = if name_only {
+        "WHERE (addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\') AND name <> ''"
+    } else {
+        "WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT addr, name, updated_at, hits FROM contacts \
-         WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
-         ORDER BY {order} LIMIT ?2"
+         {filter} ORDER BY {order} LIMIT ?2"
     ))?;
     stmt.query_map(rusqlite::params![pattern, limit], contact_row)?
         .collect::<Result<Vec<_>, _>>()

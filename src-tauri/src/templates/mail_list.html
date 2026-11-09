@@ -50,9 +50,10 @@
                    title="按主题归组往来邮件（会话视图）">{% if is_thread %}🗒️ 单封视图{% else %}💬 会话视图{% endif %}</a>
                 {% endif %}
                 {% if folder == 'inbox' %}
-                <a class="tb-item {% if unread_only %}on{% endif %}" href="{{ unread_href }}">{% if unread_only %}✓ 显示全部{% else %}● 只看未读{% endif %}</a>
+                <a class="tb-item {% if unread_only %}on{% endif %}" href="{{ unread_href }}"
+                   title="{% if unread_only %}点击取消未读筛选{% else %}只显示未读邮件{% endif %}">{% if unread_only %}✓ 只看未读{% else %}● 只看未读{% endif %}</a>
                 <a class="tb-item {% if external_only %}on{% endif %}" href="{{ external_href }}"
-                   title="只显示发件人为外部域名的邮件">{% if external_only %}✓ 显示全部{% else %}🌐 只看外部{% endif %}</a>
+                   title="{% if external_only %}点击取消外部筛选{% else %}只显示发件人为外部域名的邮件{% endif %}">{% if external_only %}✓ 只看外部{% else %}🌐 只看外部{% endif %}</a>
                 {% endif %}
                 <div class="btn-sep"></div>
                 <button type="button" class="tb-item" id="fetch-btn"
@@ -89,15 +90,19 @@
         <form class="search" method="get" action="/" title="输入关键词后回车搜索（支持中文/编号/多词 AND）">
             <span>🔍</span>
             <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
-            {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件）；🎛️ 配"高级"文案（贴合筛选语义） #}
+            {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件）；🎛️ 配"高级"文案（贴合筛选语义）。
+               全文搜索启用（q 非空）时高级筛选无意义，隐藏入口，改为「清除」搜索 #}
+            {% if q %}
+            <a class="adv-toggle" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索关键词">清除</a>
+            {% else %}
             <button type="button" id="adv-toggle"
                     class="adv-toggle {% if from_filter or df or dt or has_attach %}on{% endif %}"
                     title="高级检索：发件人、日期区间、附件" aria-label="高级检索">🎛️ 高级</button>
+            {% endif %}
             <input type="hidden" name="folder" value="{{ folder }}">
             {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
             {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
             {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
-            {% if q %}<a class="search-clear" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索">×</a>{% endif %}
         </form>
     </div>
 
@@ -145,7 +150,7 @@
                         {% if t.attach_cnt > 0 %}<span class="mr-clip" title="{{ t.attach_cnt }} 个附件">📎 {{ t.attach_cnt }}</span>{% endif %}
                         <span class="mr-time">{{ t.time_label }}</span>
                     </div>
-                    <div class="mr-preview">{{ t.body_preview }}</div>
+                    <div class="mr-preview">{% if t.body_preview %}{{ t.body_preview }}{% else %}<span class="mr-no-body">（无正文）</span>{% endif %}</div>
                 </div>
             </a>
         </div>
@@ -196,7 +201,7 @@
                         {% if m.attach_cnt > 0 %}<span class="mr-clip" title="{{ m.attach_cnt }} 个附件">📎 {{ m.attach_cnt }}</span>{% endif %}
                         <span class="mr-time">{{ m.time_label }}</span>
                     </div>
-                    <div class="mr-preview">{{ m.body_preview }}</div>
+                    <div class="mr-preview">{% if m.body_preview %}{{ m.body_preview }}{% else %}<span class="mr-no-body">（无正文）</span>{% endif %}</div>
                 </div>
             </a>
         </div>

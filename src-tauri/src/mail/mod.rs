@@ -450,10 +450,23 @@ fn decode_entity(html: &str, i: &mut usize, out: &mut String) {
                     match parsed.ok().and_then(char::from_u32) {
                         // 控制字符（含 \0）对预览/检索文本无意义，原样保留标记
                         Some(c) if !c.is_control() => out.push(c),
-                        _ => out.push_str(other),
+                        // 非法码位原样保留（含 & 与 ;），避免留下 "#20320" 残串
+                        _ => {
+                            out.push('&');
+                            out.push_str(other);
+                            out.push(';');
+                        }
                     }
                 }
-                other => out.push_str(other),
+                other => match named_entity(other) {
+                    Some(c) => out.push(c),
+                    // 未知实体原样保留（含 & 与 ;），不能只留下名称残串
+                    None => {
+                        out.push('&');
+                        out.push_str(other);
+                        out.push(';');
+                    }
+                },
             }
             *i += 1 + pos + 1;
         }
@@ -462,6 +475,63 @@ fn decode_entity(html: &str, i: &mut usize, out: &mut String) {
             *i += 1;
         }
     }
+}
+
+/// 常见命名实体（非数字）：中文 HTML 邮件大量使用弯引号/省略号/破折号，
+/// 不解码时列表预览会把 `&hellip;`、`&ldquo;` 等原样显示成“乱码”
+/// （详情页由浏览器解码，故只在预览侧出现）。名称按 ASCII 不区分大小写。
+fn named_entity(name: &str) -> Option<char> {
+    let lower = name.to_ascii_lowercase();
+    Some(match lower.as_str() {
+        "mdash" => '—',
+        "ndash" => '–',
+        "hellip" => '…',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "laquo" => '«',
+        "raquo" => '»',
+        "bull" => '•',
+        "middot" => '·',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "times" => '×',
+        "divide" => '÷',
+        "deg" => '°',
+        "euro" => '€',
+        "pound" => '£',
+        "yen" => '¥',
+        "sect" => '§',
+        "para" => '¶',
+        "plusmn" => '±',
+        "frac12" => '½',
+        "frac14" => '¼',
+        "frac34" => '¾',
+        "sup2" => '²',
+        "sup3" => '³',
+        "micro" => 'µ',
+        "ensp" | "emsp" | "thinsp" => ' ',
+        _ => return None,
+    })
+}
+
+/// 仅解码文本中的 HTML 实体（不动标签/结构）；用于存量 body_text 的显示侧
+/// 兜底（入库时未识别的命名实体会原样留在纯文本列）。
+pub fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'&' {
+            decode_entity(text, &mut i, &mut out);
+        } else {
+            let ch = text[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -1548,14 +1618,18 @@ pub fn search(
     })
 }
 
-/// 正文摘要：压缩空白后取前 100 字符（chars 截断防中文 panic）
+/// 正文摘要：解码残留实体 + 压缩空白后取前 100 字符（chars 截断防中文 panic）。
+/// 显示侧解码可同时修复存量数据里未识别的命名实体（无需迁移）
 fn preview(text: &str) -> String {
-    flatten_ws(text).chars().take(100).collect()
+    flatten_ws(&decode_entities(text))
+        .chars()
+        .take(100)
+        .collect()
 }
 
-/// 悬停预览正文：压缩空白 + 300 字符截断 + 超长补省略号（M5 列表 tooltip）
+/// 悬停预览正文：解码残留实体 + 压缩空白 + 300 字符截断 + 超长补省略号
 fn preview_tip(text: &str) -> String {
-    let flat = flatten_ws(text);
+    let flat = flatten_ws(&decode_entities(text));
     let mut tip: String = flat.chars().take(300).collect();
     if flat.chars().count() > 300 {
         tip.push('…');

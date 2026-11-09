@@ -753,16 +753,18 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     let unread_part = if unread_only { "unread=1&" } else { "" };
     let external_part = if external_only { "external=1&" } else { "" };
     let page_base = format!("{base}{unread_part}{external_part}");
+    // 筛选开关需保持当前视图（会话/单封），否则在会话视图点筛选会退回单封
+    let view_keep = if is_thread { "mode=thread&" } else { "" };
     let unread_href = if unread_only {
-        // 取消未读筛选：保留外部筛选，回到当前页
-        format!("{base}{external_part}page={page}")
+        // 取消未读筛选：保留外部筛选与当前视图，回到当前页
+        format!("{base}{view_keep}{external_part}page={page}")
     } else {
-        format!("{base}unread=1&{external_part}page=1")
+        format!("{base}{view_keep}unread=1&{external_part}page=1")
     };
     let external_href = if external_only {
-        format!("{base}{unread_part}page={page}")
+        format!("{base}{view_keep}{unread_part}page={page}")
     } else {
-        format!("{base}external=1&{unread_part}page=1")
+        format!("{base}{view_keep}external=1&{unread_part}page=1")
     };
     // 会话/单封视图切换链接：保留 folder/unread/external/q，翻页重置（两种视图行数不同）
     // 目标 = 当前态取反 mode；仅 threadable（收件箱/全部）时渲染切换按钮
@@ -772,6 +774,13 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     let mut list_query = String::new();
     if folder != "inbox" {
         list_query.push_str(&format!("folder={folder}"));
+    }
+    // 会话视图往返：详情页「返回列表」必须回到会话列表而非单封视图
+    if is_thread {
+        if !list_query.is_empty() {
+            list_query.push('&');
+        }
+        list_query.push_str("mode=thread");
     }
     if unread_only {
         if !list_query.is_empty() {
@@ -2916,6 +2925,7 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     };
     let q = get("q");
     let page = get("page");
+    let mode = get("mode");
     let unread = get("unread");
     let external = get("external");
     let per = get("per");
@@ -2926,6 +2936,7 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let att = get("att");
     rebuild_list_query(
         &folder,
+        mode.as_deref(),
         unread.as_deref(),
         external.as_deref(),
         q.as_deref(),
@@ -2947,6 +2958,7 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn rebuild_list_query(
     folder: &str,
+    mode: Option<&str>,
     unread: Option<&str>,
     external: Option<&str>,
     q: Option<&str>,
@@ -2967,6 +2979,10 @@ fn rebuild_list_query(
     // 列表链接都依赖 folder 明确，省略会让回跳退到邮件自身 folder 而错落
     // 草稿箱/发件箱。收件箱显式 folder=inbox 只是 URL 更明确，语义不变。
     qs.push(format!("folder={folder}"));
+    // 会话视图仅收件箱/全部可用；其他箱体即使带 mode=thread 也无意义，丢弃
+    if mode == Some("thread") && matches!(folder.as_str(), "inbox" | "all") {
+        qs.push("mode=thread".into());
+    }
     if unread == Some("1") {
         qs.push("unread=1".into());
     }
@@ -3063,6 +3079,7 @@ fn form_list_query(form: &HashMap<String, String>) -> String {
     };
     rebuild_list_query(
         pick("folder").unwrap_or("inbox"),
+        pick("mode"),
         pick("unread"),
         pick("external"),
         pick("q"),

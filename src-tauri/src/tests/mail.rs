@@ -207,6 +207,21 @@ fn preview_tip_truncates_long_body_with_ellipsis() {
     );
 }
 
+/// 列表预览乱码修复：命名实体（弯引号/省略号/破折号）与数字实体都要解码；
+/// 未知实体原样保留，避免误吞正文
+#[test]
+fn preview_decodes_named_entities() {
+    assert_eq!(
+        decode_entities("&ldquo;你好&rdquo;&hellip;&mdash;"),
+        "“你好”…—"
+    );
+    assert_eq!(decode_entities("&#20320;&#x597d;"), "你好");
+    assert_eq!(decode_entities("&nbsp;&amp;&lt;"), " &<");
+    assert_eq!(decode_entities("&unknown;"), "&unknown;");
+    // preview 走同一解码：中文邮件正文里的 &hellip; 不再原样显示
+    assert_eq!(preview("进度&hellip;"), "进度…");
+}
+
 #[test]
 fn preview_kind_falls_back_to_extension_for_octet_stream() {
     // MIME 缺失/八进制流 → 扩展名兜底（真实邮件附件头常不规范）
@@ -808,9 +823,9 @@ fn strip_html_decodes_numeric_char_refs() {
     // 与命名实体混排：你 + & + 好 + 空格
     assert_eq!(strip_html("&#20320;&amp;&#22909;&nbsp;"), "你&好 ");
     // 非法码位：0（NUL 不可成 char）、代理区 D800、超 0x10FFFF → 原样保留
-    assert_eq!(strip_html("&#0;"), "#0");
-    assert_eq!(strip_html("&#xD800;"), "#xD800");
-    assert_eq!(strip_html("&#x110000;"), "#x110000");
+    assert_eq!(strip_html("&#0;"), "&#0;");
+    assert_eq!(strip_html("&#xD800;"), "&#xD800;");
+    assert_eq!(strip_html("&#x110000;"), "&#x110000;");
     // 纯数字但超出 8 字符实体扫描窗口 → 原文输出（含 & 与 ;）
     assert_eq!(
         strip_html("&#99999999999999999999;"),

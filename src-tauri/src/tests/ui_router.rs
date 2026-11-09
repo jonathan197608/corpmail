@@ -297,7 +297,15 @@ fn unread_toggle_restores_full_list() {
         &req_q("GET", "/", "unread=1", b""),
         &tester,
     ));
-    assert!(unread.contains("显示全部"), "开启态应有恢复文字：{unread}");
+    // 开启态：开关保持自身语义（✓ 只看未读），不再出现两个「显示全部」
+    assert!(
+        unread.contains("✓ 只看未读"),
+        "开启态应标记自身筛选：{unread}"
+    );
+    assert!(
+        !unread.contains("显示全部"),
+        "两个筛选同时展示时不得出现重复「显示全部」：{unread}"
+    );
     // 恢复链接不带 unread 参数（minijinja 按规范将 / 转义为 &#x2f;，浏览器解码后
     // 即 /?page=1；断言按渲染原文精确匹配）
     assert!(
@@ -4039,7 +4047,13 @@ fn dump_smoke_html() {
 
     // 复制真实静态资源（与发行物同源）
     let ui_dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-dist");
-    for f in ["app.css", "htmx.min.js", "app.js", "favicon.svg"] {
+    for f in [
+        "app.css",
+        "htmx.min.js",
+        "app.js",
+        "office-preview.js",
+        "favicon.svg",
+    ] {
         std::fs::copy(ui_dist.join(f), root.join(f)).unwrap();
     }
     // wangEditor vendor（compose 页富文本编辑器）：保持子目录结构
@@ -4047,6 +4061,16 @@ fn dump_smoke_html() {
     std::fs::create_dir_all(&vendor).unwrap();
     for f in ["index.js", "style.css", "VERSION.txt"] {
         std::fs::copy(ui_dist.join("vendor/wang-editor").join(f), vendor.join(f)).unwrap();
+    }
+    // Office 预览 vendor（xlsx/docx/pptx 解析脚本）：预览实测需要
+    let office = root.join("vendor/office");
+    std::fs::create_dir_all(&office).unwrap();
+    if let Ok(rd) = std::fs::read_dir(ui_dist.join("vendor/office")) {
+        for e in rd.flatten() {
+            if e.path().is_file() {
+                std::fs::copy(e.path(), office.join(e.file_name())).unwrap();
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(&db_dir);
 }
@@ -4639,6 +4663,21 @@ fn detail_back_link_preserves_list_filters() {
             r#"href="&#x2f;?folder=inbox&amp;unread=1&amp;external=1&amp;q=%E6%BF%80%E5%8A%B1&amp;page=3"#
         ),
         "返回列表应原样还原过滤状态（含 folder=inbox）：{html}"
+    );
+
+    // 会话视图进入详情：返回链接必须保持 mode=thread（否则退回单封视图）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/emails/1", "folder=inbox&mode=thread", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("folder=inbox&amp;mode=thread"),
+        "会话视图详情返回列表应保持 mode=thread：{html}"
     );
 
     // 无参数进入：回落到邮件所在 folder（sent → /?folder=sent）
@@ -5974,10 +6013,12 @@ fn contacts_page_sort_orders_and_preserves() {
                 "INSERT INTO contacts(addr, name, updated_at, hits) VALUES
                  ('c0@x.cn', '王五', {a}, 1),
                  ('c1@x.cn', '陈一', {b}, 9),
-                 ('c2@x.cn', '李三', {c}, 5)",
+                 ('c2@x.cn', '李三', {c}, 5),
+                 ('c3@x.cn', '', {d}, 0)",
                 a = now,
                 b = now - 7200,
-                c = now - 3600
+                c = now - 3600,
+                d = now - 10800
             ))
             .map_err(|e| e.to_string())
         })
@@ -6044,6 +6085,29 @@ fn contacts_page_sort_orders_and_preserves() {
         html.find("c2@x.cn").unwrap(),
     );
     assert!(n2 < n0 && n0 < n1, "sort=name 应按姓名升序（UTF-8 字节序）");
+    // 姓名排序排除未命名联系人（无可排姓名的行不显示）
+    assert!(
+        !html.contains("c3@x.cn"),
+        "sort=name 不应显示未命名联系人：{html}"
+    );
+    // sort=addr：地址升序，且未命名联系人在此视图保留
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "sort=addr&per=10", b""),
+        &tester,
+    ));
+    assert!(
+        html.contains(r#"<option value="addr" selected"#),
+        "addr 选项应选中：{html}"
+    );
+    let pos = |needle: &str| html.find(needle).unwrap();
+    assert!(
+        pos("c0@x.cn") < pos("c1@x.cn")
+            && pos("c1@x.cn") < pos("c2@x.cn")
+            && pos("c2@x.cn") < pos("c3@x.cn"),
+        "sort=addr 应按地址升序"
+    );
     cleanup(&dir);
 }
 

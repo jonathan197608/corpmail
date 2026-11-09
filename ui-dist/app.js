@@ -1813,11 +1813,8 @@ function mbxTplInitAll(root) {
     (root || document).querySelectorAll('[data-tpl-field]').forEach(mbxTplInitField);
 }
 
-// 片段重渲染（保存/删除/tab 切换）与整页进入都初始化
+// 片段重渲染（保存/删除/tab 切换）与整页进入都初始化。
+// 注意：hx-swap=outerHTML 时 afterSwap 的 target 可能仍指向已被替换的旧节点，
+// 初始化旧 DOM 会让按钮看似“无效”。因此统一扫描文档中尚未初始化的字段。
 document.addEventListener('DOMContentLoaded', function () { mbxTplInitAll(document); });
-document.body.addEventListener('htmx:afterSwap', function (ev) {
-    var t = ev.detail && ev.detail.target;
-    if (t && (t.id === 'settings-pane' || t.querySelector('[data-tpl-field]'))) {
-        mbxTplInitAll(t);
-    }
-});
+document.body.addEventListener('htmx:afterSwap', function () { mbxTplInitAll(document); });

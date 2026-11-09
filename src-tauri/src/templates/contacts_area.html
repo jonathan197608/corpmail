@@ -21,6 +21,7 @@
                     <option value="recent" {% if sort == 'recent' %}selected{% endif %}>最近联系</option>
                     <option value="hits" {% if sort == 'hits' %}selected{% endif %}>联系最多</option>
                     <option value="name" {% if sort == 'name' %}selected{% endif %}>姓名</option>
+                    <option value="addr" {% if sort == 'addr' %}selected{% endif %}>地址</option>
                 </select>
             </label>
         </form>
@@ -74,7 +75,7 @@
             </div>
             <a class="btn small ct-edit-link"
                href="/contacts?edit={{ c.edit_qs }}"
-               title="修改姓名（地址不可改）">编辑</a>
+               title="修改姓名（地址不可改）">改名</a>
             <button type="button" class="btn small danger ct-del"
                     hx-post="/contacts/delete"
                     hx-include="#contacts-search" hx-vals='{"addr": {{ c.addr | js_str }}}'

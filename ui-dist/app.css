@@ -1795,9 +1795,16 @@ a.btn.link.disabled {
 .mr-preview {
     font-size: 12.5px;
     color: var(--muted);
+    /* 固定单行高度：正文为空（占位）与有正文的行保持等高 */
+    line-height: 1.45;
+    min-height: 19px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.mr-no-body {
+    color: #9aa6b8;
 }
 
 /* ---------- 分页 ---------- */
@@ -2264,6 +2271,37 @@ a.btn.link.disabled {
     display: flex;
     justify-content: flex-end;
     margin-bottom: 6px;
+}
+
+/* 内容区跨满整行：.sfield 是 108px 标签 + 1fr 两列网格，内容块若只落在
+   某一列会明显偏窄（纯文本框此前仅 108px）。升级按钮行/纯文本/富文本
+   区域统一跨两列，标签独占上一行 */
+[data-tpl-field] > .tpl-plain-head,
+[data-tpl-field] > [data-tpl-plain],
+[data-tpl-field] > .tpl-editor {
+    grid-column: 1 / -1;
+}
+
+/* 纯文本内容框：占满内容列（此前 textarea 无宽度规则，UA 默认约 20 列，
+   在宽表单里明显偏窄）；高度可拖拽，聚焦高亮与其它输入框一致 */
+[data-tpl-plain] textarea[name="body_text"] {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 96px;
+    resize: vertical;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    font-family: inherit;
+    color: var(--ink);
+    background: var(--panel);
+    outline: none;
+}
+
+[data-tpl-plain] textarea[name="body_text"]:focus {
+    border-color: var(--accent);
 }
 
 .tpl-editor {
@@ -3345,7 +3383,7 @@ a.btn.link.disabled {
 /* ============ B8 Office 附件预览 ============ */
 /* 宽版面板：Word/Excel/PPT 需要比图片预览更大的画布。
    预览无工具栏行（另存入口统一在邮件详情页附件列表）：
-   XLSX 多工作表与 PPTX 多页连续渲染进 iframe，滚动浏览 */
+   XLSX 按工作表 tab 切换，PPTX 多页连续渲染进 iframe */
 .pm-panel.office {
     width: min(94vw, 1280px);
     height: min(90vh, 900px);
@@ -3363,6 +3401,60 @@ a.btn.link.disabled {
     display: block;
     border: none;
     background: #fff;
+}
+
+/* XLSX 工作表 tab（面板内唯一控件；其余下载入口仍在详情页附件列表） */
+.pm-body.office.has-tabs {
+    display: flex;
+    flex-direction: column;
+}
+
+.pm-body.office.has-tabs iframe {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+}
+
+.pm-sheet-tabs {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #e2e8f0;
+    background: #f8fafc;
+    overflow-x: auto;
+}
+
+.pm-sheet-tab {
+    flex: none;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: #44546a;
+    font-size: 13px;
+    line-height: 1;
+    padding: 7px 12px;
+    cursor: pointer;
+}
+
+.pm-sheet-tab:hover {
+    background: #edf2f9;
+}
+
+.pm-sheet-tab.on {
+    background: #fff;
+    border-color: #cfd9e6;
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.pm-sheet-note {
+    margin-left: auto;
+    padding-left: 12px;
+    font-size: 11.5px;
+    color: #a63b0a;
+    white-space: nowrap;
 }
 
 .pm-loading {

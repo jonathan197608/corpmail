@@ -1,6 +1,7 @@
 // Office 附件预览（B8）：本地解析 DOCX/XLSX/PPTX，产物净化后注入 sandbox iframe。
 // 预览界面无工具栏（另存入口在邮件详情页附件列表）：
-// XLSX 多工作表与 PPTX 多页均连续渲染进 iframe，滚动浏览代替标签切换/翻页。
+// XLSX 按工作表渲染为 tab 切换（仅 tab，无其他按钮）；
+// PPTX 多页连续渲染进 iframe，滚动浏览代替翻页。
 // 安全边界：
 // - 附件字节来自服务端已清洗副本（宏/OLE/外部关系已移除）；
 // - 渲染产物走 DOM 白名单净化，去掉脚本/事件/外部资源；
@@ -81,7 +82,7 @@
         if (p) p.classList.remove('office');
         const b = bodyEl();
         if (b) {
-            b.classList.remove('office');
+            b.classList.remove('office', 'has-tabs');
             b.innerHTML = '';
         }
     }
@@ -227,6 +228,58 @@
         b.appendChild(frame);
     }
 
+    /// 工作表 tab：条在面板内（原生 DOM，可交互），内容仍在 sandbox iframe。
+    /// 每个工作表一个 tab，切换即换 iframe 的 blob 内容（不重建解析结果）。
+    async function showSheetTabs(sheets, css) {
+        const b = bodyEl();
+        if (!b) return;
+        b.innerHTML = '';
+        b.classList.add('office', 'has-tabs');
+        const cleaned = [];
+        for (const s of sheets) {
+            cleaned.push({ name: s.name, note: s.note, html: await prepareHtml(s.html) });
+        }
+        const bar = document.createElement('div');
+        bar.className = 'pm-sheet-tabs';
+        bar.setAttribute('role', 'tablist');
+        const note = document.createElement('span');
+        note.className = 'pm-sheet-note';
+        const frame = document.createElement('iframe');
+        frame.setAttribute('sandbox', '');
+        frame.setAttribute('referrerpolicy', 'no-referrer');
+        frame.title = $('pm-name') ? $('pm-name').textContent : '附件预览';
+        let current = -1;
+        function show(i) {
+            if (i === current) return;
+            current = i;
+            if (state.objectUrl) {
+                try { URL.revokeObjectURL(state.objectUrl); } catch (e) { /* 忽略 */ }
+            }
+            state.objectUrl = URL.createObjectURL(new Blob(
+                [buildSrcdoc(cleaned[i].html, css)], { type: 'text/html' }));
+            frame.src = state.objectUrl;
+            Array.prototype.forEach.call(bar.querySelectorAll('.pm-sheet-tab'), function (el, idx) {
+                el.classList.toggle('on', idx === i);
+                el.setAttribute('aria-selected', idx === i ? 'true' : 'false');
+            });
+            note.textContent = cleaned[i].note || '';
+        }
+        cleaned.forEach(function (s, i) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'pm-sheet-tab';
+            btn.setAttribute('role', 'tab');
+            btn.textContent = s.name;
+            btn.title = s.name + (s.note ? '（' + s.note + '）' : '');
+            btn.addEventListener('click', function () { show(i); });
+            bar.appendChild(btn);
+        });
+        bar.appendChild(note);
+        b.appendChild(bar);
+        b.appendChild(frame);
+        show(0);
+    }
+
     function showLoading(text) {
         const b = bodyEl();
         if (!b) return;
@@ -300,30 +353,24 @@
         return r.e.r + 1 > MAX_ROWS || r.e.c + 1 > MAX_COLS;
     }
 
-    function esc(s) {
-        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-
     async function renderXlsx(buf) {
         await loadFor(state.kind);
         const wb = window.XLSX.read(new Uint8Array(buf), { type: 'array' });
         state.wb = wb;
         state.sheets = (wb.SheetNames || []).slice(0, MAX_SHEETS);
         if (!state.sheets.length) throw new Error('工作簿中没有可预览的工作表。');
-        // 全部工作表连续渲染（标题分隔，截断提示随标题），iframe 内滚动浏览
-        const parts = [];
-        state.sheets.forEach(function (name) {
+        // 每工作表一个 tab（滚动浏览改为点击切换），截断提示随当前 tab 显示
+        const sheets = state.sheets.map(function (name) {
             const ws = wb.Sheets[name];
-            const title = '<h3 class="sheet-title">' + esc(name)
-                + (sheetTruncated(ws)
-                    ? '<span class="sheet-note">仅预览前 ' + MAX_ROWS + ' 行 / ' + MAX_COLS + ' 列</span>'
-                    : '')
-                + '</h3>';
-            parts.push(title + window.XLSX.utils.sheet_to_html(
-                limitSheet(ws, MAX_ROWS, MAX_COLS), { editable: false }));
+            const truncated = sheetTruncated(ws);
+            return {
+                name: name,
+                note: truncated ? '仅预览前 ' + MAX_ROWS + ' 行 / ' + MAX_COLS + ' 列' : '',
+                html: window.XLSX.utils.sheet_to_html(
+                    limitSheet(ws, MAX_ROWS, MAX_COLS), { editable: false })
+            };
         });
-        await showIframe(parts.join('\n'), XLSX_CSS);
+        await showSheetTabs(sheets, XLSX_CSS);
     }
 
     // ---------- PPTX ----------
@@ -461,11 +508,7 @@
         html, body { height: 100%; }
         body { margin: 0; padding: 16px; background: #fff; color: #1f2937;
                font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; font-size: 13px; }
-        /* 全部工作表连续渲染：标题作分隔，滚动浏览代替标签切换 */
-        .sheet-title { margin: 8px 0 10px; font-size: 14px; color: #0f172a; }
-        .sheet-title + table { margin-bottom: 24px; }
-        .sheet-note { font-size: 11.5px; color: #a63b0a; background: #fdece0;
-                   border-radius: 5px; padding: 1px 6px; margin-left: 8px; vertical-align: middle; }
+        /* 单工作表内容：切换由面板内 tab 负责 */
         table { border-collapse: collapse; table-layout: auto; }
         td, th { border: 1px solid #cbd5e1; padding: 4px 8px; white-space: nowrap; vertical-align: top; }
         tr:first-child td { background: #f8fafc; }
