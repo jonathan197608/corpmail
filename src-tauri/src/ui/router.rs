@@ -2207,13 +2207,10 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
     let scheduled_at = if sched_raw.trim().is_empty() {
         0
     } else {
-        match mail::sched_epoch_of(&sched_raw) {
-            Some(at) => at,
-            None => {
-                eprintln!("[compose] scheduled_at 解析失败（按非定时处理）：{sched_raw:?}");
-                0
-            }
-        }
+        mail::sched_epoch_of(&sched_raw).unwrap_or_else(|| {
+            eprintln!("[compose] scheduled_at 解析失败（按非定时处理）：{sched_raw:?}");
+            0
+        })
     };
     let input = mail::DraftInput {
         id: draft_id,
