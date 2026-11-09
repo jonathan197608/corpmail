@@ -3444,6 +3444,7 @@ fn dump_smoke_html() {
             .replace("href=\"/app.css\"", "href=\"app.css\"")
             .replace("src=\"/htmx.min.js\"", "src=\"htmx.min.js\"")
             .replace("src=\"/app.js\"", "src=\"app.js\"")
+            .replace("src=\"/office-preview.js\"", "src=\"office-preview.js\"")
             .replace("href=\"/favicon.svg\"", "href=\"favicon.svg\"")
             // wangEditor vendor 资源（仅 compose 页引入）
             .replace(

@@ -1,4 +1,6 @@
 // Office 附件预览（B8）：本地解析 DOCX/XLSX/PPTX，产物净化后注入 sandbox iframe。
+// 预览界面无工具栏（另存入口在邮件详情页附件列表）：
+// XLSX 多工作表与 PPTX 多页均连续渲染进 iframe，滚动浏览代替标签切换/翻页。
 // 安全边界：
 // - 附件字节来自服务端已清洗副本（宏/OLE/外部关系已移除）；
 // - 渲染产物走 DOM 白名单净化，去掉脚本/事件/外部资源；
@@ -19,13 +21,9 @@
     const state = {
         kind: '',
         url: '',
-        emailId: 0,
-        attachId: 0,
         pv: null,
         wb: null,
         sheets: [],
-        sheetIndex: 0,
-        slideIndex: 0,
         objectUrl: ''
     };
 
@@ -33,7 +31,6 @@
     function modal() { return $('preview-modal'); }
     function panel() { return modal() ? modal().querySelector('.pm-panel') : null; }
     function bodyEl() { return $('pm-body'); }
-    function toolbarEl() { return $('pm-toolbar'); }
 
     // ---------- 懒加载 vendor ----------
     function loadScript(src) {
@@ -77,13 +74,9 @@
         }
         state.kind = '';
         state.url = '';
-        state.emailId = 0;
-        state.attachId = 0;
         state.pv = null;
         state.wb = null;
         state.sheets = [];
-        state.sheetIndex = 0;
-        state.slideIndex = 0;
         const p = panel();
         if (p) p.classList.remove('office');
         const b = bodyEl();
@@ -91,21 +84,11 @@
             b.classList.remove('office');
             b.innerHTML = '';
         }
-        const t = toolbarEl();
-        if (t) {
-            t.hidden = true;
-            t.innerHTML = '';
-        }
     }
 
     window.mbxOfficeReset = reset;
 
     // ---------- URL / 数据 ----------
-    function idsFromUrl(url) {
-        const m = /\/emails\/(\d+)\/attachments\/(\d+)\/view(?:\?.*)?$/.exec(url || '');
-        return m ? { emailId: Number(m[1]), attachId: Number(m[2]) } : { emailId: 0, attachId: 0 };
-    }
-
     function endpoint(url, suffix) {
         return String(url || '').replace(/\/view(?:\?.*)?$/, '/' + suffix);
     }
@@ -270,27 +253,6 @@
         return b;
     }
 
-    function toolbarLayout() {
-        const t = toolbarEl();
-        t.innerHTML = '';
-        t.hidden = false;
-        const left = document.createElement('div');
-        left.className = 'pm-tools-left';
-        const right = document.createElement('div');
-        right.className = 'pm-tools-right';
-        t.appendChild(left);
-        t.appendChild(right);
-        return { left, right };
-    }
-
-    function addDownload(right) {
-        if (!state.emailId || !state.attachId) return;
-        const name = $('pm-name') ? $('pm-name').textContent : '附件';
-        right.appendChild(button('另存为', '另存到本机', () => {
-            if (window.mbxSaveAttachment) window.mbxSaveAttachment(state.emailId, state.attachId, name);
-        }));
-    }
-
     // ---------- DOCX ----------
     async function renderDocx(buf) {
         await loadFor('docx');
@@ -309,14 +271,6 @@
         // DOCX_CSS 失效；取 textContent 得纯 CSS 文本，再由 buildSrcdoc 统一包裹
         const css = styleHost.textContent + DOCX_CSS;
         await showIframe(bodyHost.innerHTML, css);
-        const { right } = toolbarLayout();
-        const left = toolbarEl().querySelector('.pm-tools-left');
-        const label = document.createElement('span');
-        label.className = 'pm-tools-label';
-        label.textContent = 'Word 文档';
-        left.appendChild(label);
-        right.appendChild(button('文本模式', '渲染异常时可切换纯文本预览', () => showTextFallback()));
-        addDownload(right);
     }
 
     // ---------- XLSX / XLS ----------
@@ -333,7 +287,7 @@
         if (merges.length) out['!merges'] = merges;
         for (let r = 0; r <= end.r; r++) {
             for (let c = 0; c <= end.c; c++) {
-                const addr = window.XLSX.utils.encode_cell({ r, c });
+                const addr = window.XLSX.utils.encode_cell({ r: r, c: c });
                 if (ws[addr]) out[addr] = ws[addr];
             }
         }
@@ -346,31 +300,9 @@
         return r.e.r + 1 > MAX_ROWS || r.e.c + 1 > MAX_COLS;
     }
 
-    async function renderSheet(index) {
-        const name = state.sheets[index];
-        if (!name) return;
-        state.sheetIndex = index;
-        const ws = state.wb.Sheets[name];
-        const html = window.XLSX.utils.sheet_to_html(limitSheet(ws, MAX_ROWS, MAX_COLS), { editable: false });
-        await showIframe(html, XLSX_CSS);
-        const { left, right } = toolbarLayout();
-        state.sheets.forEach((sheetName, i) => {
-            const tab = document.createElement('button');
-            tab.type = 'button';
-            tab.className = 'pm-sheet-tab' + (i === index ? ' on' : '');
-            tab.textContent = sheetName;
-            tab.title = sheetName;
-            tab.addEventListener('click', () => renderSheet(i));
-            left.appendChild(tab);
-        });
-        if (sheetTruncated(ws)) {
-            const tip = document.createElement('span');
-            tip.className = 'pm-tools-note';
-            tip.textContent = '仅预览前 ' + MAX_ROWS + ' 行 / ' + MAX_COLS + ' 列';
-            left.appendChild(tip);
-        }
-        right.appendChild(button('文本模式', '渲染异常时可切换纯文本预览', () => showTextFallback()));
-        addDownload(right);
+    function esc(s) {
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     async function renderXlsx(buf) {
@@ -379,7 +311,19 @@
         state.wb = wb;
         state.sheets = (wb.SheetNames || []).slice(0, MAX_SHEETS);
         if (!state.sheets.length) throw new Error('工作簿中没有可预览的工作表。');
-        await renderSheet(0);
+        // 全部工作表连续渲染（标题分隔，截断提示随标题），iframe 内滚动浏览
+        const parts = [];
+        state.sheets.forEach(function (name) {
+            const ws = wb.Sheets[name];
+            const title = '<h3 class="sheet-title">' + esc(name)
+                + (sheetTruncated(ws)
+                    ? '<span class="sheet-note">仅预览前 ' + MAX_ROWS + ' 行 / ' + MAX_COLS + ' 列</span>'
+                    : '')
+                + '</h3>';
+            parts.push(title + window.XLSX.utils.sheet_to_html(
+                limitSheet(ws, MAX_ROWS, MAX_COLS), { editable: false }));
+        });
+        await showIframe(parts.join('\n'), XLSX_CSS);
     }
 
     // ---------- PPTX ----------
@@ -399,41 +343,19 @@
         await pv.preview(buf);
         if (!pv.slideCount) throw new Error('PPTX 中没有可预览的幻灯片。');
         state.pv = pv;
-        state.slideIndex = 0;
-        await renderSlide(0);
+        // 全部幻灯片连续渲染，iframe 内滚动浏览（翻页由滚动代替按钮）
+        const parts = [];
+        const hostDom = pv.dom || document;
+        for (let i = 0; i < pv.slideCount; i++) {
+            pv.renderSingleSlide(i);
+            await new Promise(r => setTimeout(r, 50));
+            const el = hostDom.querySelector('.pptx-preview-slide-wrapper-' + i)
+                || hostDom.querySelector('.pptx-preview-slide-wrapper');
+            if (el) parts.push(el.outerHTML);
+        }
+        if (!parts.length) throw new Error('幻灯片渲染结果为空。');
+        await showIframe(parts.join('\n'), PPTX_CSS);
     }
-
-    async function renderSlide(index) {
-        const pv = state.pv;
-        if (!pv) return;
-        if (index < 0 || index >= pv.slideCount) return;
-        state.slideIndex = index;
-        pv.renderSingleSlide(index);
-        await new Promise(r => setTimeout(r, 50));
-        // 渲染宿主不在文档树中，需从 pv.dom 查找（renderSingleSlide 把节点挂到 pv.dom）
-        const host = pv.dom || document;
-        const el = host.querySelector('.pptx-preview-slide-wrapper-' + index)
-            || host.querySelector('.pptx-preview-slide-wrapper');
-        const html = el ? el.outerHTML : '';
-        if (!html) throw new Error('幻灯片渲染结果为空。');
-        await showIframe(html, PPTX_CSS);
-        const { left, right } = toolbarLayout();
-        left.appendChild(button('‹', '上一页', () => renderSlide(state.slideIndex - 1)));
-        const page = document.createElement('span');
-        page.className = 'pm-tools-label';
-        page.textContent = (index + 1) + ' / ' + pv.slideCount;
-        left.appendChild(page);
-        left.appendChild(button('›', '下一页', () => renderSlide(state.slideIndex + 1)));
-        right.appendChild(button('下载', '用 PowerPoint 打开以查看完整效果', () => {
-            const name = $('pm-name') ? $('pm-name').textContent : '附件';
-            if (window.mbxSaveAttachment) window.mbxSaveAttachment(state.emailId, state.attachId, name);
-        }));
-        // 页码按钮在首/尾禁用
-        const btns = left.querySelectorAll('button');
-        if (btns[0]) btns[0].disabled = index <= 0;
-        if (btns[1]) btns[1].disabled = index >= pv.slideCount - 1;
-    }
-
     // ---------- 文本兜底 / 错误 ----------
     async function showTextFallback() {
         const b = bodyEl();
@@ -453,14 +375,6 @@
             pre.textContent = text;
             b.appendChild(note);
             b.appendChild(pre);
-            const { right } = toolbarLayout();
-            const left = toolbarEl().querySelector('.pm-tools-left');
-            const label = document.createElement('span');
-            label.className = 'pm-tools-label';
-            label.textContent = '纯文本';
-            left.appendChild(label);
-            right.appendChild(button('重新渲染', '重新尝试图形预览', () => open(state.url, state.kind, $('pm-name').textContent)));
-            addDownload(right);
         } catch (e) {
             showError((e && e.message) || '文本提取失败', false);
         }
@@ -484,13 +398,11 @@
         if (allowText) {
             actions.appendChild(button('纯文本预览', '提取文字内容（版式丢失）', () => showTextFallback()));
         }
-        addDownload(actions);
         actions.appendChild(button('关闭', '关闭预览', () => window.mbxClosePreview && window.mbxClosePreview()));
         wrap.appendChild(title);
         wrap.appendChild(msg);
         wrap.appendChild(actions);
         b.appendChild(wrap);
-        toolbarEl().hidden = true;
     }
 
     // ---------- 入口 ----------
@@ -498,9 +410,6 @@
         reset();
         state.kind = kind;
         state.url = url;
-        const ids = idsFromUrl(url);
-        state.emailId = ids.emailId;
-        state.attachId = ids.attachId;
         const m = modal();
         const p = panel();
         if (!m || !p) return;
@@ -552,6 +461,11 @@
         html, body { height: 100%; }
         body { margin: 0; padding: 16px; background: #fff; color: #1f2937;
                font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; font-size: 13px; }
+        /* 全部工作表连续渲染：标题作分隔，滚动浏览代替标签切换 */
+        .sheet-title { margin: 8px 0 10px; font-size: 14px; color: #0f172a; }
+        .sheet-title + table { margin-bottom: 24px; }
+        .sheet-note { font-size: 11.5px; color: #a63b0a; background: #fdece0;
+                   border-radius: 5px; padding: 1px 6px; margin-left: 8px; vertical-align: middle; }
         table { border-collapse: collapse; table-layout: auto; }
         td, th { border: 1px solid #cbd5e1; padding: 4px 8px; white-space: nowrap; vertical-align: top; }
         tr:first-child td { background: #f8fafc; }
@@ -559,7 +473,9 @@
     const PPTX_CSS = `
         html, body { height: 100%; }
         body { margin: 0; padding: 12px; background: #fff; box-sizing: border-box; overflow: auto; }
+        /* 全部幻灯片连续渲染：滚动翻页代替按钮 */
         .pptx-preview-slide-wrapper { position: relative !important; top: 0 !important;
-            margin: 0 auto !important; box-shadow: 0 1px 4px rgba(15,23,42,.15); }
+            margin: 0 auto 20px !important; box-shadow: 0 1px 4px rgba(15,23,42,.15); }
+        .pptx-preview-slide-wrapper:last-child { margin-bottom: 0 !important; }
     `;
 })();

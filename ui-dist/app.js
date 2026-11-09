@@ -271,7 +271,6 @@ function mbxPreviewAttachment(url, kind, name) {
         frame.src = url;
         frame.title = name;
         body.appendChild(frame);
-        mbxBuildPdfSave(url, name);
     } else if (kind === 'text') {
         fetch(url)
             .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
@@ -292,30 +291,6 @@ function mbxPreviewAttachment(url, kind, name) {
         body.appendChild(tip);
     }
     modal.hidden = false;
-}
-
-// PDF 预览顶栏「另存为」：WebView 内置 PDF 查看器右下角的下载按钮
-// 在 Tauri 下未接管、点击无效，改由弹层顶栏提供可用的另存入口，
-// 复用附件页已验证的 mbxSaveAttachment（系统对话框 + 服务端落盘）。
-function mbxBuildPdfSave(url, name) {
-    const toolbar = document.getElementById('pm-toolbar');
-    if (!toolbar) return;
-    toolbar.innerHTML = '';
-    const m = /\/emails\/(\d+)\/attachments\/(\d+)\/view(?:\?.*)?$/.exec(url || '');
-    if (!m) {
-        toolbar.hidden = true;
-        return;
-    }
-    const emailId = Number(m[1]);
-    const attachId = Number(m[2]);
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn small';
-    btn.textContent = '另存为';
-    btn.title = '下载此 PDF 附件到本机';
-    btn.addEventListener('click', function () { mbxSaveAttachment(emailId, attachId, name); });
-    toolbar.appendChild(btn);
-    toolbar.hidden = false;
 }
 
 function mbxClosePreview() {

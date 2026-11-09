@@ -50,7 +50,8 @@
     <div id="boot"><i></i>正在启动 CorpMail…</div>
     {% block body %}{% endblock %}
 
-    {# 附件预览模态（M5：img/pdf/text 三类内嵌渲染；页面共享） #}
+    {# 附件预览模态（M5：img/pdf/text 三类内嵌渲染；页面共享）。
+       无工具栏行：Office/PDF 预览的另存入口统一收敛到邮件详情页附件列表 #}
     <div id="preview-modal" class="preview-modal" hidden>
         <div class="pm-mask" onclick="mbxClosePreview()"></div>
         <div class="pm-panel" role="dialog" aria-label="附件预览">
@@ -58,7 +59,6 @@
                 <span id="pm-name" class="pm-name"></span>
                 <button type="button" class="pm-close" onclick="mbxClosePreview()" title="关闭预览">✕</button>
             </div>
-            <div id="pm-toolbar" class="pm-toolbar" hidden></div>
             <div id="pm-body" class="pm-body"></div>
         </div>
     </div>
