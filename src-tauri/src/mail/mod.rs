@@ -1904,13 +1904,60 @@ fn inline_limit(state: &AppState) -> u64 {
 }
 
 /// 文件名净化：Windows/Unix 保留字符替换为 `_`
-fn safe_filename(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
+/// 头部值清洗：控制字符（含 CR/LF）替换为空格。库内字段来自收件解析或用户
+/// 输入，若夹带 CRLF 会被拼进邮件头产生头注入（伪造 From/To/X-* 等）；
+/// RFC 5322 头值域本就不允许裸控制字符，清洗无信息损失。
+/// eml 重建（拼头字符串）与 SMTP 发信（交给 lettre 前）共用。
+pub(crate) fn head_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// 控制字符折叠为单个空格（连续 CR/LF 不产生连续空位，头尾不产空白）：
+/// 用于显示型文本（通知正文/联系人姓名），比 head_safe 更整洁。
+pub(crate) fn collapse_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for ch in s.chars() {
+        if ch.is_control() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 文件名净化：非法字符与控制字符统一替换为 `_`，按字节截断到 200
+/// （文件名组件上限通常 255 字节；中文多字节需按字节而非字符计）。
+/// 入参来自邮件 MIME 头的 filename——恶意邮件可控，是落盘路径的唯一屏障。
+fn safe_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(200));
+    let mut bytes = 0usize;
+    for c in name.chars() {
+        let mapped = match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        };
+        let len = mapped.len_utf8();
+        if bytes + len > 200 {
+            break;
+        }
+        bytes += len;
+        out.push(mapped);
+    }
+    if out.is_empty() {
+        return "attachment".to_string();
+    }
+    out
 }
 
 /// 附件入库上下文（insert_attachment 参数组，避免超长参数列表）

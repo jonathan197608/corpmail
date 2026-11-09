@@ -1358,3 +1358,19 @@ fn attach_eml_added_once_on_first_save() {
     assert!(already, "重存应能识别已附加");
     cleanup(&dir);
 }
+
+/// 安全：附件文件名净化（收件 MIME 头 filename 可控）——控制字符替换、
+/// 路径/保留字符替换、按字节截断 200、空名回落 attachment
+#[test]
+fn safe_filename_strips_control_chars_and_bounds_length() {
+    assert_eq!(safe_filename("a\u{0}b\r\nc.pdf"), "a_b__c.pdf");
+    assert_eq!(safe_filename("../../etc/passwd"), ".._.._etc_passwd");
+    assert_eq!(safe_filename("正常 报告.xlsx"), "正常 报告.xlsx");
+    // 超长：中文 3 字节/字，按字节截到 ≤200
+    let long = "长".repeat(100);
+    let got = safe_filename(&long);
+    assert!(got.len() <= 200, "应截断到 200 字节内：{}", got.len());
+    assert!(got.chars().all(|c| c == '长'));
+    // 空输入 → attachment
+    assert_eq!(safe_filename(""), "attachment");
+}

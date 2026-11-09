@@ -88,3 +88,16 @@ fn notified_set_caps_growth() {
     }
     reset_for_test();
 }
+
+/// 安全：主题中的控制字符（CR/LF）在通知正文里折叠为空格，不打乱排版
+#[test]
+fn summary_collapses_control_chars_in_subject() {
+    let p = mails(&[(1, "正常\r\n主题")]);
+    assert_eq!(build_summary(&p), "正常 主题");
+    let p = mails(&[(1, "a\n\nb"), (2, "c\r\rd")]);
+    let out = build_summary(&p);
+    assert!(
+        !out.contains('\r') && !out.contains('\n'),
+        "通知正文不得含控制字符：{out:?}"
+    );
+}

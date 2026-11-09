@@ -823,3 +823,55 @@ fn sched_helpers_roundtrip_and_reject_invalid() {
     // epoch 0 → 空串（未定时不渲染控件值）
     assert_eq!(crate::mail::sched_local_value(0), "");
 }
+
+/// 安全：发信前主题/显示名的 CR/LF 必须被清洗（防头注入）。
+/// 库内字段可能来自收件解析或用户输入，交 lettre 组包前不能带裸控制字符。
+#[test]
+fn dispatch_strips_control_chars_from_headers() {
+    let (state, dir) = temp_state("send-head-safe");
+    let input = DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟\r\nX-Injected: yes".into(),
+        to_addrs: "peer@x.cn".into(),
+        cc_addrs: String::new(),
+        bcc_addrs: String::new(),
+        subject: "正常主题\r\nBcc: evil@attacker.example".into(),
+        body_text: "正文".into(),
+        in_reply_to: None,
+        scheduled_at: 0,
+    };
+    state
+        .store_password("demo@chinatelecom.cn", "pw-head-safe")
+        .unwrap();
+    let id = save_draft(&state, &input).unwrap();
+    assert!(enqueue_draft(&state, id));
+    let sender = FakeSender::ok();
+    let smtp = SmtpConfig::from_config(&state.config_snapshot());
+    let result = state.with_conn(|c| {
+        dispatch_one(
+            c,
+            &sender,
+            id,
+            &smtp,
+            &dir.join("attachments"),
+            &state.key_file(),
+        )
+    });
+    assert_eq!(result.unwrap(), "sent");
+    let seen = sender.seen.lock().unwrap();
+    let msg = &seen[0].3;
+    assert!(
+        !msg.subject.contains('\r') && !msg.subject.contains('\n'),
+        "主题不得含控制字符：{:?}",
+        msg.subject
+    );
+    assert!(msg.subject.contains("正常主题"), "{:?}", msg.subject);
+    assert!(
+        !msg.from_name.contains('\r') && !msg.from_name.contains('\n'),
+        "显示名不得含控制字符：{:?}",
+        msg.from_name
+    );
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}

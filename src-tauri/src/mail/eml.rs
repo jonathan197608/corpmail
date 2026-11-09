@@ -12,14 +12,8 @@ use crate::state::AppState;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-/// 头部值清洗：控制字符（含 CR/LF）替换为空格。库内字段来自收件解析或用户
-/// 输入，若夹带 CRLF 会被拼进头部产生头注入（伪造 From/To/X-* 等）；
-/// RFC 5322 头值域本就不允许裸控制字符，清洗无信息损失。
-fn head_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
+/// 头部值清洗复用 crate 级实现（与 SMTP 发信共用同一口径）
+use super::head_safe;
 
 /// RFC 2047 B 编码：纯 ASCII 原样返回（控制字符已清洗）；非 ASCII 按字符累积分段
 /// （≈45 字节），段间用 CRLF + 空格折行，避免长主题头超 76 字符

@@ -63,23 +63,9 @@ fn addr_plausible(addr: &str) -> bool {
 
 /// 联系人姓名清洗：控制字符折叠为单个空格（连续 CR/LF 不产生连续空位），
 /// 头尾控制不产空白——恶意邮件头的 CR/LF 不应进入建议列表与联系人页。
+/// 复用 crate 级 collapse_control（与系统通知正文同一口径）。
 fn name_safe(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut pending_space = false;
-    for ch in name.chars() {
-        if ch.is_control() {
-            if !out.is_empty() {
-                pending_space = true;
-            }
-        } else {
-            if pending_space {
-                out.push(' ');
-                pending_space = false;
-            }
-            out.push(ch);
-        }
-    }
-    out
+    super::collapse_control(name)
 }
 
 /// 写入/合并一条联系人（事务内或独立连接均可）。

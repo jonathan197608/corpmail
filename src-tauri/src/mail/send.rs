@@ -397,6 +397,11 @@ pub fn dispatch_one(
             return Ok("failed");
         }
     };
+    // 头值清洗：主题/显示名来自收件解析或用户输入，夹带 CR/LF 会在交给
+    // lettre 组包前产生头注入（伪造 From/To 等），与 eml 重建同一口径。
+    // 收件人地址本身由 lettre 地址解析器严格校验（非法即明确报错）
+    msg.subject = super::head_safe(&msg.subject);
+    msg.from_name = super::head_safe(&msg.from_name);
     msg.message_id = new_message_id(&msg.from_addr);
     // 纯密送是合法形态（仅 To/Cc 空但 Bcc 有收件人，lettre envelope 照常投递）
     if msg.to_addrs.is_empty() && msg.cc_addrs.is_empty() && msg.bcc_addrs.is_empty() {

@@ -99,7 +99,9 @@ fn build_summary(pending: &[(i64, String)]) -> String {
         if empty(s) {
             format!("（无主题 · #{id}）")
         } else {
-            s.clone()
+            // 主题来自收件头解析，可能含控制字符（CR/LF）——通知正文折叠为
+            // 单空格，避免系统通知里出现换行/不可见控制符打乱排版
+            crate::mail::collapse_control(s)
         }
     };
     let mut body = if count == 1 {
