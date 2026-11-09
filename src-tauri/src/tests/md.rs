@@ -41,9 +41,41 @@ fn html_to_md_lists_headings_table() {
     let got = html_to_md_text(
         "<table><tr><td>客户</td><td>数量</td></tr><tr><td>A</td><td>200</td></tr></table>",
     );
-    assert!(got.contains("客户 | 数量 |"), "单元格应补分隔：{got}");
-    assert!(got.contains("A | 200 |"), "{got}");
-    assert!(!got.contains("数量 |\n\nA"), "表格行间不应空行：{got}");
+    // 标准 GFM 表格：首行表头 + 分隔行 + 数据行
+    assert_eq!(
+        got, "| 客户 | 数量 |\n| --- | --- |\n| A | 200 |",
+        "表格应转为标准 GFM：{got}"
+    );
+}
+
+/// 标准 GFM 表格的边界：thead/th、单元格内联标签与实体、管道转义、
+/// 列数不齐补齐、嵌套表格退化、未闭合表格尽力输出
+#[test]
+fn html_to_md_gfm_table_edges() {
+    let got = html_to_md_text(
+        "<table><thead><tr><th>名称</th><th>值</th></tr></thead>\
+         <tbody><tr><td>a|b</td><td><b>1</b>&amp;2</td></tr>\
+         <tr><td>仅一列</td></tr></tbody></table>",
+    );
+    assert_eq!(
+        got, "| 名称 | 值 |\n| --- | --- |\n| a\\|b | 1&2 |\n| 仅一列 |  |",
+        "单元格清洗与列补齐：{got}"
+    );
+    // 单元格内换行折叠为空格（不破坏行结构）
+    let got = html_to_md_text("<table><tr><td>x<br>y</td></tr><tr><td>z</td></tr></table>");
+    assert_eq!(got, "| x y |\n| --- |\n| z |", "{got}");
+    // 嵌套表格：外层结构保留，内层文字并入单元格
+    let got = html_to_md_text(
+        "<table><tr><td>外<table><tr><td>内</td></tr></table></td><td>b</td></tr></table>",
+    );
+    assert!(
+        got.starts_with("| 外内 | b |"),
+        "嵌套应退化不破坏外层：{got}"
+    );
+    assert_eq!(got.matches("| --- |").count(), 1, "仅一个表头分隔行：{got}");
+    // 未闭合表格：已收集的行尽力输出
+    let got = html_to_md_text("<table><tr><td>甲</td><td>乙</td></tr>");
+    assert_eq!(got, "| 甲 | 乙 |\n| --- | --- |", "{got}");
 }
 
 /// 未闭合 `<` 不吞正文；连续空行压缩；首尾修剪

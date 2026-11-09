@@ -7,8 +7,9 @@
 //! - front matter 值用 `serde_json::to_string` 转义：JSON 字符串是合法 YAML
 //!   （YAML 1.2 是 JSON 超集），主题/姓名中的换行、引号、冒号等任意字符
 //!   都不会破坏结构，也无需手写 YAML 转义规则
-//! - HTML→MD 是适度转换（块级换行、li 前缀、td 分隔、h* 标题）：目的是
-//!   让 AI 读到连贯的分段文本，不追求视觉上等价原邮件版式
+//! - HTML→MD 是结构化转换（块级换行、li 前缀、h* 标题、表格转标准 GFM
+//!   表格）：目的是让 AI 读到连贯分段与可解析的表格结构，不追求像素级
+//!   等价原邮件版式
 //! - 纯文本邮件原样导出；超大占位邮件按占位说明导出（提示未下载）
 
 use crate::state::AppState;
@@ -71,14 +72,16 @@ pub fn build_md(state: &AppState, email_id: i64) -> Result<String, String> {
 }
 
 /// HTML → Markdown 文本（纯函数，无 I/O）：
-/// - 块级标签（p/div/tr/li/h1..h6/blockquote/table）结束补换行，段落不粘连
-/// - `<li>` 开标签转 "- " 列表前缀；h1..h6 开标签转对应层级 "#"（正文标题
-///   从 ## 起步，避免与文档级 "## 正文" 冲突）
-/// - `td`/`th` 结束补 " | "，表格保持行×列结构（近似 MD 表格的可读形态）
-/// - `<br>` 换行；内联标签（span/b 等）剥除；实体解码复用 strip_html 口径
+/// - 块级标签（p/div/tr/li/h1..h6/blockquote）结束补换行，段落不粘连
+/// - `<li>` 开标签转 "- " 列表前缀；h1..h6 转对应层级 "#"（正文从 ## 起步）
+/// - 表格转**标准 GFM 表格**：首行作表头 + `| --- |` 分隔行 + 逐行
+///   `| a | b |`；列数不齐按最大列补齐；单元格内 `|` 转义为 `\|`、换行折叠
+///   为空格；th 与 td 同等对待（GFM 表头固定取首行，无 thead 的表也按此
+///   行业惯例降级）；嵌套表格退化为单元格文本（不破坏外层结构）
+/// - `<br>` 换行；内联标签剥除；实体解码复用 strip_html 口径
 /// - 未闭合 `<` 不吞后文；连续空行压缩为一段
 pub fn html_to_md_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
+    let mut b = MdBuilder::default();
     let bytes = html.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -93,34 +96,205 @@ pub fn html_to_md_text(html: &str) -> String {
                         .split(|c: char| c.is_whitespace() || c == '>')
                         .next()
                         .unwrap_or("");
-                    apply_tag(&mut out, name, closing);
+                    b.on_tag(name, closing);
                     i += rel + 1;
                 }
                 None => {
                     // 未闭合：余下按原文保留（畸形 HTML 不吞正文）
-                    out.push_str(&html[i..]);
+                    let rest = &html[i..];
+                    b.text_target().push_str(rest);
                     break;
                 }
             },
-            b'&' => super::decode_entity(html, &mut i, &mut out),
+            b'&' => {
+                // i 为独立局部，target 从构建器借出（表格内落单元格）
+                let target = b.text_target();
+                super::decode_entity(html, &mut i, target);
+            }
             _ => {
                 let ch = html[i..].chars().next().unwrap_or(' ');
-                out.push(ch);
+                b.text_target().push(ch);
                 i += ch.len_utf8();
             }
         }
     }
-    collapse_blank_lines(&out)
+    b.finish()
 }
 
-/// 单个标签的 MD 结构映射（html_to_md_text 的标签分派）：
-/// 块级开标签前确保空行（段落/标题/列表与表格整体与前后文空行分隔），
-/// li/tr 开标签前确保单换行（列表项/表格行间紧凑），闭标签统一补换行。
+/// MD 构建器：普通内容写 out；进入表格后文本改写入当前单元格，
+/// `</table>` 时一次性生成 GFM 表格（表头分隔行由结构保证存在）
+#[derive(Default)]
+struct MdBuilder {
+    out: String,
+    table: Option<TableBuf>,
+}
+
+/// 表格收集缓冲：已完成行 / 当前行单元格 / 当前单元格文本 / 嵌套深度
+#[derive(Default)]
+struct TableBuf {
+    rows: Vec<Vec<String>>,
+    row: Vec<String>,
+    cell: String,
+    /// 嵌套 table 深度（内层结构忽略，文字进当前单元格；外层正常收尾）
+    depth: u32,
+}
+
+impl MdBuilder {
+    /// 当前文本落点：表格内的单元格 or 普通输出
+    fn text_target(&mut self) -> &mut String {
+        match &mut self.table {
+            Some(t) => &mut t.cell,
+            None => &mut self.out,
+        }
+    }
+
+    fn on_tag(&mut self, name: &str, closing: bool) {
+        // 表格边界：最外层进入/退出收集模式
+        if name == "table" {
+            match &mut self.table {
+                None => {
+                    self.table = if closing {
+                        None
+                    } else {
+                        Some(TableBuf::default())
+                    }
+                }
+                Some(t) => {
+                    if closing {
+                        if t.depth == 0 {
+                            self.end_table();
+                        } else {
+                            t.depth -= 1;
+                        }
+                    } else {
+                        t.depth += 1;
+                    }
+                }
+            }
+            return;
+        }
+        if self.table.is_some() {
+            self.on_table_tag(name, closing);
+            return;
+        }
+        apply_tag(&mut self.out, name, closing);
+    }
+
+    /// 表格内标签：结构标签归集行/单元格；内联标签剥除；br 折叠为空格
+    fn on_table_tag(&mut self, name: &str, closing: bool) {
+        let Some(t) = &mut self.table else { return };
+        // 嵌套表格内层：所有结构标签忽略（内层文字自然留在当前单元格，
+        // 尤其不能因内层 `<td>` 开标签清掉外层已收集的文本）
+        if t.depth > 0 {
+            return;
+        }
+        match (name, closing) {
+            // 单元格开始：清空残留文本（如 caption，表格转换中不保留）
+            ("td" | "th", false) => t.cell.clear(),
+            // 单元格结束：原始文本收进当前行（清洗留到生成时统一做）
+            ("td" | "th", true) => {
+                let cell = std::mem::take(&mut t.cell);
+                t.row.push(cell);
+            }
+            // 行结束：收进表格
+            ("tr", true) => {
+                if !t.row.is_empty() {
+                    let row = std::mem::take(&mut t.row);
+                    t.rows.push(row);
+                    t.cell.clear();
+                }
+            }
+            // 表格结构标签自身不产生文本
+            ("tr" | "thead" | "tbody" | "tfoot" | "colgroup" | "col" | "caption", _) => {}
+            // 单元格内换行一律折叠为空格（MD 表格单元格不能跨行）
+            ("br", false) => t.cell.push(' '),
+            // 单元格内块级标签以空格分隔，避免文字粘连（嵌套 p/div/li）
+            ("p" | "div" | "li" | "blockquote", _) => t.cell.push(' '),
+            _ => {}
+        }
+    }
+
+    /// 生成标准 GFM 表格：首行作表头 + 分隔行 + 数据行；列数不齐按最大列补齐
+    fn end_table(&mut self) {
+        let Some(t) = self.table.take() else { return };
+        if t.rows.is_empty() {
+            return;
+        }
+        let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 {
+            return;
+        }
+        ensure_blank(&mut self.out);
+        write_table_row(&mut self.out, &t.rows[0], cols);
+        // 表头分隔行（GFM 表格必需）
+        self.out.push('|');
+        for _ in 0..cols {
+            self.out.push_str(" --- |");
+        }
+        self.out.push('\n');
+        for row in &t.rows[1..] {
+            write_table_row(&mut self.out, row, cols);
+        }
+    }
+
+    /// 收尾：未闭合表格尽力输出（畸形 HTML），再压缩空行
+    fn finish(mut self) -> String {
+        if self.table.is_some() {
+            self.end_table();
+        }
+        collapse_blank_lines(&self.out)
+    }
+}
+
+/// 输出一行 MD 表格：`| a | b |`（缺列补空单元格）
+fn write_table_row(out: &mut String, row: &[String], cols: usize) {
+    out.push('|');
+    for c in 0..cols {
+        out.push(' ');
+        if let Some(raw) = row.get(c) {
+            out.push_str(&clean_cell(raw));
+        }
+        out.push_str(" |");
+    }
+    out.push('\n');
+}
+
+/// 单元格内容清洗：`|` 转义为 `\|`（不破坏表格语法）；换行/制表/连续空白
+/// 折叠为单空格；首尾去空白
+fn clean_cell(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        match ch {
+            '|' => {
+                if pending_space && !out.is_empty() {
+                    out.push(' ');
+                }
+                pending_space = false;
+                out.push_str("\\|");
+            }
+            c if c.is_whitespace() => pending_space = !out.is_empty(),
+            c => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// 单个标签的 MD 结构映射（表格由 MdBuilder 单独处理，不经此处）：
+/// 块级开标签前确保空行（段落/标题/列表与前文空行分隔），
+/// li/tr 开标签前确保单换行，闭标签统一补换行。
 fn apply_tag(out: &mut String, name: &str, closing: bool) {
     if !closing {
         match name {
-            "p" | "div" | "blockquote" | "ul" | "ol" | "table" | "h1" | "h2" | "h3" | "h4"
-            | "h5" | "h6" => ensure_blank(out),
+            "p" | "div" | "blockquote" | "ul" | "ol" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                ensure_blank(out);
+            }
             "li" | "tr" => ensure_newline(out),
             _ => {}
         }
@@ -128,16 +302,14 @@ fn apply_tag(out: &mut String, name: &str, closing: bool) {
     match (name, closing) {
         ("br", false) => out.push('\n'),
         (
-            "p" | "div" | "blockquote" | "tr" | "li" | "ul" | "ol" | "table" | "h1" | "h2" | "h3"
-            | "h4" | "h5" | "h6",
+            "p" | "div" | "blockquote" | "tr" | "li" | "ul" | "ol" | "h1" | "h2" | "h3" | "h4"
+            | "h5" | "h6",
             true,
         ) => out.push('\n'),
         ("li", false) => out.push_str("- "),
         ("h1", false) => out.push_str("## "),
         ("h2", false) => out.push_str("### "),
         ("h3" | "h4" | "h5" | "h6", false) => out.push_str("#### "),
-        // 单元格结束补分隔；行首/行尾可能多出 "| "，结构可读即可
-        ("td" | "th", true) => out.push_str(" | "),
         _ => {}
     }
 }
