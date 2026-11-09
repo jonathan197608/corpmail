@@ -1035,11 +1035,14 @@ fn email_export_eml(state: &AppState, req: &Req) -> Resp {
         return Resp::not_found();
     };
     let form = parse_form(&req.body);
-    let Some(dest) = trimmed_field(&form, "dest") else {
+    let Some(raw_dest) = trimmed_field(&form, "dest") else {
         return Resp::html(
             r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
         );
     };
+    // 保存对话框里改了文件名、忘写后缀时自动补全（带其他后缀也补，
+    // 保证双击即可用邮件客户端打开）
+    let dest = ensure_ext(&raw_dest, ".eml");
     let toast = |cls: &str, msg: &str| {
         Resp::html(format!(
             r#"<div id="toast" class="toast {cls}" hx-swap-oob="true">{}</div>"#,
@@ -1066,11 +1069,12 @@ fn email_export_md(state: &AppState, req: &Req) -> Resp {
         return Resp::not_found();
     };
     let form = parse_form(&req.body);
-    let Some(dest) = trimmed_field(&form, "dest") else {
+    let Some(raw_dest) = trimmed_field(&form, "dest") else {
         return Resp::html(
             r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
         );
     };
+    let dest = ensure_ext(&raw_dest, ".md");
     let toast = |cls: &str, msg: &str| {
         Resp::html(format!(
             r#"<div id="toast" class="toast {cls}" hx-swap-oob="true">{}</div>"#,
@@ -2600,6 +2604,17 @@ fn attachments_save_all(state: &AppState, req: &Req) -> Resp {
 }
 
 // ---------- M2 辅助 ----------
+
+/// 保存路径后缀补全：不以指定扩展名结尾（大小写不敏感）则追加。
+/// 系统保存对话框改过文件名或手输路径时，落盘文件可能没有后缀，
+/// 双击无法关联应用打开；导出路径的最终形态以补全后为准
+fn ensure_ext(dest: &str, ext: &str) -> String {
+    if dest.to_ascii_lowercase().ends_with(ext) {
+        dest.to_string()
+    } else {
+        format!("{dest}{ext}")
+    }
+}
 
 /// 路径首段正整数 id（/emails/{id}...）
 fn path_id(path: &str, prefix: &str) -> Option<i64> {

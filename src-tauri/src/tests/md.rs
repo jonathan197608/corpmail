@@ -182,3 +182,77 @@ fn suggested_filename_matches_eml_base() {
         "路径/保留字符应清洗：{got}"
     );
 }
+
+/// 附件小节：短文本内嵌内容、大文本/二进制给本地路径或说明、已清理说明不可用
+#[test]
+fn build_md_attachment_sections_embed_and_path() {
+    let (state, dir) = temp_state("md-attach");
+    let input = crate::mail::DraftInput {
+        id: None,
+        from_addr: "demo@chinatelecom.cn".into(),
+        from_name: "张伟".into(),
+        to_addrs: "peer@x.cn".into(),
+        cc_addrs: String::new(),
+        bcc_addrs: String::new(),
+        subject: "带附件".into(),
+        body_text: "正文".into(),
+        in_reply_to: None,
+        scheduled_at: 0,
+    };
+    let id = crate::mail::save_draft(&state, &input).unwrap();
+    // 短文本：内嵌
+    crate::mail::add_attachment_bytes(
+        &state,
+        id,
+        "说明.txt",
+        "text/plain",
+        "第一行内容".as_bytes(),
+    )
+    .unwrap();
+    // 超阈值文本（> 64KB）：不给内容，inline BLOB 无独立文件说明
+    crate::mail::add_attachment_bytes(&state, id, "大日志.log", "text/plain", &vec![b'x'; 100_000])
+        .unwrap();
+    // 二进制 + 独立文件存储：输出本地完整路径
+    crate::mail::add_attachment_bytes(&state, id, "截图.png", "image/png", &[1, 2, 3]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE attachments SET storage = 'file', file_path = '2026-11/99/1_截图.png.gz'
+                 WHERE email_id = ?1 AND filename = '截图.png'",
+                [id],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    // 已清理：说明不可导出
+    crate::mail::add_attachment_bytes(&state, id, "旧报告.pdf", "application/pdf", &[9]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE attachments SET detached = 1
+                 WHERE email_id = ?1 AND filename = '旧报告.pdf'",
+                [id],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let md = build_md(&state, id).unwrap();
+    assert!(md.contains("### 说明.txt"), "{md}");
+    assert!(
+        md.contains("```text\n第一行内容\n```"),
+        "短文本应内嵌：{md}"
+    );
+    assert!(md.contains("### 大日志.log"), "{md}");
+    assert!(
+        md.contains("附件内容存于本地数据库（无独立文件"),
+        "超阈值 inline 文本应改说明：{md}"
+    );
+    assert!(!md.contains("```text\nxxxx"), "{md}");
+    assert!(md.contains("### 截图.png"), "{md}");
+    assert!(
+        md.contains("本地文件：") && md.contains("2026-11/99/1_截图.png.gz（gzip 压缩存储）"),
+        "file 存储应输出完整路径：{md}"
+    );
+    assert!(md.contains("文件已按清理策略移除，无法导出。"), "{md}");
+    cleanup(&dir);
+}

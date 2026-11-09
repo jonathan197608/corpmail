@@ -21,6 +21,13 @@ use std::sync::{Mutex, OnceLock};
 /// 品牌统一后旧服务名 "mailbox" 下的凭据不迁移（0.2.x 无存量用户）
 const KEYRING_SERVICE: &str = "corpmail";
 
+/// 测试二进制短路 keychain：真实 keychain 调用在无 GUI 授权环境（CI/后台）
+/// 会**挂起等待授权**而非返回错误——降级分支永远等不到，测试进程卡死。
+/// tests/secrets.rs 早已绕开 keyring 只测 keyfile 分支，但走 store/retrieve
+/// 的向导/发信/dump 测试仍会碰真实 keychain（本机授权过才碰巧能跑）。
+/// cfg!(test) 下统一直走 keyfile，消除对系统钥匙串的隐式依赖
+const TEST_SKIP_KEYCHAIN: bool = cfg!(test);
+
 /// 凭据读取结果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GetResult {
@@ -100,12 +107,19 @@ fn cache_drop(account: &str) {
 /// 保证本进程后续读取拿到新密码而不是旧缓存。
 ///
 /// `key_file`：回退密钥文件路径（锚点目录）。只有走回退分支才会被创建。
+///
+/// 测试二进制短路 keychain（见 TEST_SKIP_KEYCHAIN）
 pub fn store(
     conn: &Connection,
     key_file: &Path,
     account: &str,
     password: &str,
 ) -> Result<bool, String> {
+    if TEST_SKIP_KEYCHAIN {
+        keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
+        cache_put(account, GetResult::Keyfile(password.to_string()));
+        return Ok(true);
+    }
     let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
     match entry.set_password(password) {
         Ok(()) => {
@@ -124,9 +138,17 @@ pub fn store(
 /// 读取密码：先查进程内缓存，未命中再试 keychain，keychain 不可用/无条目时
 /// 落到 keyfile 回退（平台后端异常与 NoEntry 同处处理——两者都只剩 keyfile 一条路）。
 /// Missing 不入缓存：用户可能随后在设置页补录，缓存空结果会让补录白做。
+/// 测试二进制短路 keychain（见 TEST_SKIP_KEYCHAIN）
 pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
     if let Some(hit) = cache_get(account) {
         return hit;
+    }
+    if TEST_SKIP_KEYCHAIN {
+        let out = keyfile_retrieve(conn, key_file, account);
+        if !matches!(out, GetResult::Missing) {
+            cache_put(account, out.clone());
+        }
+        return out;
     }
     let out = match keyring::Entry::new(KEYRING_SERVICE, account) {
         Ok(entry) => match entry.get_password() {
@@ -142,10 +164,10 @@ pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult 
 }
 
 /// 删除密码（改密/清空时调用）：两条路径都尝试清，幂等；同时丢弃缓存，
-/// 否则本进程仍会用已删的旧密码继续发信
+/// 否则本进程仍会用已删的旧密码继续发信。测试二进制短路 keychain
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn clear(conn: &Connection, account: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
+    if !TEST_SKIP_KEYCHAIN && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
         let _ = entry.delete_credential();
     }
     let key = format!("enc:{account}");

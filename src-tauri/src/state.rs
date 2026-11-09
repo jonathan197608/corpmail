@@ -50,6 +50,12 @@ pub mod keys {
     /// 发件箱（服务器已发送）独立游标：UIDVALIDITY 按邮箱独立，不可与收件箱共用
     pub const LAST_UIDVALIDITY_SENT: &str = "last_uidvalidity_sent";
     pub const LAST_UID_SENT: &str = "last_uid_sent";
+    /// 首拉阶段化（发件箱优先）：各箱「首拉范围已完整拉取」标志（"1" = 完成）。
+    /// 任一箱未完成时收件轮次按「先发件箱、后收件箱」串行推进——某箱中断
+    /// 重试只针对未完成箱，已完成箱不再重跑；跨重启仍生效（标志持久在库）。
+    /// 改动首拉范围（清游标重拉）时同步清除，重新进入阶段化模式
+    pub const FIRST_PULL_DONE_SENT: &str = "first_pull_done_sent";
+    pub const FIRST_PULL_DONE_INBOX: &str = "first_pull_done_inbox";
 
     /// 自定义数据目录指针（存独立配置文件 corpmail.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
@@ -1250,6 +1256,32 @@ fn read_fetch_cursor(conn: &Connection, uv_key: &str, uid_key: &str) -> crate::m
     }
 }
 
+/// 首拉完成标志读取（"1" = 该箱首拉范围已完整拉取）。
+/// 标志持久在库：中断重试（同轮 attempt 或重启后的新轮）都据此判断
+/// "发件箱拉取是否完成"，未完成的箱才需要重跑
+fn first_pull_done(conn: &Connection, dest: crate::mail::MailDest) -> bool {
+    let key = match dest {
+        crate::mail::MailDest::Sent => keys::FIRST_PULL_DONE_SENT,
+        crate::mail::MailDest::Inbox => keys::FIRST_PULL_DONE_INBOX,
+    };
+    crate::db::settings::get(conn, key)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "1")
+}
+
+/// 置首拉完成标志。失败仅记日志：标志丢失的代价是下轮多发一次全量查询，
+/// 由 remote_uid 入库去重兜底，不值得为它判定整轮失败
+fn mark_first_pull_done(conn: &Connection, dest: crate::mail::MailDest) {
+    let key = match dest {
+        crate::mail::MailDest::Sent => keys::FIRST_PULL_DONE_SENT,
+        crate::mail::MailDest::Inbox => keys::FIRST_PULL_DONE_INBOX,
+    };
+    if let Err(err) = crate::db::settings::set(conn, key, "1") {
+        eprintln!("[fetch] 首拉完成标志写入失败（{key}）：{err}");
+    }
+}
+
 /// 同步目标 → 游标键对（收件箱沿用历史键，发件箱独立键）
 fn cursor_keys(dest: crate::mail::MailDest) -> (&'static str, &'static str) {
     match dest {
@@ -1521,6 +1553,26 @@ fn fetch_round(job: FetchJob) {
     let mut added = 0usize;
     let mut last_err = String::new();
     let mut done = false;
+    // 首拉阶段化（发件箱优先）：任一箱首拉未完成时，本轮按「先发件箱、
+    // 后收件箱」严格串行——发件箱未完成就中断/失败，重试只针对发件箱
+    // （收件箱不开始）；发件箱完成后才开始收件箱，收件箱中断重试时同样
+    // 只重试收件箱。完成标志持久在库，跨 attempt 与跨重启均生效。
+    // 两箱均完成后走常规增量轮（发件箱失败不阻断收件箱的既有容错保持）
+    let mut sent_pending = !first_pull_done(&conn, crate::mail::MailDest::Sent);
+    let inbox_pending = !first_pull_done(&conn, crate::mail::MailDest::Inbox);
+    let phased = sent_pending || inbox_pending;
+    if phased {
+        eprintln!(
+            "[fetch] 首拉阶段化（发件箱优先）：待完成 = {}",
+            if sent_pending && inbox_pending {
+                "发件箱 → 收件箱"
+            } else if sent_pending {
+                "发件箱"
+            } else {
+                "收件箱"
+            }
+        );
+    }
     for attempt in 1..=FETCH_ATTEMPTS {
         let (cur_sent, cur_inbox) = if attempt == 1 {
             (last_sent, last)
@@ -1541,34 +1593,84 @@ fn fetch_round(job: FetchJob) {
             last_err = format!("{e}；服务器不可达");
             continue;
         }
-        // 阶段一：发件箱先同步（失败不阻断收件箱——发件箱命名/权限差异不该拖垮收件）
-        let sent_outcome = sync_phase(
-            &mut conn,
-            &data_dir,
-            &fetch_state,
-            epoch,
-            &host,
-            port,
-            security,
-            &account,
-            &password,
-            first_days,
-            max_mail_bytes,
-            crate::mail::MailDest::Sent,
-            cur_sent,
-            &mut added,
-        );
-        let sent_err = match &sent_outcome {
-            // 未发现发件箱（中文服务器的 mUTF-7 名称、命名不规范等）也要可见：
-            // 静默跳过会让用户以为已同步（webmail 有已发送、本地永远空）
-            Ok(None) => "未发现服务器「已发送」邮箱，已跳过发件箱同步".to_string(),
-            Ok(Some(_)) => String::new(),
-            Err(e) => {
-                eprintln!("[fetch] 发件箱同步失败（继续收件箱）：{e}");
-                e.clone()
+        // 发件箱提示文案（完成态拼接给用户；增量轮沿用原容错文案）
+        let mut sent_note = String::new();
+        if phased {
+            // —— 阶段一：发件箱（未完成才执行；完成后各 attempt 直接跳过）——
+            if sent_pending {
+                let outcome = sync_phase(
+                    &mut conn,
+                    &data_dir,
+                    &fetch_state,
+                    epoch,
+                    &host,
+                    port,
+                    security,
+                    &account,
+                    &password,
+                    first_days,
+                    max_mail_bytes,
+                    crate::mail::MailDest::Sent,
+                    cur_sent,
+                    &mut added,
+                );
+                match outcome {
+                    // 未发现发件箱（中文服务器 mUTF-7 名称等）：视为完成并置标志，
+                    // 否则每轮重复探测；用户可见提示保留
+                    Ok(None) => {
+                        sent_note = "未发现服务器「已发送」邮箱，已跳过发件箱同步".to_string();
+                        mark_first_pull_done(&conn, crate::mail::MailDest::Sent);
+                        sent_pending = false;
+                    }
+                    Ok(Some(_)) => {
+                        mark_first_pull_done(&conn, crate::mail::MailDest::Sent);
+                        sent_pending = false;
+                    }
+                    Err(e) => {
+                        // 发件箱未完成：收件箱不开始，下个 attempt 只重试发件箱
+                        eprintln!("[fetch] 阶段化模式：发件箱同步失败（重试前不拉收件箱）：{e}");
+                        last_err = e;
+                        let aborted =
+                            fetch_state.lock().unwrap_or_else(|e| e.into_inner()).epoch != epoch;
+                        if aborted {
+                            // 看门狗复位/新一轮已开始：finish 的 epoch 校验会丢弃
+                            // 迟到结果，此处仅停止重试
+                            eprintln!("[fetch] 轮次已失效（看门狗复位/新一轮开始）：{last_err}");
+                            break;
+                        }
+                        continue;
+                    }
+                }
             }
-        };
-        // 阶段二：收件箱
+        } else {
+            // —— 增量轮：发件箱先同步（失败不阻断收件箱——发件箱命名/权限差异
+            //    不该拖垮收件；既有容错语义保持）——
+            let sent_outcome = sync_phase(
+                &mut conn,
+                &data_dir,
+                &fetch_state,
+                epoch,
+                &host,
+                port,
+                security,
+                &account,
+                &password,
+                first_days,
+                max_mail_bytes,
+                crate::mail::MailDest::Sent,
+                cur_sent,
+                &mut added,
+            );
+            sent_note = match &sent_outcome {
+                Ok(None) => "未发现服务器「已发送」邮箱，已跳过发件箱同步".to_string(),
+                Ok(Some(_)) => String::new(),
+                Err(e) => {
+                    eprintln!("[fetch] 发件箱同步失败（继续收件箱）：{e}");
+                    e.clone()
+                }
+            };
+        }
+        // —— 阶段二：收件箱 ——
         let inbox_outcome = sync_phase(
             &mut conn,
             &data_dir,
@@ -1587,6 +1689,9 @@ fn fetch_round(job: FetchJob) {
         );
         match inbox_outcome {
             Ok(Some((uidvalidity, max_uid))) => {
+                if phased {
+                    mark_first_pull_done(&conn, crate::mail::MailDest::Inbox);
+                }
                 // 收尾游标（与每批持久化共用同一 DB 侧单调实现）：写 last_sync_at
                 if let Err(err) = persist_fetch_cursor(
                     &mut conn,
@@ -1599,10 +1704,10 @@ fn fetch_round(job: FetchJob) {
                     eprintln!("[fetch] 游标写入失败（本轮邮件已入库，下轮重拉去重兜底）：{err}");
                 }
                 eprintln!("[fetch] 完成：入库 {added} 封（发件箱+收件箱）");
-                let msg = if sent_err.is_empty() {
+                let msg = if sent_note.is_empty() {
                     String::new()
                 } else {
-                    format!("收件完成，但发件箱未同步：{sent_err}")
+                    format!("收件完成，但发件箱未同步：{sent_note}")
                 };
                 finish(added as i64, msg);
                 // 新邮件摘要通知（异步钩子在收件线程内触发；失败静默不影响主流程）

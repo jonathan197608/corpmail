@@ -1062,3 +1062,25 @@ fn rebind_send_worker_rebuilds_on_new_dir() {
     let _ = std::fs::remove_dir_all(&target);
     let _ = std::fs::remove_dir_all(&anchor);
 }
+
+/// 首拉阶段化标志（发件箱优先）：读写口径与"未配置即未完成"语义
+#[test]
+fn first_pull_done_flags_read_and_mark() {
+    let dir = std::env::temp_dir().join(format!("corpmail-st-flags-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = open(&dir.join("corpmail.db")).unwrap();
+    // 未配置 → 未完成（false）：阶段化模式在全新库上必然开启
+    assert!(!first_pull_done(&conn, crate::mail::MailDest::Sent));
+    assert!(!first_pull_done(&conn, crate::mail::MailDest::Inbox));
+    // 置位后 → 完成；两箱标志互不影响
+    mark_first_pull_done(&conn, crate::mail::MailDest::Sent);
+    assert!(first_pull_done(&conn, crate::mail::MailDest::Sent));
+    assert!(!first_pull_done(&conn, crate::mail::MailDest::Inbox));
+    mark_first_pull_done(&conn, crate::mail::MailDest::Inbox);
+    assert!(first_pull_done(&conn, crate::mail::MailDest::Inbox));
+    // 范围重拉语义：清零后回到未完成（refetch 路径写 "0"）
+    settings::set(&conn, keys::FIRST_PULL_DONE_SENT, "0").unwrap();
+    assert!(!first_pull_done(&conn, crate::mail::MailDest::Sent));
+    let _ = std::fs::remove_dir_all(&dir);
+}

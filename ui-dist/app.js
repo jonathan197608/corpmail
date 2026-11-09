@@ -35,6 +35,23 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
     if (ok) ok.focus();
 }
 
+// htmx 2.0.6 的 hx-confirm 硬编码调用 window.confirm（不读 htmx.config.confirm）
+// ——在 Tauri macOS WKWebView 上恒返 false 且不弹窗，邮件删除/联系人删除/
+// 立即清理/删除备份等全部 hx-confirm 按钮会静默失效（点了没反应）。
+// htmx:confirm 事件 + 异步 issueRequest 是官方异步确认口：preventDefault
+// 取消同步路径，页面内模态确认后直接 issueRequest 发起请求——不再重走
+// 触发器（无防抖窗口、无死循环）。无 hx-confirm 的请求 question 为空、
+// 必须 什么都不做（preventDefault 会误拦所有请求）
+document.body.addEventListener('htmx:confirm', function (evt) {
+    var question = evt.detail && evt.detail.question;
+    if (!question) return;
+    evt.preventDefault();
+    var issue = evt.detail.issueRequest;
+    mbxConfirmLeave(question, function () {
+        if (issue) issue();
+    }, '确定', '取消');
+});
+
 // 启动引导动画移除（M5：base.html 内联 #boot，脚本就绪即撤）
 (function removeBoot() {
     const boot = document.getElementById('boot');
@@ -998,14 +1015,33 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             fail('正文不能为空；如只想发送附件，请在正文补充一句说明');
             return;
         }
-        if (!window.confirm('正文为空，仅发送附件，确定吗？')) {
+        // 页面内模态确认（原 window.confirm 在 macOS WKWebView 不弹窗且恒返
+        // false，空正文带附件的邮件根本发不出去）。确认后带标志重触发：
+        // 重入校验时凭标志放行，避免再次弹窗死循环
+        if (elt.dataset.mbxBodyOk !== '1') {
             ev.preventDefault();
+            mbxConfirmLeave('正文为空，仅发送附件，确定吗？', function () {
+                elt.dataset.mbxBodyOk = '1';
+                // 550ms 后重触发：避开按钮 hx-trigger 的 500ms 防抖窗口
+                setTimeout(function () { elt.click(); }, 550);
+            }, '仍要发送', '返回修改');
             return;
         }
+        delete elt.dataset.mbxBodyOk;
     }
-    // 3) 主题为空：确认放行（企业邮件无主题易被过滤/忽视，确认防手滑）
-    if (!field('subject') && !window.confirm('主题为空，确定直接发送吗？')) {
-        ev.preventDefault();
+    // 3) 主题为空：确认放行（企业邮件无主题易被过滤/忽视，确认防手滑）。
+    //    同样走页面内模态（window.confirm 在 macOS 不可用），独立标志防与
+    //    正文确认叠加时互相吞
+    if (!field('subject')) {
+        if (elt.dataset.mbxSubjOk !== '1') {
+            ev.preventDefault();
+            mbxConfirmLeave('主题为空，确定直接发送吗？', function () {
+                elt.dataset.mbxSubjOk = '1';
+                setTimeout(function () { elt.click(); }, 550);
+            }, '仍要发送', '返回修改');
+            return;
+        }
+        delete elt.dataset.mbxSubjOk;
     }
 });
 
@@ -1179,11 +1215,19 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         } else {
             params.set('ids', JSON.stringify(stateBox.ids));
         }
-        if (confirmMsg && !window.confirm(confirmMsg)) return;
-        htmx.ajax('POST', '/emails/batch', {
-            target: '#list-area', swap: 'outerHTML',
-            values: Object.fromEntries(params.entries())
-        });
+        // 批量删除确认：页面内模态（原 window.confirm 在 macOS WKWebView
+        // 不弹窗恒返 false，批量删除会静默失效）
+        var submit = function () {
+            htmx.ajax('POST', '/emails/batch', {
+                target: '#list-area', swap: 'outerHTML',
+                values: Object.fromEntries(params.entries())
+            });
+        };
+        if (confirmMsg) {
+            mbxConfirmLeave(confirmMsg, submit, '确定删除', '取消');
+            return;
+        }
+        submit();
     }
 
     function confirmText(action) {

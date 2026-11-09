@@ -79,7 +79,7 @@
                     hx-post="/contacts/delete"
                     hx-include="#contacts-search" hx-vals='{"addr": {{ c.addr | js_str }}}'
                     hx-target="#contacts-area" hx-swap="outerHTML"
-                    hx-confirm="删除联系人 {{ c.name }} <{{ c.addr }}>？下次往来时会自动重新采集。"
+                    hx-confirm="删除联系人 {% if c.name %}{{ c.name }}（{{ c.addr }}）{% else %}{{ c.addr }}{% endif %}？下次往来时会自动重新采集。"
                     hx-trigger="click throttle:500ms" hx-disabled-elt="this">删除</button>
         </div>
         {% endfor %}

@@ -14,6 +14,10 @@
 
 use crate::state::AppState;
 
+/// 导出 .md 时可直接内嵌的附件大小上限（字节）：短文本附件直接进正文代码块，
+/// AI 单次可读、MD 不致膨胀；超过则改为输出本地文件路径
+const MD_EMBED_ATTACH_MAX: i64 = 64 * 1024;
+
 /// 导出 .md 的推荐文件名：与 .eml 同源清洗，仅扩展名不同
 pub fn suggested_filename(subject: &str, id: i64) -> String {
     match super::eml::suggested_filename(subject, id).strip_suffix(".eml") {
@@ -68,7 +72,104 @@ pub fn build_md(state: &AppState, email_id: i64) -> Result<String, String> {
     };
     md.push_str(&body);
     md.push('\n');
+    if !detail.attachments.is_empty() {
+        md.push_str("\n## 附件\n\n");
+        for a in &detail.attachments {
+            write_attachment_section(state, email_id, a, &mut md);
+        }
+    }
     Ok(md)
+}
+
+/// 单附件小节：短文本附件直接内嵌内容（fenced 代码块）；大附件/二进制
+/// 输出本地完整路径供后续处理；已清理的附件说明不可用
+fn write_attachment_section(
+    state: &AppState,
+    email_id: i64,
+    a: &crate::mail::AttachView,
+    md: &mut String,
+) {
+    md.push_str(&format!(
+        "### {}（{}）\n\n",
+        a.filename,
+        crate::templates::fmt_size(a.size_orig)
+    ));
+    if a.detached {
+        md.push_str("文件已按清理策略移除，无法导出。\n\n");
+        return;
+    }
+    if let Some(lang) = text_lang_of(&a.mime, &a.filename)
+        && a.size_orig <= MD_EMBED_ATTACH_MAX
+        && let Some((_, bytes)) = crate::mail::attachment_bytes(state, email_id, a.id)
+    {
+        // 短文本：内容直接进代码块（AI 单次可读）；内容含 ``` 时用 4 反引号防破坏
+        let content = String::from_utf8_lossy(&bytes);
+        let fence = if content.contains("```") {
+            "````"
+        } else {
+            "```"
+        };
+        md.push_str(&format!("{fence}{lang}\n{content}\n{fence}\n\n"));
+        return;
+    }
+    // 大附件/二进制：本地完整路径（storage=file 为磁盘真实文件，gzip 压缩存储；
+    // inline BLOB 存于数据库无独立文件，如实说明）
+    let location = state
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT storage, COALESCE(file_path, '') FROM attachments WHERE id = ?1",
+                [a.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        })
+        .ok();
+    match location.as_ref().map(|(s, p)| (s.as_str(), p.as_str())) {
+        Some(("file", p)) if !p.is_empty() => md.push_str(&format!(
+            "本地文件：{}（gzip 压缩存储）\n\n",
+            state.data_dir().join("attachments").join(p).display()
+        )),
+        _ => md.push_str(&format!(
+            "附件内容存于本地数据库（无独立文件，{}）\n\n",
+            crate::templates::fmt_size(a.size_orig)
+        )),
+    }
+}
+
+/// 文本类附件判定（返回 fenced 代码块语言标注；None = 二进制不适合内嵌）。
+/// MIME 优先；octet-stream/缺失时按扩展名兜底（真实邮件附件头常不规范）
+fn text_lang_of(mime: &str, filename: &str) -> Option<&'static str> {
+    let m = mime.trim().to_ascii_lowercase();
+    if let Some(lang) = match m.as_str() {
+        "application/json" => Some("json"),
+        "application/xml" => Some("xml"),
+        _ if m.starts_with("text/") => Some("text"),
+        _ => None,
+    } {
+        return Some(lang);
+    }
+    if !m.is_empty() && m != "application/octet-stream" {
+        return None; // 其他显式 MIME（图片/PDF/zip 系）不靠扩展名猜
+    }
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "txt" | "log" | "ini" | "conf" | "env" => "text",
+        "md" | "markdown" => "markdown",
+        "csv" | "tsv" => "csv",
+        "json" => "json",
+        "xml" => "xml",
+        "yml" | "yaml" => "yaml",
+        "html" | "htm" => "html",
+        "js" => "javascript",
+        "py" => "python",
+        "rs" => "rust",
+        "sql" => "sql",
+        "sh" | "bat" => "bash",
+        _ => return None,
+    })
 }
 
 /// HTML → Markdown 文本（纯函数，无 I/O）：

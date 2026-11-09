@@ -13,7 +13,7 @@
         </div>
 
         <div class="card compose-card">
-            {% if undone %}<div class="compose-note ok">↩️ 已撤销发送，可继续编辑或重新发送</div>{% endif %}
+            {% if undone %}<div class="compose-note ok">↩ 已撤销发送，可继续编辑或重新发送</div>{% endif %}
             {% if saved %}<div class="compose-note ok">✓ 草稿已保存</div>{% endif %}
             {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个 0 字节文件（未附加）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
@@ -89,7 +89,7 @@
                 </div>
 
                 <div class="attach-area">
-                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎️ 添加附件</button>
+                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎 添加附件</button>
                     <ul id="picked-list" class="att-list"></ul>
                     {% if attachments %}
                     <div class="kept-title">已保存的附件（保存草稿时保留）</div>
@@ -125,7 +125,7 @@
                     <button type="button" class="btn primary big"
                             hx-post="/compose/send" hx-include="closest form"
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this">📨 发送</button>
-                    <button type="submit" class="btn big">💾️ 存草稿</button>
+                    <button type="submit" class="btn big">💾 存草稿</button>
                 </div>
             </form>
         </div>

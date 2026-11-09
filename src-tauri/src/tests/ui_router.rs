@@ -2653,12 +2653,15 @@ fn settings_storage_save_triggers_cleanup_and_enables_clean_button() {
 #[test]
 fn settings_sync_refetch_resets_cursor_and_keeps_range() {
     let (state, dir) = temp_state("sync-refetch");
-    // 预置：已拉过 90 天并落游标（模拟真实首拉后的状态）
+    // 预置：已拉过 90 天并落游标（模拟真实首拉后的状态），
+    // 首拉阶段化标志也已置位
     state
         .set_batch(&[
             (keys::FIRST_FETCH_DAYS, "90"),
             (keys::LAST_UID, "9503"),
             (keys::LAST_UIDVALIDITY, "1"),
+            (keys::FIRST_PULL_DONE_SENT, "1"),
+            (keys::FIRST_PULL_DONE_INBOX, "1"),
         ])
         .unwrap();
     let resp = route(
@@ -2689,6 +2692,16 @@ fn settings_sync_refetch_resets_cursor_and_keeps_range() {
         state.get_or(keys::LAST_UIDVALIDITY, &d).as_deref(),
         Some("0"),
         "uidvalidity 须清空"
+    );
+    assert_eq!(
+        state.get_or(keys::FIRST_PULL_DONE_SENT, &d).as_deref(),
+        Some("0"),
+        "首拉阶段化标志须随游标一并清除（重新进入发件箱优先串行模式）"
+    );
+    assert_eq!(
+        state.get_or(keys::FIRST_PULL_DONE_INBOX, &d).as_deref(),
+        Some("0"),
+        "收件箱首拉标志同样须清除"
     );
     assert!(
         body(&resp).contains("触发重新拉取"),
@@ -7712,5 +7725,56 @@ fn export_eml_strips_crlf_from_headers() {
     assert!(!head.contains("\r\nid@"), "Message-ID 注入应清洗：{head:?}");
     // 主体（正文部分）不受影响
     let _ = rest;
+    cleanup(&dir);
+}
+
+/// 导出后缀自动补全：保存对话框改了文件名/手输路径漏写后缀时，
+/// .eml / .md 落盘文件以补全后的路径为准
+#[test]
+fn export_routes_autocomplete_missing_extension() {
+    let (state, dir) = temp_state("export-ext");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','后缀补全',
+                     '正文','x','y',1,1,1)",
+            [],
+        )
+        .unwrap();
+        Ok::<(), rusqlite::Error>(())
+    })
+    .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // eml：dest 无后缀 → 落盘 .eml
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/export-eml",
+            &form(&[("dest", dir.join("邮件").to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    assert!(body(&resp).contains(".eml"), "toast 应显示补全后路径");
+    assert!(dir.join("邮件.eml").exists(), "应落盘到补全后的路径");
+    // md：dest 带其他后缀（.txt）→ 追加 .md
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/export-md",
+            &form(&[("dest", dir.join("归档").to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    assert!(body(&resp).contains(".md"), "toast 应显示补全后路径");
+    assert!(dir.join("归档.md").exists(), "应落盘到补全后的路径");
     cleanup(&dir);
 }

@@ -6,14 +6,14 @@
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
         {% if not is_thread and items %}
         {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）；
-           本页全选/已选计数/删除/取消常驻，低频动作（标已读/标未读/星标/
-           取消星标）收进「批量⋯」下拉节省横向空间；按钮禁用态随选中数切换 #}
+           本页全选/已选计数/删除/清空选择常驻，低频动作（标已读/标未读/星标/
+           取消星标）收进「批量操作⋯」下拉节省横向空间；按钮禁用态随选中数切换 #}
         <div class="mbx-inline" id="batch-bar">
             <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">全选</label>
             <span class="ba-count" id="ba-count"></span>
             <button type="button" class="btn small danger" data-batch="delete">🗑️ 删除</button>
             <div class="split ba-more">
-                <button type="button" class="btn small" data-split-toggle aria-label="更多批量操作">批量⋯</button>
+                <button type="button" class="btn small" data-split-toggle aria-label="更多批量操作">批量操作⋯</button>
                 <div class="split-menu" hidden>
                     {# 跨页全选入口放菜单内：选中后文案较长，留在行内会把顶栏挤换行 #}
                     <a href="#" id="ba-select-all" hidden></a>
@@ -23,7 +23,7 @@
                     <button type="button" data-batch="unstar">✩ 取消星标</button>
                 </div>
             </div>
-            <button type="button" class="btn small" id="ba-clear">取消</button>
+            <button type="button" class="btn small" id="ba-clear">清空选择</button>
             <input type="hidden" id="batch-mode" value="ids">
             <input type="hidden" id="batch-exclude" value="[]">
             <input type="hidden" id="ba-folder" value="{{ folder }}">
@@ -119,7 +119,7 @@
             <input type="date" name="dt" value="{{ dt }}">
         </label>
         <label class="adv-check">
-            <input type="checkbox" name="att" value="1" {% if has_attach %}checked{% endif %}> 仅看有附件
+            <input type="checkbox" name="att" value="1" {% if has_attach %}checked{% endif %}> 只看有附件
         </label>
         <button class="btn small primary" type="submit">应用筛选</button>
         <button class="btn small" type="button" id="adv-clear">清除筛选</button>
@@ -228,7 +228,7 @@
             {% else %}
             <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7l9-4 9 4"/><path d="M3 7v12h18V7"/><path d="M3 7l9 6 9-6"/></svg></div>
             <h2>这里还没有邮件</h2>
-            <p>撰写并保存的草稿会出现在这里，<br>收取与发送功能将在后续版本开放。</p>
+            <p>还没有收到邮件，可从顶栏 ⋯ 菜单「🔄 收取新邮件」拉取。</p>
             <a class="btn" href="/compose">✏️ 撰写邮件</a>
             {% endif %}
         </div>

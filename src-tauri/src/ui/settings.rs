@@ -503,6 +503,9 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         pairs.push((keys::LAST_UID, "0"));
         pairs.push((keys::LAST_UIDVALIDITY_SENT, "0"));
         pairs.push((keys::LAST_UID_SENT, "0"));
+        // 首拉阶段化标志一并清除：范围重拉重新进入「先发件箱后收件箱」串行模式
+        pairs.push((keys::FIRST_PULL_DONE_SENT, "0"));
+        pairs.push((keys::FIRST_PULL_DONE_INBOX, "0"));
     }
     if state.set_batch(&pairs).is_err() {
         // 保存失败回渲染当前值，用户重试（库错误在此无更优交互）
@@ -537,11 +540,14 @@ pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
     let pairs = [
         (keys::FIRST_FETCH_DAYS, days.as_str()),
         // 清空游标 → 走首拉分支（无游标 = 首次拉取），按新范围 UID SEARCH ALL / SINCE。
-        // 双箱都清（2026-11-03 修复：此前漏清发件箱游标，重拉对发件箱不完整）
+        // 双箱都清（2026-11-03 修复：此前漏清发件箱游标，重拉对发件箱不完整）；
+        // 首拉阶段化标志一并清，重新进入「先发件箱后收件箱」串行模式
         (keys::LAST_UID, "0"),
         (keys::LAST_UIDVALIDITY, "0"),
         (keys::LAST_UID_SENT, "0"),
         (keys::LAST_UIDVALIDITY_SENT, "0"),
+        (keys::FIRST_PULL_DONE_SENT, "0"),
+        (keys::FIRST_PULL_DONE_INBOX, "0"),
     ];
     if state.set_batch(&pairs).is_err() {
         return sync_pane(state, false);

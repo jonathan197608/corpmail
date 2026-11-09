@@ -102,7 +102,7 @@
         </div>
         {% else %}
         <div class="md-status sending">⏰ 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
-        <div class="sched-tip">修改或取消：编辑草稿并调整定时时间；或清空定时后「发送」立即发出。</div>
+        <div class="sched-tip">要修改或取消定时：编辑草稿调整时间，或清空时间后点「发送」立即发出。</div>
         {% endif %}
         {% endif %}
         {% if email.status == 'queued' %}
