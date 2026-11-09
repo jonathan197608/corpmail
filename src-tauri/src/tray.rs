@@ -52,7 +52,11 @@ pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> 
         // Tauri Image 只接受 RGBA 原始字节：44x44 模板图（黑线 + 透明底，
         // 对应菜单栏 22pt@2x，与系统/其他应用图标同尺寸）
         let mac_icon = tauri::image::Image::new(include_bytes!("../icons/tray-mac.rgba"), 44, 44);
-        builder = builder.icon(mac_icon);
+        // 模板图：随菜单栏明暗主题自动反色（macOS 标准做法，黑白按钮）。
+        // 用 builder 级 icon_as_template（仅 macOS 生效、无错误路径）而非
+        // build 后的 tray.set_icon_as_template——后者需要绑定 tray 句柄，
+        // 而句柄在 Windows/Linux 无后续调用，会触发 unused_variables 告警
+        builder = builder.icon(mac_icon).icon_as_template(true);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -60,14 +64,9 @@ pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> 
             builder = builder.icon(icon.clone());
         }
     }
-    let tray = builder.build(app)?;
-    #[cfg(target_os = "macos")]
-    {
-        // 模板图：随菜单栏明暗主题自动反色（macOS 标准做法，黑白按钮）
-        if let Err(err) = tray.set_icon_as_template(true) {
-            eprintln!("[tray] 模板图设置失败（不影响主流程）：{err}");
-        }
-    }
+    // 托盘句柄由 app 管理器持有，后续刷新走 tray_by_id 查找（refresh_badge），
+    // 此处无需保留返回值——避免非 macOS 平台的 unused_variables 告警
+    builder.build(app)?;
     refresh_badge(app);
     Ok(())
 }
