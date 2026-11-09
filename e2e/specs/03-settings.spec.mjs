@@ -1,5 +1,5 @@
 import { browser, $, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText, htmxAjax, runDir } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, waitText, htmxAjax, runDir, openSplit } from '../support/helpers.mjs'
 import path from 'node:path'
 import fs from 'node:fs'
 
@@ -80,9 +80,11 @@ describe('03 设置与收件状态', () => {
     await shot('设置-关于')
   })
 
-  it('收取新邮件：状态条从进行中回到空闲（无错误）', async () => {
+  it('收取新邮件：顶栏 ⋯ 菜单入口 → 状态条从进行中回到空闲（无错误）', async () => {
     await goto('/')
     await waitBoot()
+    // 2026-11 改版：「收取新邮件」收进顶栏 ⋯ 菜单（.tb-more），先展开再点
+    await openSplit('.tb-more [data-split-toggle]')
     await $('#fetch-btn').click()
     // 状态条进入 running 或直接空闲都接受；关键是不出现错误态
     await browser.waitUntil(

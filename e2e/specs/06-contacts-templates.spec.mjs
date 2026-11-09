@@ -1,5 +1,12 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText, autoConfirm } from '../support/helpers.mjs'
+import {
+  goto,
+  shot,
+  waitBoot,
+  waitText,
+  confirmModalText,
+  acceptConfirm,
+} from '../support/helpers.mjs'
 
 // 06：联系人（自动采集/搜索/新增/删除/补全接口）与邮件模板（F2–F5）。
 // 联系人数据来自 01 首拉时采集的 3 位发件人。
@@ -57,8 +64,7 @@ describe('06 联系人与模板', () => {
     )
     await shot('联系人-新增成功')
 
-    // 删除刚加的（hx-confirm 弹 confirm，已放行）
-    await autoConfirm()
+    // 删除刚加的（hx-confirm 走页面内模态，window.confirm 在 WKWebView 恒 false）
     const rows = await $$('.contact-row')
     for (const row of rows) {
       if ((await row.getText()).includes('partner@example.com')) {
@@ -66,6 +72,9 @@ describe('06 联系人与模板', () => {
         break
       }
     }
+    const question = await confirmModalText()
+    expect(question).toContain('partner@example.com')
+    await acceptConfirm()
     await browser.waitUntil(
       async () => !(await $('body').getText()).includes('partner@example.com'),
       { timeoutMsg: '删除联系人后行未消失' },
@@ -110,10 +119,9 @@ describe('06 联系人与模板', () => {
     await shot('模板-撰写页下拉')
   })
 
-  it('F5c 模板删除：列表中消失', async () => {
+  it('F5c 模板删除：确认模态后列表中消失', async () => {
     await goto('/settings/templates')
     await waitBoot()
-    await autoConfirm()
     const before = await countTemplates(TPL_NAME)
     expect(before).toBeGreaterThanOrEqual(1)
     // 删除按钮在 .tpl-head 里（与 details > form 平级，不在编辑表单内），
@@ -129,10 +137,120 @@ describe('06 联系人与模板', () => {
       }
     }
     expect(clicked).toBe(true)
+    const question = await confirmModalText()
+    expect(question).toContain(TPL_NAME)
+    await acceptConfirm()
     await browser.waitUntil(
       async () => (await countTemplates(TPL_NAME)) === before - 1,
       { timeoutMsg: '模板删除后列表未减少' },
     )
     await shot('模板-删除成功')
+  })
+
+  it('F6 联系人分页与排序：sort 下拉回显 + per=1 翻页', async () => {
+    await goto('/contacts')
+    await waitBoot()
+    // 排序下拉默认「最近联系」；选项文案与邮件列表对齐
+    const opts = await browser.execute(() =>
+      [...document.querySelectorAll('.per-form select[name="sort"] option')].map(
+        (o) => o.textContent.trim(),
+      ),
+    )
+    expect(opts).toEqual(['最近联系', '联系最多', '姓名'])
+    expect(
+      await browser.execute(
+        () => document.querySelector('.per-form select[name="sort"]').value,
+      ),
+    ).toBe('recent')
+
+    const all = (await $$('.contact-row')).length
+    expect(all).toBeGreaterThanOrEqual(3)
+
+    await goto('/contacts?per=1')
+    await waitBoot()
+    expect((await $$('.contact-row')).length).toBe(1)
+    // 用地址标识行，不用姓名：采集不到 display name 的联系人统一显示「（未命名）」
+    const firstAddr = (await (await $$('.contact-row'))[0].$('.ct-addr').getText()).trim()
+    expect(firstAddr).toContain('@')
+    await shot('联系人-每页1人')
+
+    await $('.pager a.pg').click() // 第 1 页只有「下一页」
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).includes('page=2'),
+      { timeoutMsg: '联系人翻页未发生' },
+    )
+    await waitBoot()
+    expect((await $$('.contact-row')).length).toBe(1)
+    const secondAddr = (await (await $$('.contact-row'))[0].$('.ct-addr').getText()).trim()
+    expect(secondAddr).not.toBe(firstAddr)
+    await shot('联系人-第2页')
+
+    // per 与邮件列表共用 settings 的 PAGE_SIZE：恢复默认，避免污染后续行数断言
+    await goto('/contacts?per=10')
+    await waitBoot()
+  })
+
+  it('F7 模板富文本：升级 → HTML 源码写入 → 保存后列表出现，再删除', async () => {
+    const RICH = 'E2E 富文本模板'
+    await goto('/settings/templates')
+    await waitBoot()
+    const before = await countTemplates(RICH)
+
+    await $('.tpl-form input[name="name"]').setValue(RICH)
+    await $('.tpl-form [data-tpl-upgrade]').click()
+    // 单向升级：纯文本区隐藏、html 区显示、隐藏域 body_mode=html
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() => {
+          const f = document.querySelector('.tpl-form [data-tpl-field]')
+          return (
+            f &&
+            !f.querySelector('[data-tpl-html-field]').hidden &&
+            f.querySelector('[data-tpl-mode]').value === 'html'
+          )
+        }),
+      { timeoutMsg: '切换富文本后 html 编辑区未显示' },
+    )
+    // 直接写 HTML 源码 textarea：不依赖 wangEditor 是否初始化成功
+    // （初始化失败时 app.js 自动降级到源码 textarea，两条路径都走同一字段）
+    await browser.execute(() => {
+      document.querySelector('.tpl-form textarea[name="body_html"]').value =
+        '<p>富文本模板正文 <b>加粗</b></p>'
+    })
+    await $('.tpl-form button[type="submit"]').click()
+    await waitText('#settings-pane', '✓ 已保存')
+    await browser.waitUntil(
+      async () => (await countTemplates(RICH)) === before + 1,
+      { timeoutMsg: '富文本模板保存后列表未新增' },
+    )
+    await shot('模板-富文本新增成功')
+
+    // 撰写页下拉应包含它（html 模板也在列表里）
+    await goto('/compose')
+    await waitBoot()
+    const texts = await browser.execute(() =>
+      [...document.querySelectorAll('#tpl-select option')].map((o) =>
+        o.textContent.trim(),
+      ),
+    )
+    expect(texts).toContain(RICH)
+
+    // 清理：删除该模板（顺带再走一次确认模态）
+    await goto('/settings/templates')
+    await waitBoot()
+    const items = await $$('.tpl-item')
+    for (const it of items) {
+      if ((await (await it.$('.tpl-title')).getText()).trim() === RICH) {
+        await it.$('button[hx-post*="templates/delete"]').click()
+        break
+      }
+    }
+    await confirmModalText()
+    await acceptConfirm()
+    await browser.waitUntil(
+      async () => (await countTemplates(RICH)) === before,
+      { timeoutMsg: '富文本模板删除后列表未恢复' },
+    )
+    await shot('模板-富文本已清理')
   })
 })

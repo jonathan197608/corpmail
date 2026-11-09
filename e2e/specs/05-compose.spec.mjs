@@ -1,5 +1,14 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText, runDir } from '../support/helpers.mjs'
+import {
+  goto,
+  shot,
+  waitBoot,
+  waitText,
+  runDir,
+  confirmModalText,
+  acceptConfirm,
+  cancelConfirm,
+} from '../support/helpers.mjs'
 import { sentMails } from '../support/mock.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -208,5 +217,52 @@ describe('05 撰写与发送', () => {
     const note = await $('.compose-note').getText()
     expect(note).toMatch(/\.eml/)
     await shot('撰写-附加eml转发')
+  })
+
+  it('D10 离开确认：自动保存后仍算「未保存」→ 页面内模态，可取消可离开', async () => {
+    await goto('/compose')
+    await waitBoot()
+    await $(COMPOSE.subject).setValue('E2E 未保存离开验证')
+    // 等自动保存完成（hint 变「✓ 已自动保存 …」）。a5b5c00 的修复点就是
+    // 「自动保存不清除未保存语义」：此时离开仍必须弹确认
+    await browser.waitUntil(
+      async () => (await $('#autosave-hint').getText()).includes('已自动保存'),
+      { timeout: 15000, timeoutMsg: '自动保存未完成' },
+    )
+
+    await $('.side a[href="/?folder=inbox"]').click()
+    const question = await confirmModalText()
+    expect(question).toContain('尚未保存')
+    await shot('撰写-离开确认模态')
+    await cancelConfirm()
+    expect(await browser.getUrl()).toContain('/compose')
+    await shot('撰写-取消离开仍在编辑')
+
+    // 再来一次并确认离开 → 跳收件箱
+    await $('.side a[href="/?folder=inbox"]').click()
+    await confirmModalText()
+    await acceptConfirm()
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).includes('folder=inbox'),
+      { timeoutMsg: '确认放弃后未跳转' },
+    )
+    await waitBoot()
+    await shot('撰写-放弃离开已跳转')
+  })
+
+  it('D11 空主题发送：模态提示，返回修改后仍停在撰写页且未发出', async () => {
+    await goto('/compose')
+    await waitBoot()
+    await $(COMPOSE.to).setValue('nosubject@corpmail.test')
+    await $(COMPOSE.body).setValue('正文有内容，但主题故意留空。')
+    await $('button.btn.primary.big').click()
+    const question = await confirmModalText()
+    expect(question).toContain('主题为空')
+    await shot('撰写-空主题确认模态')
+    await cancelConfirm()
+    expect(await browser.getUrl()).toContain('/compose')
+    // 没有真正发出：邮件仍在撰写页（发送会整页跳列表）
+    expect(await $(COMPOSE.subject).getValue()).toBe('')
+    await shot('撰写-空主题返回修改')
   })
 })

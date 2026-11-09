@@ -102,18 +102,22 @@ spec 与数据依赖：`00→01` 依赖全新 HOME，`02–07` 依赖 01 完成�
 | B7 ★ | 排序 | `date_asc` 首行=最早邮件；`subject_asc` 字典序 | 2 | 04 |
 | B8 ★ | 每页条数 + 翻页 | `per=1` 单行 + 「下一页」；翻页显示第 2 封 | 2 | 04 |
 | B9 ★ | 文件夹切换与侧栏计数 | sent/draft 空态文案；侧栏 `.unread-chip` 计数 | 2 | 04 |
-| B10 ★ | 批量星标/取消 | 行选 → star → `.starred` 脊线；unstar 恢复 | 2 | 04 |
-| B11 ★ | 批量删除 | 行数 -1，toast 确认文案 | 1 | 04 |
+| B10 ★ | 批量星标/取消 | 行选 → 批量操作⋯ 菜单 star → `.starred`；unstar 恢复 | 2 | 04 |
+| B11 ★ | 批量删除 | 页面内确认模态 → 行数 -1 | 1 | 04 |
 | B12 ★ | 高级检索：发件人 | `from=张伟` 命中欢迎邮件 1 封 | 1 | 04 |
 | B13 ★ | 高级检索：仅看附件 | `att=1` 命中季度报表 1 封 | 1 | 04 |
 | B14 ★ | 高级检索：日期区间 | `df/dt` 命中区间内邮件，区间外排除 | 1 | 04 |
+| B15 | 批量标已读/标未读 + 清空选择 | 批量操作⋯ 菜单切换 unread 类；清空后计数归零 | 3 | 04 |
+| B16 | 高级检索面板交互 | 默认收起 → 🎛️ 展开 → 应用筛选 att=1 → 清除恢复 | 3 | 04 |
 | C1 ★ | 纯文本正文 | 正文文本完整、换行保留 | 1 | 02 |
 | C2 ★ | 附件清单 | `report.csv` 出现、`.att-row` 数量正确 | 1 | 02 |
 | C3 ★ | 附件预览模态 | `#preview-modal` 可见、关闭可用 | 1 | 02 |
-| C4 ★ | 原文视图 | `/emails/<id>/source` 含 Message-ID/收发头 | 1 | 07 |
+| C4 ★ | 原文视图 | 详情页 ⋯ 菜单入口 → `?part=headers` 含 Message-ID/收发头 | 1 | 07 |
 | C5 ★ | 导出 .eml（B4） | `htmx.ajax` POST dest → toast + 文件落盘 + 内容含头 | 2 | 07 |
 | C6 ★ | 附件另存（单个/全部 A4） | toast「已保存 N 个附件」+ 落盘文件内容=fixture CSV | 2 | 07 |
 | C7 | HTML 正文净化 | 无 `<script>`、外部图片走 `/proxy/image` | 1 | 07 |
+| C8 | 导出 Markdown | POST dest → 落盘 .md 含 YAML front matter + `## 正文`/`## 附件` | 1 | 07 |
+| C9 | 原文页增强 | 行号 gutter 行数>1 + 复制按钮存在 | 1 | 07 |
 | D1 ★ | 撰写页初始态 | 标题「撰写新邮件」、模板下拉为空占位 | 1 | 05 |
 | D2 ★ | 草稿自动保存 | 输入后 `#autosave-hint` 出现「已自动保存」 | 1 | 05 |
 | D3 ★ | 存草稿 | 草稿箱 +1，行出现在草稿箱列表 | 2 | 05 |
@@ -123,7 +127,9 @@ spec 与数据依赖：`00→01` 依赖全新 HOME，`02–07` 依赖 01 完成�
 | D7 ★ | 回复全部 | 标题「回复全部」 | 1 | 05 |
 | D8 ★ | 转发 | 主题转：前缀 +「将携带 1 个附件」提示 | 1 | 05 |
 | D9 ★ | 附加 .eml 转发（B6） | 「将以附件 xxx.eml 加入」提示 | 1 | 05 |
-| D10 ★ | 发送失败与重发 | mock 对 `fail@` 收件人 550 → failed 状态 + 重发按钮 → 重发回撰写页 | 3 | 90 |
+| D10 | 离开确认（未保存） | 自动保存后仍算未保存 → 页面内模态；取消留在撰写页、确认后跳转 | 3 | 05 |
+| D11 | 空主题发送确认 | 模态「主题为空」→ 返回修改停在撰写页且未发出 | 2 | 05 |
+| D12 ★ | 发送失败与重发 | mock 对 `fail@` 收件人 550 → failed 状态 + 重发按钮 → 重发回撰写页 | 3 | 90 |
 | E1 ★ | 账号页签 | 当前账号、凭据保管状态 | 1 | 03 |
 | E2 ★ | 同步页签保存回显 | 改间隔提交 → pane 回显新值 | 2 | 03 |
 | E3 ★ | 连接测试按钮 | test-smtp / test-imap 结果区显示成功（打真 mock） | 2 | 03 |
@@ -133,7 +139,9 @@ spec 与数据依赖：`00→01` 依赖全新 HOME，`02–07` 依赖 01 完成�
 | F2 ★ | 联系人自动采集 | 3 位发件人出现且带姓名 | 1 | 06 |
 | F3 ★ | 联系人搜索/新增/删除 | 过滤 1 行；新增出现；删除消失 | 3 | 06 |
 | F4 ★ | 收件人补全接口 | `suggest?q=` JSON 含地址（页面 fetch 注入断言） | 1 | 06 |
-| F5 ★ | 邮件模板增删 | 保存后列表出现；撰写页 `#tpl-select` 有该项；删除消失 | 3 | 06 |
+| F5 ★ | 邮件模板增删 | 保存后列表出现；撰写页 `#tpl-select` 有该项；确认模态后删除消失 | 3 | 06 |
+| F6 | 联系人分页与排序 | sort 下拉回显（最近联系/联系最多/姓名）；per=1 单行翻页、地址唯一 | 2 | 06 |
+| F7 | 模板富文本升级 | 升级后 html 区显示 + body_mode=html → HTML 源码保存 → 列表 + 撰写页出现 → 删除 | 3 | 06 |
 | G1 | 关窗隐藏（外壳） | Cmd+W 后进程常驻、窗口数 0 | 1 | L3 |
 | G2 | 托盘唤回（外壳） | 点击 Dock/托盘后窗口重新出现 | 1 | L3 |
 
@@ -150,6 +158,7 @@ spec 与数据依赖：`00→01` 依赖全新 HOME，`02–07` 依赖 01 完成�
 | H3b | 迁移：同当前目录 | dest = pane 当前目录 | 「目标目录与当前数据目录相同」 |
 | H3c | 迁移：目标已有库 | dest 预置假 corpmail.db | 错误含 corpmail.db + 当前目录不变 |
 | H4 | 发送失败状态机 | mock 拒收 fail@（550） | 撤销窗后详情页 `.md-status.failed` + 重发按钮 → 回撰写页预填 |
+| H5 | 导出空目标 | dest 为空/纯空白 POST export-eml/export-md | toast「未选择保存位置」，不落盘 |
 
 ### 分层原则
 
@@ -220,28 +229,27 @@ scripts/e2e-shell-macos.sh
 | P2 | L3 外壳层接入 CI、L4 视觉基线（pixelmatch 阈值 0.1%） | 关键页截图 diff 稳定 |
 | P3 | GitHub Actions `macos-14` 跑全量（app 需 GUI 会话，先验证 runner 能力） | 每次 push 出截图 artifact |
 
-## 11. 当前实测状态（不夸大）
+## 11. 当前实测状态（2026-11-09）
 
-已在本机验证：
+**全量通过**：`e2e/run.sh` → 9 spec / 65 用例全绿（00 smoke 3、01 向导 6、
+02 读信 5、03 设置 8、04 列表 12、05 撰写 11、06 联系模板 9、07 导出 6、
+90 失败链路 5），全程 ~3 min（含增量构建）。
 
-- `cargo build --features e2e` 成功，产物启动后 **`127.0.0.1:4445` 返回
-  `{"value":{"message":"waiting for webview initialization","ready":false}}`**
-  ——内嵌 WebDriver 服务端确实起来了
-- `mockmail.py` 用 `imaplib` + `smtplib` 全命令自测通过（SEARCH/FETCH/STORE/DATA）
-- 隔离 `HOME` 生效：数据库落在 `artifacts/<run>/home/Library/Application Support/com.corpmail.desktop/`
-- **smoke spec 全链路通过**（会话/元素查询/`saveScreenshot`），焦点管理 WARN 已静默
-- 00–07 共 51 个用例全部编写完成并通过语法校验；选择器均核对过模板源码
+2026-11 UI 改版（35 提交）后的适配记录，沉淀为驱动经验（`support/helpers.mjs`）：
 
-尚未验证（首次全量跑时确认）：
+| 经验 | 说明 |
+|---|---|
+| `hx-confirm` 不再走 `window.confirm` | htmx 2.0.6 硬编码 `window.confirm` 在 WKWebView 恒 false，项目改用 `mbxConfirmLeave` 页面内模态（`#mbx-leave-confirm`）。`autoConfirm` 已删除，统一用 `confirmModalText()` + `acceptConfirm()`/`cancelConfirm()` |
+| split 菜单展开 | 必须 `dispatchEvent(new MouseEvent('click', {bubbles:true}))` 且打在 `[data-split-toggle]` 按钮上；`el.click()` 在详情页 ⋯ 上不触发 document 委托，事件打在 `.split` 容器上会被判为「点击外部」而收起。统一走 `openSplit()`（接受选择器或元素，容器自动收敛到按钮） |
+| `body.getText()` 含 `<script>` 文本 | 「等状态转变」类 waitUntil 禁用 `body.getText().includes()`（app.js 文案字面量会误命中），用 `execute` 查具体 DOM |
+| 列表顶栏结构 | 筛选/收取收进 `.tb-more` ⋯ 菜单；批量低频动作收进 `.ba-more` 菜单；详情页动作整行入顶栏，源码/导出入口在 ⋯ 菜单 |
+| 联系人行唯一标识 | 用 `.ct-addr`，不用 `.ct-name`（无 display name 的联系人统一显示「（未命名）」） |
+| `per` 写入 settings | 联系人与邮件列表共用 `PAGE_SIZE`，测 `per=1` 后必须恢复 `per=10` |
 
-- `browser.execute`（WebDriver ExecuteScript，经插件 eval_channel）：
-  `autoConfirm`/`htmxxAjax`/suggest 断言依赖它，若驱动未实现会在
-  04-B11、03-A6、06-F4、07-C5/C6/C7 明确报错
-- 全量 spec 的实际通过情况与 ≈60 张截图产出
-
-首次运行建议：`e2e/run.sh --spec specs/00-smoke.spec.mjs` 先确认会话与截图链路，
-再跑全量。若 `saveScreenshot` 返回空或报 not implemented，L3 的 `screencapture`
-可作为截图兜底（方案 §9 的降级路径同样适用于截图）。
+历史修复（2026-11-05 全绿轮次）：`just_sent` 被 app.js 首帧 `replaceState` 清掉
+（D4/D5 改等 toast，F4 改读 `HX-Redirect` 头）、RFC 2047 解码兼容 lettre 小写 `b`
++ 只编码非 ASCII 段、`clamp_per` 下限降为 1、详情页 href 带 `list_query` 后缀
+禁用 `$=` 锚定等，详见 git log 与 `.workbuddy` 记忆日志。
 
 不想跑整套 wdio 时，用诊断脚本三秒定位是哪一环断了：
 

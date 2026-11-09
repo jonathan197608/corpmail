@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { browser } from '@wdio/globals'
+import { browser, $, $$ } from '@wdio/globals'
 
 const RUN_DIR = process.env.E2E_RUN_DIR || path.resolve('artifacts', 'adhoc')
 fs.mkdirSync(RUN_DIR, { recursive: true })
@@ -113,11 +113,90 @@ export async function htmxAjax(method, url, values, target = '#toast') {
   )
 }
 
-/** 把 window.confirm 一律放行（hx-confirm / 批量删除确认框） */
-export async function autoConfirm() {
-  await browser.execute(() => {
-    window.confirm = () => true
-  })
+/**
+ * 展开 split 下拉菜单（列表顶栏 ⋯、批量操作⋯、详情页 ⋯/回复▾）。
+ * 菜单由 app.js 事件委托切 hidden，点 toggle 按钮本身即可；已展开则不重复点。
+ * @param target 选择器，或已定位的元素（详情页有多个 ⋯ 时用后者取最后一个）
+ */
+export async function openSplit(target) {
+  let toggle = typeof target === 'string' ? await $(target) : target
+  // 允许传 .split 容器：委托按 ev.target.closest('[data-split-toggle]') 判定，
+  // 事件必须落在按钮上——打在容器上会被当成「点击外部」而收起菜单
+  const isToggle = await browser.execute(
+    (el) => !!el.matches?.('[data-split-toggle]'),
+    toggle,
+  )
+  if (!isToggle) toggle = await toggle.$('[data-split-toggle]')
+  const isOpen = () =>
+    browser.execute((el) => {
+      const split = el && el.closest('.split')
+      const menu = split && split.querySelector('.split-menu')
+      return !!menu && !menu.hidden
+    }, toggle)
+  if (await isOpen()) return
+  // 用 dispatchEvent(MouseEvent) 而不是 el.click()/wdio click：
+  // 实测详情页 ⋯ 按钮上两者都不触发 app.js 的 document 委托（菜单不展开），
+  // 而合成 MouseEvent 能正常冒泡到委托（2026-11-09 探针：before true →
+  // after false）。toggle 分支是 hidden 取反，重试点到「展开」为止。
+  for (let i = 0; i < 3; i += 1) {
+    await browser.execute((el) => {
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    }, toggle)
+    if (await isOpen()) return
+    await browser.pause(150)
+  }
+  throw new Error(
+    `下拉菜单未展开：${typeof target === 'string' ? target : '(element)'}`,
+  )
+}
+
+/** 按可见文本点元素（菜单项没有稳定 class 时用；.tb-item/.split-menu a） */
+export async function clickByText(selector, text) {
+  const els = await $$(selector)
+  for (const el of els) {
+    if ((await el.getText()).includes(text)) {
+      await el.click()
+      return
+    }
+  }
+  throw new Error(`找不到含「${text}」的元素：${selector}`)
+}
+
+/**
+ * 页面内确认模态（app.js 的 mbxConfirmLeave）。
+ * 2026-11 起 hx-confirm 不再走 window.confirm——htmx 2.0.6 硬编码调用
+ * window.confirm 在 Tauri WKWebView 恒返 false，项目改用 htmx:confirm +
+ * 页面内模态，所以 autoConfirm 覆盖 window.confirm 已无效，必须点模态按钮。
+ * 返回模态正文，供断言具体提示语。
+ */
+export async function confirmModalText() {
+  await browser.waitUntil(
+    async () =>
+      browser.execute(() => !!document.getElementById('mbx-leave-confirm')),
+    { timeout: 10000, timeoutMsg: '确认模态未出现' },
+  )
+  return browser.execute(
+    () => document.querySelector('#mbx-leave-confirm p')?.textContent ?? '',
+  )
+}
+
+async function dismissConfirm(buttonSelector) {
+  await $(`#mbx-leave-confirm ${buttonSelector}`).click()
+  await browser.waitUntil(
+    async () =>
+      browser.execute(() => !document.getElementById('mbx-leave-confirm')),
+    { timeout: 5000, timeoutMsg: '确认模态未关闭' },
+  )
+}
+
+/** 确认（[data-leave-ok]，默认「放弃并离开」/「确定删除」） */
+export async function acceptConfirm() {
+  await dismissConfirm('[data-leave-ok]')
+}
+
+/** 取消（[data-leave-cancel]，默认「继续编辑」/「取消」） */
+export async function cancelConfirm() {
+  await dismissConfirm('[data-leave-cancel]')
 }
 
 /**

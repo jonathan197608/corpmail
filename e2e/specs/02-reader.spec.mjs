@@ -72,4 +72,41 @@ describe('02 读信与检索', () => {
     })
     await shot('检索-清空恢复')
   })
+
+  // 2026-11 UI 改版：动作区整行移入顶栏、标题并入正文卡片、预览弹窗去掉
+  // 工具栏行（Office/PDF 另存入口收敛到详情页附件列表）
+  it('详情页结构：动作在顶栏、标题在卡片内、预览无工具栏', async () => {
+    const rows = await $$('.mail-row')
+    for (const row of rows) {
+      if ((await row.getText()).includes('季度报表')) {
+        await row.$('.mr-link').click()
+        break
+      }
+    }
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).includes('/emails/'),
+      { timeoutMsg: '未进入详情页' },
+    )
+    await waitBoot()
+
+    const s = await browser.execute(() => {
+      const tb = document.querySelector('.tb-actions')
+      const card = document.querySelector('.mail-detail')
+      return {
+        hasReply: !!tb?.querySelector('a[href*="reply_to"]'),
+        hasForward: !!tb?.querySelector('a[href*="forward_from"]'),
+        hasDelete: !!tb?.querySelector('button[hx-post*="/delete"]'),
+        splitCount: tb?.querySelectorAll('[data-split-toggle]').length ?? 0,
+        titleInCard: !!card?.querySelector('.md-detail-title'),
+        toolbarGone: !document.getElementById('pm-toolbar'),
+      }
+    })
+    expect(s.hasReply).toBe(true)
+    expect(s.hasForward).toBe(true)
+    expect(s.hasDelete).toBe(true)
+    expect(s.splitCount).toBeGreaterThanOrEqual(2) // 回复▾ + ⋯
+    expect(s.titleInCard).toBe(true)
+    expect(s.toolbarGone).toBe(true)
+    await shot('读信-顶栏动作区')
+  })
 })

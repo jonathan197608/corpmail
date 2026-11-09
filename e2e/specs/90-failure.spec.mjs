@@ -131,4 +131,18 @@ describe('90 失败链路', () => {
     expect(await $('input[name="subject"]').getValue()).toContain('E2E 发送失败注入')
     await shot('失败-重发回撰写页')
   })
+
+  it('F5 导出空目标：toast 提示未选择保存位置，不落盘', async () => {
+    await goto('/')
+    await waitBoot()
+    const rows = await $$('.mail-row')
+    expect(rows.length).toBeGreaterThan(0)
+    const id = await rows[0].getAttribute('data-mail-id')
+    const res = await htmxAjax('POST', `/emails/${id}/export-eml`, { dest: '' })
+    expect(res.text).toContain('未选择保存位置')
+    // Markdown 导出同一入口逻辑
+    const res2 = await htmxAjax('POST', `/emails/${id}/export-md`, { dest: '  ' })
+    expect(res2.text).toContain('未选择保存位置')
+    await shot('失败-导出空目标拦截')
+  })
 })
