@@ -2241,14 +2241,7 @@ a.btn.link.disabled {
     border-radius: 8px;
     padding: 7px 10px;
 }
-.body-field .plain-head {
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 6px;
-}
-.upgrade-btn {
-    margin-top: 0;
-}
+/* 升级富文本入口：已并入撰写页 .body-tools 工具行（margin-left:auto 靠右） */
 #toolbar-container {
     border: 1px solid var(--line);
     border-bottom: none;
@@ -3105,15 +3098,15 @@ a.btn.link.disabled {
     cursor: pointer;
 }
 
-/* ============ 邮件模板（B2） ============ */
-.tpl-bar {
+/* 撰写页工具行：插入模板下拉 + 升级富文本按钮合并一行（按钮靠右） */
+.body-tools {
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
 }
 
-.tpl-bar select {
+.body-tools select {
     font-size: 12.5px;
     color: var(--ink-soft);
     border: 1px solid var(--line);
@@ -3124,10 +3117,14 @@ a.btn.link.disabled {
     max-width: 260px;
 }
 
-.tpl-bar select:focus {
+.body-tools select:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.body-tools .upgrade-btn {
+    margin-left: auto;
 }
 
 .tpl-hint {

@@ -725,6 +725,9 @@ function mbxUpgradeHtml() {
     if (mbxEditor) {
         if (plainBox) plainBox.hidden = true;
         if (htmlBox) htmlBox.hidden = false;
+        // 升级入口已移出 #body-plain（与插入模板同一工具行），需单独隐藏
+        const tools = document.getElementById('plain-tools');
+        if (tools) tools.hidden = true;
         if (mode) mode.value = 'html';
     }
 }

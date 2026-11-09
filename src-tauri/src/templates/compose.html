@@ -55,9 +55,11 @@
                     {# 无标签栏：正文区全宽（wangEditor 工具栏即视觉分区） #}
                     <input type="hidden" name="body_mode" id="body-mode" value="{{ body_mode }}">
 
-                    {# 邮件模板（B2）：选择后插入正文光标处（纯文本）/ 编辑器光标处（富文本） #}
-                    {% if templates %}
-                    <div class="tpl-bar">
+                    {# 工具行：插入模板（有模板时）+ 升级富文本（纯文本模式时），
+                       合并在一行——模板下拉靠左、升级按钮 margin-left:auto 靠右，
+                       上下留空 4px（原两行合计 14px），与正文区视觉衔接更紧凑 #}
+                    <div class="body-tools">
+                        {% if templates %}
                         <select id="tpl-select" aria-label="插入模板">
                             <option value="">📄 插入模板…</option>
                             {% for t in templates %}
@@ -65,15 +67,15 @@
                             {% endfor %}
                         </select>
                         <span class="tpl-hint">插入到当前光标位置</span>
-                    </div>
-                    {% endif %}
-
-                    {# 纯文本区：textarea + 单向升级入口（HTML 不能降级回纯文本） #}
-                    <div id="body-plain" {% if body_mode == 'html' %}hidden{% endif %}>
-                        <div class="plain-head">
+                        {% endif %}
+                        <div id="plain-tools" {% if body_mode == 'html' %}hidden{% endif %}>
                             <button type="button" class="btn small upgrade-btn" onclick="mbxUpgradeHtml()"
                                     title="把当前纯文本转为富文本（不可再降级）">切换为富文本 ›</button>
                         </div>
+                    </div>
+
+                    {# 纯文本区：textarea（单向升级入口在上方工具行，HTML 不能降级回纯文本） #}
+                    <div id="body-plain" {% if body_mode == 'html' %}hidden{% endif %}>
                         <textarea name="body_text" id="body-text" rows="14">{{ body_text }}</textarea>
                     </div>
 
