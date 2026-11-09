@@ -160,6 +160,28 @@ async function mbxExportEml(emailId, filename) {
     }
 }
 
+// 导出 Markdown：选保存文件 → 服务端组装 front matter + 正文 + 附件清单的
+// MD 写盘（供 AI 分析处理）。与 .eml 导出同一交互模式，共用防抖标志。
+async function mbxExportMd(emailId, filename) {
+    if (mbxExportBusy) return;
+    mbxExportBusy = true;
+    try {
+        const dest = await window.__TAURI__.dialog.save({
+            defaultPath: filename || `corpmail-${emailId}.md`
+        });
+        if (!dest) return;
+        await htmx.ajax('POST', `/emails/${emailId}/export-md`, {
+            target: '#toast',
+            swap: 'innerHTML',
+            values: { dest }
+        });
+    } catch (e) {
+        console.error('[mbx] 导出 Markdown 失败', e);
+    } finally {
+        mbxExportBusy = false;
+    }
+}
+
 // 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
 // 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区。
 // 请求护栏（M5 防抖审计）：弹窗+请求全程只允许一次在途

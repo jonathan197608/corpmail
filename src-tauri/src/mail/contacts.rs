@@ -48,17 +48,51 @@ pub fn parse_addr_list(raw: &str) -> Vec<(String, String)> {
     out
 }
 
+/// 自动采集地址的可入库判定（比 `validate_addr` 宽松——允许无点内网域名，
+/// 但拦控制字符/空白/分隔符/尖括号/超长）。这些地址可能来自恶意邮件头，
+/// 脏数据会污染建议列表与模糊匹配；显示层虽有 HTML 转义兜底，仍应入库前拦截。
+fn addr_plausible(addr: &str) -> bool {
+    addr.len() <= 254
+        && addr
+            .rsplit_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
+        && !addr.chars().any(|c| {
+            c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | '"' | ',' | ';' | '\'')
+        })
+}
+
+/// 联系人姓名清洗：控制字符折叠为单个空格（连续 CR/LF 不产生连续空位），
+/// 头尾控制不产空白——恶意邮件头的 CR/LF 不应进入建议列表与联系人页。
+fn name_safe(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut pending_space = false;
+    for ch in name.chars() {
+        if ch.is_control() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// 写入/合并一条联系人（事务内或独立连接均可）。
 ///
-/// 空地址忽略；已有记录时：新姓名非空才覆盖（避免后续只带地址的邮件清掉姓名），
+/// 空地址/不可信地址忽略；已有记录时：新姓名非空才覆盖（避免后续只带地址的邮件清掉姓名），
 /// hits 累加、updated_at 取新旧最大值——`at` 传入的是**邮件实际往来时间**，
 /// 历史邮件/乱序收取（先收新信后收旧信）不得把"最近联系"往回拨。
 pub fn upsert_conn(conn: &Connection, addr: &str, name: &str, at: i64) -> rusqlite::Result<()> {
     let addr = addr.trim();
-    if addr.is_empty() || !addr.contains('@') {
+    if !addr_plausible(addr) {
         return Ok(());
     }
-    let name = name.trim();
+    let name = name_safe(name.trim());
     conn.execute(
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
          ON CONFLICT(addr) DO UPDATE SET

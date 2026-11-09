@@ -13,6 +13,8 @@
 pub mod contacts;
 /// .eml 导出与「作为附件转发」（B4/B6）
 pub mod eml;
+/// 导出 Markdown（供 AI 分析处理）
+pub mod md;
 /// Office 附件预览安全预处理与文本兜底（B8）
 pub mod office;
 mod recv;
@@ -410,44 +412,7 @@ pub fn strip_html(html: &str) -> String {
                     break;
                 }
             },
-            b'&' => {
-                // 实体：扫描到 ';'（最多 8 字符）；未闭合则原样输出
-                let rest = &html[i + 1..];
-                match rest.find(';').filter(|pos| *pos <= 8) {
-                    Some(pos) => {
-                        match &rest[..pos] {
-                            "nbsp" => out.push(' '),
-                            "lt" => out.push('<'),
-                            "gt" => out.push('>'),
-                            "amp" => out.push('&'),
-                            "quot" => out.push('"'),
-                            // 数字字符引用：&#20320;（十进制）/ &#x4f60;（十六进制）。
-                            // 中文邮件常把正文编码成数字实体（GB2312 网关/老客户端
-                            // 常见）；此前走 other 分支原样输出残串（"#20320"），
-                            // 列表预览即"乱码"而详情页（浏览器解码）正常。
-                            // 非法码位（0/越大/代理区）原样保留，不 panic
-                            other if other.starts_with('#') => {
-                                let num = other[1..].strip_prefix(['x', 'X']);
-                                let parsed = match num {
-                                    Some(hex) => u32::from_str_radix(hex, 16),
-                                    None => other[1..].parse::<u32>(),
-                                };
-                                match parsed.ok().and_then(char::from_u32) {
-                                    // 控制字符（含 \0）对预览/检索文本无意义，原样保留标记
-                                    Some(c) if !c.is_control() => out.push(c),
-                                    _ => out.push_str(other),
-                                }
-                            }
-                            other => out.push_str(other),
-                        }
-                        i += 1 + pos + 1;
-                    }
-                    None => {
-                        out.push('&');
-                        i += 1;
-                    }
-                }
-            }
+            b'&' => decode_entity(html, &mut i, &mut out),
             _ => {
                 let ch = html[i..].chars().next().unwrap_or(' ');
                 out.push(ch);
@@ -456,6 +421,47 @@ pub fn strip_html(html: &str) -> String {
         }
     }
     out
+}
+
+/// HTML 实体解码一步（strip_html 与 MD 导出共用）：从 `&` 起扫描到 `;`
+/// （最多 8 字符），命中已知实体解码；未闭合/未知原样输出。
+/// `i` 指向 `&` 字节，返回时推进到实体之后。
+fn decode_entity(html: &str, i: &mut usize, out: &mut String) {
+    let rest = &html[*i + 1..];
+    match rest.find(';').filter(|pos| *pos <= 8) {
+        Some(pos) => {
+            match &rest[..pos] {
+                "nbsp" => out.push(' '),
+                "lt" => out.push('<'),
+                "gt" => out.push('>'),
+                "amp" => out.push('&'),
+                "quot" => out.push('"'),
+                // 数字字符引用：&#20320;（十进制）/ &#x4f60;（十六进制）。
+                // 中文邮件常把正文编码成数字实体（GB2312 网关/老客户端
+                // 常见）；此前走 other 分支原样输出残串（"#20320"），
+                // 列表预览即"乱码"而详情页（浏览器解码）正常。
+                // 非法码位（0/越大/代理区）原样保留，不 panic
+                other if other.starts_with('#') => {
+                    let num = other[1..].strip_prefix(['x', 'X']);
+                    let parsed = match num {
+                        Some(hex) => u32::from_str_radix(hex, 16),
+                        None => other[1..].parse::<u32>(),
+                    };
+                    match parsed.ok().and_then(char::from_u32) {
+                        // 控制字符（含 \0）对预览/检索文本无意义，原样保留标记
+                        Some(c) if !c.is_control() => out.push(c),
+                        _ => out.push_str(other),
+                    }
+                }
+                other => out.push_str(other),
+            }
+            *i += 1 + pos + 1;
+        }
+        None => {
+            out.push('&');
+            *i += 1;
+        }
+    }
 }
 
 fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {

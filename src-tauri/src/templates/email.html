@@ -23,6 +23,8 @@
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
                         <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
                         <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
                     </div>
@@ -34,6 +36,8 @@
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
                         <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
                         <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
                     </div>
@@ -57,6 +61,8 @@
                     <div class="split-menu" hidden>
                         <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
                                 title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
                         <button type="button" onclick="mbxPrintEmail()"
                                 title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">🖨 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"

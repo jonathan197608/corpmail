@@ -276,3 +276,58 @@ fn list_rows_filters_and_remove_deletes() {
     assert!(after.iter().all(|r| r.addr != "b@x.cn"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 自动采集地址入库判定（安全修复③）：控制字符/空白/分隔符/尖括号/超长/缺 @ 拒绝
+#[test]
+fn upsert_rejects_dirty_addresses_and_names() {
+    let (state, dir) = temp_state("dirty-addr");
+    state
+        .with_conn(|c| {
+            // 正常地址入库
+            upsert_conn(c, "ok@x.cn", "正常", 100).unwrap();
+            // CRLF 注入形态（邮件头拆行攻击）
+            upsert_conn(c, "evil@x.cn\r\nBcc: victim@x.cn", "注入", 100).unwrap();
+            // 空白/尖括号/引号/逗号（分隔符残留）
+            upsert_conn(c, "sp ace@x.cn", "a", 100).unwrap();
+            upsert_conn(c, "<angle@x.cn>", "a", 100).unwrap();
+            upsert_conn(c, "quote\"@x.cn", "a", 100).unwrap();
+            // 缺 @ / 空段
+            upsert_conn(c, "no-at-sign", "a", 100).unwrap();
+            upsert_conn(c, "@x.cn", "a", 100).unwrap();
+            upsert_conn(c, "a@", "a", 100).unwrap();
+            // 超长（> 254）
+            let long = format!("{}@x.cn", "a".repeat(260));
+            upsert_conn(c, &long, "a", 100).unwrap();
+            // 姓名控制字符清洗（地址合法）
+            upsert_conn(c, "name@x.cn", "张\r\n三", 100).unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let rows: Vec<(String, String)> = state
+        .with_conn(|c| {
+            Ok::<Vec<(String, String)>, rusqlite::Error>(
+                list_rows(c, "", 500, ContactsSort::Recent)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.addr, r.name))
+                    .collect(),
+            )
+        })
+        .unwrap();
+    let addrs: Vec<&str> = rows.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(rows.len(), 2, "仅两条合法地址应入库：{rows:?}");
+    assert!(addrs.contains(&"ok@x.cn"), "{rows:?}");
+    assert!(addrs.contains(&"name@x.cn"), "{rows:?}");
+    assert!(
+        !addrs.iter().any(|a| a.contains('\n') || a.contains('\r')),
+        "CR/LF 地址不得入库：{rows:?}"
+    );
+    // 姓名清洗：CR/LF 替换为空格，不残留控制字符
+    let name = rows
+        .iter()
+        .find(|(a, _)| a == "name@x.cn")
+        .map(|(_, n)| n)
+        .unwrap();
+    assert_eq!(name, "张 三", "姓名控制字符应替换为空格：{name:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

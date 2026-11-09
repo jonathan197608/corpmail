@@ -20,7 +20,7 @@ use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use url::form_urlencoded;
 
@@ -272,6 +272,8 @@ struct EmailCtx {
     notice: String,
     /// B4 导出 .eml 的推荐文件名（主题清洗后 + .eml）
     export_name: String,
+    /// 导出 Markdown 的推荐文件名（与 .eml 同源清洗，扩展名 .md）
+    export_md_name: String,
 }
 
 /// 源码页（A5）：排查正文乱码、HTML 表格丢失、投递链路问题。
@@ -460,6 +462,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         // B4 导出 .eml（前端选保存位置后 POST）
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/export-eml") => {
             Some(email_export_eml(state, req))
+        }
+        // 导出 Markdown（供 AI 分析；前端选保存位置后 POST）
+        ("POST", p) if p.starts_with("/emails/") && p.ends_with("/export-md") => {
+            Some(email_export_md(state, req))
         }
         ("POST", p) if p.starts_with("/emails/") && p.ends_with("/resend") => {
             Some(email_resend(state, req))
@@ -881,6 +887,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let back_href = detail_back_href(req, &folder);
     let list_query = list_query_of(req, &folder);
     let export_name = mail::eml::suggested_filename(&email.subject, email.id);
+    let export_md_name = mail::md::suggested_filename(&email.subject, email.id);
     Some(render_html(
         "email.html",
         &EmailCtx {
@@ -894,6 +901,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             bcc_chips,
             notice,
             export_name,
+            export_md_name,
         },
     ))
 }
@@ -1043,6 +1051,37 @@ fn email_export_eml(state: &AppState, req: &Req) -> Resp {
     }
     match mail::eml::build_eml(state, id) {
         Ok(bytes) => match std::fs::write(&dest, bytes) {
+            Ok(()) => toast("ok", &format!("已导出到 {dest}")),
+            Err(e) => toast("err", &format!("写入失败：{e}")),
+        },
+        Err(e) => toast("err", &e),
+    }
+}
+
+/// 导出 Markdown（POST /emails/{id}/export-md）：与 .eml 导出同一交互模式
+/// （前端保存对话框选好 dest 后 POST），由 md::build_md 组装
+/// front matter + 正文 + 附件清单的 MD 文本写盘，方便交给 AI 分析处理。
+fn email_export_md(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    let form = parse_form(&req.body);
+    let Some(dest) = trimmed_field(&form, "dest") else {
+        return Resp::html(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">未选择保存位置</div>"#.into(),
+        );
+    };
+    let toast = |cls: &str, msg: &str| {
+        Resp::html(format!(
+            r#"<div id="toast" class="toast {cls}" hx-swap-oob="true">{}</div>"#,
+            html_escape(msg)
+        ))
+    };
+    if let Err(e) = mail::guard_sensitive_path(state, &dest) {
+        return toast("err", &e);
+    }
+    match mail::md::build_md(state, id) {
+        Ok(text) => match std::fs::write(&dest, text) {
             Ok(()) => toast("ok", &format!("已导出到 {dest}")),
             Err(e) => toast("err", &format!("写入失败：{e}")),
         },
@@ -1575,15 +1614,17 @@ fn proxy_image(req: &Req) -> Resp {
     if !matches!(parsed.scheme(), "http" | "https") {
         return proxy_error(400, "仅支持 http/https");
     }
-    let Some(host) = parsed.host_str() else {
-        return proxy_error(400, "缺少主机");
+    // DNS 重绑定加固：先解析一次并校验全部地址为公网，再把这批地址固定给
+    // resolver 建连——连接不再二次解析，恶意 DNS 无法在校验与建连之间切换
+    // 回内网地址（旧实现"校验后按域名再连"的残留风险，至此闭合）。
+    let addrs = match resolve_public_addrs(&parsed) {
+        Ok(a) => a,
+        Err(msg) => return proxy_error(403, msg),
     };
-    if !is_public_host(host) {
-        return proxy_error(403, "禁止访问内网地址");
-    }
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .redirects(0)
+        .resolver(move |_: &str| Ok(addrs.clone()))
         .build();
     let resp = match agent.get(&raw).set("Accept", "image/*").call() {
         Ok(r) => r,
@@ -1625,17 +1666,32 @@ fn proxy_error(status: u16, msg: &str) -> Resp {
     }
 }
 
-/// 仅允许公网主机：拒绝 localhost/单标签主机；解析后任一地址为内网即拒绝。
-/// （未做 IP 固定连接，DNS 重绑定属本地代理可接受的残留风险）
-fn is_public_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || !host.contains('.') {
-        return false;
-    }
-    let addrs: Vec<IpAddr> = match (host, 0u16).to_socket_addrs() {
-        Ok(it) => it.map(|s| s.ip()).collect(),
-        Err(_) => return false,
+/// 解析 URL 主机并校验全部为公网地址，返回固定给 resolver 的地址集。
+/// 字面量 IP 直接构造（不经过系统解析器）；域名解析一次（localhost 与
+/// 无点单标签拒绝，与旧口径一致）。任一地址命中内网即整体拒绝。
+fn resolve_public_addrs(parsed: &url::Url) -> Result<Vec<SocketAddr>, &'static str> {
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = match parsed.host() {
+        Some(url::Host::Domain(d)) => {
+            if d.eq_ignore_ascii_case("localhost") || !d.contains('.') {
+                return Err("禁止访问内网地址");
+            }
+            (d, port)
+                .to_socket_addrs()
+                .map_err(|_| "无法解析服务器地址")?
+                .collect()
+        }
+        Some(url::Host::Ipv4(v)) => vec![SocketAddr::from((v, port))],
+        Some(url::Host::Ipv6(v)) => vec![SocketAddr::from((v, port))],
+        None => return Err("缺少主机"),
     };
-    !addrs.is_empty() && addrs.iter().all(|ip| !is_private_ip(*ip))
+    if addrs.is_empty() {
+        return Err("无法解析服务器地址");
+    }
+    if addrs.iter().any(|a| is_private_ip(a.ip())) {
+        return Err("禁止访问内网地址");
+    }
+    Ok(addrs)
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {

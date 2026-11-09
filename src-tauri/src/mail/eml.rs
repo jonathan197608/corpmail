@@ -12,11 +12,21 @@ use crate::state::AppState;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-/// RFC 2047 B 编码：纯 ASCII 原样返回；非 ASCII 按字符累积分段（≈45 字节），
-/// 段间用 CRLF + 空格折行，避免长主题头超 76 字符
+/// 头部值清洗：控制字符（含 CR/LF）替换为空格。库内字段来自收件解析或用户
+/// 输入，若夹带 CRLF 会被拼进头部产生头注入（伪造 From/To/X-* 等）；
+/// RFC 5322 头值域本就不允许裸控制字符，清洗无信息损失。
+fn head_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// RFC 2047 B 编码：纯 ASCII 原样返回（控制字符已清洗）；非 ASCII 按字符累积分段
+/// （≈45 字节），段间用 CRLF + 空格折行，避免长主题头超 76 字符
 fn rfc2047(s: &str) -> String {
+    let s = head_safe(s);
     if s.is_ascii() {
-        return s.to_string();
+        return s;
     }
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -33,18 +43,20 @@ fn rfc2047(s: &str) -> String {
     out.join("\r\n ")
 }
 
-/// 简单地址头：`Name <addr>`（姓名按 RFC 2047 编码）
+/// 简单地址头：`Name <addr>`（姓名按 RFC 2047 编码；两者都过控制字符清洗）
 fn addr_header(name: &str, addr: &str) -> String {
-    let name = name.trim();
+    let name = head_safe(name.trim());
+    let addr = head_safe(addr.trim());
     if name.is_empty() {
-        return addr.trim().to_string();
+        return addr;
     }
-    format!("{} <{}>", rfc2047(name), addr.trim())
+    format!("{} <{}>", rfc2047(&name), addr)
 }
 
-/// 逗号分隔地址串 → 地址头（姓名未知，只拼纯地址；过滤空段）
+/// 逗号分隔地址串 → 地址头（姓名未知，只拼纯地址；过滤空段；控制字符清洗）
 fn addr_list_header(raw: &str) -> String {
-    raw.split(',')
+    head_safe(raw)
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -173,7 +185,8 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
     let message_id = if message_id.trim().is_empty() {
         format!("<corpmail-{email_id}@localhost>")
     } else {
-        message_id.trim().to_string()
+        // Message-Id 来自收件头解析，可能夹带控制字符——清洗后再拼头
+        head_safe(message_id.trim())
     };
 
     // 附件字节（detached/缺失的跳过：导出不因一个已清理附件整体失败）

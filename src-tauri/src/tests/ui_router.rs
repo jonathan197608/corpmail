@@ -7597,3 +7597,120 @@ fn office_preview_routes_report_expected_errors() {
     assert!(String::from_utf8_lossy(&resp.body).contains("PPTX"));
     cleanup(&dir);
 }
+
+/// 导出 Markdown 路由（B9）：dest 落盘 + front matter/正文/附件结构；
+/// 敏感路径守卫与未选位置提示与 .eml 同口径。
+#[test]
+fn export_md_route_writes_file() {
+    let (state, dir) = temp_state("b9-export-md");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                subject, body_text, body_html, subject_tokens, body_tokens,
+                                unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','客户张','demo@chinatelecom.cn',
+                     '配案说明',
+                     '占位正文','<p>第一段</p><ul><li>要点一</li><li>要点二</li></ul>',
+                     'x','y',1,1,1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let dest = dir.join("out.md");
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/export-md",
+            &form(&[("dest", dest.to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    let html = body(&resp);
+    assert!(html.contains("已导出到"), "应回成功 toast：{html}");
+    let raw = std::fs::read_to_string(&dest).unwrap();
+    assert!(raw.starts_with("---\n"), "front matter 开头：{raw}");
+    assert!(raw.contains("subject: \"配案说明\""), "{raw}");
+    assert!(raw.contains("from: \"客户张 <a@189.cn>\""), "{raw}");
+    assert!(raw.contains("## 正文"), "{raw}");
+    // HTML 正文应转块级结构：段落与列表空行分隔、列表项紧凑
+    assert!(raw.contains("第一段\n\n- 要点一\n- 要点二"), "{raw}");
+    // 未选保存位置
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/export-md", &form(&[])),
+        &tester,
+    );
+    assert!(body(&resp).contains("未选择保存位置"));
+    cleanup(&dir);
+}
+
+/// 安全修复①端到端：库内主题/地址含 CR/LF 时，导出 .eml 不产生头注入。
+/// 主题夹带 `\r\nBcc: evil@x.cn` 若未清洗会被拼成新头（伪造收件人）。
+#[test]
+fn export_eml_strips_crlf_from_headers() {
+    let (state, dir) = temp_state("b4-crlf");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let evil_subject = "normal subject\r\nBcc: evil@attacker.example";
+    let evil_from = "spoofer@x.cn\r\nX-Injected: yes";
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                message_id, body_text, subject_tokens, body_tokens,
+                                unread, created_at, received_at)
+             VALUES ('in','inbox','received',?1,'demo@chinatelecom.cn',?2,?3,
+                     '正文','x','y',1,1,1)",
+                rusqlite::params![evil_from, evil_subject, "<fake\r\nid@x>"],
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let dest = dir.join("out.eml");
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/emails/1/export-eml",
+            &form(&[("dest", dest.to_str().unwrap())]),
+        ),
+        &tester,
+    );
+    assert!(body(&resp).contains("已导出到"));
+    let raw = std::fs::read_to_string(&dest).unwrap();
+    // 头区（首个空行前）不得出现注入头：任何 CRLF 后接 "Bcc:"/"X-Injected:"/"id@"
+    let (head, rest) = raw.split_once("\r\n\r\n").unwrap_or(("", &raw));
+    assert!(
+        !head.contains("\r\nBcc:") && !head.contains("\r\nX-Injected:"),
+        "头区被注入：{head:?}"
+    );
+    // CR/LF 应被替换为空格，注入载荷不得成为独立的头行（残留为 Subject
+    // 行内文本属预期——它已经不是头字段，无法伪造收件人）
+    for line in head.split("\r\n") {
+        let l = line.trim_start();
+        assert!(
+            !l.starts_with("Bcc:") && !l.starts_with("X-Injected:"),
+            "注入载荷成为独立头行：{head:?}"
+        );
+    }
+    assert!(!head.contains("\r\nid@"), "Message-ID 注入应清洗：{head:?}");
+    // 主体（正文部分）不受影响
+    let _ = rest;
+    cleanup(&dir);
+}
