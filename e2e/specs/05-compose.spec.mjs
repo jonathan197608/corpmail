@@ -45,7 +45,7 @@ describe('05 撰写与发送', () => {
     await $('.tpl-form input[name="name"]').setValue('E2E 撰写页预置模板')
     await $('.tpl-form textarea[name="body_text"]').setValue('收到，我这边核对后回复您。')
     await $('.tpl-form button[type="submit"]').click()
-    await waitText('#settings-pane', '✓ 已保存')
+    await waitText('#settings-pane', '已保存') // 勾选图标 SVG 化：只断文字
     await waitText('#settings-pane', 'E2E 撰写页预置模板')
     await shot('设置-新增模板成功')
 
@@ -223,7 +223,7 @@ describe('05 撰写与发送', () => {
     await goto('/compose')
     await waitBoot()
     await $(COMPOSE.subject).setValue('E2E 未保存离开验证')
-    // 等自动保存完成（hint 变「✓ 已自动保存 …」）。a5b5c00 的修复点就是
+    // 等自动保存完成（hint 变「已自动保存 …」）。a5b5c00 的修复点就是
     // 「自动保存不清除未保存语义」：此时离开仍必须弹确认
     await browser.waitUntil(
       async () => (await $('#autosave-hint').getText()).includes('已自动保存'),

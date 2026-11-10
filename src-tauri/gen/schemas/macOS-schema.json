@@ -2491,6 +2491,12 @@
           "type": "string",
           "const": "notification:deny-show",
           "markdownDescription": "Denies the show command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the plugin",
+          "type": "string",
+          "const": "wdio-webdriver:default",
+          "markdownDescription": "Default permissions for the plugin"
         }
       ]
     },

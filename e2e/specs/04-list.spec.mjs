@@ -19,6 +19,8 @@ import {
 //      `.tb-more .split-menu .tb-item`，需先点 [data-split-toggle] 展开
 //   2. 批量栏并入顶栏 `#batch-bar`，低频动作（标已读/标未读/星标/取消星标）
 //      收进「批量操作⋯」`.ba-more` 菜单；hx-confirm 改走页面内模态
+//   3. 2026-11-10：筛选开关自带状态（激活态图标勾选），无「显示全部」项，
+//      关闭 = 再点同一项；图标全面 SVG 化（筛选/收取按钮等）
 const subjectOf = async (row) => row.$('.mr-subject').getText()
 
 /** 列表顶栏 ⋯ 菜单里点一项（会整页导航） */
@@ -34,7 +36,7 @@ async function clickBatchMenu(text) {
 }
 
 describe('04 列表筛选与批量操作', () => {
-  it('B5 只看未读：⋯ 菜单开关后所有行都带 unread 类，切回恢复全量', async () => {
+  it('B5 只看未读：⋯ 菜单开关后所有行都带 unread 类，再点同一项切回恢复全量', async () => {
     await goto('/')
     await waitBoot()
     const before = (await $$('.mail-row')).length
@@ -53,7 +55,13 @@ describe('04 列表筛选与批量操作', () => {
     }
     await shot('列表-只看未读')
 
-    await clickListMenu('显示全部')
+    // 2026-11-10：开关自带状态（激活态图标 ✓），不再有独立的「显示全部」项；
+    // 再点同一项即关闭（unread_href 在激活态指向无参路径）
+    await clickListMenu('只看未读')
+    await browser.waitUntil(
+      async () => !(await browser.getUrl()).includes('unread=1'),
+      { timeoutMsg: '再点「只看未读」未取消过滤' },
+    )
     await waitBoot()
     await browser.waitUntil(
       async () => (await $$('.mail-row')).length === before,
@@ -73,8 +81,12 @@ describe('04 列表筛选与批量操作', () => {
     await waitText('.main', '没有外部邮件')
     await shot('列表-只看外部（空态）')
 
-    // 恢复全量，避免影响后续行数断言
-    await clickListMenu('显示全部')
+    // 恢复全量：同 B5，再点同一项关闭（无「显示全部」入口）
+    await clickListMenu('只看外部')
+    await browser.waitUntil(
+      async () => !(await browser.getUrl()).includes('external=1'),
+      { timeoutMsg: '再点「只看外部」未取消过滤' },
+    )
     await waitBoot()
     await browser.waitUntil(async () => (await $$('.mail-row')).length >= 3, {
       timeoutMsg: '外部过滤取消后未恢复全量',
@@ -227,19 +239,19 @@ describe('04 列表筛选与批量操作', () => {
     await shot('列表-清空选择')
   })
 
-  it('B16 高级检索面板：默认收起 → 🎛️ 高级展开 → 只看有附件应用筛选', async () => {
+  it('B16 高级检索面板：默认收起 → 高级展开 → 应用筛选后面板保持展开', async () => {
     await goto('/')
     await waitBoot()
     const hiddenAtStart = await browser.execute(
       () => document.getElementById('adv-panel').hidden,
     )
-    expect(hiddenAtStart).toBe(true) // 2026-11 改版：即使有激活条件也默认收起
+    expect(hiddenAtStart).toBe(true) // 无激活条件时默认收起
 
     await $('#adv-toggle').click()
     await browser.waitUntil(
       async () =>
         !(await browser.execute(() => document.getElementById('adv-panel').hidden)),
-      { timeoutMsg: '点「🎛️ 高级」后面板未展开' },
+      { timeoutMsg: '点「高级」后面板未展开' },
     )
     await shot('检索-高级面板展开')
 
@@ -257,14 +269,23 @@ describe('04 列表筛选与批量操作', () => {
     const rows = await $$('.mail-row')
     expect(rows.length).toBe(1)
     expect(await subjectOf(rows[0])).toContain('季度报表')
-    await shot('检索-高级面板应用筛选')
+    // 2026-11-09 改版：应用筛选后面板保持展开（否则用户看不到/改不了当前
+    // 条件）；入口按钮带 on 状态表示有激活筛选
+    const keptOpen = await browser.execute(() => ({
+      panelOpen: !document.getElementById('adv-panel').hidden,
+      toggleOn: document.getElementById('adv-toggle')?.classList.contains('on'),
+    }))
+    expect(keptOpen.panelOpen).toBe(true)
+    expect(keptOpen.toggleOn).toBe(true)
+    await shot('检索-应用筛选后面板保持展开')
 
-    // 清除筛选 → 恢复全量
-    await $('#adv-toggle').click()
+    // 面板已展开，直接清除筛选 → 恢复全量（旧版需要先再点—次开关，
+    // 新行为下再点会收起反而点不到清除按钮）
     await $('#adv-clear').click()
     await browser.waitUntil(async () => (await $$('.mail-row')).length >= 3, {
       timeoutMsg: '清除筛选后未恢复全量',
     })
+    await waitBoot()
   })
 
   it('B12 高级检索·发件人：from=张伟 命中欢迎邮件', async () => {

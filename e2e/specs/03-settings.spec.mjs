@@ -75,6 +75,37 @@ describe('03 设置与收件状态', () => {
     await shot('设置-数据目录待生效')
   })
 
+  it('E6 字段说明改气泡：聚焦显示、Esc 关闭（hint 小字改版回归）', async () => {
+    // 2026-11-10：设置页 label 后的 12px hint 小字改为 info 图标气泡，
+    // 悬停/聚焦/点击/Enter 显示，Esc/滚动/失焦关闭；浮层挂 body 不受裁剪
+    await goto('/settings/sync')
+    await waitBoot()
+    const state = await browser.execute(() => {
+      const t = document.querySelector('.tip-i[data-tip]')
+      if (!t) return null
+      t.focus() // focusin → show
+      const layer = document.querySelector('.tip-layer')
+      return {
+        tip: t.getAttribute('data-tip'),
+        visible: !!layer && !layer.hidden,
+        text: layer ? layer.textContent : '',
+      }
+    })
+    expect(state && state.tip).toBeTruthy()
+    expect(state.visible).toBe(true)
+    expect(state.text).toBe(state.tip)
+    await shot('设置-气泡说明聚焦显示')
+
+    await browser.execute(() =>
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })),
+    )
+    const closed = await browser.execute(() => {
+      const l = document.querySelector('.tip-layer')
+      return !l || l.hidden
+    })
+    expect(closed).toBe(true)
+  })
+
   it('关于页签', async () => {
     await goto('/settings/about')
     await shot('设置-关于')

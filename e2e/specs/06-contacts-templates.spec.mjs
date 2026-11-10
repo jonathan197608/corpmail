@@ -156,7 +156,8 @@ describe('06 联系人与模板', () => {
         (o) => o.textContent.trim(),
       ),
     )
-    expect(opts).toEqual(['最近联系', '联系最多', '姓名'])
+    // 排序下拉选项（含后加的「地址」：recent/hits/name/addr 四项）
+    expect(opts).toEqual(['最近联系', '联系最多', '姓名', '地址'])
     expect(
       await browser.execute(
         () => document.querySelector('.per-form select[name="sort"]').value,
@@ -218,7 +219,7 @@ describe('06 联系人与模板', () => {
         '<p>富文本模板正文 <b>加粗</b></p>'
     })
     await $('.tpl-form button[type="submit"]').click()
-    await waitText('#settings-pane', '✓ 已保存')
+    await waitText('#settings-pane', '已保存') // 勾选图标 SVG 化后只断文字
     await browser.waitUntil(
       async () => (await countTemplates(RICH)) === before + 1,
       { timeoutMsg: '富文本模板保存后列表未新增' },

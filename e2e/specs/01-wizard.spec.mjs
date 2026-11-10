@@ -21,6 +21,9 @@ describe('01 首启向导与首次收件', () => {
     await expect($('input[name="smtp_port"]')).toHaveValue('465')
     await expect($('input[name="recv_port"]')).toHaveValue('993')
     await expect($('select[name="recv_security"]')).toHaveValue('auto')
+    // 字段说明已改气泡触发点（2026-11-10）：登录账号/数据保存目录两处
+    const tips = await browser.execute(() => document.querySelectorAll('.tip-i').length)
+    expect(tips).toBeGreaterThanOrEqual(2)
     await shot('向导-默认配置')
   })
 

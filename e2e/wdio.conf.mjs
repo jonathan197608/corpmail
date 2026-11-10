@@ -30,7 +30,9 @@ process.env.HOME = HOME
 
 export const config = {
   runner: 'local',
-  specs: ['./specs/**/*.spec.mjs'],
+  // 单层 glob：specs/*.spec.mjs = 主链路（00-07 + 90）；
+  // specs/phase2/ 由 run.sh 第二阶段显式 --spec 调起（需重装前置状态）
+  specs: ['./specs/*.spec.mjs'],
   maxInstances: 1,
   logLevel: 'info',
   bail: 0,

@@ -64,7 +64,9 @@ describe('02 读信与检索', () => {
   })
 
   it('清空检索恢复全量列表', async () => {
-    await $('a.search-clear').click()
+    // 2026-11-09 改版：q 非空时搜索框右侧是「清除」链接（.adv-toggle 复用自
+    // 高级检索入口位），原 search-clear × 已随图标 SVG 化移除
+    await $('a.adv-toggle').click()
     await waitBoot()
     await browser.waitUntil(async () => (await $$('.mail-row')).length >= 3, {
       timeout: 15000,

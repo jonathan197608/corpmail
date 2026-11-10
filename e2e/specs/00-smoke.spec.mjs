@@ -22,4 +22,19 @@ describe('00 启动与欢迎页', () => {
     const text = (await status.isExisting()) ? await status.getText() : ''
     expect(text).not.toContain('凭据缺失')
   })
+
+  it('图标 SVG 化：功能卡线性图标在场，正文不出现 emoji/文本符号', async () => {
+    // 2026-11-10 全站图标改内联 SVG（跨平台线重/基线一致）后的回归守卫：
+    // 欢迎页 3 张特性卡图标必须以内联 <svg class="ic"> 渲染，且页面文字
+    // 不得再出现 emoji 或 ✓✗✕● 一类文本符号（与单测禁用清单同源）
+    const iconCount = await browser.execute(
+      () => document.querySelectorAll('svg.ic').length,
+    )
+    expect(iconCount).toBeGreaterThanOrEqual(3)
+    const text = await browser.execute(() => document.body.innerText)
+    expect(text).not.toMatch(
+      /[✓✗✕●×⭐📎🗑📥📤📝👥⚙🔍🔎🔄⌨🖨💾📄📨📁🔒🗄⚠⏰⏳✏🌐🎛💬]/,
+    )
+    await shot('欢迎页-SVG图标')
+  })
 })
