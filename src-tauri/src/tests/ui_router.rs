@@ -3858,6 +3858,8 @@ fn dump_smoke_html() {
     dump("main-draft.html", get_url("/?folder=draft"));
     // 定时草稿详情页（「已定时」状态条）
     dump("email-scheduled.html", get(&format!("/emails/{d2}")));
+    // 既有数据沿用后的完成页（重装/换机采纳目录 → 沿用提示可见）
+    dump("done-reuse.html", get("/welcome/done"));
     // M2-2 会话视图素材：「全部」已移除（2026-11-09），仅收件箱会话列表
     dump("main-thread.html", get_url("/?mode=thread"));
     dump("thread-detail.html", get(&format!("/threads/{inbox_id}")));
@@ -8058,5 +8060,409 @@ fn settings_hints_use_tip_and_no_emoji_icons() {
             );
         }
     }
+    cleanup(&dir);
+}
+
+// ---------- 首设向导：既有数据目录的采纳/拒用（重装/换机找回历史邮件） ----------
+
+/// 造一个"上一台机器留下的"数据目录：corpmail.db 含 owner 账号的发件与
+/// 收件各一封，另写入已完成首拉的收件游标（采纳后应原样保留、增量续收）
+fn seed_old_store(dir: &std::path::Path, owner: &str) {
+    use rusqlite::params;
+    std::fs::create_dir_all(dir).unwrap();
+    let conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                            body_text, subject_tokens, body_tokens, unread, created_at, sent_at)
+         VALUES ('out','sent','sent',?1,'peer@x.cn','旧库外发','正文','旧 库','正文',0,1,1)",
+        params![owner],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                            body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+         VALUES ('in','inbox','received','peer@x.cn',?1,'旧库来信','正文','旧 库','正文',1,2,2)",
+        params![owner],
+    )
+    .unwrap();
+    for (k, v) in [
+        (keys::LAST_UIDVALIDITY, "111"),
+        (keys::LAST_UID, "55"),
+        (keys::FIRST_PULL_DONE_INBOX, "1"),
+        (keys::FIRST_PULL_DONE_SENT, "1"),
+    ] {
+        conn.execute("INSERT INTO settings(k, v) VALUES (?1, ?2)", params![k, v])
+            .unwrap();
+    }
+}
+
+#[test]
+fn wizard_adopts_existing_store_of_same_account() {
+    // 需求：首设向导选非空数据目录 → 归属账号一致时直接沿用（存量邮件、
+    // 收件游标全保留，增量续收），不走"请选择空目录"的拒绝路径
+    let (state, dir) = temp_state("wiz-adopt-ok");
+    let target = std::env::temp_dir().join(format!("mbx-wiz-adopt-ok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    seed_old_store(&target, "unit.router@chinatelecom.cn");
+
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("first_fetch_days", "7"));
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "同账号既有目录应采纳成功并跳转完成页"
+    );
+    assert!(state.configured(), "配置应已保存");
+    assert_eq!(state.data_dir(), target, "应会话内切换到既有数据目录");
+    assert!(state.pending_data_dir().is_none(), "采纳即时生效，无需重启");
+    // 存量数据与收件进度原样保留 + 归属标记写入
+    let (mails, marker, cursor, pull_inbox) = state.with_conn(|c| {
+        (
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            c.query_row(
+                "SELECT v FROM settings WHERE k = ?1",
+                [keys::STORE_OWNER],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            c.query_row(
+                "SELECT v FROM settings WHERE k = ?1",
+                [keys::LAST_UID],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            c.query_row(
+                "SELECT v FROM settings WHERE k = ?1",
+                [keys::FIRST_PULL_DONE_INBOX],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+    });
+    assert_eq!(mails, 2, "存量邮件应原样保留");
+    assert_eq!(marker, "unit.router@chinatelecom.cn", "归属标记应写入");
+    assert_eq!(cursor, "55", "收件游标应保留（增量续收）");
+    assert_eq!(pull_inbox, "1", "首拉完成标志应保留（不重新全量拉取）");
+    // 首拉范围按本次表单覆盖写入（重新拉取按钮按它工作）
+    assert_eq!(
+        state.get_or(keys::FIRST_FETCH_DAYS, &defaults()).as_deref(),
+        Some("7")
+    );
+    // 锚点（默认目录）启动空库应被清理
+    assert!(!dir.join("corpmail.db").exists());
+    // 完成页：目录立即生效 + 沿用提示，不出现重启提示
+    let done = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/done", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        done.contains("数据目录已设置为") && done.contains("立即生效"),
+        "done 页应提示目录即时生效：{done}"
+    );
+    assert!(
+        done.contains("2 封历史邮件") && done.contains("增量拉取"),
+        "done 页应提示沿用既有数据：{done}"
+    );
+    assert!(!done.contains("重启应用后生效"), "不应出现重启提示");
+    // 主列表能看到旧库来信（真实复用，不是表面指针切换）
+    let list = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        list.contains("旧库来信"),
+        "收件箱应显示沿用目录中的既有邮件"
+    );
+    // 重启视角：指针 + 配置 + 存量数据都在
+    {
+        let state3 = AppState::open_with_anchor(&target, &dir);
+        assert!(state3.configured());
+        let n = state3.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        });
+        assert_eq!(n, 2, "重启视角存量数据完好");
+    }
+    state.clear_password("unit.router@chinatelecom.cn");
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_rejects_existing_store_of_other_account() {
+    // 需求：目标目录数据与登录账号不一致 → 拒绝使用（防两个账号邮件混库），
+    // 且不动指针、不动目标目录
+    let (state, dir) = temp_state("wiz-adopt-mismatch");
+    let target =
+        std::env::temp_dir().join(format!("mbx-wiz-adopt-mismatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    seed_old_store(&target, "colleague@chinatelecom.cn");
+
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let b = body(&resp);
+    assert!(
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+        "不一致应拒绝，不跳转：{b}"
+    );
+    assert!(
+        b.contains("colleague@chinatelecom.cn") && b.contains("不一致"),
+        "拒绝文案应指明库内账号与不一致：{b}"
+    );
+    assert!(!state.configured(), "不得落任何配置");
+    assert_eq!(state.data_dir(), dir, "当前数据目录不应变化");
+    assert!(
+        state.get(keys::DATA_DIR).flatten().is_none(),
+        "指针不应写入：{:?}",
+        state.get(keys::DATA_DIR)
+    );
+    // 目标目录数据原样（仍 2 封）
+    let conn = crate::db::open(&target.join("corpmail.db")).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "目标目录数据不得被改动");
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_rejects_existing_store_with_unknown_owner() {
+    // 库非空但无法判定归属（无标记、无发件、收件无可统计收件人）→ 保守拒绝
+    let (state, dir) = temp_state("wiz-adopt-unknown");
+    let target = std::env::temp_dir().join(format!("mbx-wiz-adopt-unknown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).unwrap();
+    {
+        let conn = crate::db::open(&target.join("corpmail.db")).unwrap();
+        conn.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','peer@x.cn','','哑来信','正文','哑','正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    }
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let b = body(&resp);
+    assert!(
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+        "无法判定归属应拒绝：{b}"
+    );
+    assert!(
+        b.contains("无法确认目标目录数据的归属账号"),
+        "应说明无法判定归属：{b}"
+    );
+    assert!(!state.configured());
+    let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_rejects_non_corpmail_db_directory() {
+    // corpmail.db 是无关 SQLite 文件或非 SQLite 文件 → 明确拒绝，不当库用
+    let (state, dir) = temp_state("wiz-adopt-foreign");
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // a) 无关 SQLite 文件（缺核心表）
+    let target_a = std::env::temp_dir().join(format!("mbx-wiz-foreign-a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target_a);
+    std::fs::create_dir_all(&target_a).unwrap();
+    {
+        let conn = rusqlite::Connection::open(target_a.join("corpmail.db")).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+    }
+    // b) 非 SQLite 文件（文本冒充）
+    let target_b = std::env::temp_dir().join(format!("mbx-wiz-foreign-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target_b);
+    std::fs::create_dir_all(&target_b).unwrap();
+    std::fs::write(target_b.join("corpmail.db"), b"this is not a database").unwrap();
+
+    for target in [&target_a, &target_b] {
+        let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+        pairs.push(("data_dir", target.to_str().unwrap()));
+        let resp = route(
+            &state,
+            &assets(),
+            &req("POST", "/welcome/setup/save", &form(&pairs)),
+            &t,
+        );
+        let b = body(&resp);
+        assert!(
+            !resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+            "非本应用数据库应拒绝：{target:?} → {b}"
+        );
+        assert!(
+            b.contains("不是 CorpMail 数据目录"),
+            "应说明不是本应用数据目录：{b}"
+        );
+    }
+    assert!(!state.configured());
+    let _ = std::fs::remove_dir_all(&target_a);
+    let _ = std::fs::remove_dir_all(&target_b);
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_reuses_current_dir_store_when_owner_matches() {
+    // corpmail.toml 丢失后重装：当前（默认目录）库有本账号旧数据、无配置 ——
+    // 向导直接沿用（不换目录），数据保留、标记补写
+    let (state, dir) = temp_state("wiz-reuse-cur");
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, subject_tokens, body_tokens, unread, created_at, sent_at)
+                 VALUES ('out','sent','sent','unit.router@chinatelecom.cn','peer@x.cn','旧外发',
+                         '正文','旧','正文',0,1,1)",
+                [],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    assert!(!state.store_is_empty(), "前置：当前库非空");
+    assert!(!state.configured(), "前置：未配置（config 丢失）");
+
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "归属一致的当前库数据应允许沿用并完成配置"
+    );
+    assert!(state.configured());
+    assert_eq!(state.data_dir(), dir, "未指定目录时数据目录不变");
+    let (mails, marker) = state.with_conn(|c| {
+        (
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            c.query_row(
+                "SELECT v FROM settings WHERE k = ?1",
+                [keys::STORE_OWNER],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+    });
+    assert_eq!(mails, 1, "原有数据保留");
+    assert_eq!(marker, "unit.router@chinatelecom.cn", "归属标记补写");
+    let done = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/done", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(done.contains("已直接沿用"), "done 页应有沿用提示");
+    state.clear_password("unit.router@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_rejects_current_dir_store_of_other_account() {
+    // toml 丢失但锚点库属于别的账号：换空目录也不得放行配置（防混库）
+    let (state, dir) = temp_state("wiz-reuse-mismatch");
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, subject_tokens, body_tokens, unread, created_at, sent_at)
+                 VALUES ('out','sent','sent','someone.else@chinatelecom.cn','peer@x.cn','他人外发',
+                         '正文','他','正文',0,1,1)",
+                [],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // ① 不填目录（沿用默认目录）：拒绝
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &t,
+    );
+    let b = body(&resp);
+    assert!(
+        b.contains("someone.else@chinatelecom.cn") && b.contains("已停止保存"),
+        "当前库归属他账号应拒绝保存：{b}"
+    );
+    assert!(!state.configured());
+    // ② 换一个空目录也应拒绝（两处数据不能都留着配新账号）
+    let target = std::env::temp_dir().join(format!("mbx-wiz-reuse-mm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).unwrap();
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("data_dir", target.to_str().unwrap()));
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &t,
+    );
+    assert!(
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+        "当前库归属他账号时，换空目录也不得直接配置：{}",
+        body(&resp)
+    );
+    assert!(!state.configured());
+    let _ = std::fs::remove_dir_all(&target);
     cleanup(&dir);
 }

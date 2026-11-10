@@ -26,6 +26,9 @@
                     <span>立即生效，无需重启。</span>
                 </div>
                 {% endif %}
+                {% if reuse_note %}
+                <div class="sec-note dir-note"><span>{{ ic.icon('archive') }} {{ reuse_note }}</span></div>
+                {% endif %}
 
                 <div class="kv"><span class="k">邮箱账号</span><b>{{ account }}</b></div>
                 <div class="kv"><span class="k">发件显示名</span><b>{{ display_name }}</b></div>

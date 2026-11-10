@@ -56,6 +56,10 @@ pub mod keys {
     /// 改动首拉范围（清游标重拉）时同步清除，重新进入阶段化模式
     pub const FIRST_PULL_DONE_SENT: &str = "first_pull_done_sent";
     pub const FIRST_PULL_DONE_INBOX: &str = "first_pull_done_inbox";
+    /// 数据归属账号标记（DB settings 行，值 = 完整地址小写）。向导配置完成时
+    /// 写入；重装/换机后向导指向既有数据目录时，据此判定库能否被当前账号
+    /// 直接沿用（历史更早的库无此行，退回发件 From 模式推导，见 store_owner_conn）
+    pub const STORE_OWNER: &str = "store_owner";
 
     /// 自定义数据目录指针（存独立配置文件 corpmail.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
@@ -384,37 +388,150 @@ impl AppState {
             eprintln!("[contacts] 新目录统计修复失败（忽略）：{err}");
         }
         // 指针先行：写失败则删掉刚建的新库文件回滚（此时尚未换连接，旧库仍在用）
+        if let Err(e) = self.point_data_dir(&dest_path) {
+            let _ = std::fs::remove_file(dest_path.join("corpmail.db"));
+            return Err(e);
+        }
+        self.swap_store(new_conn, &dest_path);
+        clean_empty_legacy_db(&cur, &self.anchor_dir);
+        Ok(format!("数据目录已设置为 {}", dest_path.display()))
+    }
+
+    /// 首设专用：采纳目标目录中的既有数据库并直接沿用（重装/换机找回历史邮件）。
+    ///
+    /// 与 switch_data_dir_first_run（空目标建新库）互补：目标含 corpmail.db 时，
+    /// 打开校验后按归属判定——
+    /// - 库为空：视同直切，任何账号可用；
+    /// - 归属账号与登录账号一致（store_owner 标记 > 发件 From 模式 > 收件人模式）：
+    ///   会话内换连即生效，存量邮件、附件目录与 IMAP 收件游标全部保留，
+    ///   收件从既有进度增量续拉，不重新首拉；
+    /// - 归属他账号或无法判定：拒绝（不动指针、不动目标目录中任何文件），
+    ///   防两个账号的邮件混入同一库。
+    ///
+    /// 安全阀：当前库非空（如配置文件丢失但锚点仍有数据）时拒绝——两处数据
+    /// 无法合并，弃当前数据属于破坏性操作，应走迁移流程由用户决断。
+    pub fn adopt_data_dir_existing(&self, dest: &str, account: &str) -> Result<String, String> {
+        let cur = self.data_dir();
+        if !self.store_is_empty() {
+            return Err(
+                "当前数据库非空，无法直接使用目标目录的既有数据（两处数据不能合并）。请清空“数据保存目录”沿用当前目录，或先在 设置 → 存储管理 迁移到空目录"
+                    .into(),
+            );
+        }
+        let dest_path = validate_adopt_dir(&cur, dest)?;
+        let db_path = dest_path.join("corpmail.db");
+        // 身份预检：核心表齐全才是本应用的数据目录（打开无关 SQLite 文件会
+        // 建出空 schema，先探测避免在无关文件里写表）。非 SQLite/损坏文件
+        // 同样在此被拒。
         {
+            let probe =
+                Connection::open(&db_path).map_err(|e| format!("目标数据库无法打开：{e}"))?;
+            let tables: i64 = probe
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+                      AND name IN ('emails', 'settings', 'attachments')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if tables != 3 {
+                return Err(
+                    "目标目录不是 CorpMail 数据目录（缺少邮件数据表），无法直接使用".into(),
+                );
+            }
+        }
+        let account_l = account.trim().to_ascii_lowercase();
+        let mut new_conn =
+            crate::db::open(&db_path).map_err(|e| format!("目标数据库无法打开：{e}"))?;
+        // 归属判定：空库人人可用；非空必须能判定且一致
+        let (mails, settings_rows): (i64, i64) = (
+            new_conn
+                .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap_or(-1),
+            new_conn
+                .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
+                .unwrap_or(-1),
+        );
+        if mails < 0 || settings_rows < 0 {
+            return Err("目标数据库无法读取（可能已损坏），无法直接使用".into());
+        }
+        if mails > 0 || settings_rows > 0 {
+            match check_store_owner_conn(&new_conn, &account_l) {
+                StoreOwner::Match => {}
+                StoreOwner::Mismatch(owner) => {
+                    return Err(format!(
+                        "目标目录的数据属于账号 {owner}，与当前登录账号 {account_l} 不一致，已拒绝使用（避免两个账号的邮件混存）。请用原账号登录，或为当前账号另选空目录"
+                    ));
+                }
+                StoreOwner::Unknown => {
+                    return Err(
+                        "无法确认目标目录数据的归属账号（库内没有可判断归属的发件记录），为安全起见不自动使用。请为当前账号另选空目录，或确认无需保留后清空该目录"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // 旧版本库补维护（幂等，失败不阻断——与启动路径同口径）
+        if let Err(err) = crate::mail::contacts::backfill(&mut new_conn) {
+            eprintln!("[contacts] 采纳库历史回填失败（忽略）：{err}");
+        }
+        if let Err(err) = crate::mail::contacts::repair_stats(&mut new_conn) {
+            eprintln!("[contacts] 采纳库统计修复失败（忽略）：{err}");
+        }
+        // 归属标记写入被采纳的库：此后无论哪个版本重装指向该目录，都能精确比对
+        let _ = new_conn.execute(
+            "INSERT INTO settings(k, v) VALUES (?1, ?2)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            rusqlite::params![keys::STORE_OWNER, account_l],
+        );
+        // 指针先行：写失败仅回滚镜像（目标库是被采纳的既有文件，绝不能删除）
+        self.point_data_dir(&dest_path)?;
+        self.swap_store(new_conn, &dest_path);
+        clean_empty_legacy_db(&cur, &self.anchor_dir);
+        Ok(format!(
+            "已沿用既有数据目录 {}（历史邮件与收件进度直接沿用，增量续收）",
+            dest_path.display()
+        ))
+    }
+
+    /// 数据目录指针写入 corpmail.toml（直切/采纳共用）：失败时恢复内存镜像
+    /// （镜像必须反映文件内容）并返回错误，不动目标目录
+    fn point_data_dir(&self, dest_path: &Path) -> Result<(), String> {
+        let (prev, save_res) = {
             let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = cfg.get(keys::DATA_DIR).cloned();
             cfg.insert(
                 keys::DATA_DIR.to_string(),
                 dest_path.to_string_lossy().into_owned(),
             );
             let snapshot = cfg.clone();
-            if let Err(e) = crate::conf::save(&self.anchor_dir, &snapshot) {
-                cfg.remove(keys::DATA_DIR); // 镜像必须反映文件内容
-                let _ = std::fs::remove_file(dest_path.join("corpmail.db"));
-                return Err(format!("配置文件写入失败：{e}"));
+            (prev, crate::conf::save(&self.anchor_dir, &snapshot))
+        };
+        if let Err(e) = save_res {
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            match prev {
+                Some(v) => {
+                    cfg.insert(keys::DATA_DIR.to_string(), v);
+                }
+                None => {
+                    cfg.remove(keys::DATA_DIR);
+                }
             }
+            return Err(format!("配置文件写入失败：{e}"));
         }
-        // 换库 → 换目录：先替换连接（旧连接 drop、文件句柄关闭），
-        // 再改路径。此后 set_batch/收件/附件全部落新目录，无需重启。
+        Ok(())
+    }
+
+    /// 换库换目录（直切/采纳共用）：先替换连接（旧连接 drop、文件句柄关闭），
+    /// 再改路径并重绑发送 worker。此后 set_batch/收件/附件全部落新目录，无需重启。
+    fn swap_store(&self, new_conn: Connection, dest_path: &Path) {
         {
             let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
             *db = new_conn;
         }
-        *self.data_dir.write().unwrap_or_else(|e| e.into_inner()) = dest_path.clone();
+        *self.data_dir.write().unwrap_or_else(|e| e.into_inner()) = dest_path.to_path_buf();
         // 发送 worker 重绑：旧 worker 持有旧库连接与旧附件根，不重绑会写错库
         self.rebind_send_worker();
-        // 旧目录残留清理：仅当旧目录 == 锚点（默认目录）且库为空（本函数前置
-        // 已保证）时，删掉启动时新建的空库文件——否则存储页会把它当
-        // "迁移备份"展示，误导用户。非默认旧目录（异常历史）不动用户文件。
-        if cur == self.anchor_dir {
-            for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
-                let _ = std::fs::remove_file(cur.join(f));
-            }
-        }
-        Ok(format!("数据目录已设置为 {}", dest_path.display()))
     }
 
     /// 库内是否无任何用户数据（emails 与 settings 均为 0 行）。
@@ -1114,20 +1231,7 @@ impl AppState {
 /// 目标须为空（无 corpmail.db / attachments——避免与既有文件混同导致回滚无法
 /// 区分"本次写入"与"用户原有文件"）、可创建可写。通过返回归一化后的目标路径。
 fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
-    // 去尾部斜杠保留根目录：Windows "C:" 盘符根（带反斜杠）不得被清成非绝对路径
-    let raw = dest.trim();
-    let trimmed = raw.trim_end_matches(['/', '\\']);
-    let dest_str = if trimmed.is_empty() {
-        raw.to_string()
-    } else if trimmed.len() == 2 && trimmed.ends_with(':') {
-        format!("{trimmed}\\")
-    } else {
-        trimmed.to_string()
-    };
-    let dest_path = PathBuf::from(dest_str);
-    if !dest_path.is_absolute() {
-        return Err("请选择绝对路径目录".into());
-    }
+    let dest_path = normalize_dest(dest)?;
     if dest_path == cur {
         return Err("目标目录与当前数据目录相同".into());
     }
@@ -1145,6 +1249,132 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
     std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
     let _ = std::fs::remove_file(&probe);
     Ok(dest_path)
+}
+
+/// 数据目录目标路径归一化：去首尾空白与尾斜杠（Windows "C:" 盘符根带反斜杠
+/// 保留，不得被清成非绝对路径），要求绝对路径。迁移校验、首设直切校验、
+/// 向导"目标目录是否含既有库"探测共用，保证各处口径一致。
+pub(crate) fn normalize_dest(dest: &str) -> Result<PathBuf, String> {
+    let raw = dest.trim();
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    let dest_str = if trimmed.is_empty() {
+        raw.to_string()
+    } else if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{trimmed}\\")
+    } else {
+        trimmed.to_string()
+    };
+    let dest_path = PathBuf::from(dest_str);
+    if !dest_path.is_absolute() {
+        return Err("请选择绝对路径目录".into());
+    }
+    Ok(dest_path)
+}
+
+/// 采纳既有库（首设直连）的路径形态校验：绝对路径、不与当前目录互相嵌套、
+/// 含 corpmail.db（无库可采纳）。不设"目标须为空"约束——既有库正是采纳对象；
+/// 读写能力由随后的 db::open 实际验证。
+fn validate_adopt_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
+    let dest_path = normalize_dest(dest)?;
+    if dest_path == cur {
+        return Err("目标目录与当前数据目录相同".into());
+    }
+    if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
+        return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
+    }
+    if !dest_path.join("corpmail.db").is_file() {
+        return Err("目标目录中没有 corpmail.db，不是可沿用的数据目录".into());
+    }
+    Ok(dest_path)
+}
+
+/// 直切/采纳后的旧目录（仅锚点默认目录）空库清理：调用方前置已保证旧库为空，
+/// 删掉启动时新建的空库文件——否则存储页会把它当"迁移备份"展示，误导用户。
+/// 非默认旧目录（异常历史）不动用户文件。
+fn clean_empty_legacy_db(cur: &Path, anchor: &Path) {
+    if cur == anchor {
+        for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+            let _ = std::fs::remove_file(cur.join(f));
+        }
+    }
+}
+
+/// 库归属账号与登录账号的比对结论（首设时判定既有目录能否直接沿用）
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StoreOwner {
+    /// 归属一致：可沿用（库为空的情形由调用方先行判空放行）
+    Match,
+    /// 归属明确但他属：拒绝沿用（携带库内推导出的账号，用于提示）
+    Mismatch(String),
+    /// 库非空但无法判定归属：拒绝沿用（宁可保守）
+    Unknown,
+}
+
+/// 推导库的归属账号（完整地址小写；无法判定 → None）。依据按可信度排序：
+/// 1. `store_owner` 标记行（本应用配置完成时写入，权威）；
+/// 2. 已发送/草稿邮件中出现最多的 From（schema 约定 direction=out 的
+///    from_addr 即登录账号，与联系人"自身地址"推导同源，天然覆盖别名）；
+/// 3. 收件邮件 To/Cc 中出现最多的地址（纯收件库兜底；邮件列表场景可能
+///    推导出列表地址——结果只用于一致性比对，推导偏差只会更保守地拒绝）。
+pub(crate) fn store_owner_conn(conn: &Connection) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    // ① 标记行
+    if let Some(m) = conn
+        .query_row(
+            "SELECT v FROM settings WHERE k = ?1",
+            [keys::STORE_OWNER],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    {
+        let m = m.trim().to_ascii_lowercase();
+        if !m.is_empty() {
+            return Some(m);
+        }
+    }
+    // ② 发件 From 模式（out 邮件的 from_addr = 登录账号；空库无发件 → 空）
+    let sent = crate::mail::contacts::self_addr_conn(conn);
+    if !sent.is_empty() {
+        return Some(sent);
+    }
+    // ③ 收件收件人模式：逗号分隔地址去掉空白后计数取最大（(次数, 地址)
+    //    元组取 max 保证并列时结果确定）
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT to_addrs, cc_addrs FROM emails WHERE direction = 'in'")
+    else {
+        return None;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return None;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        for col in [0usize, 1usize] {
+            if let Ok(list) = row.get::<_, String>(col) {
+                for part in list.split(',') {
+                    let a = part.trim().to_ascii_lowercase();
+                    if a.contains('@') {
+                        *counts.entry(a).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(a, n)| (*n, a.clone()))
+        .map(|(a, _)| a)
+}
+
+/// 库归属与登录账号比对（account 大小写不敏感）
+pub(crate) fn check_store_owner_conn(conn: &Connection, account: &str) -> StoreOwner {
+    let want = account.trim().to_ascii_lowercase();
+    match store_owner_conn(conn) {
+        Some(o) if o == want => StoreOwner::Match,
+        Some(o) => StoreOwner::Mismatch(o),
+        None => StoreOwner::Unknown,
+    }
 }
 
 /// 目录递归统计：(字节, 文件数)；目录不存在 → (0, 0)（附件占用与迁移备份共用）

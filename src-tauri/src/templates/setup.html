@@ -90,10 +90,10 @@
                     {% endif %}
                 </div>
                 <div class="sfield">
-                    <label>数据保存目录{{ ic.tip('留空使用默认目录') }}</label>
+                    <label>数据保存目录{{ ic.tip('留空使用默认目录；也可选择已有 CorpMail 数据的目录——仅当其账号与本次登录一致时，历史邮件与收件进度直接沿用') }}</label>
                     <div class="port-row">
                         <input class="mono" type="text" name="data_dir" value="{{ data_dir }}" spellcheck="false"
-                            placeholder="留空使用默认目录；填写后邮件数据将保存到该目录">
+                            placeholder="留空使用默认目录；可填新目录或已有数据的目录（同账号沿用）">
                         <button type="button" class="btn small" onclick="mbxPickSetupDir(this)"
                             title="浏览选择目录">选择…</button>
                     </div>

@@ -386,6 +386,8 @@ struct DoneCtx {
     pending_dir: Option<String>,
     /// 首设直切（或已生效的）自定义数据目录：无重启，done 页展示当前目录
     dir_changed: Option<String>,
+    /// 数据目录中已有历史邮件（向导直连沿用）：提示增量续收不重新全量拉取
+    reuse_note: Option<String>,
 }
 
 /// 连接测试结果片段
@@ -2720,6 +2722,12 @@ fn wizard_done(state: &AppState) -> Resp {
     }
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
+    // 既有数据沿用提示：完成页在向导成功后立即展示，此时库里的邮件只可能
+    // 来自采纳/沿用的存量（后台首收可能已开始，计数会略增，但仍为"既有"语义）
+    let mails: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap_or(0)
+    });
     let ctx = DoneCtx {
         account: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
         display_name: g(keys::DISPLAY_NAME),
@@ -2730,6 +2738,9 @@ fn wizard_done(state: &AppState) -> Resp {
         pending_dir: state.pending_data_dir(),
         dir_changed: (state.data_dir() != state.anchor_dir().to_path_buf())
             .then(|| state.data_dir().display().to_string()),
+        reuse_note: (mails > 0).then(|| {
+            format!("数据目录中已有 {mails} 封历史邮件，已直接沿用；收件将从既有进度继续增量拉取，不重新全量收取")
+        }),
     };
     render_html("done.html", &ctx)
 }
@@ -2783,6 +2794,10 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         let display = trimmed_field(&form, "display_name").unwrap_or_default();
         let smtp_port_s = smtp_port.to_string();
         let recv_port_s = recv_port.to_string();
+        // 归属标记（小写完整地址）：配置完成时写入当前库（DB settings 行，
+        // 非 corpmail.toml 键）。此后重装/换机指向该数据目录，向导可据此
+        // 精确判定"库属于这个账号"，直接沿用而无需重新全量拉取。
+        let account_l = account.to_ascii_lowercase();
         let pairs: Vec<(&str, &str)> = vec![
             (keys::ACCOUNT_PREFIX, prefix.as_str()),
             (keys::ACCOUNT_DOMAIN, &domain),
@@ -2794,13 +2809,39 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
             (keys::RECV_PORT, recv_port_s.as_str()),
             (keys::RECV_SECURITY, recv_security.as_str()),
             (keys::FIRST_FETCH_DAYS, first_fetch.as_str()),
+            (keys::STORE_OWNER, account_l.as_str()),
         ];
         // 首设空库直切：未配置且库无任何数据时，自定义目录不走迁移——
         // 迁移的快照/复制/重启对空库全是无谓成本，直切在会话内立即生效。
         // 必须排在 set_batch 之前：配置随后写入的才是新库（与迁移路径
         // "先保存后快照"互补，空库没有可快照的内容）。
-        let first_run_fresh = !state.configured() && state.store_is_empty();
+        let first_run = !state.configured();
+        let first_run_fresh = first_run && state.store_is_empty();
         let data_dir_input = trimmed_field(&form, "data_dir").unwrap_or_default();
+        // 首设但当前库已有数据（corpmail.toml 丢失/损坏后的重装）：沿用前
+        // 须核对归属账号——不一致直接拒绝保存，防两个账号的邮件混入库。
+        // 该检查独立于目录输入（未填目录 = 沿用默认目录，同样要核）
+        if first_run && !first_run_fresh {
+            match state.with_conn(|c| state::check_store_owner_conn(c, &account_l)) {
+                state::StoreOwner::Match => {}
+                state::StoreOwner::Mismatch(owner) => {
+                    return test_fragment(
+                        Vec::new(),
+                        &format!(
+                            "当前数据目录中的数据属于账号 {owner}，与登录账号 {account_l} 不一致，已停止保存（避免两个账号的邮件混存）。请改用原账号登录；若确认不再需要原数据，可删除该目录下的 corpmail.db 后重试"
+                        ),
+                        false,
+                    );
+                }
+                state::StoreOwner::Unknown => {
+                    return test_fragment(
+                        Vec::new(),
+                        "无法确认当前数据目录数据的归属账号，已停止保存。请为当前账号选择空的数据目录，或确认无需保留原数据后清空当前目录",
+                        false,
+                    );
+                }
+            }
+        }
         // 向导把 data_dir 预填成当前目录（与存储页同源回显）：用户不动它 =
         // 不更换，不得送进直切校验——validate_data_dir 拒绝同路径，
         // 曾导致首配不动目录直接提交必然失败且不跳转 done 页。
@@ -2811,16 +2852,35 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                     .data_dir()
                     .to_string_lossy()
                     .trim_end_matches(['/', '\\']);
-        if first_run_fresh
+        // 目标目录是否含既有库（口径与 state 校验一致：归一化后探测 corpmail.db）
+        let target_has_db = state::normalize_dest(&data_dir_input)
+            .map(|p| p.join("corpmail.db").is_file())
+            .unwrap_or(false);
+        // 当前库有数据且目标也含既有库：两处数据无法合并，提前拒绝
+        // （不先保存账号——半保存态反而误导，见 C6 注）
+        if first_run
+            && !first_run_fresh
             && !data_dir_input.is_empty()
             && !data_dir_unchanged
-            && let Err(e) = state.switch_data_dir_first_run(&data_dir_input)
+            && target_has_db
         {
             return test_fragment(
                 Vec::new(),
-                &format!("数据目录设置失败：{e}（可清空目录后重新提交）"),
+                "当前数据目录已有数据，目标目录也含既有数据库，两处数据无法合并。请清空「数据保存目录」沿用当前目录，或为目标另选空目录",
                 false,
             );
+        }
+        if first_run_fresh && !data_dir_input.is_empty() && !data_dir_unchanged {
+            // 目标含既有库 → 核对归属后采纳沿用（存量邮件/附件/收件游标全
+            // 保留，增量续收）；目标为空 → 建新库直切。失败均不落任何配置
+            let res = if target_has_db {
+                state.adopt_data_dir_existing(&data_dir_input, &account_l)
+            } else {
+                state.switch_data_dir_first_run(&data_dir_input)
+            };
+            if let Err(e) = res {
+                return test_fragment(Vec::new(), &e, false);
+            }
         }
         // C2/C6：配置与密码先落库，迁移最后执行——
         // C2：first_fetch_days 存 DB（非 corpmail.toml 键），若迁移在前，快照发生于
