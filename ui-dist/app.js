@@ -2,7 +2,9 @@
 // 全局 500ms 防抖由 htmx 触发器表达式承担（hx-trigger="... once:500ms"，设计 §7）
 
 // ---------- 内联图标（2026-11-10）：与模板 icons.html 同几何 ----------
-// 只拼接固定路径字符串（无用户输入）；样式由 .ic 类统一（1em、stroke 1.8、currentColor）
+// 只拼接固定路径字符串（无用户输入）；样式由 .ic 类统一（1em、stroke 1.8、currentColor）。
+// check/x/dot（2026-11-10 二批）：文本状态符号 ✓✗✕● 也改 SVG——不同字体
+// 下线重与基线不一，统一后与功能图标视觉一致
 var MBX_IC = (function () {
     function svg(body) {
         return '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true" focusable="false">' + body + '</svg>';
@@ -12,7 +14,10 @@ var MBX_IC = (function () {
         star: svg('<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>'),
         starFill: svg('<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" fill="currentColor" stroke="none"/>'),
         pencil: svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
-        keyboard: svg('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/>')
+        keyboard: svg('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/>'),
+        check: svg('<polyline points="20 6 9 17 4 12"/>'),
+        x: svg('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
+        dot: svg('<circle cx="12" cy="12" r="5" fill="currentColor" stroke="none"/>')
     };
 })();
 
@@ -422,7 +427,7 @@ document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 // 后端 POST /emails/{id}/star 空体 + 事件头；前端按所在页面分派：
 // - 列表页：星标置顶会重排行序 → 重拉当前列表片段换入（保持过滤/页码，
 //   与收取完成同路径；侧栏计数不随星标变，一并刷新无副作用）
-// - 详情页：无重排，就地翻转按钮态（★/☆ 文案 + on 类 + aria-pressed）
+// - 详情页：无重排，就地翻转按钮态（星形图标 + on 类 + aria-pressed）
 document.body.addEventListener('mbx:starDone', function (ev) {
     var starred = !!(ev.detail && ev.detail.starred);
     if (document.getElementById('list-area')) {
@@ -480,9 +485,11 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     toast.appendChild(undo);
     slot.appendChild(toast);
     var started = Date.now();
-    var settle = function (text, cls, stayMs) {
+    // icon 前缀仅允许本文件固定 SVG 字符串；文字统一 escapeHtml 后入 innerHTML
+    // （toast 文案可能携带服务端错误信息，不能裸拼）
+    var settle = function (text, cls, stayMs, icon) {
         toast.className = 'toast ' + cls;
-        toast.textContent = text;
+        toast.innerHTML = (icon ? MBX_IC[icon] + ' ' : '') + escapeHtml(text);
         // 终态刷新：列表区（过滤/页码保持）+侧栏计数，复用收取完成路径
         if (window.mbxOnFetchDone) mbxOnFetchDone();
         setTimeout(function () { toast.remove(); }, stayMs);
@@ -492,7 +499,7 @@ document.body.addEventListener('mbx:starDone', function (ev) {
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (s) {
                 if (!s) return settle('发送状态查询失败，请在发件箱确认', 'err', 6000);
-                if (s.status === 'sent') return settle('✓ 已发送', 'ok', 2500);
+                if (s.status === 'sent') return settle('已发送', 'ok', 2500, 'check');
                 if (s.status === 'failed') {
                     return settle('发送失败：' + (s.error || '未知原因'), 'err', 6000);
                 }
@@ -812,7 +819,7 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             detail.parameters['inline_images'] = JSON.stringify(converted);
             var note = document.querySelector('.compose-note-inline') || document.createElement('div');
             note.className = 'compose-note ok compose-note-inline';
-            note.textContent = '✓ ' + converted.length + ' 张超过 2MB 的内嵌图片已转为附件，将随邮件发送';
+            note.innerHTML = MBX_IC.check + ' ' + converted.length + ' 张超过 2MB 的内嵌图片已转为附件，将随邮件发送';
             var card = document.querySelector('.compose-card');
             if (card) card.insertBefore(note, card.firstChild);
         }
@@ -868,7 +875,7 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
                     idEl.value = String(res.draft_id);
                 }
                 var hint = document.getElementById('autosave-hint');
-                if (hint) hint.textContent = '✓ 已自动保存 ' + clock();
+                if (hint) hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());
             }
         });
         // 下轮防抖：保存后再有输入才会触发，不做周期性轮询
@@ -1474,7 +1481,7 @@ document.addEventListener('click', function (ev) {
         if (!ready) return;
         edited = true;
         var hint = document.getElementById('autosave-hint');
-        if (hint) hint.textContent = '● 未保存';
+        if (hint) hint.innerHTML = MBX_IC.dot + ' 未保存';
     }
     document.body.addEventListener('input', markEdited, true);
     document.body.addEventListener('change', markEdited, true);
@@ -1639,17 +1646,17 @@ function mbSourceCopy(pre) {
     function settle(label) {
         if (!btn) return;
         btn.dataset.label = original;
-        btn.textContent = label;
+        btn.innerHTML = MBX_IC.check + ' ' + escapeHtml(label);
         setTimeout(function () { btn.textContent = original; }, 1500);
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(
-            function () { settle('✓ 已复制'); },
-            function () { mbCopyTextFallback(text); settle('✓ 已复制'); }
+            function () { settle('已复制'); },
+            function () { mbCopyTextFallback(text); settle('已复制'); }
         );
     } else {
         mbCopyTextFallback(text);
-        settle('✓ 已复制');
+        settle('已复制');
     }
 }
 

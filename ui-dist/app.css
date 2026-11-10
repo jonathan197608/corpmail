@@ -631,6 +631,14 @@ body {
     line-height: 1;
     padding: 0 2px;
     flex: none;
+    display: inline-flex;
+    align-items: center;
+}
+
+/* 清除按钮图标（2026-11-10：文本×改 SVG）：固定 13px 与原字形等大 */
+.search-clear .ic {
+    width: 13px;
+    height: 13px;
 }
 
 .search-clear:hover {
@@ -695,6 +703,16 @@ body {
     font-size: 15px;
     color: var(--muted);
     flex: none;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px;
+    line-height: 1;
+}
+
+/* 预览模态关闭图标（2026-11-10：文本✕改 SVG）：固定 14px 与原字形等大 */
+.pm-close .ic {
+    width: 14px;
+    height: 14px;
 }
 
 .pm-close:hover {
@@ -1031,6 +1049,13 @@ body {
     font-size: 11px;
     font-family: var(--mono);
     background: var(--panel);
+}
+
+/* 完成步骤勾选图标（2026-11-10：文本✓改 SVG）：1em（11px）偏小，
+   固定 13px 与数字编号视觉等重 */
+.step .n .ic {
+    width: 13px;
+    height: 13px;
 }
 
 .step.on {

@@ -73,7 +73,7 @@
                         <button type="button"
                                 hx-post="/emails/{{ email.id }}/unread{% if list_query %}?{{ list_query }}{% endif %}"
                                 hx-trigger="click throttle:500ms" hx-disabled-elt="this"
-                                title="标为未读并返回列表（留待后续处理）">● 标为未读</button>
+                                title="标为未读并返回列表（留待后续处理）">{{ ic.icon('dot') }} 标为未读</button>
                         {% endif %}
                     </div>
                 </div>
@@ -111,14 +111,14 @@
         {% elif email.status == 'sending' %}
         <div class="md-status sending">{{ ic.icon('hourglass') }} 发送中…</div>
         {% elif email.status == 'failed' %}
-        <div class="md-status failed">✕ 发送失败：{{ email.error }}
+        <div class="md-status failed">{{ ic.icon('x') }} 发送失败：{{ email.error }}
             <button type="button" class="btn small"
                     hx-post="/emails/{{ email.id }}/resend"
                     hx-trigger="click throttle:500ms"
                     hx-disabled-elt="this">重新编辑发送</button>
         </div>
         {% elif email.status == 'sent' %}
-        <div class="md-status sent">✓ 已发送</div>
+        <div class="md-status sent">{{ ic.icon('check') }} 已发送</div>
         {% endif %}
 
         <div class="mail-detail card">

@@ -1,4 +1,4 @@
-<!doctype html>
+{% import "icons.html" as ic %}<!doctype html>
 <html lang="zh-CN">
 
 <head>
@@ -57,7 +57,7 @@
         <div class="pm-panel" role="dialog" aria-label="附件预览">
             <div class="pm-head">
                 <span id="pm-name" class="pm-name"></span>
-                <button type="button" class="pm-close" onclick="mbxClosePreview()" title="关闭预览">✕</button>
+                <button type="button" class="pm-close" onclick="mbxClosePreview()" title="关闭预览">{{ ic.icon('x') }}</button>
             </div>
             <div id="pm-body" class="pm-body"></div>
         </div>

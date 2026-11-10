@@ -58,9 +58,9 @@
                    title="按主题归组往来邮件（会话视图）">{% if is_thread %}{{ ic.icon('mail') }} 单封视图{% else %}{{ ic.icon('chat') }} 会话视图{% endif %}</a>
                 {% if folder == 'inbox' %}
                 <a class="tb-item {% if unread_only %}on{% endif %}" href="{{ unread_href }}"
-                   title="{% if unread_only %}点击取消未读筛选{% else %}只显示未读邮件{% endif %}">{% if unread_only %}✓ 只看未读{% else %}● 只看未读{% endif %}</a>
+                   title="{% if unread_only %}点击取消未读筛选{% else %}只显示未读邮件{% endif %}">{% if unread_only %}{{ ic.icon('check') }} 只看未读{% else %}{{ ic.icon('dot') }} 只看未读{% endif %}</a>
                 <a class="tb-item {% if external_only %}on{% endif %}" href="{{ external_href }}"
-                   title="{% if external_only %}点击取消外部筛选{% else %}只显示发件人为外部域名的邮件{% endif %}">{% if external_only %}✓ 只看外部{% else %}{{ ic.icon('globe') }} 只看外部{% endif %}</a>
+                   title="{% if external_only %}点击取消外部筛选{% else %}只显示发件人为外部域名的邮件{% endif %}">{% if external_only %}{{ ic.icon('check') }} 只看外部{% else %}{{ ic.icon('globe') }} 只看外部{% endif %}</a>
                 {% endif %}
                 <div class="btn-sep"></div>
                 <button type="button" class="tb-item" id="fetch-btn"

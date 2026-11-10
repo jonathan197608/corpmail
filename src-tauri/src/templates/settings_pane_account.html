@@ -53,7 +53,7 @@
                 <button type="button" class="btn" hx-post="/settings/account/test-smtp" hx-target="#smtp-result"
                     hx-swap="innerHTML" hx-disabled-elt="this">测试连接</button>
                 <button type="submit" class="btn primary" hx-disabled-elt="this">保存</button>
-                {% if saved %}<span class="test-result ok">✓ 已保存</span>{% endif %}
+                {% if saved %}<span class="test-result ok">{{ ic.icon('check') }} 已保存</span>{% endif %}
                 {% if error %}<span class="test-result fail">{{ error }}</span>{% endif %}
                 <span id="smtp-result" class="test-inline"></span>
             </div>

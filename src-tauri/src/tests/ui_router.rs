@@ -444,10 +444,10 @@ fn unread_toggle_restores_full_list() {
         &req_q("GET", "/", "unread=1", b""),
         &tester,
     ));
-    // 开启态：开关保持自身语义（✓ 只看未读），不再出现两个「显示全部」
+    // 开启态：开关保持自身语义（勾选图标 + 只看未读），不再出现两个「显示全部」
     assert!(
-        unread.contains("✓ 只看未读"),
-        "开启态应标记自身筛选：{unread}"
+        unread.contains("只看未读") && unread.contains("class=\"ic\""),
+        "开启态应保留自身筛选文案（SVG 勾）：{unread}"
     );
     assert!(
         !unread.contains("显示全部"),
@@ -2638,7 +2638,10 @@ fn settings_sync_save_roundtrip() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("✓ 已保存"), "保存后片段应回显已保存");
+    assert!(
+        body(&resp).contains("已保存") && body(&resp).contains("class=\"ic\""),
+        "保存后片段应回显已保存（SVG 勾）"
+    );
     let d = defaults();
     assert_eq!(
         state.get_or(keys::SYNC_INTERVAL_MIN, &d).as_deref(),
@@ -2938,7 +2941,7 @@ fn settings_storage_save_roundtrip_with_blank_semantics() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("✓ 已保存"));
+    assert!(body(&resp).contains("已保存") && body(&resp).contains("class=\"ic\""));
     assert!(body(&resp).contains("50"), "片段应回显新上限");
     let d = defaults();
     assert_eq!(
@@ -3037,7 +3040,7 @@ fn settings_account_save_keeps_credential_when_blank() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("✓ 已保存"));
+    assert!(body(&resp).contains("已保存") && body(&resp).contains("class=\"ic\""));
     assert!(
         matches!(
             state.retrieve_password("unit.router@chinatelecom.cn"),
@@ -3311,7 +3314,11 @@ fn settings_account_ignores_readonly_submissions() {
             imap_ok: true,
         },
     );
-    assert!(body(&resp).contains("✓ 已保存"), "{}", body(&resp));
+    assert!(
+        body(&resp).contains("已保存") && body(&resp).contains("class=\"ic\""),
+        "{}",
+        body(&resp)
+    );
     let d = defaults();
     assert_eq!(
         state.get_or(keys::ACCOUNT_PREFIX, &d).as_deref(),
@@ -3423,7 +3430,7 @@ fn settings_account_test_uses_saved_credential() {
     );
     let html = body(&resp);
     assert!(html.contains("收信通道"), "应返回收信通道结果");
-    assert!(html.contains("✓"), "假测试器应成功");
+    assert!(html.contains("class=\"ic\""), "假测试器应成功（SVG 勾）");
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
@@ -5304,7 +5311,7 @@ fn sync_pane_refetch_entry_hidden_until_range_changes() {
             imap_ok: true,
         },
     ));
-    assert!(html.contains("✓ 已保存"));
+    assert!(html.contains("已保存") && html.contains("class=\"ic\""));
     assert!(
         html.contains("data-first-fetch-initial=\"90\""),
         "保存后基准应更新为 90：{html}"
@@ -5976,7 +5983,10 @@ fn settings_account_save_persists_signature() {
             imap_ok: true,
         },
     ));
-    assert!(html.contains("✓ 已保存"), "保存应成功：{html}");
+    assert!(
+        html.contains("已保存") && html.contains("class=\"ic\""),
+        "保存应成功：{html}"
+    );
     assert!(html.contains("张伟\n电话 123"), "CRLF 归一为 LF 后回显");
     let d = defaults();
     let saved = state.get_or(keys::SIGNATURE, &d).unwrap_or_default();
@@ -7268,7 +7278,10 @@ fn template_settings_and_compose_picker() {
         &t,
     );
     let html = body(&resp);
-    assert!(html.contains("✓ 已保存"), "保存成功提示：{html}");
+    assert!(
+        html.contains("已保存") && html.contains("class=\"ic\""),
+        "保存成功提示：{html}"
+    );
     assert!(html.contains("收到请回复"), "列表应出现新模板");
     // 撰写页下拉含模板（HTML 转义后的 data-text）
     let html = body(&route(&state, &assets(), &req("GET", "/compose", b""), &t));
@@ -7315,7 +7328,10 @@ fn template_body_mode_single_field_semantics() {
         &t,
     );
     let html = body(&resp);
-    assert!(html.contains("✓ 已保存"), "保存成功：{html}");
+    assert!(
+        html.contains("已保存") && html.contains("class=\"ic\""),
+        "保存成功：{html}"
+    );
     let (text, tpl_html): (String, String) = state.with_conn(|c| {
         c.query_row(
             "SELECT body_text, body_html FROM templates WHERE name = '富文本模板'",
@@ -7363,7 +7379,7 @@ fn template_body_mode_single_field_semantics() {
         ),
         &t,
     );
-    assert!(body(&resp).contains("✓ 已保存"));
+    assert!(body(&resp).contains("已保存") && body(&resp).contains("class=\"ic\""));
     let saved_html: String = state.with_conn(|c| {
         c.query_row(
             "SELECT body_html FROM templates WHERE name = '纯文本模板'",
@@ -8052,7 +8068,8 @@ fn settings_hints_use_tip_and_no_emoji_icons() {
         // emoji 图标回归守卫（彩色 emoji 区段 + 常用符号）
         for bad in [
             '📥', '📤', '📝', '👥', '⚙', '✏', '📎', '🔄', '🗑', '⭐', '💬', '🌐', '🎛', '🔍', '🔎',
-            '💾', '🖨', '📨', '📄', '📁', '🔒', '🗄', '📡', '⚠', '⌨', '⏰', '⏳', '↪', '↩', '✎',
+            '💾', '🖨', '📨', '📄', '📁', '🔒', '🗄', '📡', '⚠', '⌨', '⏰', '⏳', '↪', '↩', '✎', '✓',
+            '✗', '✕', '●', '×',
         ] {
             assert!(
                 !html.contains(bad),
