@@ -1,10 +1,16 @@
-{# 设置·关于 pane（上下文：SettingsCtx）#}
+{# 设置·关于 pane（上下文：SettingsCtx）。
+   上架微软商店的安全与合规考量：不展示技术栈/引擎信息（框架与存储引擎
+   版本属可被探测的攻击面），只给用户看得懂、商店审核也需要的常规信息：
+   产品定位、版本、数据存放位置与隐私承诺 #}
 <div class="settings-pane on" id="settings-pane">
     <div class="card settings-card">
         <h3>关于</h3>
-        <p class="desc">CorpMail v{{ app_version }} · Tauri 2 + htmx + SQLite（本地单机应用）</p>
+        <p class="desc">CorpMail 是一款企业邮箱本地客户端：邮件、附件与联系人全部保存在本机，
+            收取、发送、检索和附件预览均在本地完成，应用不向任何第三方上传您的数据，
+            也不包含广告或遥测组件。</p>
         <div class="kv"><span class="k">版本</span><b>v{{ app_version }}</b></div>
-        <div class="kv"><span class="k">存储引擎</span><b>SQLite {{ sqlite_version }} · FTS5</b></div>
-        <div class="kv"><span class="k">数据目录</span><span class="mono">{{ data_dir }}</span></div>
+        <div class="kv"><span class="k">数据存储</span><span>全部保存在本机，可在「存储管理」随时查看与清理</span></div>
+        <div class="kv"><span class="k">账号安全</span><span>邮箱密码由操作系统凭据保管，应用本身不留存明文</span></div>
+        <div class="kv"><span class="k">隐私承诺</span><span>除您配置的邮箱服务器外，应用不会连接其他服务器上传数据</span></div>
     </div>
 </div>

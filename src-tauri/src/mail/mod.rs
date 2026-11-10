@@ -703,81 +703,6 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
     Ok(())
 }
 
-/// 历史数据修复（正文/HTML 乱码）：邮件头声明 gb2312/gbk 而正文实为 UTF-8 时，
-/// 收件路径曾按声明解码产生“璇—□镮囬”类乱码入库。逆过程：把库内文本按
-/// GB18030 逆推回字节，字节恰为合法 UTF-8 且含 CJK 时按 UTF-8 重解码写回
-/// （body_text 同步重算 body_tokens 保 FTS 检索一致）。正常中文逆推为 GBK
-/// 字节序列，几乎不可能整段恰为合法 UTF-8，不会误伤；幂等（修复后的文本
-/// 二次逆推必失败，空扫退出）；失败不阻断启动（与主题修复同策略）。
-pub fn repair_mojibake_bodies(conn: &mut rusqlite::Connection) -> Result<(), String> {
-    let rows: Vec<(i64, String, Option<String>)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, body_text, body_html FROM emails")
-            .map_err(|e| e.to_string())?;
-        let rs = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rs.filter_map(Result::ok).collect::<Vec<_>>()
-    };
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut fixed_text = 0usize;
-    let mut fixed_html = 0usize;
-    for (id, bt, bh) in rows {
-        if let Some(new_bt) = recover_gbk_mojibake(&bt) {
-            tx.execute(
-                "UPDATE emails SET body_text = ?2, body_tokens = ?3 WHERE id = ?1",
-                rusqlite::params![id, new_bt, tokenize(&new_bt)],
-            )
-            .map_err(|e| e.to_string())?;
-            fixed_text += 1;
-        }
-        if let Some(h) = bh.as_deref()
-            && let Some(new_h) = recover_gbk_mojibake(h)
-            && new_h != h
-        {
-            tx.execute(
-                "UPDATE emails SET body_html = ?2 WHERE id = ?1",
-                rusqlite::params![id, new_h],
-            )
-            .map_err(|e| e.to_string())?;
-            fixed_html += 1;
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    if fixed_text + fixed_html > 0 {
-        eprintln!("[repair] 正文 GBK 乱码修复 {fixed_text} 封正文 / {fixed_html} 封 HTML");
-    }
-    Ok(())
-}
-
-/// UTF-8 被按 GBK 误解码的乱码还原：文本按 GB18030 逆推回字节后恰为合法
-/// UTF-8（且含 CJK、与原文不同）即认定乱码并返回重解码结果。
-/// 误伤防护：高位字符 <4 个不处理（短文本巧合面大）；编码不可逆（含 U+FFFD，
-/// 字节已丢）放弃；修复结果须自身不再可逆推（防多层套娃改写）。
-pub(crate) fn recover_gbk_mojibake(text: &str) -> Option<String> {
-    if text.chars().filter(|c| (*c as u32) >= 0x80).count() < 4 {
-        return None;
-    }
-    let (bytes, _, had_errors) = encoding_rs::GB18030.encode(text);
-    if had_errors {
-        return None;
-    }
-    let fixed = String::from_utf8(bytes.into_owned()).ok()?;
-    if fixed == text || !fixed.chars().any(is_cjk) {
-        return None;
-    }
-    if recover_gbk_mojibake(&fixed).is_some() {
-        return None; // 修复结果还能再“修”一层 → 疑巧合文本，不动
-    }
-    Some(fixed)
-}
-
 /// 会话归组键存量回填（M2-2，v8 升级/首启）：把 NULL 的 thread_key 按 subject
 /// 普通化补齐（空主题 → 空串）。幂等：`WHERE thread_key IS NULL` 只扫待补行，
 /// 补齐后空扫退出；失败不阻断启动（与联系人回填同策略）。应在主题修复后调用，
@@ -1522,6 +1447,32 @@ pub fn thread_mails(
     }))
 }
 
+/// 发件箱/草稿箱列表的「对方」展示（2026-11-09）：解析 to_addrs 取姓名/地址，
+/// 有姓名用姓名，多个用「、」连接，超过 3 个截断补「等 N 位」；无法解析出
+/// 任何地址时原样回显（草稿可能暂存未完成输入）
+fn recipient_display(to_addrs: &str) -> String {
+    const MAX: usize = 3;
+    let list = contacts::parse_addr_list(to_addrs);
+    if list.is_empty() {
+        let t = to_addrs.trim();
+        return if t.is_empty() {
+            "（无收件人）".into()
+        } else {
+            t.into()
+        };
+    }
+    let shown: Vec<String> = list
+        .iter()
+        .take(MAX)
+        .map(|(a, n)| if n.is_empty() { a.clone() } else { n.clone() })
+        .collect();
+    if list.len() > MAX {
+        format!("{} 等 {} 位", shown.join("、"), list.len())
+    } else {
+        shown.join("、")
+    }
+}
+
 /// 列表行映射（list/search 共用；列序：id,folder,status,subject,from_addr,from_name,
 /// to_addrs,body_text,attach_cnt,unread,t）。highlight_words=Some 时标题做命中高亮
 fn summary_from_row(
@@ -1535,15 +1486,26 @@ fn summary_from_row(
     };
     let name: String = r.get(5)?;
     let addr: String = r.get(4)?;
+    let folder: String = r.get(1)?;
+    let to_addrs: String = r.get(6)?;
     let body: String = r.get(7)?;
     let scheduled_at = r.get::<_, i64>(13)?;
+    // 发件箱/草稿箱列表展示收件人（2026-11-09）：这两箱的「对方」是收件人，
+    // 显示发件人（自己）没有信息量
+    let from_display = if folder == "sent" || folder == "draft" {
+        recipient_display(&to_addrs)
+    } else if name.is_empty() {
+        addr
+    } else {
+        name
+    };
     Ok(EmailSummary {
         id: r.get(0)?,
         folder: r.get(1)?,
         status: r.get(2)?,
         subject,
-        from_display: if name.is_empty() { addr } else { name },
-        to_addrs: r.get(6)?,
+        from_display,
+        to_addrs,
         body_preview: preview(&body),
         preview_tip: preview_tip(&body),
         attach_cnt: r.get(8)?,

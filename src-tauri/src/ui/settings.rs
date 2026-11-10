@@ -86,7 +86,6 @@ pub(super) struct SettingsCtx {
     templates: Vec<crate::mail::templates::Template>,
     // 关于 tab
     app_version: String,
-    sqlite_version: String,
 }
 
 /// 手动清理结果展示（存储页报告区；ok=false 时仅展示 error）
@@ -260,7 +259,6 @@ pub(super) fn settings_ctx(
             Vec::new()
         },
         app_version: env!("CARGO_PKG_VERSION").into(),
-        sqlite_version: state.sqlite_version(),
     }
 }
 

@@ -200,6 +200,98 @@ fn list_page_shows_drafts_with_sidebar_counts() {
     cleanup(&dir);
 }
 
+/// 发件箱/草稿箱（2026-11-09 需求）：①列表行「对方」显示收件人而非自己；
+/// ②批量按钮组只保留「全选」（删除/批量操作/清空选择不渲染）；
+/// ③顶栏 ⋯ 下拉（含「收取新邮件」）不渲染；收件箱视图不受影响
+#[test]
+fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
+    let (state, dir) = temp_state("toolbar-sent-draft");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '季度汇报','已发送正文','季度 汇报','正文',1,1),
+                        ('out','draft','draft','demo@chinatelecom.cn','张伟',
+                         '李四 <lisi@x.cn>, wangwu@x.cn, zhao@x.cn, qian@x.cn',
+                         '未完草稿','草稿正文','未完 草稿','正文',2,NULL),
+                        ('in','inbox','received','boss@x.cn','部门领导','demo@chinatelecom.cn',
+                         '月度激励清单','收件正文','月度 激励 清单','正文',3,NULL)",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    // 发件箱：对方列显示收件人地址，不显示自己姓名；按钮精简
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "folder=sent", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains(r#"class="mr-who">peer@x.cn</span>"#),
+        "发件箱行「对方」位应渲染收件人地址：{html}"
+    );
+    assert!(
+        !html.contains(r#"class="mr-who">张伟</span>"#),
+        "发件箱行「对方」位不应显示发件人（自己）：{html}"
+    );
+    assert!(html.contains("全选"), "批量组应保留全选");
+    assert!(
+        !html.contains("data-batch=\"delete\"") && !html.contains("清空选择"),
+        "发件箱不应渲染删除/清空选择按钮：{html}"
+    );
+    assert!(
+        !html.contains("收取新邮件") && !html.contains("tb-more-btn"),
+        "发件箱不应渲染 ⋯ 下拉（含收取新邮件）：{html}"
+    );
+    // 草稿箱：收件人姓名优先、超 3 个截断补「等 N 位」
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "folder=draft", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("李四、wangwu@x.cn、zhao@x.cn 等 4 位"),
+        "草稿行应显示收件人（姓名优先、多收件人截断）：{html}"
+    );
+    assert!(
+        !html.contains("收取新邮件"),
+        "草稿箱不应渲染收取新邮件：{html}"
+    );
+    // 收件箱：按钮组与 ⋯ 下拉保持原样
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("data-batch=\"delete\"") && html.contains("清空选择"),
+        "收件箱应保留完整批量按钮组：{html}"
+    );
+    assert!(
+        html.contains("收取新邮件") && html.contains("tb-more-btn"),
+        "收件箱应保留 ⋯ 下拉与收取入口：{html}"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn root_search_highlights_and_falls_back_on_stopwords() {
     let (state, dir) = temp_state("m5-search");

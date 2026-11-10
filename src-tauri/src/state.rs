@@ -232,11 +232,6 @@ impl AppState {
         if let Err(err) = crate::mail::repair_gbk_subjects(&mut conn) {
             eprintln!("[repair] 主题乱码修复失败（忽略）：{err}");
         }
-        // 历史正文/HTML GBK 乱码一次性修复（UTF-8 被误标 gb2312 解码入库；
-        // 幂等，修完二次逆推必失败空扫退出）
-        if let Err(err) = crate::mail::repair_mojibake_bodies(&mut conn) {
-            eprintln!("[repair] 正文乱码修复失败（忽略）：{err}");
-        }
         // 会话归组键存量回填（v8 升级/首启）：在主题修复后执行，基于已修复 subject
         if let Err(err) = crate::mail::backfill_thread_keys(&mut conn) {
             eprintln!("[thread] 会话归组键回填失败（忽略）：{err}");
@@ -1026,13 +1021,6 @@ impl AppState {
             .filter_map(|f| std::fs::metadata(self.data_dir().join(f)).ok())
             .map(|m| m.len())
             .sum()
-    }
-
-    /// SQLite 版本串（关于页展示）
-    pub fn sqlite_version(&self) -> String {
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))
-            .unwrap_or_default()
     }
 
     /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（5 个计数）
