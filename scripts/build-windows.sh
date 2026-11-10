@@ -35,7 +35,17 @@ if [ ! -f "${CACHE_DIR}/MicrosoftEdgeWebview2Setup.exe" ]; then
     echo "[build-windows] 已预置 Bootstrapper 打包缓存：${CACHE_DIR}/MicrosoftEdgeWebview2Setup.exe"
 fi
 
-# 2) 交叉编译 + NSIS 打包（单命令两步内聚：cargo build → bundler）
+# 2) 质量门禁：clippy 零告警才允许打包（与开发约定一致；SKIP_CLIPPY=1 可跳过）
+#    对 Windows 交叉目标整库 + 全部 targets 检查（编译期与 bundler 同目标，保障
+#    不引入平台条件编译告警）。clippy 失败即中止（set -e），阻断出包。
+if [ "${SKIP_CLIPPY:-0}" != "1" ]; then
+    echo "[build-windows] 质量门禁：cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings"
+    cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+else
+    echo "[build-windows] 已跳过 clippy 门禁（SKIP_CLIPPY=1，仅用于本地调试）" >&2
+fi
+
+# 3) 交叉编译 + NSIS 打包（单命令两步内聚：cargo build → bundler）
 #    bundle.targets 经 --config 内联指定：CLI 的 --bundles 参数按宿主平台条件编译枚举
 #    （macOS 无 nsis 变体）必被拒，而 config targets 走平台无关 BundleType、bundler 按
 #    target triple 调度——这是官方交叉打包的通道。
@@ -57,7 +67,7 @@ fi
 cargo tauri build --target x86_64-pc-windows-gnu \
     --config "$CONFIG_JSON" "$@"
 
-# 3) 产物清单
+# 4) 产物清单
 echo
 echo "[build-windows] 安装器产物："
 ls -la target/x86_64-pc-windows-gnu/release/bundle/nsis/
