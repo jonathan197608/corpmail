@@ -246,6 +246,10 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     );
     assert!(html.contains("全选"), "批量组应保留全选");
     assert!(
+        html.contains(r#"id="ba-select-all""#),
+        "发件箱应保留「跨页选择全部」入口：{html}"
+    );
+    assert!(
         !html.contains("data-batch=\"delete\"") && !html.contains("清空选择"),
         "发件箱不应渲染删除/清空选择按钮：{html}"
     );

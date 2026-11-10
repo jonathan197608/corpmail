@@ -6,8 +6,8 @@
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
         {% if not is_thread and items %}
         {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）；
-           发件箱/草稿箱按钮精简（2026-11-09）：只保留「全选」，删除/批量操作/
-           清空选择仅收件箱与全部视图渲染（这两个箱的邮件另有详情页操作入口） #}
+           发件箱/草稿箱按钮精简（2026-11-09）：只保留「全选」与「跨页选择全部」，
+           删除/批量操作/清空选择仅收件箱与全部视图渲染 #}
         <div class="mbx-inline" id="batch-bar">
             <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">全选</label>
             <span class="ba-count" id="ba-count"></span>
@@ -25,6 +25,10 @@
                 </div>
             </div>
             <button type="button" class="btn small" id="ba-clear">清空选择</button>
+            {% else %}
+            {# 发件/草稿箱：无批量动作与 ⋯ 下拉，但跨页「选择全部 N 封」仍需常驻
+               （js 选中后填充文案并显隐，与下拉内入口共用同一 id/逻辑） #}
+            <a href="#" id="ba-select-all" class="btn small" hidden></a>
             {% endif %}
             <input type="hidden" id="batch-mode" value="ids">
             <input type="hidden" id="batch-exclude" value="[]">
