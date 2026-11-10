@@ -125,6 +125,6 @@ powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
 | build-msix.ps1（PowerShell 原生，WinApp CLI 打包） | ✅ |
 | 版本 0.3.0 全链统一 | ✅ |
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
-| 本体品牌 CorpMail（productName/窗口标题/页面/启动动画） | ✅ 本版统一 |
+| 品牌（productName=CorpMail；窗口标题/托盘菜单中文名「企业邮箱客户端」） | ✅ 本版统一 |
 | 公开隐私文档路径（仓库根） | ✅ 本次修复（原 docs/ 整体在 .gitignore，链接会 404） |
 | GitHub 仓库迁移至 corpmail（原 mailbox 仓库停用为历史归档） | ✅ 已迁移（商店隐私链接等全链指向新仓库） |

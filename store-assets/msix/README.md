@@ -11,9 +11,8 @@ store-assets/
 │   ├── assets/              # 全套商店图标（像素风，最近邻放大无损）
 │   └── （out/ 构建产物，不入库）
 ├── listing/
-│   ├── store-listing.md     # Partner Center 逐字段对照表（中英双语）
-│   ├── PRIVACY.zh-CN.md     # 隐私声明草稿（正式版已发布在仓库根 PRIVACY.zh-CN.md）
-│   └── PRIVACY.en-US.md
+│   └── store-listing.md     # Partner Center 逐字段对照表（中英双语）
+│   （隐私声明正式版见仓库根 PRIVACY.zh-CN.md / PRIVACY.en-US.md，副本已去除）
 └── screenshots/             # 1920×1080 商店截图 ×5（真实页面渲染）
 ```
 
