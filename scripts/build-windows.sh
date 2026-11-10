@@ -9,20 +9,25 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${ROOT}/src-tauri"
 
-# 0) 本机 patched NSIS 工具链（PATH 前置）。
+# 0) 本机 patched NSIS 工具链（PATH 前置；持久目录，见 build-patched-nsis.sh）。
 #    brew nsis 3.13 在 macOS 上必崩：libiconv 的 "wchar_t" 通道拒绝 NSIS 内部标记串中的
 #    U+0002（EILSEQ）→ makensis 处理任意脚本即 bad_alloc；中文 .nlf 再触发 "Bad text
 #    encoding"（详见设计文档 §11.4）。
-#    自建 patched 工具链位于 .temp/nsis-toolchain：bin/makensis 是 wrapper 脚本（注入
-#    NSISDIR），bin/makensis.bin 才是真实二进制。
+#    patched 工具链位于 ~/.local/share/corpmail/nsis-toolchain：bin/makensis 是 wrapper
+#    脚本（进程内注入 NSISDIR），bin/makensis.bin 才是真实二进制。
 #    注意：tauri-bundler 调 makensis 时会 .env_remove("NSISDIR")，导出该变量无效，
 #    数据目录定位必须由 wrapper 在进程内完成。
-NSIS_BIN="${ROOT}/.temp/nsis-toolchain/bin"
-if [ -x "${NSIS_BIN}/makensis" ]; then
+NSIS_BIN="${HOME}/.local/share/corpmail/nsis-toolchain/bin"
+if [ -x "${NSIS_BIN}/makensis" ] && [ -x "${NSIS_BIN}/makensis.bin" ]; then
     export PATH="${NSIS_BIN}:${PATH}"
     echo "[build-windows] 使用自建 patched NSIS：${NSIS_BIN}/makensis（wrapper → makensis.bin）"
 else
-    echo "[build-windows] 警告：未找到自建 patched NSIS，将回退系统 makensis（brew 3.13 已知必崩）" >&2
+    echo "[build-windows] 错误：未找到自建 patched NSIS（${NSIS_BIN}/makensis）" >&2
+    echo "  macOS 宿主下系统 brew makensis 3.13 因 libiconv 'wchar_t' 通道 EILSEQ 必崩，" >&2
+    echo "  不能回退。请先构建工具链（源码构建约 1 分钟）：" >&2
+    echo "    scripts/build-patched-nsis.sh" >&2
+    echo "  （Linux CI 宿主无此 bug，直接用 apt install nsis，不依赖本工具链）" >&2
+    exit 1
 fi
 
 # 1) 预置 WebView2 Bootstrapper 打包缓存。
