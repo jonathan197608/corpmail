@@ -114,8 +114,11 @@
     </div>
 
     {# 高级检索面板（B1）：GET 表单，保留 folder/q/mode/per/sort；
-       默认收起（2026-11-05：即使有激活筛选也收起，点 ⚙ 展开查看/修改条件） #}
-    <form class="adv-panel" id="adv-panel" method="get" action="/" hidden>
+       无激活筛选默认收起；有激活筛选（发件人/日期/附件任一）保持展开——
+       2026-11-09 调整：原“即使有筛选也收起”导致点「应用筛选」后面板自动
+       隐藏，用户看不到/改不了当前条件 #}
+    <form class="adv-panel" id="adv-panel" method="get" action="/"
+          {% if not from_filter and not df and not dt and not has_attach %}hidden{% endif %}>
         <input type="hidden" name="folder" value="{{ folder }}">
         {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
         {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}

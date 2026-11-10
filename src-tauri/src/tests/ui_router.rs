@@ -7144,16 +7144,29 @@ fn advanced_search_filters_and_persists() {
         2,
         "非法日期应忽略：{html}"
     );
-    // 高级面板默认收起（2026-11-05：即使有筛选条件也收起，点 ⚙ 展开查看）
+    // 高级面板显隐（2026-11-09 调整）：有激活筛选保持展开——点「应用筛选」
+    // 提交回来仍能看到/修改条件；无筛选默认收起
     let html = body(&route(
         &state,
         &assets(),
         &req_q("GET", "/", "from=partner", b""),
         &t,
     ));
+    // 取面板开标签整体（含可能的换行），判定 hidden 显隐
+    fn panel_tag(html: &str) -> &str {
+        let pos = html.find(r#"id="adv-panel""#).unwrap();
+        let start = html[..pos].rfind("<form").unwrap();
+        let end = html[pos..].find('>').unwrap() + pos;
+        &html[start..=end]
+    }
     assert!(
-        html.contains("id=\"adv-panel\" method=\"get\" action=\"/\" hidden"),
-        "面板应渲染且默认收起（hidden）：{html}"
+        !panel_tag(&html).contains("hidden"),
+        "有激活筛选时面板应保持展开（不带 hidden）：{html}"
+    );
+    let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
+    assert!(
+        panel_tag(&html).contains("hidden"),
+        "无筛选时面板应默认收起：{html}"
     );
     cleanup(&dir);
 }
