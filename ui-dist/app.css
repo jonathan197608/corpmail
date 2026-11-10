@@ -51,6 +51,82 @@ a {
     text-decoration: none;
 }
 
+/* ============ 统一 SVG 图标（2026-11-10） ============
+   全站 emoji 图标改为内联 SVG：Windows 的 emoji 字体在 125%/150% DPI 下
+   由系统反复缩放，发虚且各字形宽度不一；SVG 随字号（1em）缩放、颜色跟随
+   currentColor，线宽统一 1.8 / 圆头圆角，跨平台完全一致 */
+.ic {
+    width: 1em;
+    height: 1em;
+    display: inline-block;
+    flex: none;
+    vertical-align: -0.125em;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.ic.sm {
+    width: 0.9em;
+    height: 0.9em;
+}
+
+.ic.lg {
+    width: 1.2em;
+    height: 1.2em;
+}
+
+/* ---------- 气泡说明（2026-11-10）：设置页行内 hint 小字改悬停/聚焦气泡 ---------- */
+.tip-i {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    margin-left: 4px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: none;
+    color: var(--t-hint);
+    cursor: help;
+    vertical-align: -0.18em;
+}
+
+.tip-i:hover,
+.tip-i:focus-visible {
+    color: var(--accent);
+    outline: none;
+}
+
+.tip-i .ic {
+    width: 15px;
+    height: 15px;
+    stroke-width: 1.7;
+}
+
+/* 浮层挂在 body（position:fixed）：设置页/向导的滚动容器不会裁掉气泡 */
+.tip-layer {
+    position: fixed;
+    z-index: 200;
+    max-width: 280px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    background: #1f2b40;
+    color: #fff;
+    font-size: 12px;
+    line-height: 1.55;
+    box-shadow: 0 6px 20px rgba(15, 28, 48, 0.28);
+    pointer-events: none;
+    white-space: normal;
+}
+
+.tip-layer[hidden] {
+    display: none;
+}
+
 html,
 body {
     height: 100%;
@@ -182,6 +258,12 @@ body {
    原 space-between 依赖单一子元素，emoji/文字/计数三段后失效 */
 .folder .fw {
     flex: 0 0 auto;
+}
+
+/* 侧栏导航图标：emoji 时代约 15-16px，SVG 按 1em 只有 13.5px，放大到 15px */
+.folder > .ic {
+    width: 15px;
+    height: 15px;
 }
 
 .folder:hover {
@@ -2239,7 +2321,7 @@ a.btn.link.disabled {
     /* 提示横跨全行：.sfield 是 108px 标签列 + 1fr 内容列，.pair 内 .pf 同理；
        不跨列会被压进标签列窄条里 */
     grid-column: 1 / -1;
-    margin: 6px 0 0;
+    margin: 6px 0;
     font-size: 12px;
     line-height: 1.6;
     color: #b45309;
@@ -2919,13 +3001,6 @@ a.btn.link.disabled {
     border-radius: 6px;
     padding: 1px 7px;
     white-space: nowrap;
-}
-
-/* 详情页星标按钮未点亮态（2026-11-04 emoji 化）：emoji 无空心形态，
-   用灰度滤镜表达"未星标"，点亮态恢复彩色——视觉重量一致 */
-.btn.star-btn .dim {
-    filter: grayscale(1);
-    opacity: 0.55;
 }
 
 /* ============ 源码页（A5：HTML/纯文本/原始信头） ============ */

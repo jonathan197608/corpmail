@@ -1,4 +1,5 @@
 {# 设置·邮件模板 pane（B2，上下文：SettingsCtx） #}
+{% import "icons.html" as ic %}
 <div class="settings-pane on" id="settings-pane">
     <div class="card settings-card">
         <h3>邮件模板</h3>
@@ -10,11 +11,11 @@
 
         <form class="tpl-form" hx-post="/templates/save" hx-target="#settings-pane" hx-swap="outerHTML">
             <div class="sfield">
-                <label>名称<small class="hint">最多 60 字，用于下拉选择</small></label>
+                <label>名称{{ ic.tip('最多 60 字，用于下拉选择') }}</label>
                 <input type="text" name="name" maxlength="60" required placeholder="如：收到请回复">
             </div>
             <div class="sfield" data-tpl-field>
-                <label>内容<small class="hint">默认按纯文本编辑；点「切换为富文本」后只能用富文本，不能再改回纯文本</small></label>
+                <label>内容{{ ic.tip('默认按纯文本编辑；点「切换为富文本」后只能用富文本，不能再改回纯文本') }}</label>
                 <input type="hidden" name="body_mode" value="plain" data-tpl-mode>
                 <div class="tpl-plain-head" data-tpl-plain-head>
                     <button type="button" class="btn small" data-tpl-upgrade
@@ -27,7 +28,7 @@
                    与邮件正文一样仅单向升级，HTML 不可降级回纯文本 #}
                 <div class="tpl-editor" data-tpl-html-field hidden>
                     <div class="tpl-ed-actions">
-                        <button type="button" class="btn small" data-tpl-src-toggle>⌨ HTML 源码</button>
+                        <button type="button" class="btn small" data-tpl-src-toggle>{{ ic.icon('keyboard') }} HTML 源码</button>
                     </div>
                     <div class="tpl-ed-toolbar" data-tpl-tb></div>
                     <div class="tpl-ed-area" data-tpl-area></div>
@@ -72,7 +73,7 @@
                         </div>
                         <div class="tpl-editor" data-tpl-html-field {% if not t.body_html %}hidden{% endif %}>
                             <div class="tpl-ed-actions">
-                                <button type="button" class="btn small" data-tpl-src-toggle>⌨ HTML 源码</button>
+                                <button type="button" class="btn small" data-tpl-src-toggle>{{ ic.icon('keyboard') }} HTML 源码</button>
                             </div>
                             <div class="tpl-ed-toolbar" data-tpl-tb></div>
                             <div class="tpl-ed-area" data-tpl-area></div>

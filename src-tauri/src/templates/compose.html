@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "icons.html" as ic %}
 {% block head %}
 <link rel="stylesheet" href="/vendor/wang-editor/style.css">
 <script src="/vendor/wang-editor/index.js" defer></script>
@@ -13,12 +14,12 @@
         </div>
 
         <div class="card compose-card">
-            {% if undone %}<div class="compose-note ok">↩ 已撤销发送，可继续编辑或重新发送</div>{% endif %}
+            {% if undone %}<div class="compose-note ok">{{ ic.icon('undo') }} 已撤销发送，可继续编辑或重新发送</div>{% endif %}
             {% if saved %}<div class="compose-note ok">✓ 草稿已保存</div>{% endif %}
             {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个 0 字节文件（未附加）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}
-            {% if forward_attach_cnt > 0 %}<div class="compose-note">📎 将携带原邮件 {{ forward_attach_cnt }} 个附件（保存后生效）</div>{% endif %}
-            {% if attach_eml_from %}<div class="compose-note">📎 原邮件将以附件 {{ attach_eml_name }} 加入（保存后生效，可被删除）</div>{% endif %}
+            {% if forward_attach_cnt > 0 %}<div class="compose-note">{{ ic.icon('paperclip') }} 将携带原邮件 {{ forward_attach_cnt }} 个附件（保存后生效）</div>{% endif %}
+            {% if attach_eml_from %}<div class="compose-note">{{ ic.icon('paperclip') }} 原邮件将以附件 {{ attach_eml_name }} 加入（保存后生效，可被删除）</div>{% endif %}
 
             <form hx-post="/compose/draft" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button[type=submit]">
                 <input type="hidden" name="draft_id" value="{{ draft_id }}">
@@ -61,7 +62,7 @@
                     <div class="body-tools">
                         {% if templates %}
                         <select id="tpl-select" aria-label="插入模板">
-                            <option value="">📄 插入模板…</option>
+                            <option value="">插入模板…</option>
                             {% for t in templates %}
                             <option value="{{ t.id }}" data-text="{{ t.body_text }}" data-html="{{ t.body_html }}">{{ t.name }}</option>
                             {% endfor %}
@@ -91,14 +92,14 @@
                 </div>
 
                 <div class="attach-area">
-                    <button type="button" class="btn" onclick="mbxPickAttachments()">📎 添加附件</button>
+                    <button type="button" class="btn" onclick="mbxPickAttachments()">{{ ic.icon('paperclip') }} 添加附件</button>
                     <ul id="picked-list" class="att-list"></ul>
                     {% if attachments %}
                     <div class="kept-title">已保存的附件（保存草稿时保留）</div>
                     <ul class="att-list">
                         {% for a in attachments %}
                         <li class="att-row kept">
-                            <span class="att-clip">📎</span>
+                            <span class="att-clip">{{ ic.icon('paperclip') }}</span>
                             <span class="att-name clickable"
                                   onclick="mbxPreviewAttachment('/emails/{{ draft_id }}/attachments/{{ a.id }}/view', {{ a.preview_kind | js_str }}, {{ a.filename | js_str }})"
                                   title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
@@ -122,12 +123,12 @@
                     <button type="button" class="btn big" id="sched-send-btn"
                             hx-post="/compose/send" hx-include="closest form"
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this"
-                            title="到定时时刻自动发送（期间驻留草稿箱）">⏰ 定时发送</button>
+                            title="到定时时刻自动发送（期间驻留草稿箱）">{{ ic.icon('clock') }} 定时发送</button>
                     <input type="hidden" name="scheduled_at" id="sched-at" value="{{ sched_local }}">
                     <button type="button" class="btn primary big"
                             hx-post="/compose/send" hx-include="closest form"
-                            hx-trigger="click throttle:500ms" hx-disabled-elt="this">📨 发送</button>
-                    <button type="submit" class="btn big">💾 存草稿</button>
+                            hx-trigger="click throttle:500ms" hx-disabled-elt="this">{{ ic.icon('send') }} 发送</button>
+                    <button type="submit" class="btn big">{{ ic.icon('save') }} 存草稿</button>
                 </div>
             </form>
         </div>

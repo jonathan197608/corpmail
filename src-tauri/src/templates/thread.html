@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "icons.html" as ic %}
 {% block body %}
 <div class="app on">
     {% include "side.html" %}
@@ -20,7 +21,7 @@
                     <span class="tm-who">{{ m.from_display }}</span>
                     <span class="tm-time">{{ m.time_label }}</span>
                     {% if m.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
-                    {% if m.starred %}<span class="tm-star">★</span>{% endif %}
+                    {% if m.starred %}<span class="tm-star">{{ ic.icon('star-fill') }}</span>{% endif %}
                 </div>
                 <div class="tm-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</div>
                 <div class="tm-body">{{ m.body_preview }}</div>

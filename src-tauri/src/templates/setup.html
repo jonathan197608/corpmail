@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "icons.html" as ic %}
 {% block body %}
 <div class="app on full">
     <div class="onboard">
@@ -16,7 +17,7 @@
                 <p class="desc">填写后会自动测试发信与收信通道，全部通过才会保存。</p>
 
             <div class="sfield">
-                <label>登录账号<small class="hint">域名可按需修改</small></label>
+                <label>登录账号{{ ic.tip('域名可按需修改') }}</label>
                 <div class="port-row">
                     <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
                         autocomplete="off" autocapitalize="none" spellcheck="false">
@@ -28,7 +29,7 @@
                 <label>密码 / 授权码</label>
                 <input type="password" name="password" required autocomplete="new-password">
                 {% if is_ct_domain %}
-                <p class="ct-guide">⚠️ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
+                <p class="ct-guide">{{ ic.icon('warning') }} 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
                 {% endif %}
             </div>
                 <div class="sfield">
@@ -85,11 +86,11 @@
                             {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
                     </div>
                     {% if is_ct_domain %}
-                    <p class="ct-guide">⚠️ 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
+                    <p class="ct-guide">{{ ic.icon('warning') }} 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
                     {% endif %}
                 </div>
                 <div class="sfield">
-                    <label>数据保存目录<small class="hint">留空使用默认目录</small></label>
+                    <label>数据保存目录{{ ic.tip('留空使用默认目录') }}</label>
                     <div class="port-row">
                         <input class="mono" type="text" name="data_dir" value="{{ data_dir }}" spellcheck="false"
                             placeholder="留空使用默认目录；填写后邮件数据将保存到该目录">
@@ -98,7 +99,7 @@
                     </div>
                 </div>
 
-                <div class="sec-note">{{ cred_note }}</div>
+                <div class="sec-note">{{ ic.icon('lock') }} {{ cred_note }}</div>
 
                 <div id="test-results" class="test-row"></div>
                 {# 提交后立即显示（hx-indicator）：双通道真实连接测试最长可等待 ~15s，

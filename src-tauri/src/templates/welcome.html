@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "icons.html" as ic %}
 {% block body %}
 <div class="app on full">
     <div class="onboard">
@@ -15,21 +16,21 @@
 
             <div class="card">
                 <div class="feature-row">
-                    <span class="fi">🔒</span>
+                    <span class="fi">{{ ic.icon('lock', 'lg') }}</span>
                     <div>
                         <b>密码安全，系统代管</b>
                         <span>邮箱密码交给系统保管（Windows 凭据管理器 / macOS 钥匙串），不落数据库</span>
                     </div>
                 </div>
                 <div class="feature-row">
-                    <span class="fi">🗄</span>
+                    <span class="fi">{{ ic.icon('archive', 'lg') }}</span>
                     <div>
                         <b>邮件全部存在本机</b>
                         <span>所有来信去信都在本地，标题和正文都能搜索</span>
                     </div>
                 </div>
                 <div class="feature-row">
-                    <span class="fi">📡</span>
+                    <span class="fi">{{ ic.icon('antenna', 'lg') }}</span>
                     <div>
                         <b>直连公司邮件服务器</b>
                         <span>发信、收信用的是公司标准服务器，不中转第三方</span>

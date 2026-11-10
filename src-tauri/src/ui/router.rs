@@ -2705,11 +2705,11 @@ pub(crate) fn is_ct_mail_domain(domain: &str) -> bool {
 /// 凭据保管文案（编译期平台自适应；模板不再写死两个平台名）
 fn cred_storage_note() -> String {
     if cfg!(target_os = "macos") {
-        "🔒 密码保存进 macOS 钥匙串，服务器与邮件数据保存在本机数据库。".into()
+        "密码保存进 macOS 钥匙串，服务器与邮件数据保存在本机数据库。".into()
     } else if cfg!(target_os = "windows") {
-        "🔒 密码保存进 Windows 凭据管理器，服务器与邮件数据保存在本机数据库。".into()
+        "密码保存进 Windows 凭据管理器，服务器与邮件数据保存在本机数据库。".into()
     } else {
-        "🔒 密码保存进系统凭据保管，服务器与邮件数据保存在本机数据库。".into()
+        "密码保存进系统凭据保管，服务器与邮件数据保存在本机数据库。".into()
     }
 }
 

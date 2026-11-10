@@ -1,4 +1,5 @@
 {# 设置·存储管理 pane（上下文：SettingsCtx）#}
+{% import "icons.html" as ic %}
 <div class="settings-pane on" id="settings-pane">
     {% if error %}
     <div class="card compose-note err">✕ {{ error }}</div>
@@ -16,7 +17,7 @@
             <p class="desc">附件压缩后超过内联上限的不入库，单独存文件。</p>
 
             <div class="kv">
-                <span class="k">数据目录<small>数据库与附件文件所在位置；服务器/账号配置存于默认目录的 corpmail.toml，不随数据迁移</small></span>
+                <span class="k">数据目录{{ ic.tip('数据库与附件文件所在位置；服务器/账号配置存于默认目录的 corpmail.toml，不随数据迁移') }}</span>
                 <span class="kv-val">
                     <span class="mono dir-path" title="{{ data_dir }}">{{ data_dir }}</span>
                     {% if data_dir_pending %}<span class="dir-badge">重启后生效</span>{% endif %}
@@ -26,13 +27,13 @@
             </div>
             {% if data_dir_pending %}
             <div class="kv">
-                <span class="k">当前使用<small>数据仍在旧目录读写，重启应用后切换到上方新目录</small></span>
+                <span class="k">当前使用{{ ic.tip('数据仍在旧目录读写，重启应用后切换到上方新目录') }}</span>
                 <span class="kv-val"><span class="mono dir-path" title="{{ data_dir_current }}">{{ data_dir_current }}</span></span>
             </div>
             {% endif %}
             {% if has_backup %}
             <div class="kv">
-                <span class="k">旧目录迁移备份<small>默认目录中的数据库与附件副本；配置文件与当前数据不受影响，删除后不可恢复</small></span>
+                <span class="k">旧目录迁移备份{{ ic.tip('默认目录中的数据库与附件副本；配置文件与当前数据不受影响，删除后不可恢复') }}</span>
                 <span class="kv-val">
                     <span class="mono backup-size">{{ backup_size }} · {{ backup_files }} 个文件</span>
                     <button type="button" class="btn small danger"
@@ -44,7 +45,7 @@
             </div>
             {% endif %}
             <div class="kv">
-                <span class="k">内联附件上限<small>超过此大小的附件 gzip 后存独立文件</small></span>
+                <span class="k">内联附件上限{{ ic.tip('超过此大小的附件 gzip 后存独立文件') }}</span>
                 <span><input class="num" type="text" name="inline_attach_max_mb" value="{{ inline_max }}"
                         inputmode="numeric"> MB</span>
             </div>
@@ -113,7 +114,7 @@
         <p class="desc">按上方策略预估；孤儿文件为异常残留。立即清理与启动/每日自动清理同逻辑。</p>
 
         <div class="kv">
-            <span class="k">预计可释放{% if clean_estimate_detail %}<small>{{ clean_estimate_detail }}</small>{% endif %}</span>
+            <span class="k">预计可释放{% if clean_estimate_detail %}{{ ic.tip(clean_estimate_detail) }}{% endif %}</span>
             <b>{{ clean_estimate_bytes }}</b>
         </div>
         {% if clean_view %}

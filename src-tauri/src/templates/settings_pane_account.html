@@ -1,4 +1,5 @@
 {# 设置·账号 pane（上下文：SettingsCtx）#}
+{% import "icons.html" as ic %}
 <div class="settings-pane on" id="settings-pane">
     <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
         <div class="card settings-card">
@@ -18,7 +19,7 @@
                 </div>
             </div>
             <div class="sfield">
-                <label>加密方式<small class="hint">自动 = 465 隐式 TLS、其余 STARTTLS</small></label>
+                <label>加密方式{{ ic.tip('自动 = 465 隐式 TLS、其余 STARTTLS') }}</label>
                 <select name="smtp_security" disabled>
                     <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                     <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465/SMTPS）</option>
@@ -38,12 +39,12 @@
             </div>
             {# 集团邮箱指引：放 pair 之后独立全宽行（.pf 双列内放不下完整路径文案） #}
             {% if is_ct_domain %}
-            <div class="ct-guide">⚠️ 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</div>
+            <div class="ct-guide">{{ ic.icon('warning') }} 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</div>
             {% endif %}
 
             {# 签名档（M3-2）：多行纯文本，撰写新邮件时预填正文底部；空 = 不启用 #}
             <div class="sfield">
-                <label>签名档<small class="hint">新邮件自动附加到正文底部；回复/转发不附加</small></label>
+                <label>签名档{{ ic.tip('新邮件自动附加到正文底部；回复/转发不附加') }}</label>
                 <textarea name="signature" rows="4" id="signature-box"
                     placeholder="张伟&#10;中国电信广州分公司 政企客户部&#10;电话：020-12345678">{{ signature }}</textarea>
             </div>
@@ -70,7 +71,7 @@
                 </div>
             </div>
             <div class="sfield">
-                <label>加密方式<small class="hint">自动 = 993 隐式 TLS、其余 STARTTLS</small></label>
+                <label>加密方式{{ ic.tip('自动 = 993 隐式 TLS、其余 STARTTLS') }}</label>
                 <select name="recv_security" disabled>
                     <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                     <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993/IMAPS）</option>
@@ -87,7 +88,7 @@
         </div>
 
         {% if degraded %}
-        <div class="sec-note">⚠️ 系统凭据服务不可用，密码已降级保存为本机加密文件（随数据库存储）。</div>
+        <div class="sec-note">{{ ic.icon('warning') }} 系统凭据服务不可用，密码已降级保存为本机加密文件（随数据库存储）。</div>
         {% endif %}
     </form>
 </div>

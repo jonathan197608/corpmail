@@ -1697,8 +1697,8 @@ fn star_endpoint_toggles_and_pins_to_top() {
         },
     ));
     assert!(
-        detail.contains("⭐ 已星标"),
-        "详情页星标按钮应回显已星标文案"
+        detail.contains("已星标") && !detail.contains('⭐'),
+        "详情页星标按钮应回显已星标文案（SVG 星形，不再用 emoji）"
     );
     // 再翻一次（取消）→ 置顶解除
     let resp = route(
@@ -5199,7 +5199,7 @@ fn detail_actions_render_at_top_with_reply_all() {
         html.contains("/compose?draft_id=3"),
         "草稿箱应有编辑入口：{html}"
     );
-    assert!(html.contains(">✏️ 编辑</a>"), "草稿箱按钮应为编辑：{html}");
+    assert!(html.contains(" 编辑</a>"), "草稿箱按钮应为编辑：{html}");
     assert!(
         !html.contains("forward_from=3"),
         "草稿箱不应有转发入口：{html}"
@@ -6325,7 +6325,10 @@ fn compose_schedule_send_flow() {
         &req_q("GET", "/", "folder=draft", b""),
         &t,
     ));
-    assert!(html.contains("⏰"), "草稿行应有定时徽标：{html}");
+    assert!(
+        html.contains("mr-flag sched"),
+        "草稿行应有定时徽标（SVG 时钟）：{html}"
+    );
     // 撰写页回显控件值（datetime-local）
     let html = body(&route(
         &state,
@@ -6874,8 +6877,8 @@ fn side_settings_entry_in_folder_list_and_no_folder_title() {
     );
     // 设置入口：folder 列表内 settings-entry（gear 已除名）
     assert!(
-        html.contains("settings-entry") && html.contains("⚙️"),
-        "设置应为侧栏 folder 行入口"
+        html.contains("settings-entry") && html.contains("<svg class=\"ic\""),
+        "设置应为侧栏 folder 行入口（SVG 图标）"
     );
     assert!(!html.contains("class=\"gear\""), "底部 gear 入口应移除");
     // 位置：设置行紧跟联系人行（DOM 顺序 = 渲染顺序）
@@ -6885,11 +6888,18 @@ fn side_settings_entry_in_folder_list_and_no_folder_title() {
         contacts_pos < settings_pos,
         "设置入口应在联系人下方（DOM 序）"
     );
-    // emoji 化核心图标在场（侧栏/列表/操作）
-    assert!(html.contains("📥"), "收件箱 emoji");
-    assert!(html.contains("👥"), "联系人 emoji");
-    assert!(html.contains("🔄"), "收取按钮 emoji");
-    assert!(html.contains("✏️"), "撰写 emoji");
+    // 图标全面 SVG 化（2026-11-10）：核心入口在场且不再出现 emoji
+    assert!(
+        html.contains("compose-btn") && html.contains("<svg class=\"ic\""),
+        "撰写按钮应使用 SVG 图标"
+    );
+    assert!(
+        !html.contains("📥")
+            && !html.contains("👥")
+            && !html.contains("🔄")
+            && !html.contains("✏️"),
+        "侧栏/顶栏不应再出现 emoji 图标"
+    );
     // 设置页侧栏：settings-entry 高亮（frame.folder=settings）
     let html = body(&route(&state, &assets(), &req("GET", "/settings", b""), &t));
     assert!(
@@ -7622,7 +7632,7 @@ fn detail_page_has_print_action() {
         html.contains("mbxPrintEmail()"),
         "详情页应有打印按钮：{html}"
     );
-    assert!(html.contains("🖨 打印"), "打印按钮文案：{html}");
+    assert!(html.contains("打印</button>"), "打印按钮文案：{html}");
     cleanup(&dir);
 }
 
@@ -7999,5 +8009,54 @@ fn export_routes_autocomplete_missing_extension() {
     );
     assert!(body(&resp).contains(".md"), "toast 应显示补全后路径");
     assert!(dir.join("归档.md").exists(), "应落盘到补全后的路径");
+    cleanup(&dir);
+}
+
+/// 2026-11-10：设置/向导页的辅助说明由行内 hint 小字改为 info 图标 + 气泡，
+/// 且全站图形图标统一为内联 SVG（不再出现 emoji）。
+#[test]
+fn settings_hints_use_tip_and_no_emoji_icons() {
+    let (state, dir) = temp_state("w10-tips");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "chinatelecom.cn"),
+            (keys::DISPLAY_NAME, "张伟"),
+        ])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 每个页面至少应有的气泡数（存储页随备份/待生效状态增减，取基础项）
+    for (path, min_tips) in [
+        ("/settings/account", 3),
+        ("/settings/sync", 1),
+        ("/settings/storage", 2),
+        ("/settings/templates", 2),
+        ("/welcome/setup", 2),
+    ] {
+        let html = body(&route(&state, &assets(), &req("GET", path, b""), &t));
+        assert!(
+            html.contains("class=\"tip-i\"") && html.contains("data-tip="),
+            "{path} 辅助说明应为气泡触发点：{html}"
+        );
+        let n = html.matches("class=\"tip-i\"").count();
+        assert!(n >= min_tips, "{path} 气泡数不足（{n} < {min_tips}）");
+        assert!(
+            !html.contains("class=\"hint\""),
+            "{path} 不应再有行内 hint 小字"
+        );
+        // emoji 图标回归守卫（彩色 emoji 区段 + 常用符号）
+        for bad in [
+            '📥', '📤', '📝', '👥', '⚙', '✏', '📎', '🔄', '🗑', '⭐', '💬', '🌐', '🎛', '🔍', '🔎',
+            '💾', '🖨', '📨', '📄', '📁', '🔒', '🗄', '📡', '⚠', '⌨', '⏰', '⏳', '↪', '↩', '✎',
+        ] {
+            assert!(
+                !html.contains(bad),
+                "{path} 不应再出现 emoji「{bad}」：{html}"
+            );
+        }
+    }
     cleanup(&dir);
 }

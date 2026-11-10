@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "icons.html" as ic %}
 {% block body %}
 <div class="app on" id="page"
     {% if email.status == 'queued' or email.status == 'sending' %}
@@ -15,58 +16,58 @@
                         hx-post="/emails/{{ email.id }}/star"
                         hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
                         aria-pressed="{% if email.starred %}true{% else %}false{% endif %}"
-                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}⭐ 已星标{% else %}<span class="dim">⭐</span> 星标{% endif %}</button>
+                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}{{ ic.icon('star-fill') }} 已星标{% else %}{{ ic.icon('star') }} 星标{% endif %}</button>
                 {% if email.folder == 'draft' %}
                 <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                   title="打开草稿继续编辑">✏️ 编辑</a>
+                   title="打开草稿继续编辑">{{ ic.icon('draft') }} 编辑</a>
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
-                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">{{ ic.icon('download') }} 导出 .eml</button>
                         <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
-                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
-                        <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
-                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
+                        <button type="button" onclick="mbxPrintEmail()">{{ ic.icon('printer') }} 打印</button>
+                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">{{ ic.icon('code') }} 源码</a>
                     </div>
                 </div>
                 {% elif email.folder == 'sent' %}
                 <a class="btn primary" href="/compose?edit_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                   title="载入该邮件内容到撰写页，修改后重新发送">✏️ 重新编辑</a>
+                   title="载入该邮件内容到撰写页，修改后重新发送">{{ ic.icon('draft') }} 重新编辑</a>
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
-                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">💾 导出 .eml</button>
+                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">{{ ic.icon('download') }} 导出 .eml</button>
                         <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
-                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
-                        <button type="button" onclick="mbxPrintEmail()">🖨 打印</button>
-                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">🔎 源码</a>
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
+                        <button type="button" onclick="mbxPrintEmail()">{{ ic.icon('printer') }} 打印</button>
+                        <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">{{ ic.icon('code') }} 源码</a>
                     </div>
                 </div>
                 {% else %}
                 {% if email.direction == 'in' %}
-                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">↪️ 转发</a>
+                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">{{ ic.icon('forward') }} 转发</a>
                 <div class="split">
                     <a class="btn primary" href="/compose?reply_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                       title="回复发件人">✏️ 回复</a>
+                       title="回复发件人">{{ ic.icon('reply') }} 回复</a>
                     <button type="button" class="btn primary caret" data-split-toggle aria-label="回复选项">▾</button>
                     <div class="split-menu" hidden>
                         <a href="/compose?reply_all_to={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                           title="回复发件人 + 原收件人 + 抄送">↪️ 回复全部</a>
+                           title="回复发件人 + 原收件人 + 抄送">{{ ic.icon('reply-all') }} 回复全部</a>
                         <a href="/compose?attach_eml={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
-                           title="把整封邮件打包为 .eml 附件发送（保留原始结构）">📎 作为附件转发</a>
+                           title="把整封邮件打包为 .eml 附件发送（保留原始结构）">{{ ic.icon('paperclip') }} 作为附件转发</a>
                     </div>
                 </div>
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
                         <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
-                                title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">💾 导出 .eml</button>
+                                title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">{{ ic.icon('download') }} 导出 .eml</button>
                         <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
-                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">📝 导出 MD</button>
+                                title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
                         <button type="button" onclick="mbxPrintEmail()"
-                                title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">🖨 打印</button>
+                                title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">{{ ic.icon('printer') }} 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
-                           title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">🔎 源码</a>
+                           title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">{{ ic.icon('code') }} 源码</a>
                         {% if not email.unread %}
                         <div class="btn-sep"></div>
                         <button type="button"
@@ -82,33 +83,33 @@
                         hx-post="/emails/{{ email.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                         hx-trigger="click throttle:500ms"
                         hx-disabled-elt="this"
-                        hx-confirm="删除后无法恢复，确定删除这封邮件？">🗑️ 删除</button>
+                        hx-confirm="删除后无法恢复，确定删除这封邮件？">{{ ic.icon('trash') }} 删除</button>
             </div>
         </div>
 
         {% if notice %}<div class="compose-note err">{{ notice }}</div>{% endif %}
 
         {% if email.too_large %}
-        <div class="md-status sending">⚠️ 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
+        <div class="md-status sending">{{ ic.icon('warning') }} 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
         {% endif %}
         {# 定时发送（M4-2）：草稿带 scheduled_at 到点由调度线程自动入队。 #}
         {% if email.status == 'draft' and email.scheduled_at > 0 %}
         {% if email.scheduled_soon %}
         {# A1 撤销窗口：8 秒内点进详情仍可拦截 #}
-        <div class="md-status sending">⏳ 即将发送（撤销窗口内）
+        <div class="md-status sending">{{ ic.icon('hourglass') }} 即将发送（撤销窗口内）
             <button type="button" class="btn small"
                     hx-post="/emails/{{ email.id }}/undo-send"
                     hx-trigger="click throttle:500ms" hx-disabled-elt="this">撤销发送</button>
         </div>
         {% else %}
-        <div class="md-status sending">⏰ 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
+        <div class="md-status sending">{{ ic.icon('clock') }} 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
         <div class="sched-tip">要修改或取消定时：编辑草稿调整时间，或清空时间后点「发送」立即发出。</div>
         {% endif %}
         {% endif %}
         {% if email.status == 'queued' %}
-        <div class="md-status sending">⏳ 排队中，即将发送…</div>
+        <div class="md-status sending">{{ ic.icon('hourglass') }} 排队中，即将发送…</div>
         {% elif email.status == 'sending' %}
-        <div class="md-status sending">⏳ 发送中…</div>
+        <div class="md-status sending">{{ ic.icon('hourglass') }} 发送中…</div>
         {% elif email.status == 'failed' %}
         <div class="md-status failed">✕ 发送失败：{{ email.error }}
             <button type="button" class="btn small"
@@ -171,7 +172,7 @@
                 <ul class="att-list">
                     {% for a in email.attachments %}
                     <li class="att-row">
-                        <span class="att-clip">📎</span>
+                        <span class="att-clip">{{ ic.icon('paperclip') }}</span>
                         {% if a.detached %}
                         <span class="att-name att-gone" title="文件已按策略清理">{{ a.filename }}</span>
                         <span class="att-gone">已清理，无法另存</span>

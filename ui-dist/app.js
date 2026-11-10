@@ -1,6 +1,21 @@
 // CorpMail 前端辅助（M2：附件选择/另存，__TAURI__.dialog；设计 §2/§5.1）
 // 全局 500ms 防抖由 htmx 触发器表达式承担（hx-trigger="... once:500ms"，设计 §7）
 
+// ---------- 内联图标（2026-11-10）：与模板 icons.html 同几何 ----------
+// 只拼接固定路径字符串（无用户输入）；样式由 .ic 类统一（1em、stroke 1.8、currentColor）
+var MBX_IC = (function () {
+    function svg(body) {
+        return '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true" focusable="false">' + body + '</svg>';
+    }
+    return {
+        clip: svg('<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'),
+        star: svg('<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>'),
+        starFill: svg('<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" fill="currentColor" stroke="none"/>'),
+        pencil: svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
+        keyboard: svg('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/>')
+    };
+})();
+
 // 通用离开确认模态：Tauri 的 macOS WKWebView（wry）未实现 JS confirm 的 UI 代理，
 // window.confirm 只会返回 false 且不弹窗，故改用页面内模态（跨平台一致）。
 // message 支持换行（CSS white-space: pre-line）；onLeave 在用户点确认按钮时调用。
@@ -92,7 +107,7 @@ function renderPicked() {
     if (!ul) return;
     ul.innerHTML = pickedPaths.map((p, i) => {
         const name = p.split(/[\\/]/).pop();
-        return `<li class="att-row picked"><span class="att-clip">📎</span>` +
+        return `<li class="att-row picked"><span class="att-clip">${MBX_IC.clip}</span>` +
                `<span class="att-name">${escapeHtml(name)}</span>` +
                `<button type="button" class="btn small" onclick="mbxRemovePicked(${i})">移除</button></li>`;
     }).join('');
@@ -421,11 +436,11 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     btn.classList.toggle('on', starred);
     btn.setAttribute('aria-pressed', starred ? 'true' : 'false');
     btn.title = starred ? '取消星标（不再置顶）' : '星标：置顶显示';
-    // 详情页按钮带文字（列表页按钮仅 ★ 符号）、两形态统一一套文案
+    // 详情页按钮带文字（列表页按钮仅星形图标）、两形态统一一套文案
     if (btn.textContent.indexOf('星') >= 0) {
-        btn.textContent = starred ? '★ 已星标' : '☆ 星标';
+        btn.innerHTML = starred ? MBX_IC.starFill + ' 已星标' : MBX_IC.star + ' 星标';
     } else {
-        btn.textContent = '★';
+        btn.innerHTML = MBX_IC.starFill;
     }
 });
 
@@ -1740,7 +1755,7 @@ function mbxTplToggleSrc(st) {
         st.bar.hidden = true;
         st.area.hidden = true;
         st.mode = 'src';
-        st.srcBtn.textContent = '✎ 富文本';
+        st.srcBtn.innerHTML = MBX_IC.pencil + ' 富文本';
     } else {
         mbxTplBuild(st);
         if (!st.ed) return;
@@ -1749,7 +1764,7 @@ function mbxTplToggleSrc(st) {
         st.bar.hidden = false;
         st.area.hidden = false;
         st.mode = 'rich';
-        st.srcBtn.textContent = '⌨ HTML 源码';
+        st.srcBtn.innerHTML = MBX_IC.keyboard + ' HTML 源码';
     }
 }
 
@@ -1818,3 +1833,96 @@ function mbxTplInitAll(root) {
 // 初始化旧 DOM 会让按钮看似“无效”。因此统一扫描文档中尚未初始化的字段。
 document.addEventListener('DOMContentLoaded', function () { mbxTplInitAll(document); });
 document.body.addEventListener('htmx:afterSwap', function () { mbxTplInitAll(document); });
+
+// ---------- 气泡说明（2026-11-10）----------
+// 设置页原先把限制说明写成 label 后的 12px 小字，既挤占布局又容易和字段值
+// 混淆；改为字段旁的 info 图标 + 悬停/聚焦气泡。浮层挂 body（position:fixed），
+// 不会被设置页/向导的滚动容器裁掉；超出视口时自动翻到触发点上方。
+(function () {
+    var layer = null;
+    var current = null;
+
+    function ensureLayer() {
+        if (!layer || !layer.isConnected) {
+            layer = document.createElement('div');
+            layer.className = 'tip-layer';
+            layer.setAttribute('role', 'tooltip');
+            layer.hidden = true;
+            document.body.appendChild(layer);
+        }
+        return layer;
+    }
+
+    function place(btn) {
+        var el = ensureLayer();
+        var r = btn.getBoundingClientRect();
+        var gap = 6;
+        var pad = 8;
+        // 先归零再量尺寸：气泡宽度随文本变化，上一轮 left/top 会造成误判
+        el.style.left = '0px';
+        el.style.top = '0px';
+        var w = el.offsetWidth;
+        var h = el.offsetHeight;
+        var left = Math.max(pad, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - pad));
+        var top = r.bottom + gap;
+        if (top + h > window.innerHeight - pad) top = r.top - h - gap;
+        el.style.left = Math.round(left) + 'px';
+        el.style.top = Math.round(Math.max(pad, top)) + 'px';
+    }
+
+    function show(btn) {
+        var text = btn.getAttribute('data-tip');
+        if (!text) return;
+        current = btn;
+        var el = ensureLayer();
+        el.textContent = text;
+        el.hidden = false;
+        place(btn);
+    }
+
+    function hide() {
+        current = null;
+        if (layer) layer.hidden = true;
+    }
+
+    function tipOf(node) {
+        return node && node.closest ? node.closest('[data-tip]') : null;
+    }
+
+    document.addEventListener('mouseover', function (ev) {
+        var b = tipOf(ev.target);
+        if (!b || b === current) return;
+        if (ev.relatedTarget && b.contains(ev.relatedTarget)) return;
+        show(b);
+    });
+    document.addEventListener('mouseout', function (ev) {
+        var b = tipOf(ev.target);
+        if (!b) return;
+        if (ev.relatedTarget && b.contains(ev.relatedTarget)) return;
+        hide();
+    });
+    document.addEventListener('focusin', function (ev) {
+        var b = tipOf(ev.target);
+        if (b) show(b);
+    });
+    document.addEventListener('focusout', function (ev) {
+        var b = tipOf(ev.target);
+        if (b && b === current) hide();
+    });
+    document.addEventListener('click', function (ev) {
+        var b = tipOf(ev.target);
+        if (b) show(b);
+        else if (current) hide();
+    });
+    document.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { hide(); return; }
+        // 键盘激活（role=button）：Enter/Space 与点击等价
+        if ((ev.key === 'Enter' || ev.key === ' ') && ev.target && ev.target.matches
+            && ev.target.matches('[data-tip]')) {
+            ev.preventDefault();
+            show(ev.target);
+        }
+    });
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('resize', hide);
+})();

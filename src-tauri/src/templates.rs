@@ -9,6 +9,8 @@ use std::sync::LazyLock;
 
 /// 注册的全部模板名（测试也按此表断言）
 const TEMPLATES: &[(&str, &str)] = &[
+    // 统一 SVG 图标宏（供各模板 {% import "icons.html" as ic %}）
+    ("icons.html", include_str!("templates/icons.html")),
     ("base.html", include_str!("templates/base.html")),
     ("welcome.html", include_str!("templates/welcome.html")),
     ("setup.html", include_str!("templates/setup.html")),
