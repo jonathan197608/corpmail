@@ -619,7 +619,6 @@ fn folder_counts_start_at_zero() {
     let c = s.folder_counts();
     assert_eq!(c["inbox"], 0);
     assert_eq!(c["inbox_unread"], 0);
-    assert_eq!(c["all"], 0);
     assert_eq!(c["sent"], 0);
     assert_eq!(c["draft"], 0);
     assert_eq!(s.attachments_stats(), (0, 0));

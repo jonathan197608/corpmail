@@ -200,6 +200,57 @@ fn list_page_shows_drafts_with_sidebar_counts() {
     cleanup(&dir);
 }
 
+/// 「全部」folder 已移除（2026-11-09）：旧链接/畸形 folder 回落收件箱，
+/// 不再跨箱全量；会话视图仅收件箱可用（发件/草稿带 mode=thread 不生效）
+#[test]
+fn removed_all_folder_falls_back_to_inbox() {
+    let (state, dir) = temp_state("no-all-folder");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '收件箱邮件','正文','收件 箱邮件','正文',1,1,1),
+                        ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
+                         '已发送邮件','正文','已 发送 邮件','正文',0,2,2)",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 旧「全部」链接：回落收件箱，只显示收件箱邮件
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "folder=all", b""),
+        &t,
+    ));
+    assert!(html.contains("收件箱"), "未知 folder 应回落收件箱：{html}");
+    assert!(html.contains("收件箱邮件"), "应显示收件箱邮件：{html}");
+    assert!(!html.contains("已发送邮件"), "不得再跨箱全量：{html}");
+    // 发件箱带 mode=thread：不进入会话列表（threadable 仅收件箱）
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "folder=sent&mode=thread", b""),
+        &t,
+    ));
+    assert!(
+        !html.contains("/threads/"),
+        "发件箱不应进入会话视图：{html}"
+    );
+    cleanup(&dir);
+}
+
 /// 发件箱/草稿箱（2026-11-09 需求）：①列表行「对方」显示收件人而非自己；
 /// ②批量按钮组只保留「全选」（删除/批量操作/清空选择不渲染）；
 /// ③顶栏 ⋯ 下拉（含「收取新邮件」）不渲染；收件箱视图不受影响
@@ -324,7 +375,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
     let html = body(&route(
         &state,
         &assets(),
-        &req_q("GET", "/", "folder=all&q=%E6%BF%80%E5%8A%B1", b""),
+        &req_q("GET", "/", "folder=draft&q=%E6%BF%80%E5%8A%B1", b""),
         &tester,
     ));
     assert!(html.contains("<mark>激励</mark>"), "命中词应高亮：{html}");
@@ -337,7 +388,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
     let html2 = body(&route(
         &state,
         &assets(),
-        &req_q("GET", "/", "folder=all&q=%E7%9A%84%E4%BA%86", b""),
+        &req_q("GET", "/", "folder=draft&q=%E7%9A%84%E4%BA%86", b""),
         &tester,
     ));
     assert!(
@@ -348,7 +399,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
     let html3 = body(&route(
         &state,
         &assets(),
-        &req_q("GET", "/", "folder=all&q=zzqqxy", b""),
+        &req_q("GET", "/", "folder=draft&q=zzqqxy", b""),
         &tester,
     ));
     assert!(html3.contains("没有匹配的邮件"), "搜索空态文案：{html3}");
@@ -3807,10 +3858,8 @@ fn dump_smoke_html() {
     dump("main-draft.html", get_url("/?folder=draft"));
     // 定时草稿详情页（「已定时」状态条）
     dump("email-scheduled.html", get(&format!("/emails/{d2}")));
-    dump("main-all.html", get_url("/?folder=all"));
-    // M2-2 会话视图素材：会话列表（inbox/all）+ 会话详情（count=2 归组）
+    // M2-2 会话视图素材：「全部」已移除（2026-11-09），仅收件箱会话列表
     dump("main-thread.html", get_url("/?mode=thread"));
-    dump("main-all-thread.html", get_url("/?folder=all&mode=thread"));
     dump("thread-detail.html", get(&format!("/threads/{inbox_id}")));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
     // A5 源码页素材：HTML 源码 / 纯文本 / 原始信头三视图

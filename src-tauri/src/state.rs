@@ -1023,13 +1023,13 @@ impl AppState {
             .sum()
     }
 
-    /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（5 个计数）
+    /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（4 个计数；
+    /// 2026-11-09 移除「全部」folder，其总数不再需要）
     pub fn folder_counts(&self) -> HashMap<&'static str, i64> {
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let row = conn.query_row(
             "SELECT COALESCE(SUM(folder = 'inbox'), 0),
                     COALESCE(SUM(folder = 'inbox' AND unread = 1), 0),
-                    count(*),
                     COALESCE(SUM(folder = 'sent'), 0),
                     COALESCE(SUM(folder = 'draft'), 0)
              FROM emails",
@@ -1040,15 +1040,13 @@ impl AppState {
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
                 ))
             },
         );
-        let (inbox, inbox_unread, all, sent, draft) = row.unwrap_or((0, 0, 0, 0, 0));
+        let (inbox, inbox_unread, sent, draft) = row.unwrap_or((0, 0, 0, 0));
         HashMap::from([
             ("inbox", inbox),
             ("inbox_unread", inbox_unread),
-            ("all", all),
             ("sent", sent),
             ("draft", draft),
         ])

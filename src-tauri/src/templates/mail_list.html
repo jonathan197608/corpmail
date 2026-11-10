@@ -49,7 +49,7 @@
         {# 顶栏 ⋯ 下拉（批次四）：筛选（只看未读/只看外部/会话视图）与收取新邮件
            是低频操作，收进下拉，顶栏保持单行；发件箱/草稿箱无筛选/会话/收取
            需求，整个下拉不渲染（2026-11-09 按钮精简） #}
-        {% if folder == 'inbox' or folder == 'all' %}
+        {% if folder == 'inbox' %}
         <div class="split tb-more">
             <button type="button" class="tb-more-btn" data-split-toggle aria-label="更多：筛选、视图与收取" title="更多：筛选、视图与收取">⋯</button>
             <div class="split-menu" hidden>

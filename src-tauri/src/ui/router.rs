@@ -205,10 +205,9 @@ pub(super) struct FrameCtx {
     pub(super) full_addr: String,
     pub(super) inbox: i64,
     pub(super) inbox_unread: i64,
-    pub(super) all_mail: i64,
     pub(super) sent: i64,
     pub(super) draft: i64,
-    /// 当前列表 folder（inbox|all|sent|draft；side.html 高亮与列表页标题用）
+    /// 当前列表 folder（inbox|sent|draft；side.html 高亮与列表页标题用）
     pub(super) folder: String,
 }
 
@@ -643,8 +642,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         // 首启未配置：配置为强制入口（设计 §8.1，无"稍后再说"）
         return render_html("welcome.html", &());
     }
+    // folder 白名单（2026-11-09 移除「全部」）：仅收件箱/发件箱/草稿箱，未知回落收件箱
     let folder = match req.query_param("folder").as_deref() {
-        Some("all") | Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
+        Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
         _ => "inbox".to_string(),
     };
     let page = clamp_page(req.query_param("page").as_deref());
@@ -695,9 +695,9 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         date_to,
         has_attach,
     };
-    // 会话视图（M2-2）：mode=thread 且仅收件箱/全部下可用（草稿/已发保持单封）；
-    // 搜索下同样可切会话（命中代表行=最新一封）
-    let threadable = matches!(folder.as_str(), "inbox" | "all");
+    // 会话视图（M2-2）：mode=thread 且仅收件箱下可用（草稿/已发保持单封；
+    // 「全部」已移除，2026-11-09）；搜索下同样可切会话（命中代表行=最新一封）
+    let threadable = folder == "inbox";
     let is_thread = threadable
         && req
             .query_param("mode")
@@ -1833,9 +1833,7 @@ fn side_frame(state: &AppState, req: &Req) -> Resp {
         return Resp::html(r#"<aside class="side"></aside>"#.into());
     }
     let folder = match req.query_param("folder").as_deref() {
-        Some("all") | Some("sent") | Some("draft") | Some("inbox") => {
-            req.query_param("folder").unwrap()
-        }
+        Some("sent") | Some("draft") | Some("inbox") => req.query_param("folder").unwrap(),
         _ => "inbox".to_string(),
     };
     // side.html 经 include 共用，字段都挂在 frame.* 下——独立渲染须同名包一层
@@ -2906,7 +2904,6 @@ pub(super) fn frame_of(
         },
         inbox: counts["inbox"],
         inbox_unread: counts["inbox_unread"],
-        all_mail: counts["all"],
         sent: counts["sent"],
         draft: counts["draft"],
         folder: folder.into(),
@@ -2920,7 +2917,7 @@ pub(super) fn frame_of(
 fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let get = |name: &str| req.query_param(name);
     let folder = match get("folder").as_deref() {
-        Some("all") | Some("sent") | Some("draft") | Some("inbox") => get("folder").unwrap(),
+        Some("sent") | Some("draft") | Some("inbox") => get("folder").unwrap(),
         _ => fallback_folder.to_string(),
     };
     let q = get("q");
@@ -2971,7 +2968,7 @@ fn rebuild_list_query(
     att: Option<&str>,
 ) -> String {
     let folder = match folder {
-        "all" | "sent" | "draft" | "inbox" => folder.to_string(),
+        "sent" | "draft" | "inbox" => folder.to_string(),
         _ => "inbox".to_string(),
     };
     let mut qs: Vec<String> = Vec::new();
@@ -2980,7 +2977,7 @@ fn rebuild_list_query(
     // 草稿箱/发件箱。收件箱显式 folder=inbox 只是 URL 更明确，语义不变。
     qs.push(format!("folder={folder}"));
     // 会话视图仅收件箱/全部可用；其他箱体即使带 mode=thread 也无意义，丢弃
-    if mode == Some("thread") && matches!(folder.as_str(), "inbox" | "all") {
+    if mode == Some("thread") && folder == "inbox" {
         qs.push("mode=thread".into());
     }
     if unread == Some("1") {

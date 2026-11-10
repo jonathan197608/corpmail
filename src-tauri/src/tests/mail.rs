@@ -299,7 +299,7 @@ fn search_ranks_matches_and_highlights_subject() {
     save_draft(&state, &draft("激励配案通知", "正文与关键词无关")).unwrap();
     save_draft(&state, &draft("别的主题", "完全无关正文")).unwrap();
     let q = ListQuery {
-        folder: "all".into(),
+        folder: "draft".into(),
         page: 1,
         unread_only: false,
         external_only: false,
@@ -919,34 +919,9 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         )
         .unwrap();
     });
+    // 「全部」已移除（2026-11-09）：会话列表只服务收件箱（跨箱往来由会话
+    // 详情 thread_mails 承载，见下一个测试）
     let q = ListQuery {
-        folder: "all".into(),
-        page: 1,
-        unread_only: false,
-        external_only: false,
-        internal_domain: "chinatelecom.cn".into(),
-        per: 50,
-        sort: SortKey::DateDesc,
-        from_filter: String::new(),
-        date_from: 0,
-        date_to: 0,
-        has_attach: false,
-    };
-    let (items, total) = list_threads(&state, &q).unwrap();
-    // 草稿/发送失败不入会、空主题不归组：只剩「会议(2)」「报价(1)」两组
-    assert_eq!(total, 2);
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].subject, "报价", "最新一封(3)在前");
-    assert_eq!(items[0].thread_count, 1, "发送失败不算会话往来");
-    assert_eq!(
-        items[1].subject, "Re: 会议",
-        "代表行保留原始主题（最新一封）"
-    );
-    assert_eq!(items[1].thread_count, 2, "草稿不入会，仅 inbox+sent 两封");
-    assert_eq!(items[1].id, 2, "代表行=组内最新一封");
-
-    // inbox 过滤只算收件：会议(1) + 报价(3) 两组
-    let inbox = ListQuery {
         folder: "inbox".into(),
         page: 1,
         unread_only: false,
@@ -959,10 +934,16 @@ fn list_threads_groups_and_excludes_drafts_failed() {
         date_to: 0,
         has_attach: false,
     };
-    let (items, total) = list_threads(&state, &inbox).unwrap();
-    assert_eq!(total, 2, "inbox 下两组（各 1 封）");
+    let (items, total) = list_threads(&state, &q).unwrap();
+    // 收件箱两组（各 1 封），空主题不归组；组级按最新时间倒序
+    assert_eq!(total, 2);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].subject, "报价", "最新一封(3)在前");
     assert_eq!(items[0].id, 3);
+    assert_eq!(items[0].thread_count, 1);
+    assert_eq!(items[1].subject, "会议");
     assert_eq!(items[1].id, 1);
+    assert_eq!(items[1].thread_count, 1);
     cleanup(&dir);
 }
 

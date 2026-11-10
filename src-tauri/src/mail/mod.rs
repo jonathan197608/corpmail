@@ -1047,11 +1047,12 @@ pub struct ThreadDetail {
     pub items: Vec<EmailSummary>,
 }
 
-/// folder 白名单校验（未知值按 all 处理；SQL 内插前必须过白名单）
+/// folder 白名单校验（未知值回落收件箱；SQL 内插前必须过白名单）。
+/// 2026-11-09 移除「全部」：未知/畸形参数不再兜底为跨箱全量（避免意外暴露）
 fn folder_of(raw: &str) -> &str {
     match raw {
-        "inbox" | "sent" | "draft" | "all" => raw,
-        _ => "all",
+        "inbox" | "sent" | "draft" => raw,
+        _ => "inbox",
     }
 }
 
@@ -1066,11 +1067,7 @@ fn folder_of(raw: &str) -> &str {
 fn list_filter_sql(q: &ListQuery, alias: &str) -> (String, String) {
     let a = alias;
     let folder = folder_of(&q.folder);
-    let folder_sql = if folder == "all" {
-        String::new()
-    } else {
-        format!(" AND {a}folder = '{folder}'")
-    };
+    let folder_sql = format!(" AND {a}folder = '{folder}'");
     let unread_sql = if q.unread_only {
         format!(" AND {a}unread = 1")
     } else {
