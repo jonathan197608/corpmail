@@ -246,46 +246,158 @@ pub fn remove(conn: &Connection, addr: &str) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+/// 只采集不计数（收件 To/Cc 中的其他地址）：更新姓名/最近联系，hits 不变。
+/// 与 upsert_conn 的分工：只有「直接往来」才累加往来次数（见 participants），
+/// 群发/抄送名单里的人只入库供撰写联想，不制造并不存在的“往来 N 次”。
+pub fn touch_conn(conn: &Connection, addr: &str, name: &str, at: i64) -> rusqlite::Result<()> {
+    let addr = addr.trim();
+    if !addr_plausible(addr) {
+        return Ok(());
+    }
+    let name = name_safe(name.trim());
+    conn.execute(
+        "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 0)
+         ON CONFLICT(addr) DO UPDATE SET
+             name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END,
+             updated_at = MAX(contacts.updated_at, excluded.updated_at)",
+        rusqlite::params![addr, name, at],
+    )?;
+    Ok(())
+}
+
+/// 本账号地址（小写；无发件记录 → 空串）：取已发送邮件里出现最多的 From。
+/// 账号配置属于 corpmail.toml（不落 settings 库），收件线程只有 DB 连接，
+/// 因此用「已发送邮件的发件人」反推自身地址——不依赖配置读取，且天然覆盖
+/// 别名/多账号场景。联系人采集与统计据此排除「自己」。
+pub fn self_addr_conn(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT lower(from_addr) FROM emails
+          WHERE direction = 'out' AND from_addr <> ''
+          GROUP BY lower(from_addr) ORDER BY count(*) DESC LIMIT 1",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_default()
+    .trim()
+    .to_string()
+}
+
+/// 去重（地址小写）+ 排除本账号，追加到 out
+fn push_deduped(
+    list: Vec<Participant>,
+    seen: &mut std::collections::HashSet<String>,
+    self_l: &str,
+    out: &mut Vec<Participant>,
+) {
+    for (addr, name) in list {
+        let a = addr.trim();
+        if a.is_empty() || !a.contains('@') {
+            continue;
+        }
+        let key = a.to_ascii_lowercase();
+        if !self_l.is_empty() && key == self_l {
+            continue;
+        }
+        if seen.insert(key) {
+            out.push((a.to_string(), name));
+        }
+    }
+}
+
+/// 参与人（地址, 姓名）
+pub type Participant = (String, String);
+
+/// 单封邮件参与人拆分（2026-11-09 统计口径修正）：
+/// - direct（计入往来次数）：收件 = From；发件 = To/Cc/Bcc；
+/// - visible（仅采集）：收件的其余 To/Cc —— 群发通知的抄送名单不算“与你往来”。
+///
+/// 两者均按地址去重并排除本账号；同一地址 direct 优先。
+pub fn participants(
+    direction: &str,
+    from_addr: &str,
+    from_name: &str,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    self_l: &str,
+) -> (Vec<Participant>, Vec<Participant>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut direct = Vec::new();
+    let mut visible = Vec::new();
+    if direction == "in" {
+        push_deduped(
+            vec![(from_addr.to_string(), from_name.to_string())],
+            &mut seen,
+            self_l,
+            &mut direct,
+        );
+        let mut others = parse_addr_list(to);
+        others.extend(parse_addr_list(cc));
+        push_deduped(others, &mut seen, self_l, &mut visible);
+    } else {
+        let mut all = parse_addr_list(to);
+        all.extend(parse_addr_list(cc));
+        all.extend(parse_addr_list(bcc));
+        push_deduped(all, &mut seen, self_l, &mut direct);
+    }
+    (direct, visible)
+}
+
 /// 回填：contacts 为空且历史邮件存在时，从 emails 一次性提取。
 ///
 /// 幂等：非空即跳过（首启执行一次；之后由收/发件增量采集维护）。
-/// 覆盖收件（From/To/Cc）与本地已发送（To/Cc）。
+/// 计数口径与增量一致：收件只计发件人、发件计 To/Cc/Bcc，单封去重、排除自己；
+/// 收件抄送名单仅入库不计数。
 pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
     let count: i64 = conn.query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))?;
     if count > 0 {
         return Ok(());
     }
-    let rows: Vec<(String, String, String, String, i64)> = crate::db::collect_rows(
+    let self_l = self_addr_conn(conn);
+    let rows: Vec<(String, String, String, String, String, String, i64)> = crate::db::collect_rows(
         conn,
-        "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''), \
+        "SELECT direction, from_addr, COALESCE(from_name,''), to_addrs, \
+         COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
          COALESCE(received_at, sent_at, created_at, 0) FROM emails",
         &[],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
     )?;
     if rows.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
-    for (from_addr, from_name, to_addrs, cc_addrs, at) in rows {
-        upsert_conn(&tx, &from_addr, &from_name, at)?;
-        for (addr, name) in parse_addr_list(&to_addrs) {
+    for (dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, at) in rows {
+        let (direct, visible) = participants(
+            &dir, &from_addr, &from_name, &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
+        );
+        for (addr, name) in direct {
             upsert_conn(&tx, &addr, &name, at)?;
         }
-        for (addr, name) in parse_addr_list(&cc_addrs) {
-            upsert_conn(&tx, &addr, &name, at)?;
+        for (addr, name) in visible {
+            touch_conn(&tx, &addr, &name, at)?;
         }
     }
-    // 回填完成后修正计数：首次出现记为 1 即可，不做历史使用频次统计
-    tx.execute("UPDATE contacts SET hits = 1", [])?;
     tx.commit()
 }
 
-/// 存量统计修复（v11 一次性，幂等）：早期收件采集把联系人 updated_at 写成
-/// 入库时间 now，导致历史邮件首次收取后「最近联系」全部变成今天。
-/// 这里按历史邮件的实际时间（received_at/sent_at，退化 created_at）重算：
-/// updated_at 取该地址所有往来邮件的最大实际时间，hits 取出现邮件数。
-/// contacts 是派生数据，但手动新增/改名的姓名必须保留——只更新能追溯到
-/// 邮件的地址，纯手动联系人原样保留。完成后写 settings 标记避免重复扫描。
+/// 存量统计修复（v12 口径，幂等）：按历史邮件重算
+/// - updated_at = 该地址所有往来邮件的最大实际时间（received_at/sent_at，退化 created_at）
+/// - hits = 直接往来邮件数（收件=From，发件=To/Cc/Bcc；单封去重、排除自己）；
+/// - 收件抄送名单只算「最近联系」，不计往来次数。
+///
+/// 同时删除本账号自身条目（早期把「自己」也采集成了联系人）。
+/// contacts 是派生数据，但手动新增/改名的姓名保留——只更新能追溯到邮件的地址。
+/// 标记写 "2"：v11 写的是 "1"，升级后自动重算一次。
 pub fn repair_stats(conn: &mut Connection) -> rusqlite::Result<()> {
     use rusqlite::OptionalExtension;
     use std::collections::HashMap;
@@ -297,7 +409,7 @@ pub fn repair_stats(conn: &mut Connection) -> rusqlite::Result<()> {
             |r| r.get(0),
         )
         .optional()?;
-    if done.as_deref() == Some("1") {
+    if done.as_deref() == Some("2") {
         return Ok(());
     }
     // contacts 为空（新库/首启）无需修复，也不写标记——保持 store_is_empty 语义
@@ -305,42 +417,51 @@ pub fn repair_stats(conn: &mut Connection) -> rusqlite::Result<()> {
     if n == 0 {
         return Ok(());
     }
-    let rows: Vec<(String, String, String, i64)> = crate::db::collect_rows(
+    let self_l = self_addr_conn(conn);
+    let rows: Vec<(String, String, String, String, String, i64)> = crate::db::collect_rows(
         conn,
-        "SELECT from_addr, to_addrs, COALESCE(cc_addrs,''), \
-         COALESCE(received_at, sent_at, created_at, 0) FROM emails",
+        "SELECT direction, from_addr, to_addrs, COALESCE(cc_addrs,''), \
+         COALESCE(bcc_addrs,''), COALESCE(received_at, sent_at, created_at, 0) FROM emails",
         &[],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
     )?;
-    // addr(小写) → (最近往来时间, 往来邮件数)
+    // addr(小写) → (最近往来时间, 直接往来邮件数)；visible 仅刷新时间，计数保持
     let mut stat: HashMap<String, (i64, i64)> = HashMap::new();
-    let bump = |stat: &mut HashMap<String, (i64, i64)>, addr: &str, at: i64| {
-        let a = addr.trim();
-        if a.is_empty() || !a.contains('@') {
-            return;
+    for (dir, from_addr, to_addrs, cc_addrs, bcc_addrs, at) in rows {
+        let (direct, visible) = participants(
+            &dir, &from_addr, "", &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
+        );
+        for (addr, _) in direct {
+            let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
+            e.0 = e.0.max(at);
+            e.1 += 1;
         }
-        let e = stat.entry(a.to_ascii_lowercase()).or_insert((at, 0));
-        e.0 = e.0.max(at);
-        e.1 += 1;
-    };
-    for (from_addr, to_addrs, cc_addrs, at) in rows {
-        bump(&mut stat, &from_addr, at);
-        for (addr, _) in parse_addr_list(&to_addrs) {
-            bump(&mut stat, &addr, at);
-        }
-        for (addr, _) in parse_addr_list(&cc_addrs) {
-            bump(&mut stat, &addr, at);
+        for (addr, _) in visible {
+            let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
+            e.0 = e.0.max(at);
         }
     }
     let tx = conn.transaction()?;
+    if !self_l.is_empty() {
+        tx.execute("DELETE FROM contacts WHERE lower(addr) = ?1", [&self_l])?;
+    }
     for (addr, (at, hits)) in stat {
         tx.execute(
-            "UPDATE contacts SET updated_at = ?2, hits = ?3 WHERE addr = ?1",
+            "UPDATE contacts SET updated_at = ?2, hits = ?3 WHERE lower(addr) = ?1",
             rusqlite::params![addr, at, hits],
         )?;
     }
     tx.execute(
-        "INSERT INTO settings(k, v) VALUES (?1, '1') ON CONFLICT(k) DO UPDATE SET v = '1'",
+        "INSERT INTO settings(k, v) VALUES (?1, '2') ON CONFLICT(k) DO UPDATE SET v = '2'",
         [crate::state::keys::CONTACTS_STATS_FIXED],
     )?;
     tx.commit()

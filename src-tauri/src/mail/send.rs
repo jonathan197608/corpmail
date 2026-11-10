@@ -463,11 +463,13 @@ pub fn dispatch_one(
                 eprintln!("[send] 邮件 {id} 回写 Message-ID 失败：{err}");
             }
             let now = now_epoch();
-            for raw in [&to_raw, &cc_raw, &bcc_raw] {
-                for (addr, name) in super::contacts::parse_addr_list(raw) {
-                    if let Err(err) = super::contacts::upsert_conn(conn, &addr, &name, now) {
-                        eprintln!("[send] 联系人采集失败（{addr}）：{err}");
-                    }
+            // 发件的收件人/抄送/密送都算直接往来；单封去重并排除自己（2026-11-09）
+            let self_l = super::contacts::self_addr_conn(conn);
+            let (direct, _) =
+                super::contacts::participants("out", "", "", &to_raw, &cc_raw, &bcc_raw, &self_l);
+            for (addr, name) in direct {
+                if let Err(err) = super::contacts::upsert_conn(conn, &addr, &name, now) {
+                    eprintln!("[send] 联系人采集失败（{addr}）：{err}");
                 }
             }
             Ok("sent")

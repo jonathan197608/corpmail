@@ -146,6 +146,115 @@ fn backfill_extracts_from_historical_emails_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 统计口径（v12）：收件只计 From；群发 To/Cc 仅采集不计数；
+/// 单封重复地址只计一次；自身排除。发件 To/Cc/Bcc 均为直接往来
+#[test]
+fn participants_split_direct_and_visible() {
+    let self_l = "me@x.cn";
+    let (direct, visible) = participants(
+        "in",
+        "boss@x.cn",
+        "领导",
+        "me@x.cn, peer@x.cn",
+        "peer@x.cn, cc@x.cn",
+        "",
+        self_l,
+    );
+    assert_eq!(direct, vec![("boss@x.cn".into(), "领导".into())]);
+    assert_eq!(
+        visible.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        ["peer@x.cn", "cc@x.cn"],
+        "群发抄送去重后仅采集"
+    );
+    let (direct, visible) = participants(
+        "out",
+        "me@x.cn",
+        "",
+        "peer@x.cn, me@x.cn",
+        "peer@x.cn",
+        "bcc@x.cn",
+        self_l,
+    );
+    assert_eq!(
+        direct.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        ["peer@x.cn", "bcc@x.cn"],
+        "发件收件人/密送均计直接往来且去重"
+    );
+    assert!(visible.is_empty());
+}
+
+/// 存量统计修复 v12：只计直接往来、群发抄送不计；删除自身条目；
+/// 旧 v11 标记不阻止重算（升级即修）
+#[test]
+fn repair_stats_v12_counts_only_direct_and_drops_self() {
+    let (state, dir) = temp_state("repair-v12");
+    state
+        .set_batch(&[
+            (crate::state::keys::ACCOUNT_PREFIX, "demo"),
+            (crate::state::keys::ACCOUNT_DOMAIN, "x.cn"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, cc_addrs,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','demo@x.cn','peer@x.cn',100,100);
+                 INSERT INTO emails(direction, folder, status, from_addr, to_addrs, cc_addrs,
+                                    created_at, received_at)
+                 VALUES ('in','inbox','received','boss@x.cn','demo@x.cn','peer@x.cn',200,200);
+                 INSERT INTO emails(direction, folder, status, from_addr, to_addrs, cc_addrs,
+                                    created_at, sent_at)
+                 VALUES ('out','sent','sent','demo@x.cn','peer@x.cn','',300,300);",
+            )
+            .unwrap();
+            // 旧版膨胀数据：boss 836、peer 900、自己 2299；v11 标记存在也应重算
+            c.execute_batch(
+                "INSERT INTO contacts(addr,name,updated_at,hits) VALUES ('boss@x.cn','领导',1,836);
+                 INSERT INTO contacts(addr,name,updated_at,hits) VALUES ('peer@x.cn','同事',1,900);
+                 INSERT INTO contacts(addr,name,updated_at,hits) VALUES ('demo@x.cn','自己',1,2299);
+                 INSERT INTO settings(k,v) VALUES ('contacts_stats_fixed','1')
+                 ON CONFLICT(k) DO UPDATE SET v='1';",
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let mut conn = crate::db::open(&state.data_dir().join("corpmail.db")).unwrap();
+    assert_eq!(
+        self_addr_conn(&conn),
+        "demo@x.cn",
+        "自身地址应能从事 settings 读出"
+    );
+    repair_stats(&mut conn).unwrap();
+    let (boss_at, boss_hits): (i64, i64) = conn
+        .query_row(
+            "SELECT updated_at, hits FROM contacts WHERE addr='boss@x.cn'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(boss_hits, 2, "收件只计发件人（两封）");
+    assert_eq!(boss_at, 200, "最近联系取最大实际时间");
+    let peer_hits: i64 = conn
+        .query_row(
+            "SELECT hits FROM contacts WHERE addr='peer@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(peer_hits, 1, "群发抄送不计数，仅自己发的那 1 封计入");
+    let self_n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM contacts WHERE addr='demo@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(self_n, 0, "自身条目应被删除");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 存量统计修复：按历史邮件实际时间重算「最近联系/往来次数」，
 /// 保留纯手动联系人；完成后写标记幂等（不再重复扫描）
 #[test]
@@ -187,7 +296,7 @@ fn repair_stats_recomputes_times_and_preserves_manual() {
         )
         .unwrap();
     assert_eq!(at, 3000, "应修正为邮件实际最近时间");
-    assert_eq!(hits, 2, "往来次数按出现邮件数重算");
+    assert_eq!(hits, 2, "往来次数按直接往来邮件数重算");
     let manual_at: i64 = conn
         .query_row(
             "SELECT updated_at FROM contacts WHERE addr = 'manual@x.cn'",

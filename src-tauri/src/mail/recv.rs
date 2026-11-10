@@ -1130,6 +1130,8 @@ pub fn store_incoming_conn(
         MailDest::Inbox => ("in", "inbox", "received", None, ""),
         MailDest::Sent => ("out", "sent", "sent", Some(false), "sent:"),
     };
+    // 本账号地址（小写）：联系人采集时排除“自己”（整批只读一次 settings）
+    let self_l = super::contacts::self_addr_conn(conn);
     for m in mails {
         let remote = format!("{remote_prefix}{}:{}", m.uidvalidity, m.uid);
         // 去重：remote_uid 唯一索引 + message_id 双保险（空串不按 message_id 去重）。
@@ -1219,15 +1221,25 @@ pub fn store_incoming_conn(
             sync_attach_stats(&tx, id)
         })();
         let stored = stored.and_then(|()| {
-            // 联系人采集（v4）：From（带姓名）+ To + Cc，与邮件行同事务落库。
+            // 联系人采集（v4，2026-11-09 口径修正）：与邮件行同事务落库。
+            // 只把「直接往来」计入 hits（收件=发件人；发件=收件人/抄送），
+            // 收件的其余 To/Cc 仅入库供联想、不计数；单封去重并排除自己。
             // 时间用 ts（INTERNALDATE，邮件实际时间）而非 now（入库瞬间）——
             // 否则历史邮件首次收取时联系人"最近联系"会全部变成今天。
-            super::contacts::upsert_conn(&tx, &m.from_addr, &m.from_name, ts).map_err(e)?;
-            for (addr, name) in super::contacts::parse_addr_list(&m.to_addrs) {
+            let (direct, visible) = super::contacts::participants(
+                direction,
+                &m.from_addr,
+                &m.from_name,
+                &m.to_addrs,
+                &m.cc_addrs,
+                "",
+                &self_l,
+            );
+            for (addr, name) in direct {
                 super::contacts::upsert_conn(&tx, &addr, &name, ts).map_err(e)?;
             }
-            for (addr, name) in super::contacts::parse_addr_list(&m.cc_addrs) {
-                super::contacts::upsert_conn(&tx, &addr, &name, ts).map_err(e)?;
+            for (addr, name) in visible {
+                super::contacts::touch_conn(&tx, &addr, &name, ts).map_err(e)?;
             }
             Ok(())
         });

@@ -71,7 +71,7 @@
             </div>
             <div class="ct-meta">
                 <span class="ct-time" title="最近联系时间">{{ c.time_label if c.time_label == '—' else '最近 ' + c.time_label }}</span>
-                <span class="ct-hits" title="往来次数">往来 {{ c.hits }} 次</span>
+                <span class="ct-hits" title="直接往来邮件数（不含群发抄送）">往来 {{ c.hits }} 封</span>
             </div>
             <a class="btn small ct-edit-link"
                href="/contacts?edit={{ c.edit_qs }}"
