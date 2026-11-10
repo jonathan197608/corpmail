@@ -1933,3 +1933,42 @@ document.body.addEventListener('htmx:afterSwap', function () { mbxTplInitAll(doc
     window.addEventListener('scroll', hide, true);
     window.addEventListener('resize', hide);
 })();
+
+// ---------- 向导：集团邮箱 OA 指引按域名实时显隐（2026-11-10）----------
+// 服务端按「页面加载时的域名」（默认 @chinatelecom.cn）渲染 .ct-guide；
+// 域名是向导里唯一可改的账号要素——客户改掉域名后 OA 指引不再适用，
+// 应随输入即时隐藏，改回则恢复。判断口径与服务端 is_ct_mail_domain
+// 一致：trim + 去前导 @ + 大小写不敏感全等（非前缀匹配）。
+(function () {
+    var CT = 'chinatelecom.cn';
+
+    function isCtDomain(v) {
+        var s = (v || '').trim();
+        while (s.charAt(0) === '@') s = s.slice(1);
+        return s.toLowerCase() === CT;
+    }
+
+    function apply(form) {
+        if (!form || !form.classList.contains('setup-card')) return;
+        var input = form.querySelector('input[name="account_domain"]');
+        if (!input) return;
+        var on = isCtDomain(input.value);
+        form.querySelectorAll('.ct-guide').forEach(function (el) {
+            el.hidden = !on;
+        });
+    }
+
+    // input 事件覆盖键入/粘贴/撤销/浏览器自动填充；事件委托挂 body
+    document.body.addEventListener('input', function (ev) {
+        var t = ev.target;
+        if (t && t.name === 'account_domain') apply(t.closest('.setup-card'));
+    });
+
+    // 页面进入校准一次（不依赖服务端初始渲染，双保险）；向导被拒绝
+    // 重提只换 #test-results 片段，表单 DOM 与 hidden 状态原样保留
+    function initAll(root) {
+        (root || document).querySelectorAll('.setup-card').forEach(apply);
+    }
+    document.addEventListener('DOMContentLoaded', function () { initAll(document); });
+    document.body.addEventListener('htmx:afterSwap', function () { initAll(document); });
+})();

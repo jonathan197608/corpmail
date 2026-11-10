@@ -2381,6 +2381,107 @@ fn wizard_setup_form_prefills_defaults() {
     assert!(html.contains("value=\"465\""), "SMTP 端口应预填 465");
     assert!(html.contains("imap.chinatelecom.cn"), "IMAP 主机应预填");
     assert!(html.contains("@chinatelecom.cn"), "后缀应固定展示");
+    assert!(
+        html.contains("需提前生成密码") && html.contains("需提前选择拉取范围"),
+        "默认集团域名应展示两条 OA 指引"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn ct_guides_hidden_when_domain_is_not_chinatelecom() {
+    // 需求：OA 指引（生成密码/选择拉取范围）仅匹配 chinatelecom.cn 域名。
+    // 非集团域名（自定义/其他企业）不适用该 OA 操作路径，不应展示。
+    let (state, dir) = temp_state("ct-guide");
+    // 模拟已存的非集团域名（直接写库与向导保存落库等效：页面只读 settings 值）
+    state
+        .set_batch(&[(keys::ACCOUNT_DOMAIN, "@custom.cn")])
+        .unwrap();
+
+    // 向导页：预填自定义域名 → 两条指引均不渲染
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/setup", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let html = body(&resp);
+    assert!(html.contains("value=\"@custom.cn\""), "域名应预填自定义值");
+    assert!(
+        !html.contains("需提前生成密码"),
+        "非集团域名不应展示密码指引"
+    );
+    assert!(
+        !html.contains("需提前选择拉取范围"),
+        "非集团域名不应展示拉取指引"
+    );
+
+    // 大小写不敏感（CHINATELECOM.CN 仍是集团域名）
+    state
+        .set_batch(&[(keys::ACCOUNT_DOMAIN, "CHINATELECOM.CN")])
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/setup", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        body(&resp).contains("需提前生成密码"),
+        "集团域名大小写变体仍应展示指引"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn settings_panes_show_ct_guides_only_for_ct_domain() {
+    // 设置·账号页与同步页的 OA 指引同口径：仅集团域名展示。
+    // 先经向导保存自定义域名（与真实链路一致，不直接写库）
+    let (state, dir) = temp_state("ct-guide-set");
+    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    pairs.push(("account_domain", "@partner.example"));
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&pairs)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let account = route(
+        &state,
+        &assets(),
+        &req("GET", "/settings", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        !body(&account).contains("需提前生成密码"),
+        "自定义域名账号页不应展示密码指引"
+    );
+    let sync = route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/panes/sync", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        !body(&sync).contains("需提前选择拉取范围"),
+        "自定义域名同步页不应展示拉取指引"
+    );
+    state.clear_password("unit.router@partner.example");
     cleanup(&dir);
 }
 

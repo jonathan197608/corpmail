@@ -24,6 +24,11 @@ describe('01 首启向导与首次收件', () => {
     // 字段说明已改气泡触发点（2026-11-10）：登录账号/数据保存目录两处
     const tips = await browser.execute(() => document.querySelectorAll('.tip-i').length)
     expect(tips).toBeGreaterThanOrEqual(2)
+    // 默认集团域名：两条 OA 指引在场（服务端按默认域名渲染）
+    const guides0 = await browser.execute(() =>
+      [...document.querySelectorAll('.setup-card .ct-guide')].map((g) => !g.hidden),
+    )
+    expect(guides0.filter(Boolean).length).toBe(2)
     await shot('向导-默认配置')
   })
 
@@ -37,6 +42,16 @@ describe('01 首启向导与首次收件', () => {
   it('指向本机 mock 服务器后「测试并保存」通过', async () => {
     await $('input[name="account_prefix"]').setValue('e2e')
     await $('input[name="account_domain"]').setValue('corpmail.test')
+    // 改掉集团域名后 OA 指引应实时隐藏（app.js 监听输入，非集团域名不适用 OA 路径）
+    await browser.waitUntil(
+      async () => {
+        const hidden = await browser.execute(
+          () => ![...document.querySelectorAll('.setup-card .ct-guide')].some((g) => !g.hidden),
+        )
+        return hidden
+      },
+      { timeout: 5000, timeoutMsg: '改自定义域名后 OA 指引未隐藏' },
+    )
     await $('input[name="password"]').setValue('e2e-password')
     await $('input[name="display_name"]').setValue('自动化测试')
 
