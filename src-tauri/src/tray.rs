@@ -21,11 +21,11 @@ pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> 
     let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
     let fetch = MenuItem::with_id(app, "fetch", "立即收取新邮件", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 CorpMail", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出企业邮箱客户端", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &fetch, &separator, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("CorpMail")
+        .tooltip("企业邮箱客户端")
         .menu(&menu)
         // 左键留给「唤起主窗口」，菜单走右键（Gmail/Outlook 桌面版习惯）
         .show_menu_on_left_click(false)
@@ -103,9 +103,9 @@ pub fn refresh_badge<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         eprintln!("[tray] 未读角标更新失败（不影响主流程）：{err}");
     }
     let tip = if unread > 0 {
-        format!("CorpMail — {unread} 封未读")
+        format!("企业邮箱客户端 — {unread} 封未读")
     } else {
-        "CorpMail".to_string()
+        "企业邮箱客户端".to_string()
     };
     let _ = tray.set_tooltip(Some(tip.as_str()));
 }

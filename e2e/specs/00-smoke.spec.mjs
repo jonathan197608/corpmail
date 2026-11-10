@@ -5,7 +5,9 @@ import { shot, waitBoot } from '../support/helpers.mjs'
 describe('00 启动与欢迎页', () => {
   it('首帧渲染欢迎页，启动遮罩已移除', async () => {
     await waitBoot()
-    await expect(browser).toHaveTitle('CorpMail')
+    // 2026-11-10：窗口标题按用户要求改为产品中文名（托盘菜单/tooltip 同步），
+    // 欢迎页 h1 仍是「欢迎使用 CorpMail」（页面文案不在改名范围）
+    await expect(browser).toHaveTitle('企业邮箱客户端')
     await expect($('h1')).toHaveText(expect.stringContaining('欢迎使用 CorpMail'))
     await shot('欢迎页')
   })
