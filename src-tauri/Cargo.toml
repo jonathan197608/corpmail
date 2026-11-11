@@ -11,9 +11,12 @@ name = "corpmail_lib"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 依赖版本约定：约束只到语义化兼容区间（如 "2"/"0.31"，即 ^2/^0.31），
-# 让 cargo update 能自由拿到兼容新版；仅 0.x 预发布库（无 semver 兼容保证，
-# 如 imap alpha）才锁具体版本，并要求注明原因。
+# 依赖版本约定（审计 R72）：
+# 1) 稳定库只写到语义化兼容区间（如 "2"/"0.31" = ^2/^0.31），让 cargo update 拿到
+#    兼容修复；升级大版本属独立评审，不随日常改动漂移。
+# 2) 预发布/alpha 库（无 semver 兼容保证）一律 `=x.y.z-pre` 精确钉死：alpha 之间的
+#    行为差异（如 imap 的 STARTTLS/NoSelect 语义）会直接改变收件逻辑，不能靠 CI 才发现。
+# 3) 已知 CVE 不靠注释断言，由 CI 的 `cargo audit` 实际扫描（见 .github/workflows/ci.yml）。
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"                                          # 表单 JSON 数组字段（M2 附件 keep_ids/attach_paths）
@@ -28,7 +31,7 @@ keyring = "4"                                              # OS 凭据保管（�
 aes-gcm = "0.10"                                           # keyfile 回退加密（§5.4）
 base64 = "0.22"                                            # keyfile/密码辅助编码
 lettre = { version = "0.11", features = ["builder", "smtp-transport", "native-tls"] }  # SMTP 测试连接（M3 发送）
-imap = "3.0.0-alpha.15"                                    # IMAP 测试连接（M4 收件；3.0 仅有 alpha 预发布，无 semver 兼容保证故锁具体版；3.x 起 NoSelect 已可用，降 2.4.1 见 §13-R2）
+imap = "=3.0.0-alpha.15"                                   # IMAP（M4 收件；3.0 仅有 alpha 预发布，故精确钉死，升级须单独评审：3.x 起 NoSelect 可用，降 2.4.1 见设计 §13-R2）
 imap-proto = "0.16"                                          # imap 库未再导出 NameAttribute（发件箱 NoSelect 判定；版本随 imap 传递锁定）
 mailparse = "0.18"                                         # MIME 解析（M4 收件：multipart/附件/RFC2047 解码，spike 已验证）
 jiff = "0.2"                                               # 时间戳格式化（RFC2822/展示）

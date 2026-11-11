@@ -1,0 +1,96 @@
+# 打标签发版：产出 macOS / Windows 安装包并挂到 GitHub Release。
+#
+# 签名现状（2026-11 起）：
+# - Windows：云签名（SignPath）路线已废弃并移除，直发 NSIS 安装器**未签名**，
+#   首次运行会有 SmartScreen 提示；商店渠道（MSIX）由 Microsoft 签名。
+# - macOS：仓库里没有分发证书，CI 用 ad-hoc 签名（`signingIdentity: "-"`），
+#   本机开发仍用 `CorpMail Local`（scripts/setup-macos-signing.sh）。
+# 因此本工作流不做任何密钥注入，也不需要仓库 Secrets。
+#
+# 更新器（tauri-plugin-updater）尚未接：需要托管 latest.json + 更新签名私钥，
+# 见 README「发布与更新」一节的待办说明。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v0.3.0；留空则不发布，只构建产物）'
+        required: false
+        default: ''
+
+jobs:
+  bundle:
+    name: 打包 ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+            targets: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+            # 无分发证书 → ad-hoc 签名，避免 tauri 去找不存在的本机身份
+            config: '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
+            artifact: corpmail-macos-aarch64
+            path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - name: Windows
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            args: ''
+            config: '{"bundle":{"targets":["nsis"]}}'
+            artifact: corpmail-windows-x64
+            path: src-tauri/target/release/bundle/nsis/*-setup.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 版本必须与 Cargo.lock 的 tauri 运行时解耦（tauri-cli 独立发版）
+      - name: 安装 tauri-cli
+        run: cargo install tauri-cli --version 2.12.4 --locked
+
+      - name: 构建安装包
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          cargo tauri build ${{ matrix.args }} --config '${{ matrix.config }}'
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+  publish:
+    name: 挂到 Release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          fail_on_unmatched_files: true
+          body: |
+            未签名直发包：Windows 首次运行会有 SmartScreen 提示（更多 → 仍要运行）。
+            商店渠道请用 Microsoft Store 版本（由商店签名与更新）。

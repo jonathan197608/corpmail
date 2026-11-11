@@ -1,0 +1,73 @@
+# 推送/PR 门禁：与本地三件套同口径（clippy -D warnings / 单测 / 依赖审计）
+#
+# 为什么跑在 macOS runner：项目的凭据、托盘、路径行为都按 macOS 开发验证，
+# 且 tauri 在 Linux 需额外装 webkit2gtk 系统依赖；换 runner 会引入与产品无关
+# 的环境差异。Windows/NSIS 打包见 release.yml。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支的新推送取消上一次未跑完的门禁，省 runner 时间
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: clippy + 单测
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: clippy（零告警门禁）
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 单测各自持有临时目录 + 钥匙串走 keyfile 分支，必须串行（--test-threads=1）
+      - name: 单元测试
+        working-directory: src-tauri
+        run: cargo test --lib -- --test-threads=1
+
+  audit:
+    name: 依赖审计（报告，暂不阻断）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # 首次引入先只看结果，按报告分级处理后再去掉 continue-on-error
+      # （审计方案 §六.5：不臆测 CVE，等实际扫描结果）
+      - name: cargo audit
+        working-directory: src-tauri
+        continue-on-error: true
+        run: cargo audit --deny warnings || cargo audit
+
+  npm-audit:
+    name: 前端依赖审计（报告，暂不阻断）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm audit（E2E 依赖，仅运行期依赖阻断）
+        working-directory: e2e
+        continue-on-error: true
+        run: |
+          npm install --no-audit --no-fund
+          npm audit --omit=dev --audit-level=high
