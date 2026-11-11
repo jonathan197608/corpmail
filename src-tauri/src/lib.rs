@@ -57,6 +57,10 @@ pub fn run() {
             let app = ctx.app_handle();
             let state = app.state::<state::AppState>();
             let assets = ui::EmbeddedAssets::new(app);
+            // 请求体上限（审计 R55）：在克隆进 Req 之前拒绝，超大 body 不进内存两次
+            if request.body().len() > ui::MAX_REQUEST_BODY {
+                return ui::to_http_response(ui::Resp::payload_too_large());
+            }
             let req = ui::Req::parse_from(&request);
             // debug 构建打印协议层请求（GUI 无控制台时也可用 stderr 日志观察）。
             // 只打 method + path + 查询参数「键名」：query 值可能含搜索词、
@@ -206,6 +210,15 @@ pub fn run() {
     // 插件聚焦，均到达同样效果，无需代码路径
     // （Windows 侧零改动，无回归风险；真机行为随下次 Windows 发版联动验证）
     app.run(|_app_handle, _event| {
+        // 退出：先置停止位（审计 R62）。ExitRequested 由托盘退出/Cmd+Q/系统关机触发，
+        // Exit 是循环结束前的最后一拍——两者都置，任一路径都不会漏。
+        // 本应用没有 prevent_exit 分支，置位后不会再回到"带全部线程继续跑"的状态
+        if matches!(
+            _event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            request_shutdown();
+        }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = _event
             && let Some(win) = _app_handle.get_webview_window("main")
@@ -232,6 +245,36 @@ fn startup_fatal(app: &tauri::App, detail: &str) -> Box<dyn std::error::Error> {
     detail.to_string().into()
 }
 
+/// 常驻线程停止信号（审计 R62）：退出流程一开始置位，各线程在检查点收手——
+/// 不再发起收件/发送/清理，不再写库，避免与正在收尾的进程抢 SQLite 写锁
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn request_shutdown() {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 可中断等待：长睡眠切成 `step` 小片，每片检查停止位。
+/// 返回 `false` = 已请求退出，调用方应直接 `return`。
+/// 常驻线程的 2s/30s/24h 等待一律走这里：直接 `thread::sleep(24h)` 的线程
+/// 在退出时永远醒不来，只能随进程被杀（正在写库的那一下就可能留下半截事务）
+fn wait_or_stop(total: std::time::Duration, step: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if shutdown_requested() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep(step.min(deadline - now));
+    }
+}
+
 /// 已读回写 worker（审计批 3）：单线程 + 1.5s 合并窗口。
 ///
 /// 旧实现每点开一封未读邮件就 spawn 一个线程做完整 IMAP 连接/登录/SELECT/STORE，
@@ -245,15 +288,28 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
         let mut failures = 0u32;
         loop {
-            // failures == 0：阻塞等待唤醒（空闲零开销；channel 关闭说明状态已销毁），
+            // failures == 0：阻塞等待唤醒（空闲零开销；channel 断开说明状态已销毁），
             // 醒来后合并窗口把连点合成一批；failures > 0：上一轮失败且退避已睡完，
             // 直接重试（旧实现睡完回 recv 阻塞——退避被架空成"等用户再点一封"，
-            // 瞬时网络抖动后必须等用户下一次点击才补得上）
+            // 瞬时网络抖动后必须等用户下一次点击才补得上）。
+            // 用 recv_timeout 而不是 recv：退出时线程要能自己收手（审计 R62）
             if failures == 0 {
-                if rx.recv().is_err() {
+                loop {
+                    if shutdown_requested() {
+                        return;
+                    }
+                    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                if !wait_or_stop(
+                    mail::seen::MERGE_WINDOW,
+                    std::time::Duration::from_millis(500),
+                ) {
                     return;
                 }
-                std::thread::sleep(mail::seen::MERGE_WINDOW);
                 while rx.try_recv().is_ok() {}
             }
             let state = worker_handle.state::<state::AppState>();
@@ -273,7 +329,9 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                         failures = 0;
                         continue;
                     }
-                    std::thread::sleep(mail::seen::backoff(failures));
+                    if !wait_or_stop(mail::seen::backoff(failures), std::time::Duration::from_secs(2)) {
+                        return;
+                    }
                 }
             }
         }
@@ -289,7 +347,12 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
 /// （注释称"即时生效"不成立）。分片后设置改动最多 30s 生效（审计 P2-17）。
 fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        if !wait_or_stop(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        ) {
+            return;
+        }
         let state = handle.state::<state::AppState>();
         let on_start = state
             .get(state::keys::SYNC_ON_START)
@@ -312,12 +375,22 @@ fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
             let mut interval = read_interval(&handle);
             if interval == 0 {
                 // 仅手动：小睡后重读，不触发（也避免忙等）
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !wait_or_stop(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(5),
+                ) {
+                    return;
+                }
                 continue;
             }
             let mut waited = 0u64;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !wait_or_stop(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(5),
+                ) {
+                    return;
+                }
                 waited += 30;
                 let now = read_interval(&handle);
                 if now != interval {
@@ -348,7 +421,12 @@ fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
 /// 策略每轮重读；失败仅记日志，下轮再试。
 fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        if !wait_or_stop(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(5),
+        ) {
+            return;
+        }
         loop {
             let state = handle.state::<state::AppState>();
             // 迁移冻结（R2）：清理器会删库行与附件文件，冻结期整轮跳过
@@ -357,7 +435,13 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
             } else if let Err(err) = clean::run(&state) {
                 eprintln!("[clean] 清理器执行失败：{err}");
             }
-            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+            // 24h 也用可中断等待：退出时不必等满一个周期才收手
+            if !wait_or_stop(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(30),
+            ) {
+                return;
+            }
         }
     });
 }
@@ -375,7 +459,12 @@ fn spawn_send_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
         }
         let mut tick = 0u32;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !wait_or_stop(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(1),
+            ) {
+                return;
+            }
             let state = handle.state::<state::AppState>();
             mail::dispatch_due_scheduled(&state);
             tick += 1;

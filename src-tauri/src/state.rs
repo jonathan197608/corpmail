@@ -173,6 +173,8 @@ pub struct AppState {
     /// （重启后 resolve_start_dir 读新指针直接打开新库，冻结位随进程消失）。
     /// Arc 是为了让收件线程/发送 worker 不持 AppState 也能读到
     migration_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 侧栏计数的上次成功值（读库失败时兜底，不清零；审计 R63）
+    counts_cache: Mutex<Option<HashMap<&'static str, i64>>>,
 }
 
 /// 迁移冻结期的统一提示（路由 409 / 收件 / 发送 worker 共用同一句中文）
@@ -300,7 +302,11 @@ impl AppState {
             .map_err(|e| format!("数据目录无法创建（{}）：{e}", data_dir.display()))?;
         let mut conn = crate::db::open(&data_dir.join("corpmail.db"))
             .map_err(|e| format!("数据库无法打开（{}）：{e}", data_dir.display()))?;
-        // 联系人库一次性回填（v4 升级/首启）：contacts 非空即跳过，失败不阻断启动
+        // 联系人库一次性回填（v4 升级/首启）：contacts 非空即跳过，失败不阻断启动。
+        // 审计 R52：以下五个存量修复全部改「按 id 分块 + 每批独立事务 + 游标续跑」，
+        // 修完只剩一次空查询。仍在启动路径同步执行而不另起后台线程：修复要写
+        // 同一套表（且触发器会连带重写 FTS），后台并发写会与 UI 读互相等锁，
+        // 还会让「修一半」的状态被界面看到；分块后单批 500 行已足够短。
         if let Err(err) = crate::mail::contacts::backfill(&mut conn) {
             eprintln!("[contacts] 历史邮件回填失败（忽略）：{err}");
         }
@@ -351,6 +357,7 @@ impl AppState {
             detached_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             round_ticket: Mutex::new(std::sync::Weak::<RoundTicket>::new()),
             migration_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            counts_cache: Mutex::new(None),
         };
         // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
         state.try_auto_clean_empty_old_backup();
@@ -620,12 +627,16 @@ impl AppState {
         if let Err(err) = crate::mail::contacts::repair_stats(&mut new_conn) {
             eprintln!("[contacts] 采纳库统计修复失败（忽略）：{err}");
         }
-        // 归属标记写入被采纳的库：此后无论哪个版本重装指向该目录，都能精确比对
-        let _ = new_conn.execute(
-            "INSERT INTO settings(k, v) VALUES (?1, ?2)
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            rusqlite::params![keys::STORE_OWNER, account_l],
-        );
+        // 归属标记写入被采纳的库：此后无论哪个版本重装指向该目录，都能精确比对。
+        // 写失败必须中止（审计 P1-50）：标记是下次判定归属的唯一依据，吞掉后
+        // 本次看似成功，重装/换机会落到 StoreOwner::Unknown 被拒绝使用
+        new_conn
+            .execute(
+                "INSERT INTO settings(k, v) VALUES (?1, ?2)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                rusqlite::params![keys::STORE_OWNER, account_l],
+            )
+            .map_err(|e| format!("目标目录写入归属标记失败（可能只读或已损坏）：{e}"))?;
         // 指针先行：写失败仅回滚镜像（目标库是被采纳的既有文件，绝不能删除）
         self.point_data_dir(&dest_path)?;
         self.swap_store(new_conn, &dest_path);
@@ -1174,13 +1185,19 @@ impl AppState {
                     Ok(Err(err)) => eprintln!("[send] 邮件 {id} 派发未执行：{err}"),
                     Err(_) => {
                         eprintln!("[send] 邮件 {id} 派发 panic（已捕获，标记失败后继续）");
-                        // 已抢占到 sending 的邮件必须落定，否则只能等下次启动自愈
-                        let _ = conn.execute(
+                        // 已抢占到 sending 的邮件必须落定，否则只能等下次启动自愈。
+                        // 落定失败要留痕（审计 P1-50）：此时邮件停在 sending，
+                        // 界面会一直显示"发送中"，用户只能等重启
+                        if let Err(err) = conn.execute(
                             "UPDATE emails SET status = 'failed',
                                     error = '发送过程异常中断，请重发'
                              WHERE id = ?1 AND status = 'sending'",
                             [id],
-                        );
+                        ) {
+                            eprintln!(
+                                "[send] 邮件 {id} 标记失败未生效（停留 sending，重启后由残留扫描自愈）：{err}"
+                            );
+                        }
                     }
                 }
             }
@@ -1426,36 +1443,63 @@ impl AppState {
             .sum()
     }
 
-    /// 侧栏文件夹计数（列表屏冗余展示）：单条聚合 SQL 一次扫表（4 个计数；
-    /// 2026-11-09 移除「全部」folder，其总数不再需要）
+    /// 侧栏文件夹计数（列表屏冗余展示）。
+    ///
+    /// 旧实现一条 `SELECT SUM(folder='inbox') … FROM emails` 全表聚合，每次
+    /// 渲染（列表页 + 设置页各一次）都扫全部行；现在四个计数各自走索引
+    /// （`idx_folder_sort` 前缀 + `idx_inbox_unread` 部分索引），且**失败时
+    /// 返回上次成功值**而不是清零——角标突然变 0 会被理解成"邮件被删了"
+    /// （审计 R63）
     pub fn folder_counts(&self) -> HashMap<&'static str, i64> {
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let row = conn.query_row(
-            "SELECT COALESCE(SUM(folder = 'inbox'), 0),
-                    COALESCE(SUM(folder = 'inbox' AND unread = 1), 0),
-                    COALESCE(SUM(folder = 'sent'), 0),
-                    COALESCE(SUM(folder = 'draft'), 0)
-             FROM emails",
-            [],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            },
-        );
-        let (inbox, inbox_unread, sent, draft) = row.unwrap_or((0, 0, 0, 0));
-        HashMap::from([
-            ("inbox", inbox),
-            ("inbox_unread", inbox_unread),
-            ("sent", sent),
-            ("draft", draft),
-        ])
+        match Self::count_mailboxes(&conn) {
+            Ok(counts) => {
+                *self
+                    .counts_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(counts.clone());
+                counts
+            }
+            Err(err) => {
+                eprintln!("[ui] 文件夹计数读取失败（沿用上次值）：{err}");
+                self.counts_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_else(Self::zero_counts)
+            }
+        }
     }
 
-    /// 回退密钥文件路径（锚点目录，与 corpmail.toml 同处）。
+    /// 四个角标计数：每个查询都带 folder 谓词，各自命中索引
+/// （`idx_folder_sort` 前缀 / `idx_inbox_unread` 部分索引），不再全表 SUM
+fn count_mailboxes(conn: &Connection) -> rusqlite::Result<HashMap<&'static str, i64>> {
+    let by_folder = |folder: &str| -> rusqlite::Result<i64> {
+        conn.prepare_cached("SELECT count(*) FROM emails WHERE folder = ?1")?
+            .query_row([folder], |r| r.get(0))
+    };
+    let inbox_unread = conn
+        .prepare_cached("SELECT count(*) FROM emails WHERE folder = 'inbox' AND unread = 1")?
+        .query_row([], |r| r.get(0))?;
+    Ok(HashMap::from([
+        ("inbox", by_folder("inbox")?),
+        ("inbox_unread", inbox_unread),
+        ("sent", by_folder("sent")?),
+        ("draft", by_folder("draft")?),
+    ]))
+}
+
+/// 无历史值时的兜底（等价于旧行为的"全 0"，但只出现在首次读就失败的情况）
+fn zero_counts() -> HashMap<&'static str, i64> {
+    HashMap::from([
+        ("inbox", 0i64),
+        ("inbox_unread", 0),
+        ("sent", 0),
+        ("draft", 0),
+    ])
+}
+
+/// 回退密钥文件路径（锚点目录，与 corpmail.toml 同处）。
     /// 放锚点而非数据目录：数据目录可被迁到外置盘/U 盘，密钥跟着走就失去
     /// 「密钥与密文分离」的意义（审计：库内容易外流，备份/同步盘/误传）
     pub fn key_file(&self) -> PathBuf {
@@ -1480,13 +1524,16 @@ impl AppState {
         crate::secrets::retrieve(&conn, &key_file, account)
     }
 
-    /// 删除密码（账号变更迁移时用；两条路径都清，幂等）
     /// 清除已存凭据（测试清理用；设置页账号只读化后生产路径暂不触达，
-    /// 保留给后续"退出账号"类功能）
+    /// 保留给后续"退出账号"类功能）。
+    /// `secrets::clear` 返回 Err 时只留痕：本方法当前无生产调用点，
+    /// 没有可回显的界面（接线到"退出账号"时再改为 Result 向上传播）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_password(&self, account: &str) {
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::clear(&conn, account);
+        if let Err(err) = crate::secrets::clear(&conn, account) {
+            eprintln!("[secrets] 账号 {account} 密码清除失败：{err}");
+        }
     }
 
     /// keychain 是否处于 keyfile 降级态（设置·账号提示用）
@@ -1756,9 +1803,11 @@ impl Drop for RoundGuard {
 /// 代价仅为重连；imap crate 无会话级读超时 API，挂死连接由看门狗兜底
 const FETCH_ATTEMPTS: usize = 3;
 
-/// 第 n 次失败后的重试等待（秒）：给服务器限流/网络抖动留恢复窗口
+/// 第 n 次失败后的重试等待（秒）：给服务器限流/网络抖动留恢复窗口。
+/// 指数增长（15s → 30s → 60s…，上限 120s）：轮内只剩两次重试，
+/// 但同一口径在长故障下不会退化成固定频率敲门（审计 R62）
 fn fetch_retry_delay(attempt: u32) -> u64 {
-    15 * u64::from(attempt)
+    crate::mail::backoff_secs(attempt, 15, 120)
 }
 
 /// 从轮次专用连接读当前游标（重试前调用）：上一轮尝试的批次已持久化，

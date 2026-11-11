@@ -280,6 +280,36 @@ fn removed_all_folder_falls_back_to_inbox() {
     cleanup(&dir);
 }
 
+/// 请求体上限（审计 R55）：正常表单远小于上限，超过即 413 且不进路由逻辑
+#[test]
+fn oversized_request_body_is_rejected() {
+    let (state, dir) = temp_state("r55-body-cap");
+    let body = vec![b'a'; MAX_REQUEST_BODY + 1];
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/autosave", &body),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 413, "超限请求体应 413");
+    // 边界内（刚好等于上限）不进 413 分支
+    let body = vec![b'a'; MAX_REQUEST_BODY];
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/autosave", &body),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_ne!(resp.status, 413, "恰好等于上限不应被拒");
+    cleanup(&dir);
+}
+
 /// 列表行片段（审计 R41）：后台刷新（收取完成/置顶重排）走 GET /list/rows，
 /// 只回邮件行 + 顶栏计数的 OOB 片段，**不回搜索框与高级面板**——否则用户
 /// 正在输入的搜索词（未提交）与展开的筛选面板会被服务端状态覆盖。

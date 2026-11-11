@@ -164,15 +164,22 @@ pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult 
 }
 
 /// 删除密码（改密/清空时调用）：两条路径都尝试清，幂等；同时丢弃缓存，
-/// 否则本进程仍会用已删的旧密码继续发信。测试二进制短路 keychain
+/// 否则本进程仍会用已删的旧密码继续发信。测试二进制短路 keychain。
+///
+/// keychain 侧失败可忽略（本来就可能不存在）；库内密文行删除失败必须上报
+/// （审计 P1-50）——行残留 + 缓存已丢，下次 retrieve 会读出已"删除"的旧密码
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn clear(conn: &Connection, account: &str) {
+pub fn clear(conn: &Connection, account: &str) -> Result<(), String> {
     if !TEST_SKIP_KEYCHAIN && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
         let _ = entry.delete_credential();
     }
     let key = format!("enc:{account}");
-    let _ = conn.execute("DELETE FROM settings WHERE k = ?1", [key]);
+    let res = conn
+        .execute("DELETE FROM settings WHERE k = ?1", [key])
+        .map(|_| ())
+        .map_err(|e| format!("清除本地密码失败：{e}"));
     cache_drop(account);
+    res
 }
 
 /// 当前是否处于 keyfile 降级态（设置页"关于/账号"提示用）。
@@ -296,7 +303,13 @@ fn keyfile_key(conn: &Connection, key_file: &Path, ensure: bool) -> Result<[u8; 
         .and_then(|b64| decode_key(b64.trim().as_bytes()))
     {
         write_key_file(key_file, &key)?;
-        let _ = conn.execute("DELETE FROM settings WHERE k = ?1", [LEGACY_KEY_ROW]);
+        // 删库内旧密钥：失败不阻断本次加解密（密钥文件已可用），但必须留痕
+        // ——行残留意味着拿到库文件的人仍能解出全部密码（审计 P1-50）
+        if let Err(err) = conn.execute("DELETE FROM settings WHERE k = ?1", [LEGACY_KEY_ROW]) {
+            eprintln!(
+                "[secrets] 迁移后清除库内旧密钥失败（密钥已与密文同库，建议手动清理 {LEGACY_KEY_ROW} 行）：{err}"
+            );
+        }
         return Ok(key);
     }
     if !ensure {

@@ -15,10 +15,17 @@
 //! 阻塞数十秒（由系统解析器上限决定）。探活只覆盖 TCP 层可达性，不代表协议可用。
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// 探活超时（连接每地址的上界）
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单个地址的连接超时
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// 整轮探活的总预算（审计 R75）。
+///
+/// 多 A 记录的域名（企业邮箱常见 4~8 个）在丢包时每个地址都要等满单地址超时，
+/// 旧实现 8 × 10s = 80s 才报「连不上」——设置页的「测试」按钮像卡死。
+/// 这里给整轮一个硬上限：预算用完立即返回最后一个错误，不再逐地址累加。
+pub const PROBE_BUDGET: Duration = Duration::from_secs(10);
 
 /// 传输加密模式（SMTP/IMAP 共用语义）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +129,17 @@ pub fn probe_tcp(host: &str, port: u16) -> Result<(), String> {
         return Err(format!("无法解析服务器地址 {host}"));
     }
     let mut last = format!("无法连接 {host}:{port}");
+    let started = Instant::now();
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
+        let left = match PROBE_BUDGET.checked_sub(started.elapsed()) {
+            Some(d) if !d.is_zero() => d,
+            // 预算已耗尽：不再尝试后续地址（否则总耗时随地址数线性膨胀）
+            _ => {
+                last = format!("连接 {host}:{port} 超时（已等待 {} 秒）", PROBE_BUDGET.as_secs());
+                break;
+            }
+        };
+        match TcpStream::connect_timeout(&addr, left.min(PROBE_TIMEOUT)) {
             Ok(_) => return Ok(()),
             Err(e) => last = format!("无法连接 {addr}：{e}"),
         }

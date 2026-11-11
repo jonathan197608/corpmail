@@ -57,24 +57,37 @@ fn addr_list_header(raw: &str) -> String {
         .join(", ")
 }
 
-/// base64 按 76 字符折行（RFC 2045 行宽上限）
-fn wrap_b64(data: &[u8]) -> String {
-    let encoded = B64.encode(data);
-    encoded
-        .as_bytes()
-        .chunks(76)
-        .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect::<Vec<_>>()
-        .join("\r\n")
+/// base64 按 76 字符折行**直接追加**到目标缓冲（RFC 2045 行宽上限）。
+///
+/// 旧实现 `B64.encode` 生成整串 → `chunks(76).join` 再拼一份 → `format!` 又拷
+/// 一份 → 最终缓冲再拷一份，单个大附件要同时占 4 份内存（审计 R61）。
+/// 57 字节输入恰好编码成 76 字符且不留 padding，按 57 字节切块每行独立合法
+fn push_b64_wrapped(out: &mut Vec<u8>, data: &[u8]) {
+    const IN_CHUNK: usize = 57;
+    let mut buf = [0u8; 76];
+    for (i, chunk) in data.chunks(IN_CHUNK).enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        // 块大小固定 → 输出必为 76 字符，缓冲区刚好够；真失败就跳过该行
+        // 而不是 panic（编码器无状态，不会影响后续行）
+        if let Ok(n) = B64.encode_slice(chunk, &mut buf) {
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
 }
 
 /// 文本正文部分（base64 传输）
-fn text_part(mime: &str, content: &str) -> String {
-    format!(
-        "Content-Type: {mime}; charset=utf-8\r\n\
-         Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        wrap_b64(content.as_bytes())
-    )
+fn push_text_part(out: &mut Vec<u8>, mime: &str, content: &str) {
+    out.extend_from_slice(
+        format!(
+            "Content-Type: {mime}; charset=utf-8\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    push_b64_wrapped(out, content.as_bytes());
+    out.extend_from_slice(b"\r\n");
 }
 
 /// 附件参数值的 ASCII 回退：非 ASCII/引号/反斜杠替换为 `_`，供老客户端读取
@@ -116,7 +129,7 @@ fn rfc2231_value(name: &str) -> Option<String> {
 
 /// 附件部分（base64 传输）。中文文件名用 RFC 2231 的 `filename*=`/`name*=`，
 /// 同时给出 ASCII 回退值：老客户端读回退名，新客户端还原中文，避免整串乱码。
-fn attach_part(boundary: &str, filename: &str, mime: &str, data: &[u8]) -> String {
+fn push_attach_part(out: &mut Vec<u8>, boundary: &str, filename: &str, mime: &str, data: &[u8]) {
     let fallback = ascii_name(filename);
     let (name_param, file_param) = match rfc2231_value(filename) {
         Some(enc) => (
@@ -128,14 +141,17 @@ fn attach_part(boundary: &str, filename: &str, mime: &str, data: &[u8]) -> Strin
             format!("filename=\"{fallback}\""),
         ),
     };
-    format!(
-        "--{boundary}\r\n\
-         Content-Type: {mime}; {name_param}\r\n\
-         Content-Transfer-Encoding: base64\r\n\
-         Content-Disposition: attachment; {file_param}\r\n\r\n\
-         {body}\r\n",
-        body = wrap_b64(data),
-    )
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Type: {mime}; {name_param}\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             Content-Disposition: attachment; {file_param}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    push_b64_wrapped(out, data);
+    out.extend_from_slice(b"\r\n");
 }
 
 /// 导出文件名：主题截断 60 字符，去掉路径分隔符与控制字符；空主题用 id
@@ -159,7 +175,29 @@ pub fn suggested_filename(subject: &str, id: i64) -> String {
     }
 }
 
-/// 重建一封邮件的 .eml 字节（B4 导出 / B6 作为附件转发的共同实现）
+/// 正文部分（有 HTML → multipart/alternative 双版本；否则纯文本）
+fn push_body(out: &mut Vec<u8>, detail: &super::EmailDetail, email_id: i64) {
+    if detail.body_html.trim().is_empty() {
+        push_text_part(out, "text/plain", &detail.body_text);
+        return;
+    }
+    let inner = format!("=_corpmail_alt_{email_id}");
+    out.extend_from_slice(
+        format!("Content-Type: multipart/alternative; boundary=\"{inner}\"\r\n\r\n").as_bytes(),
+    );
+    out.extend_from_slice(format!("--{inner}\r\n").as_bytes());
+    push_text_part(out, "text/plain", &detail.body_text);
+    out.extend_from_slice(format!("--{inner}\r\n").as_bytes());
+    push_text_part(out, "text/html", &detail.body_html);
+    out.extend_from_slice(format!("--{inner}--\r\n").as_bytes());
+}
+
+/// 重建一封邮件的 .eml 字节（B4 导出 / B6 作为附件转发的共同实现）。
+///
+/// 全程流式写一个 `Vec<u8>`（审计 R61）：附件逐个读、逐个编码、写完即丢弃，
+/// 峰值内存 ≈ 成品大小 + 单个最大附件，而不是"全部附件 + 4 倍 base64 拷贝"。
+/// 附件结构必须先定，故先用 `attachment_available` 做一次只查元数据/存在性的
+/// 预检（不解压不读字节）
 pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
     let detail = crate::mail::get(state, email_id).ok_or("邮件不存在".to_string())?;
     // 时间与 Message-ID 需单独取（EmailDetail 只带展示文本）
@@ -183,66 +221,53 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
         head_safe(message_id.trim())
     };
 
-    // 附件字节（detached/缺失的跳过：导出不因一个已清理附件整体失败）
-    let mut attachments: Vec<(String, String, Vec<u8>)> = Vec::new();
-    for a in &detail.attachments {
-        if let Some((view, bytes)) = crate::mail::attachment_bytes(state, email_id, a.id) {
-            attachments.push((view.filename, view.mime, bytes));
-        }
-    }
+    // 可导出的附件清单：detached/文件缺失的跳过（导出不因一个已清理附件整体失败）
+    let parts: Vec<(String, String, i64)> = detail
+        .attachments
+        .iter()
+        .filter(|a| crate::mail::attachment_available(state, email_id, a.id))
+        .map(|a| (a.filename.clone(), a.mime.clone(), a.id))
+        .collect();
 
     let boundary = format!("=_corpmail_{email_id}_{:x}", super::now_epoch());
-    let mut out = String::new();
-    out.push_str(&format!(
-        "From: {}\r\n",
-        addr_header(&detail.from_name, &detail.from_addr)
-    ));
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(
+        format!("From: {}\r\n", addr_header(&detail.from_name, &detail.from_addr)).as_bytes(),
+    );
     if !detail.to_addrs.trim().is_empty() {
-        out.push_str(&format!("To: {}\r\n", addr_list_header(&detail.to_addrs)));
+        out.extend_from_slice(format!("To: {}\r\n", addr_list_header(&detail.to_addrs)).as_bytes());
     }
     if !detail.cc_addrs.trim().is_empty() {
-        out.push_str(&format!("Cc: {}\r\n", addr_list_header(&detail.cc_addrs)));
+        out.extend_from_slice(format!("Cc: {}\r\n", addr_list_header(&detail.cc_addrs)).as_bytes());
     }
-    out.push_str(&format!("Subject: {}\r\n", rfc2047(&detail.subject)));
-    out.push_str(&format!("Date: {date}\r\n"));
-    out.push_str(&format!("Message-ID: {message_id}\r\n"));
-    out.push_str("MIME-Version: 1.0\r\n");
+    out.extend_from_slice(format!("Subject: {}\r\n", rfc2047(&detail.subject)).as_bytes());
+    out.extend_from_slice(format!("Date: {date}\r\n").as_bytes());
+    out.extend_from_slice(format!("Message-ID: {message_id}\r\n").as_bytes());
+    out.extend_from_slice(b"MIME-Version: 1.0\r\n");
 
-    let has_html = !detail.body_html.trim().is_empty();
-    let body = if has_html {
-        let inner = format!("=_corpmail_alt_{email_id}");
-        format!(
-            "Content-Type: multipart/alternative; boundary=\"{inner}\"\r\n\r\n\
-             --{inner}\r\n{}\
-             --{inner}\r\n{}\
-             --{inner}--\r\n",
-            text_part("text/plain", &detail.body_text),
-            text_part("text/html", &detail.body_html),
-        )
-    } else {
-        text_part("text/plain", &detail.body_text)
-    };
-
-    if attachments.is_empty() {
-        out.push_str(&body);
-    } else {
-        out.push_str(&format!(
-            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
-             --{boundary}\r\n{body}"
-        ));
-        for (filename, mime, bytes) in &attachments {
-            out.push_str(&attach_part(
-                &boundary,
-                filename,
-                if mime.trim().is_empty() {
-                    "application/octet-stream"
-                } else {
-                    mime
-                },
-                bytes,
-            ));
-        }
-        out.push_str(&format!("--{boundary}--\r\n"));
+    if parts.is_empty() {
+        push_body(&mut out, &detail, email_id);
+        return Ok(out);
     }
-    Ok(out.into_bytes())
+    out.extend_from_slice(
+        format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n")
+            .as_bytes(),
+    );
+    push_body(&mut out, &detail, email_id);
+    for (filename, mime, attach_id) in &parts {
+        // 读取失败（预检后被删/被占用）只跳过该附件：正文与其余附件照常导出
+        let Some((_, bytes)) = crate::mail::attachment_bytes(state, email_id, *attach_id) else {
+            eprintln!("[eml] 附件「{filename}」读取失败，导出时跳过");
+            continue;
+        };
+        let mime = if mime.trim().is_empty() {
+            "application/octet-stream"
+        } else {
+            mime.as_str()
+        };
+        push_attach_part(&mut out, &boundary, filename, mime, &bytes);
+        // bytes 在此丢弃：下一个附件重新读，不累积整封的附件字节
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok(out)
 }

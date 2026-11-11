@@ -72,6 +72,11 @@ impl ConnTester for RealTester {
     }
 }
 
+/// 请求体上限（审计 R55）：本应用的表单只有收件人/主题/正文/ID 列表，
+/// 正常远小于 1 MB。协议层在克隆进 `Req` 之前就挡掉超限请求，避免
+/// 「先复制一份、再解析一遍、最后丢给 SQL 拼占位符」的整条链路被超大 body 拖住。
+pub const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
+
 /// 平台无关请求（协议层参数脱壳后的形态）
 pub struct Req {
     pub method: String,
@@ -150,6 +155,14 @@ impl Resp {
             body: body.into_bytes(),
             extra_headers: Vec::new(),
         }
+    }
+
+    /// 413：请求体超过 `MAX_REQUEST_BODY`（协议层拒绝，不解析不落库）
+    pub fn payload_too_large() -> Self {
+        Self::text(
+            413,
+            &format!("请求体过大（上限 {} MB）", MAX_REQUEST_BODY / (1024 * 1024)),
+        )
     }
 
     /// 纯文本响应（协议层拒绝：403 跨站来源 / 400 非 htmx 的副作用 GET）。
@@ -482,6 +495,10 @@ pub fn route<A: Assets>(state: &AppState, assets: &A, req: &Req, tester: &dyn Co
     // 发起方来源，Sec-Fetch-Site 标注跨站。任一判定为跨站即拒。
     if foreign_origin(req) {
         return Resp::text(403, "拒绝跨站请求（仅允许应用内发起）");
+    }
+    // 请求体上限（审计 R55）：正常表单 < 100 KB，超 4 MB 的一定不是界面发的
+    if req.body.len() > MAX_REQUEST_BODY {
+        return Resp::payload_too_large();
     }
     // 迁移冻结（审计 H2/R2）：数据目录已迁走、等待重启期间，任何带副作用的请求
     // 都必须明确失败——静默写进旧库，等于用户刚做的修改在重启后凭空消失
@@ -821,7 +838,7 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
     if let Some(p) = per_url
         && p != settings_per
     {
-        let _ = state.set_batch(&[(keys::PAGE_SIZE, p.to_string().as_str())]);
+        persist_page_size(state, p);
     }
     // 内部域取账号域名（默认 chinatelecom.cn）：判定外部发件人的唯一口径
     let d = defaults();
@@ -1051,7 +1068,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
         mail::thread_mails(state, id, &domain)
             .ok()
             .flatten()
-            .map(|t| t.items.len() as i64)
+            .map(|t| t.total)
             .unwrap_or(0)
     };
     Some(render_html(
@@ -1583,7 +1600,7 @@ fn contact_paging(state: &AppState, per_raw: Option<&str>, page_raw: Option<&str
     if let Some(p) = per_url
         && p != settings_per
     {
-        let _ = state.set_batch(&[(keys::PAGE_SIZE, p.to_string().as_str())]);
+        persist_page_size(state, p);
     }
     let page = clamp_page(page_raw);
     (per, page)
@@ -3491,6 +3508,16 @@ fn per_from_settings(state: &AppState) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(PER_DEFAULT)
         .clamp(PER_MIN, PER_MAX)
+}
+
+/// 每页条数持久化（用户从顶栏选择即写 settings，下次无参访问沿用）。
+/// 失败只留痕不报错：本次渲染已按 URL 参数生效，持久化失败仅影响下次默认值
+/// （审计 P1-50 的「关键写」指状态判定前提，本项属纯偏好，不阻断渲染）
+fn persist_page_size(state: &AppState, per: i64) {
+    let text = per.to_string();
+    if let Err(err) = state.set_batch(&[(keys::PAGE_SIZE, text.as_str())]) {
+        eprintln!("[ui] 每页条数 {per} 持久化失败（本次仍按该值显示）：{err}");
+    }
 }
 
 /// 表单隐藏域 list_query（compose 页透传的进入前列表上下文）重新过滤——

@@ -1602,3 +1602,186 @@ fn html_escape_also_escapes_single_quote() {
         "&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;"
     );
 }
+
+/// 分块修复的游标语义（审计 R52）：跨多批全部处理完、游标落在最大 id、
+/// 再跑只处理新增行（不重扫历史）。用 1200 行覆盖 3 批（REPAIR_CHUNK=500）。
+#[test]
+fn chunked_repair_covers_all_batches_and_resumes_from_cursor() {
+    let dir = std::env::temp_dir().join(format!("corpmail-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    // GBK「会议通知」按字节当 latin1 读入 = 典型 mojibake 主题
+    let mojibake: String = [0xBBu8, 0xE1, 0xD2, 0xE9, 0xCD, 0xA8, 0xD6, 0xAA]
+        .iter()
+        .map(|b| *b as char)
+        .collect();
+    let insert = |conn: &rusqlite::Connection, n: usize| {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received',?1,'me@x.cn',?2,'','',1)",
+                rusqlite::params![format!("m{i}@x.cn"), mojibake],
+            )
+            .unwrap();
+        }
+    };
+    insert(&conn, 1200);
+    repair_gbk_subjects(&mut conn).unwrap();
+    let fixed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM emails WHERE subject = '会议通知'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fixed, 1200, "三轮批处理后应全部修好");
+    let cursor = repair_mark_get(&conn, "gbk_subjects");
+    assert_eq!(cursor, 1200, "游标应停在已处理的最大 id");
+    // 新增一封后再跑：只处理新增（游标续跑，不重扫历史）
+    insert(&conn, 1);
+    repair_gbk_subjects(&mut conn).unwrap();
+    let fixed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM emails WHERE subject = '会议通知'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fixed, 1201, "新增行也应被修复");
+    assert_eq!(repair_mark_get(&conn, "gbk_subjects"), 1201);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 附件读取上限（审计 R55）：超大文件在读之前就被 metadata 挡住
+/// （用稀疏文件造大小，不真占磁盘，也不进内存）
+#[test]
+fn oversized_attachment_file_is_rejected_before_read() {
+    let dir = std::env::temp_dir().join(format!("corpmail-attcap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("huge.gz");
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(300 * 1024 * 1024).unwrap(); // 300 MB 稀疏文件
+    drop(f);
+    assert!(
+        read_attach_file(&big).is_none(),
+        "超过上限的附件文件应在读取前被判失败"
+    );
+    // 正常小文件照常读得到
+    let small = dir.join("small.gz");
+    std::fs::write(&small, b"abc").unwrap();
+    assert_eq!(read_attach_file(&small).as_deref(), Some(&b"abc"[..]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 读不了 ≠ 已清理（审计 R58）：权限不足必须与「文件不存在」区分开，
+/// 否则 UI 报「附件已被清理」，用户会去重新收件而不是修权限。
+/// 只在 Unix 跑：Windows 的 chmod 语义不同（只读位不阻止读取）
+#[cfg(unix)]
+#[test]
+fn attachment_read_distinguishes_permission_from_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("corpmail-attperm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let locked = dir.join("locked.gz");
+    std::fs::write(&locked, b"data").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    match read_attach_gz(&locked) {
+        Err(AttachIo::Unreadable(why)) => assert!(
+            why.contains("权限"),
+            "应说明权限问题而不是笼统失败：{why}"
+        ),
+        other => panic!("权限不足应判 Unreadable，实际：{:?}", other.is_ok()),
+    }
+    // 不存在 → Missing
+    assert!(matches!(
+        read_attach_gz(&dir.join("nope.gz")),
+        Err(AttachIo::Missing)
+    ));
+    // 还原权限后清理（否则 remove_dir_all 会失败）
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 导出（审计 R61）：base64 逐块编码后仍按 76 列折行，且拼回来解码与原字节一致。
+/// 旧实现把整段编码串拼成 String 再 join，单个大附件要占 4 份内存；改为按
+/// 57 字节（= 76 字符、无 padding）切块直接追加，此用例钉住编码正确性
+#[test]
+fn eml_attachment_base64_wraps_at_76_cols_and_round_trips() {
+    use crate::mail::eml;
+    use base64::Engine as _;
+    let (state, dir) = temp_state("r61-eml-b64");
+    let id = save_draft(&state, &draft("多行附件", "正文")).unwrap();
+    // 300 字节：跨 5 个 57 字节块，末块带 padding
+    let payload: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+    add_attachment_bytes(&state, id, "blob.bin", "application/octet-stream", &payload).unwrap();
+
+    let raw = String::from_utf8(eml::build_eml(&state, id).unwrap()).unwrap();
+    let after = raw
+        .split("Content-Disposition: attachment")
+        .nth(1)
+        .expect("应写出附件头");
+    let block = after.split("\r\n\r\n").nth(1).expect("附件头后应有空行");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in block.split("\r\n") {
+        if line.starts_with("--") {
+            break;
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    assert!(lines.len() > 1, "300 字节必须折成多行：{lines:?}");
+    assert!(lines.iter().all(|l| l.len() <= 76), "单行超 76 列：{lines:?}");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(lines.concat())
+        .unwrap();
+    assert_eq!(decoded, payload, "逐块编码后拼回必须与原字节一致");
+    cleanup(&dir);
+}
+
+/// 导出（审计 R61）：附件已被清理时导出照样成功，且不再声明 multipart/mixed
+/// （预检只查元数据/存在性，不读字节；写阶段读不到就跳过该附件）
+#[test]
+fn eml_export_skips_cleaned_attachment() {
+    use crate::mail::eml;
+    let (state, dir) = temp_state("r61-eml-detached");
+    let id = save_draft(&state, &draft("带清理附件", "正文")).unwrap();
+    add_attachment_bytes(&state, id, "big.bin", "application/octet-stream", b"abc").unwrap();
+    state
+        .with_conn(|conn| {
+            conn.execute("UPDATE attachments SET detached = 1 WHERE email_id = ?1", [id])
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+    let raw = String::from_utf8(eml::build_eml(&state, id).unwrap()).unwrap();
+    assert!(raw.starts_with("From: "), "导出应成功：{raw}");
+    assert!(
+        !raw.contains("multipart/mixed"),
+        "无可用附件时不该声明 mixed：{raw}"
+    );
+    assert!(
+        !raw.contains("Content-Disposition: attachment"),
+        "已清理的附件不应出现在导出里"
+    );
+    cleanup(&dir);
+}
+
+/// 审计 R62：收件重试与已读回写共用同一指数退避口径
+#[test]
+fn backoff_secs_is_exponential_and_capped() {
+    // 收件轮内重试：15s 起翻倍，120s 上限（旧实现 15·n 线性）
+    assert_eq!(backoff_secs(1, 15, 120), 15);
+    assert_eq!(backoff_secs(2, 15, 120), 30);
+    assert_eq!(backoff_secs(3, 15, 120), 60);
+    assert_eq!(backoff_secs(4, 15, 120), 120);
+    assert_eq!(backoff_secs(30, 15, 120), 120, "必须封顶，不能无限翻倍");
+    // 已读回写：60s 起 / 600s 上限（与 seen::backoff 序列一致）
+    assert_eq!(backoff_secs(1, 60, 600), 60);
+    assert_eq!(backoff_secs(3, 60, 600), 240);
+    assert_eq!(backoff_secs(5, 60, 600), 600);
+}

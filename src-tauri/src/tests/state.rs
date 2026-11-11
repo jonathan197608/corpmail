@@ -1396,3 +1396,82 @@ fn wait_fetch_idle_times_out_while_round_running() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 侧栏计数（审计 R63）：读库失败时沿用上次成功值，不清零。
+/// 旧实现 `row.unwrap_or((0,0,0,0))` 会让角标在瞬时读失败后显示全 0，
+/// 用户会以为邮件被清空（此处用改名表模拟读失败）
+#[test]
+fn folder_counts_keep_last_value_on_read_failure() {
+    let dir = temp_dir("counts");
+    let state = AppState::open(&dir);
+    state
+        .with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs,
+                                    subject, subject_tokens, body_tokens, created_at, unread)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn','一','一','一',10,1),
+                        ('in','inbox','received','a@x.cn','b@x.cn','二','二','二',11,0),
+                        ('out','sent','sent','b@x.cn','a@x.cn','三','三','三',12,0);",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let first = state.folder_counts();
+    assert_eq!(first["inbox"], 2, "收件箱计数应按 folder 精确统计");
+    assert_eq!(first["inbox_unread"], 1);
+    assert_eq!(first["sent"], 1);
+    assert_eq!(first["draft"], 0);
+
+    // 读失败：沿用上次成功值
+    state
+        .with_conn(|conn| {
+            conn.execute_batch("ALTER TABLE emails RENAME TO emails_gone")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    let after = state.folder_counts();
+    assert_eq!(after["inbox"], 2, "读失败不得把角标清零");
+    assert_eq!(after["inbox_unread"], 1);
+    assert_eq!(after["sent"], 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 采纳既有数据目录（审计 P1-50）：归属标记写不进去必须整体失败。
+/// 标记是"下次重装能否判定归属"的唯一依据，吞掉失败等于让用户以为
+/// 沿用成功、下次启动却因归属未知被拒绝
+#[test]
+fn adopt_fails_when_owner_mark_cannot_be_written() {
+    let base = temp_dir("adopt-owner");
+    let cur = base.join("cur");
+    let dest = base.join("dest");
+    std::fs::create_dir_all(&cur).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    // 目标库：已属于本账号（归属判定走 Match 分支），但 settings 更新被触发器挡死
+    {
+        let d = AppState::open(&dest);
+        d.set_batch(&[
+            (keys::STORE_OWNER, "demo@chinatelecom.cn"),
+            (keys::ACCOUNT_PREFIX, "demo"),
+        ])
+        .unwrap();
+        d.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER block_owner BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'readonly'); END;",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    }
+    let state = AppState::open(&cur);
+    let err = state
+        .adopt_data_dir_existing(dest.to_str().unwrap(), "demo@chinatelecom.cn")
+        .expect_err("归属标记写不进去必须失败");
+    assert!(
+        err.contains("归属标记"),
+        "错误应指明归属标记写入失败：{err}"
+    );
+    // 失败后不得改动指针：当前目录仍是 cur
+    assert_eq!(state.data_dir(), cur);
+    let _ = std::fs::remove_dir_all(&base);
+}

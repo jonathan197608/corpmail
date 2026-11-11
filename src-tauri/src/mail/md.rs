@@ -27,12 +27,36 @@ pub fn suggested_filename(subject: &str, id: i64) -> String {
 }
 
 /// 组装单封邮件的 Markdown 文本。
+///
+/// 正文不整段拷贝（审计 R61）：纯文本直接借用 `detail.body_text` 追加；
+/// HTML 转换把 front matter 作为初始缓冲交给 `MdBuilder`，省掉
+/// 「转换结果 String + 再 push 一次」的中间副本
 pub fn build_md(state: &AppState, email_id: i64) -> Result<String, String> {
     let detail = crate::mail::get(state, email_id).ok_or("邮件不存在".to_string())?;
+    let mut md = front_matter(&detail);
+    md.push_str("## 正文\n\n");
+    let mut md = if detail.body_html.trim().is_empty() {
+        md.push_str(&detail.body_text);
+        md
+    } else {
+        html_to_md_text_into(&detail.body_html, md)
+    };
+    md.push('\n');
+    if !detail.attachments.is_empty() {
+        md.push_str("\n## 附件\n\n");
+        for a in &detail.attachments {
+            write_attachment_section(state, email_id, a, &mut md);
+        }
+    }
+    Ok(md)
+}
+
+/// YAML front matter（`---` 包裹的元数据块 + 空行）
+fn front_matter(detail: &crate::mail::EmailDetail) -> String {
     // JSON 字符串转义 = 合法 YAML 值（见模块头注释）
     let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
 
-    let mut md = String::new();
+    let mut md = String::with_capacity(512 + detail.subject.len() + detail.body_text.len());
     md.push_str("---\n");
     md.push_str(&format!("subject: {}\n", q(&detail.subject)));
     let from = if detail.from_name.is_empty() {
@@ -63,22 +87,7 @@ pub fn build_md(state: &AppState, email_id: i64) -> Result<String, String> {
         }
     }
     md.push_str("---\n\n");
-
-    md.push_str("## 正文\n\n");
-    let body = if detail.body_html.trim().is_empty() {
-        detail.body_text.clone()
-    } else {
-        html_to_md_text(&detail.body_html)
-    };
-    md.push_str(&body);
-    md.push('\n');
-    if !detail.attachments.is_empty() {
-        md.push_str("\n## 附件\n\n");
-        for a in &detail.attachments {
-            write_attachment_section(state, email_id, a, &mut md);
-        }
-    }
-    Ok(md)
+    md
 }
 
 /// 单附件小节：短文本附件直接内嵌内容（fenced 代码块）；大附件/二进制
@@ -181,8 +190,19 @@ fn text_lang_of(mime: &str, filename: &str) -> Option<&'static str> {
 ///   行业惯例降级）；嵌套表格退化为单元格文本（不破坏外层结构）
 /// - `<br>` 换行；内联标签剥除；实体解码复用 strip_html 口径
 /// - 未闭合 `<` 不吞后文；连续空行压缩为一段
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn html_to_md_text(html: &str) -> String {
-    let mut b = MdBuilder::default();
+    html_to_md_text_into(html, String::new())
+}
+
+/// 同上，但把 `seed` 作为输出缓冲起点（导出时直接传入已写好的 front matter，
+/// 省掉「转换结果再 push 一次」的整段副本，审计 R61）。
+/// `seed` 内容原样保留在头部，只对整体做空行折叠与首尾空白修剪
+pub fn html_to_md_text_into(html: &str, seed: String) -> String {
+    let mut b = MdBuilder {
+        out: seed,
+        table: None,
+    };
     let bytes = html.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -343,7 +363,9 @@ impl MdBuilder {
         if self.table.is_some() {
             self.end_table();
         }
-        collapse_blank_lines(&self.out)
+        // 原地折叠（旧实现另开一个 String 再拷一遍，长正文多占一整份）
+        collapse_blank_lines(&mut self.out);
+        self.out
     }
 }
 
@@ -435,21 +457,28 @@ fn ensure_blank(out: &mut String) {
 }
 
 /// 连续 3+ 换行压缩为 2（一个空行），并去掉首尾空白
-fn collapse_blank_lines(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// 连续空行折叠为最多一个空行，并修剪首尾空白——**原地**改写（不额外分配）
+///
+/// 用 `retain` 保持字符级不可变式安全改写：不在 UTF-8 边界上做字节操作，
+/// 也不为新内容再开一份缓冲（审计 R61）
+fn collapse_blank_lines(s: &mut String) {
     let mut newlines = 0u32;
-    for ch in s.chars() {
+    s.retain(|ch| {
         if ch == '\n' {
             newlines += 1;
-            if newlines <= 2 {
-                out.push(ch);
-            }
+            newlines <= 2
         } else {
             newlines = 0;
-            out.push(ch);
+            true
         }
+    });
+    // 首尾空白：先砍尾（truncate 到最后一个非空白字节），再砍头（drain）
+    let trimmed_end = s.trim_end().len();
+    s.truncate(trimmed_end);
+    let lead = s.len() - s.trim_start().len();
+    if lead > 0 {
+        s.drain(..lead);
     }
-    out.trim().to_string()
 }
 
 #[cfg(test)]

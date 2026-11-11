@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use tauri::http::{Response, StatusCode, header};
 
 pub use assets::{Assets, EmbeddedAssets};
-pub use router::{RealTester, Req, Resp, route};
+pub use router::{MAX_REQUEST_BODY, RealTester, Req, Resp, route};
 
 /// 内容安全策略（审计 R7）。
 ///

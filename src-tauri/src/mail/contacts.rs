@@ -354,40 +354,50 @@ pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
     let self_l = self_addr_conn(conn);
-    let rows: Vec<(String, String, String, String, String, String, i64)> = crate::db::collect_rows(
-        conn,
-        "SELECT direction, from_addr, COALESCE(from_name,''), to_addrs, \
-         COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
-         COALESCE(received_at, sent_at, created_at, 0) FROM emails",
-        &[],
-        |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        },
-    )?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.transaction()?;
-    for (dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, at) in rows {
-        let (direct, visible) = participants(
-            &dir, &from_addr, &from_name, &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
-        );
-        for (addr, name) in direct {
-            upsert_conn(&tx, &addr, &name, at)?;
+    // 审计 R52：分块读写（每批 500，独立事务）。首启大信箱时旧实现一次性把
+    // 全部邮件的收件人串读进内存再开一个大事务，启动既慢又占内存
+    let mut after = 0i64;
+    loop {
+        type BackfillRow = (i64, String, String, String, String, String, String, i64);
+        let rows: Vec<BackfillRow> = crate::db::collect_rows(
+                conn,
+                "SELECT id, direction, from_addr, COALESCE(from_name,''), to_addrs, \
+                 COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
+                 COALESCE(received_at, sent_at, created_at, 0) FROM emails \
+                 WHERE id > ?1 ORDER BY id LIMIT ?2",
+                &[&after, &crate::mail::REPAIR_CHUNK],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )?;
+        let Some(last) = rows.last().map(|r| r.0) else {
+            break;
+        };
+        let tx = conn.transaction()?;
+        for (_, dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, at) in rows {
+            let (direct, visible) = participants(
+                &dir, &from_addr, &from_name, &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
+            );
+            for (addr, name) in direct {
+                upsert_conn(&tx, &addr, &name, at)?;
+            }
+            for (addr, name) in visible {
+                touch_conn(&tx, &addr, &name, at)?;
+            }
         }
-        for (addr, name) in visible {
-            touch_conn(&tx, &addr, &name, at)?;
-        }
+        tx.commit()?;
+        after = last;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// 存量统计修复（v12 口径，幂等）：按历史邮件重算
@@ -418,37 +428,49 @@ pub fn repair_stats(conn: &mut Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
     let self_l = self_addr_conn(conn);
-    let rows: Vec<(String, String, String, String, String, i64)> = crate::db::collect_rows(
-        conn,
-        "SELECT direction, from_addr, to_addrs, COALESCE(cc_addrs,''), \
-         COALESCE(bcc_addrs,''), COALESCE(received_at, sent_at, created_at, 0) FROM emails",
-        &[],
-        |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        },
-    )?;
-    // addr(小写) → (最近往来时间, 直接往来邮件数)；visible 仅刷新时间，计数保持
+    // addr(小写) → (最近往来时间, 直接往来邮件数)；visible 仅刷新时间，计数保持。
+    // 审计 R52：按 id 分批读（每批 500），聚合表只保留地址维度，不再一次性
+    // 把整表邮件行读进内存（大信箱上是几十万行 × 多个地址串）
     let mut stat: HashMap<String, (i64, i64)> = HashMap::new();
-    for (dir, from_addr, to_addrs, cc_addrs, bcc_addrs, at) in rows {
-        let (direct, visible) = participants(
-            &dir, &from_addr, "", &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
-        );
-        for (addr, _) in direct {
-            let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
-            e.0 = e.0.max(at);
-            e.1 += 1;
+    let mut after = 0i64;
+    loop {
+        type StatRow = (i64, String, String, String, String, String, i64);
+        let rows: Vec<StatRow> = crate::db::collect_rows(
+            conn,
+            "SELECT id, direction, from_addr, to_addrs, COALESCE(cc_addrs,''), \
+             COALESCE(bcc_addrs,''), COALESCE(received_at, sent_at, created_at, 0) FROM emails \
+             WHERE id > ?1 ORDER BY id LIMIT ?2",
+            &[&after, &crate::mail::REPAIR_CHUNK],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )?;
+        let Some(last) = rows.last().map(|r| r.0) else {
+            break;
+        };
+        for (_, dir, from_addr, to_addrs, cc_addrs, bcc_addrs, at) in rows {
+            let (direct, visible) = participants(
+                &dir, &from_addr, "", &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
+            );
+            for (addr, _) in direct {
+                let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
+                e.0 = e.0.max(at);
+                e.1 += 1;
+            }
+            for (addr, _) in visible {
+                let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
+                e.0 = e.0.max(at);
+            }
         }
-        for (addr, _) in visible {
-            let e = stat.entry(addr.to_ascii_lowercase()).or_insert((at, 0));
-            e.0 = e.0.max(at);
-        }
+        after = last;
     }
     let tx = conn.transaction()?;
     if !self_l.is_empty() {

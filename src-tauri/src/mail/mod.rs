@@ -183,6 +183,17 @@ fn strip_thread_prefix(subject: &str) -> Option<&str> {
     }
 }
 
+/// 指数退避秒数：第 `attempt` 次失败后等 `base·2^(attempt-1)`，上限 `cap`。
+///
+/// 已读回写（`seen::backoff`，60s 起 / 600s 上限）与收件轮内重试共用同一口径
+/// （审计 R62：收件重试旧实现 `15·n` 线性增长，服务器限流或长时间故障时
+/// 重试节奏过密，反而把限流窗口越拖越长）
+pub(crate) fn backoff_secs(attempt: u32, base: u64, cap: u64) -> u64 {
+    // 移位上限 10 足够覆盖所有上限（base≥1 时 2^10 已超额）
+    let shift = attempt.saturating_sub(1).min(10);
+    base.saturating_mul(1u64 << shift).min(cap)
+}
+
 /// 当前 epoch 秒
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -640,11 +651,63 @@ fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     enc.finish()
 }
 
+/// 附件解压上限（审计 R55）：预览/另存/导出都要把附件解压进 `Vec<u8>`。
+/// 库里存的是 gz，几 MB 的合法压缩包可以膨胀到几十 GB（zip bomb），
+/// `read_to_end` 会一直吃内存直到进程被杀。这里读到上限就停并判失败。
+pub(crate) const MAX_ATTACH_BYTES: u64 = 128 * 1024 * 1024;
+
 fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut dec = GzDecoder::new(bytes);
+    let dec = GzDecoder::new(bytes);
     let mut out = Vec::new();
-    dec.read_to_end(&mut out).ok()?;
+    // 多读 1 字节用于判定「是否超限」，不依赖解压后才知道大小
+    dec.take(MAX_ATTACH_BYTES + 1).read_to_end(&mut out).ok()?;
+    if out.len() as u64 > MAX_ATTACH_BYTES {
+        return None;
+    }
     Some(out)
+}
+
+/// 附件文件读取失败的原因（审计 R58）
+enum AttachIo {
+    /// 文件不存在（被策略清理、数据目录被换、内容丢失）
+    Missing,
+    /// 存在但读不出来（权限不足、被占用、体积异常）——**不是**已清理，
+    /// 报「已被清理」会让用户去重新收件，而真正该做的是修权限
+    Unreadable(String),
+}
+
+/// 读附件的独立文件（storage='file'）：先 metadata 预检再读。
+/// 被篡改/外部写入的超大 .gz 不该直接进内存——上限同 `MAX_ATTACH_BYTES`
+/// （压缩后文件允许略大，但同样不该无界）。
+fn read_attach_gz(path: &Path) -> Result<Vec<u8>, AttachIo> {
+    const MAX_GZ_BYTES: u64 = 256 * 1024 * 1024;
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            if !md.is_file() {
+                return Err(AttachIo::Missing);
+            }
+            if md.len() > MAX_GZ_BYTES {
+                return Err(AttachIo::Unreadable(format!(
+                    "文件异常过大（{} MB）",
+                    md.len() / (1024 * 1024)
+                )));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AttachIo::Missing);
+        }
+        Err(err) => return Err(AttachIo::Unreadable(err.to_string())),
+    }
+    std::fs::read(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => AttachIo::Missing,
+        std::io::ErrorKind::PermissionDenied => AttachIo::Unreadable("文件权限不足".into()),
+        _ => AttachIo::Unreadable(err.to_string()),
+    })
+}
+
+/// 宽口径版本：读不到就 None（预览/导出等「读不到就跳过」的路径用）
+fn read_attach_file(path: &Path) -> Option<Vec<u8>> {
+    read_attach_gz(path).ok()
 }
 
 // ---------- 时间展示（epoch 秒 → 本地时区 label） ----------
@@ -835,44 +898,127 @@ pub fn infer_display_name_conn(conn: &rusqlite::Connection, account: &str) -> Op
     names.iter().find_map(|s| clean_display_name(s))
 }
 
+// ---------- 存量修复的分块骨架（审计 R52） ----------
+
+/// 修复批大小：每批独立事务提交，启动时既不长时间持锁，也不整表读进内存
+pub(crate) const REPAIR_CHUNK: i64 = 500;
+
+/// `repair_marks` 表（k/v 文本）：存**已处理到的最大 id** 与一次性标记。
+///
+/// 故意不写 `settings`：`store_is_empty()` 用 settings 行数判定「空库首设」，
+/// 往里写标记会让首设向导误走「沿用既有库」的归属校验并拒绝保存。
+pub(crate) fn ensure_repair_marks(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS repair_marks(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 读分块游标（缺失/非数字 → 0 = 从头扫一遍）
+pub(crate) fn repair_mark_get(conn: &rusqlite::Connection, key: &str) -> i64 {
+    conn.query_row("SELECT v FROM repair_marks WHERE k = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+    .and_then(|v| v.trim().parse::<i64>().ok())
+    .unwrap_or(0)
+}
+
+/// 写分块游标（在数据事务内调用，与数据同进同退）
+fn repair_mark_set(
+    tx: &rusqlite::Connection,
+    key: &str,
+    v: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO repair_marks(k, v) VALUES(?1, ?2)
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        rusqlite::params![key, v.to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 分块修复驱动：按 id 递增，每批一个事务；游标与数据**同事务**提交。
+///
+/// `load(conn, after_id)` 返回 `(本批待处理项, 本批扫到的最大 id)`——后者即使
+/// 待处理项为空也必须前进，否则「过滤条件不匹配」的批会让循环原地打转。
+/// 任一批失败即返回 Err，游标停在上一批已提交处，下次启动从断点续跑
+/// （这就是「失败写 repair_marks 供下次重试」的落地方式）。
+pub(crate) fn repair_chunked<T>(
+    conn: &mut rusqlite::Connection,
+    mark: &str,
+    mut load: impl FnMut(&rusqlite::Connection, i64) -> Result<(Vec<T>, i64), String>,
+    mut apply: impl FnMut(&rusqlite::Transaction<'_>, &T) -> Result<(), String>,
+) -> Result<usize, String> {
+    ensure_repair_marks(conn)?;
+    let mut cursor = repair_mark_get(conn, mark);
+    let mut changed = 0usize;
+    loop {
+        let (batch, scanned) = load(conn, cursor)?;
+        if scanned <= cursor {
+            break;
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for row in &batch {
+            apply(&tx, row)?;
+            changed += 1;
+        }
+        repair_mark_set(&tx, mark, scanned)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        cursor = scanned;
+    }
+    Ok(changed)
+}
+
 // ---------- 草稿（撰写/存草稿/覆盖，§9） ----------
 
 /// 历史数据修复（主题乱码）：早期收件路径对未编码的原始 GBK/GB2312 主题头
 /// 退 Latin-1，库内主题是"每字节一 U+00xx 字符"的 latin1-mojibake。逆过程：
 /// 把 U+00xx 字符还原为对应字节 → GB18030 解码，命中 CJK 即确认为 GBK 主题
 /// 并写回（同步重算 subject_tokens 保 FTS 检索一致）。西文 latin1 主题（如
-/// é→0xE9）GBK 解码不成 CJK，不误伤；启动后幂等（修完无 U+00xx 字符即空扫）
+/// é→0xE9）GBK 解码不成 CJK，不误伤。
+///
+/// 审计 R52：老实现**每次启动都全表读一遍主题**（无 marker），五万封邮件就是
+/// 五万行 IO；现在按 id 分块（每批 500，独立事务）并用 `repair_marks` 记游标，
+/// 修完即空转一次查询，中途失败下次从断点续跑。
 pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String> {
-    let mojibake: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, subject FROM emails")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(Result::ok)
-            // 只处理「整串都在 U+00xx 内」的主题：出现任何 >0xFF 字符（CJK、破折号、
-            // emoji）说明这串不是纯 latin1 误读，硬按 GB18030 逆推会丢字或造出
-            // 乱码（审计 P1-16：`Résumé — 会议通知` 曾被啃成半截）。
-            .filter(|(_, s)| {
-                s.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}'))
-                    && s.chars().all(|c| (c as u32) <= 0xff)
-            })
-            .collect::<Vec<_>>()
-    };
-    if mojibake.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut fixed = 0usize;
-    for (id, s) in mojibake {
-        let bytes: Vec<u8> = s
-            .chars()
-            .filter(|c| (*c as u32) <= 0xff)
-            .map(|c| c as u8)
-            .collect();
-        let (cow, _, _) = encoding_rs::GB18030.decode(&bytes);
-        if cow.chars().any(is_cjk) {
+    const MARK: &str = "gbk_subjects";
+    let fixed = repair_chunked(
+        conn,
+        MARK,
+        |c, after| {
+            let mut stmt = c
+                .prepare("SELECT id, subject FROM emails WHERE id > ?1 ORDER BY id LIMIT ?2")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![after, REPAIR_CHUNK], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            // 即使本批没有待修项，游标也要推进到已扫描的最大 id
+            let scanned = rows.last().map(|r| r.0).unwrap_or(after);
+            let todo = rows
+                .into_iter()
+                .filter(|(_, s)| is_latin1_mojibake(s))
+                .collect::<Vec<_>>();
+            Ok((todo, scanned))
+        },
+        |tx, row| {
+            let (id, s) = row;
+            let bytes: Vec<u8> = s
+                .chars()
+                .filter(|c| (*c as u32) <= 0xff)
+                .map(|c| c as u8)
+                .collect();
+            let (cow, _, _) = encoding_rs::GB18030.decode(&bytes);
+            if !cow.chars().any(is_cjk) {
+                return Ok(());
+            }
             let subject = cow.trim();
             // 主题变了必须同事务重算归组键：否则会话视图仍按乱码键分组，
             // 修好的邮件与同主题的新邮件分处两组（审计 P1-11）
@@ -881,98 +1027,88 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
                 rusqlite::params![id, subject, tokenize(subject), thread_key_of(subject)],
             )
             .map_err(|e| e.to_string())?;
-            fixed += 1;
-        }
+            Ok(())
+        },
+    )?;
+    if fixed > 0 {
+        eprintln!("[repair] 主题 GBK 乱码修复 {fixed} 封");
     }
-    tx.commit().map_err(|e| e.to_string())?;
-    eprintln!("[repair] 主题 GBK 乱码修复 {fixed} 封");
     Ok(())
+}
+
+/// 「整串都在 U+00xx 内」= 纯 latin1 误读的候选。
+///
+/// 出现任何 >0xFF 字符（CJK、破折号、emoji）说明这串不是纯 latin1 误读，
+/// 硬按 GB18030 逆推会丢字或造出乱码（审计 P1-16：`Résumé — 会议通知`
+/// 曾被啃成半截）。
+fn is_latin1_mojibake(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')) && s.chars().all(|c| (c as u32) <= 0xff)
 }
 
 /// 存量正文乱码一次性修复（v12）：乱码 `body_text` 优先用同源 `body_html`
 /// 派生的纯文本写回（详情页显示正常的那一列），无 HTML 时按 GB18030 逆推
 /// 还原 UTF-8；同步重算 `body_tokens` 保 FTS 检索一致。
 ///
-/// 之前只修收件侧解码（e5abf2f）对新邮件有效，存量数据不会变；93c174b 又
+/// 之前只修收件侧解码（e5abf6f）对新邮件有效，存量数据不会变；93c174b 又
 /// 以"应用未发布"为由移除了存量修复 → 老邮件列表预览一直乱码。显示侧
 /// `preview_text` 已能让列表立即正常，本函数把搜索/转发/MD 导出也洗干净。
-/// marker 保证只跑一次；幂等（修完不再判乱码）；失败不阻断启动。
+///
+/// 审计 R52：整表一次读入（连 body 全文）会在大信箱上把启动内存顶到几百 MB。
+/// 改为按 id 分块 + `repair_marks` 游标续跑：修完只多一次空查询，中途失败
+/// 下次从断点继续（幂等：已修的行不再判乱码）。
 pub fn repair_mojibake_bodies(conn: &mut rusqlite::Connection) -> Result<(), String> {
-    const MARK: &str = "body_mojibake_v12";
-    // 标记存独立表，**不能写 settings**：store_is_empty() 用 settings 表行数
-    // 判定"空库首设"，往 settings 写标记会让首设向导误走「沿用既有库」的
-    // 归属校验并拒绝保存。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS repair_marks(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
-    // 标记值 = 扫描时的「行数:最大 id」：无新邮件时完全跳过；有新邮件或
-    // 数据目录被换成另一套库（id 体系变化）时重新全量扫一遍，避免空库
-    // 首次启动写死 marker 导致后来导入的存量数据永远不被修复。
-    let stamp: String = conn
-        .query_row(
-            "SELECT count(*) || ':' || COALESCE(max(id), 0) FROM emails",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or_default();
-    let prev: String = conn
-        .query_row("SELECT v FROM repair_marks WHERE k = ?1", [MARK], |r| {
-            r.get(0)
-        })
-        .unwrap_or_default();
-    if prev == stamp {
-        return Ok(());
-    }
-    let rows: Vec<(i64, String, String)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, body_text, COALESCE(body_html, '') FROM emails
-                 WHERE body_text IS NOT NULL AND body_text <> ''",
+    // 旧标记值形如 "行数:最大id"，非数字 → 游标从 0 重扫一遍（幂等，无副作用）
+    const MARK: &str = "body_mojibake_v13";
+    let fixed = repair_chunked(
+        conn,
+        MARK,
+        |c, after| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, body_text, COALESCE(body_html, '') FROM emails
+                     WHERE id > ?1 AND body_text IS NOT NULL AND body_text <> ''
+                     ORDER BY id LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![after, REPAIR_CHUNK], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            let scanned = rows.last().map(|r| r.0).unwrap_or(after);
+            let todo = rows
+                .into_iter()
+                .filter(|(_, bt, _)| looks_mojibake(bt))
+                .collect::<Vec<_>>();
+            Ok((todo, scanned))
+        },
+        |tx, row| {
+            let (id, bt, bh) = row;
+            let from_html = if bh.trim().is_empty() {
+                None
+            } else {
+                let derived = decode_entities(&strip_html(bh)).trim().to_string();
+                (!derived.is_empty() && !looks_mojibake(&derived)).then_some(derived)
+            };
+            let Some(new_bt) = from_html.or_else(|| recover_gbk_mojibake(bt)) else {
+                return Ok(());
+            };
+            tx.execute(
+                "UPDATE emails SET body_text = ?2, body_tokens = ?3 WHERE id = ?1",
+                rusqlite::params![id, new_bt, tokenize(&new_bt)],
             )
             .map_err(|e| e.to_string())?;
-        let rs = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rs.filter_map(Result::ok).collect()
-    };
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut fixed = 0usize;
-    for (id, bt, bh) in rows {
-        if !looks_mojibake(&bt) {
-            continue;
-        }
-        let from_html = if bh.trim().is_empty() {
-            None
-        } else {
-            let derived = decode_entities(&strip_html(&bh)).trim().to_string();
-            (!derived.is_empty() && !looks_mojibake(&derived)).then_some(derived)
-        };
-        let Some(new_bt) = from_html.or_else(|| recover_gbk_mojibake(&bt)) else {
-            continue;
-        };
-        tx.execute(
-            "UPDATE emails SET body_text = ?2, body_tokens = ?3 WHERE id = ?1",
-            rusqlite::params![id, new_bt, tokenize(&new_bt)],
-        )
-        .map_err(|e| e.to_string())?;
-        fixed += 1;
-    }
-    tx.execute(
-        "INSERT OR REPLACE INTO repair_marks(k, v) VALUES(?1, ?2)",
-        rusqlite::params![MARK, stamp],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        },
+    )?;
     if fixed > 0 {
-        eprintln!("[repair] 正文乱码修复 {fixed} 封（v12 一次性）");
+        eprintln!("[repair] 正文乱码修复 {fixed} 封（v13 分块）");
     }
     Ok(())
 }
@@ -983,48 +1119,56 @@ pub fn repair_mojibake_bodies(conn: &mut rusqlite::Connection) -> Result<(), Str
 /// v13 起兼修「键过期」行：早期主题乱码修复只改 subject 不改 thread_key，
 /// 库里留下按乱码主题算出的键（含 U+00C0–U+00FF 高位字符），会话视图会把
 /// 修好的邮件与同主题新邮件分成两组。这里对含高位字符的键重算比对，不一致即覆盖。
-/// 幂等：补齐/修正后空扫退出；失败不阻断启动（与联系人回填同策略）。
-/// 应在主题修复后调用，使 backfill 基于已修复的 subject 计算归组键。
+///
+/// 审计 R52：改为按 id 分块 + `repair_marks` 游标（每批 500，独立事务）。
+/// GLOB 先粗筛，避免每批都把整表 subject 读出来。应在主题修复后调用。
 pub fn backfill_thread_keys(conn: &mut rusqlite::Connection) -> Result<(), String> {
-    let targets: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare(
-                // GLOB 按 Unicode 码点匹配：先粗筛 null 与含高位的键，避免全表读 subject
-                "SELECT id, subject, thread_key FROM emails
-                  WHERE thread_key IS NULL OR thread_key GLOB '*[À-ÿ]*'",
+    const MARK: &str = "thread_keys";
+    repair_chunked(
+        conn,
+        MARK,
+        |c, after| {
+            let mut stmt = c
+                .prepare(
+                    // GLOB 按 Unicode 码点匹配：先粗筛 null 与含高位的键
+                    "SELECT id, subject, thread_key FROM emails
+                      WHERE id > ?1 AND (thread_key IS NULL OR thread_key GLOB '*[À-ÿ]*')
+                      ORDER BY id LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![after, REPAIR_CHUNK], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            let scanned = rows.last().map(|r| r.0).unwrap_or(after);
+            let todo = rows
+                .into_iter()
+                .filter(|(_, subject, key)| match key {
+                    None => true,
+                    Some(k) => k != &thread_key_of(subject),
+                })
+                .map(|(id, subject, _)| (id, subject))
+                .collect::<Vec<_>>();
+            Ok((todo, scanned))
+        },
+        |tx, row| {
+            let (id, subject) = row;
+            tx.execute(
+                "UPDATE emails SET thread_key = ?2 WHERE id = ?1",
+                rusqlite::params![id, thread_key_of(subject)],
             )
             .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(Result::ok)
-            .filter(|(_, subject, key)| match key {
-                None => true,
-                Some(k) => k != &thread_key_of(subject),
-            })
-            .map(|(id, subject, _)| (id, subject))
-            .collect::<Vec<_>>()
-    };
-    if targets.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    for (id, subject) in targets {
-        let key = thread_key_of(&subject);
-        tx.execute(
-            "UPDATE emails SET thread_key = ?2 WHERE id = ?1",
-            rusqlite::params![id, key],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
+            Ok(())
+        },
+    )
+    .map(|_| ())
 }
 
 /// 撰写表单入参（存草稿；发送为 M3）
@@ -1203,14 +1347,16 @@ impl SortKey {
 fn order_sql(sort: SortKey, alias: &str) -> String {
     let a = alias;
     match sort {
-        SortKey::DateDesc => format!("{a}starred DESC, t DESC, {a}id DESC"),
-        SortKey::DateAsc => format!("t ASC, {a}id ASC"),
+        // 排序列用派生列 sort_time 而不是 SELECT 别名 t：别名/表达式只能走
+        // 临时 B 树排序，引列名才能命中 idx_folder_sort（审计 R27）
+        SortKey::DateDesc => format!("{a}starred DESC, {a}sort_time DESC, {a}id DESC"),
+        SortKey::DateAsc => format!("{a}sort_time ASC, {a}id ASC"),
         SortKey::FromAsc => {
             format!(
-                "{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, t DESC, {a}id DESC"
+                "{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, {a}sort_time DESC, {a}id DESC"
             )
         }
-        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, t DESC, {a}id DESC"),
+        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, {a}sort_time DESC, {a}id DESC"),
     }
 }
 
@@ -1320,9 +1466,17 @@ pub struct ThreadDetail {
     /// 组主题（代表邮件原主题，展示用）
     pub subject: String,
     pub thread_key: String,
-    /// 组内邮件摘要（已排除草稿/失败；正序 = 会话内从早到晚）
+    /// 组内邮件摘要（已排除草稿/失败；正序 = 会话内从早到晚；上限
+    /// `THREAD_MAX_ITEMS`，超长会话只渲染最近一批）
     pub items: Vec<EmailSummary>,
+    /// 组内实际封数（不受 items 上限影响，用于「会话 · N 封往来」计数）
+    pub total: i64,
 }
+
+/// 会话详情一次渲染的最大封数（审计 R53）：正常往来远小于此值，
+/// 这里只为挡住「同一主题自动回复循环」造出的上万封组，避免一次查询
+/// 把整组读进内存并渲染成超长页面
+pub const THREAD_MAX_ITEMS: i64 = 500;
 
 /// folder 白名单校验（未知值回落收件箱；SQL 内插前必须过白名单）。
 /// 2026-11-09 移除「全部」：未知/畸形参数不再兜底为跨箱全量（避免意外暴露）
@@ -1380,6 +1534,10 @@ pub enum BatchTarget {
     /// 跨页全选：当前筛选全集 - exclude_ids + 附加排除（见 batch_apply 注释）
     SelectAll { exclude: Vec<i64>, query: ListQuery },
 }
+
+/// 批量写操作的每批行数（审计 R56）：跨页全选可命中几万封，
+/// 一条 SQL 拼几万个 `?` 会让语句准备与参数绑定都变成瓶颈
+const BATCH_CHUNK: usize = 500;
 
 /// 批量动作
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1463,71 +1621,74 @@ pub fn batch_apply(
     if ids.is_empty() {
         return Ok(0);
     }
-    // 单事务执行
+    // 分批执行（审计 R56）：跨页全选可以一次命中几万封，拼一条几万占位符的
+    // SQL 既慢又容易撞 SQLite 的变量上限；按 BATCH_CHUNK 一批，单事务仍保证
+    // 全有或全无（任一批失败整体回滚，附件文件也不会先删）。
     let root = attach_root(state);
     let n = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
-        let marks = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let changed = match action {
-            BatchAction::MarkRead | BatchAction::MarkUnread => {
-                let v: i64 = if action == BatchAction::MarkRead {
-                    0
-                } else {
-                    1
-                };
-                // 仅收件箱有意义（unread 列语义限定；批量标已读时对草稿/发件 noop）
-                tx.execute(
-                    &format!(
-                        "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
-                    ),
-                    rusqlite::params_from_iter(ids.iter()),
-                )
-                .map_err(e)?
-            }
-            // 批量星标（M2-1 进批量栏）：全信箱行均合法（星标置顶对所有文件夹生效）。
-            // starred 不在 emails_au 触发器的 FTS 监听列内，翻转不引发检索重写
-            BatchAction::Star | BatchAction::Unstar => {
-                let v: i64 = if action == BatchAction::Star { 1 } else { 0 };
-                tx.execute(
-                    &format!("UPDATE emails SET starred = {v} WHERE id IN ({marks})"),
-                    rusqlite::params_from_iter(ids.iter()),
-                )
-                .map_err(e)?
-            }
-            BatchAction::Delete => {
-                // 先收独立附件路径（行删除前；外键级联删附件行）
-                let mut stmt = tx
-                    .prepare(&format!(
-                        "SELECT a.file_path FROM attachments a
-                          JOIN emails e ON e.id = a.email_id
-                          WHERE a.storage = 'file' AND e.id IN ({marks})"
-                    ))
-                    .map_err(e)?;
-                let files: Vec<String> = stmt
-                    .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .map_err(e)?
-                    .filter_map(Result::ok)
-                    .collect();
-                drop(stmt);
-                let n = tx
-                    .execute(
-                        &format!("DELETE FROM emails WHERE id IN ({marks})"),
-                        rusqlite::params_from_iter(ids.iter()),
-                    )
-                    .map_err(e)?;
-                tx.commit().map_err(e)?;
-                // 提交后删文件（与单删/clean 同模式：失败残留由孤儿回收兜底）
-                for rel in &files {
-                    let _ = std::fs::remove_file(root.join(rel));
+        let mut changed = 0usize;
+        let mut files: Vec<String> = Vec::new();
+        for chunk in ids.chunks(BATCH_CHUNK) {
+            let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            match action {
+                BatchAction::MarkRead | BatchAction::MarkUnread => {
+                    let v: i64 = if action == BatchAction::MarkRead { 0 } else { 1 };
+                    // 仅收件箱有意义（unread 列语义限定；批量标已读时对草稿/发件 noop）
+                    changed += tx
+                        .execute(
+                            &format!(
+                                "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
+                            ),
+                            rusqlite::params_from_iter(chunk.iter()),
+                        )
+                        .map_err(e)?;
                 }
-                prune_empty_dirs(&root);
-                return Ok::<usize, String>(n);
+                // 批量星标（M2-1 进批量栏）：全信箱行均合法（星标置顶对所有文件夹生效）。
+                // starred 不在 emails_au 触发器的 FTS 监听列内，翻转不引发检索重写
+                BatchAction::Star | BatchAction::Unstar => {
+                    let v: i64 = if action == BatchAction::Star { 1 } else { 0 };
+                    changed += tx
+                        .execute(
+                            &format!("UPDATE emails SET starred = {v} WHERE id IN ({marks})"),
+                            rusqlite::params_from_iter(chunk.iter()),
+                        )
+                        .map_err(e)?;
+                }
+                BatchAction::Delete => {
+                    // 先收独立附件路径（行删除前；外键级联删附件行）
+                    let mut stmt = tx
+                        .prepare(&format!(
+                            "SELECT a.file_path FROM attachments a
+                              JOIN emails e ON e.id = a.email_id
+                              WHERE a.storage = 'file' AND e.id IN ({marks})"
+                        ))
+                        .map_err(e)?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .map_err(e)?;
+                    files.extend(rows.filter_map(Result::ok));
+                    drop(stmt);
+                    changed += tx
+                        .execute(
+                            &format!("DELETE FROM emails WHERE id IN ({marks})"),
+                            rusqlite::params_from_iter(chunk.iter()),
+                        )
+                        .map_err(e)?;
+                }
             }
-        };
+        }
         tx.commit().map_err(e)?;
-        Ok(changed)
+        // 提交后删文件（与单删/clean 同模式：失败残留由孤儿回收兜底）
+        if action == BatchAction::Delete {
+            for rel in &files {
+                let _ = std::fs::remove_file(root.join(rel));
+            }
+            prune_empty_dirs(&root);
+        }
+        Ok::<usize, String>(changed)
     })?;
     Ok(n)
 }
@@ -1558,7 +1719,7 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
             .prepare(&format!(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
-                        COALESCE(received_at, sent_at, created_at) AS t,
+                        sort_time AS t,
                         {ext_col} AS from_external, starred, scheduled_at,
                         COALESCE(body_html, '') AS body_html
                  FROM emails {where_sql}
@@ -1601,29 +1762,46 @@ pub fn thread_mails(
     };
     let domain = internal_domain.trim();
     let ext_col = external_col("", domain);
-    let items = state.with_conn(|conn| {
+    // 取「最近的一批」而不是最早的：会话页按时间正序渲染，超长组截断时
+    // 用户要的是最新往来（DESC + LIMIT 后再反转）
+    let (items, total) = state.with_conn(|conn| {
+        let total: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM emails
+                 WHERE thread_key = ?1 AND folder <> 'draft'
+                   AND status NOT IN ('draft','failed')",
+                [&thread_key],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
-                        COALESCE(received_at, sent_at, created_at) AS t,
+                        sort_time AS t,
                         {ext_col} AS from_external, starred, scheduled_at,
                         COALESCE(body_html, '') AS body_html
                  FROM emails
                  WHERE thread_key = ?1 AND folder <> 'draft'
                    AND status NOT IN ('draft','failed')
-                 ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC"
+                 ORDER BY sort_time DESC, id DESC
+                 LIMIT ?2"
             ))
             .map_err(e)?;
         let rows = stmt
-            .query_map([&thread_key], |r| summary_from_row(r, None))
+            .query_map(rusqlite::params![thread_key, THREAD_MAX_ITEMS], |r| {
+                summary_from_row(r, None)
+            })
             .map_err(e)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(e)
+        let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
+        items.reverse(); // 回到正序（早 → 晚）
+        Ok::<_, String>((items, total))
     })?;
     Ok(Some(ThreadDetail {
         subject,
         thread_key,
         items,
+        total,
     }))
 }
 
@@ -1671,6 +1849,10 @@ fn summary_from_row(
     let to_addrs: String = r.get(6)?;
     let body: String = r.get(7)?;
     let html: String = r.get(14)?;
+    // 审计 R53：摘要与悬停预览此前各算一遍 preview_base（strip_html +
+    // decode_entities 都是全量扫描），一页 100 行就是 200 次重复解析。
+    // 这里算一次、两处复用。
+    let base = preview_base(&body, &html);
     let scheduled_at = r.get::<_, i64>(13)?;
     // 发件箱/草稿箱列表展示收件人（2026-11-09）：这两箱的「对方」是收件人，
     // 显示发件人（自己）没有信息量
@@ -1688,8 +1870,8 @@ fn summary_from_row(
         subject,
         from_display,
         to_addrs,
-        body_preview: preview_text(&body, &html),
-        preview_tip: preview_tip(&body, &html),
+        body_preview: preview_text_base(&base),
+        preview_tip: preview_tip_base(&base),
         attach_cnt: r.get(8)?,
         unread: r.get::<_, i64>(9)? == 1,
         from_external: r.get::<_, i64>(11)? == 1,
@@ -1823,7 +2005,7 @@ pub fn search(
             .prepare(&format!(
                 "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                         e.to_addrs, e.body_text, e.attach_cnt, e.unread,
-                        COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
+                        e.sort_time AS t,
                         {ext_col} AS from_external, e.starred, e.scheduled_at,
                         COALESCE(e.body_html, '') AS body_html
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
@@ -1886,16 +2068,29 @@ fn has_html_markup(text: &str) -> bool {
 }
 
 /// 正文摘要：详情同源修复 + 压缩空白后取前 100 字符
+///
+/// 生产路径走 `preview_text_base`（列表逐行只算一次 base），这个两参形态
+/// 仅供单测直接喂原始列值
+#[cfg(test)]
 fn preview_text(text: &str, html: &str) -> String {
-    flatten_ws(&preview_base(text, html))
-        .chars()
-        .take(100)
-        .collect()
+    preview_text_base(&preview_base(text, html))
+}
+
+/// 摘要（入参为已算好的 preview_base：列表逐行调用时避免重复解析）
+fn preview_text_base(base: &str) -> String {
+    flatten_ws(base).chars().take(100).collect()
 }
 
 /// 悬停预览正文：同源修复 + 压缩空白 + 300 字符截断 + 超长补省略号
+/// （两参形态仅供单测，理由同上）
+#[cfg(test)]
 fn preview_tip(text: &str, html: &str) -> String {
-    let flat = flatten_ws(&preview_base(text, html));
+    preview_tip_base(&preview_base(text, html))
+}
+
+/// 悬停预览（入参为已算好的 preview_base，同上）
+fn preview_tip_base(base: &str) -> String {
+    let flat = flatten_ws(base);
     let mut tip: String = flat.chars().take(300).collect();
     if flat.chars().count() > 300 {
         tip.push('…');
@@ -2204,7 +2399,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                 "SELECT direction, folder, status, subject, from_addr, from_name, to_addrs,
                         cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
                         attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
-                        COALESCE(received_at, sent_at, created_at), too_large, starred,
+                        sort_time, too_large, starred,
                         scheduled_at, COALESCE(raw_headers, ''), sent_at IS NOT NULL
                  FROM emails WHERE id = ?1",
                 [id],
@@ -2633,6 +2828,17 @@ pub fn add_attachments(
         let mut count = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         for p in paths {
+            // 先看大小再读（审计 R55）：用户误选一个 4GB 镜像不该走「读进内存
+            // → 再决定 inline/落盘」，那一步已经 OOM 了
+            let md = std::fs::metadata(p)
+                .map_err(|err| format!("读取附件失败 {}: {err}", safe_filename(p)))?;
+            if md.len() > MAX_ATTACH_BYTES {
+                return Err(format!(
+                    "附件过大：{} 超过 {} MB 上限",
+                    safe_filename(p),
+                    MAX_ATTACH_BYTES / (1024 * 1024)
+                ));
+            }
             let orig = std::fs::read(p)
                 .map_err(|err| format!("读取附件失败 {}: {err}", safe_filename(p)))?;
             let filename = Path::new(p)
@@ -2968,6 +3174,39 @@ fn save_dest_allowed(p: &Path) -> bool {
     !denied.iter().any(|r| path_within(&target, r))
 }
 
+/// 附件是否可导出/可预览：**只查元数据与文件是否存在，不解压不读字节**
+/// （审计 R61）。导出 .eml 需要先确定 multipart/mixed 结构，若用
+/// `attachment_bytes` 预检就会把所有附件全读进内存，这与流式写的目的相反
+pub fn attachment_available(state: &AppState, email_id: i64, attach_id: i64) -> bool {
+    let root = attach_root(state);
+    state.with_conn(|conn| {
+        // 查不到/读失败一律当不可用（导出侧会跳过该附件，不影响正文）
+        let row = conn
+            .query_row(
+                "SELECT storage, COALESCE(file_path,''), detached = 1
+                 FROM attachments WHERE id = ?1 AND email_id = ?2",
+                [attach_id, email_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+        match row {
+            Some((_, _, detached)) if detached => false,
+            // inline 数据在库里，行存在即可（真读失败由写入阶段的读取兜底）
+            Some((storage, _, _)) if storage == "inline" => true,
+            Some((_, path, _)) => root.join(path).is_file(),
+            None => false,
+        }
+    })
+}
+
 /// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）。
 /// 归属校验：email_id 与 attach_id 联合匹配——URL 里的邮件 id 必须是附件
 /// 真实属主，防 /emails/{other}/attachments/{aid} 跨邮件取附件（审计 L1）
@@ -2976,6 +3215,17 @@ pub fn attachment_bytes(
     email_id: i64,
     attach_id: i64,
 ) -> Option<(AttachView, Vec<u8>)> {
+    attachment_bytes_checked(state, email_id, attach_id).ok()
+}
+
+/// 同上，但给出**可区分**的失败原因（审计 R58）：
+/// 「已被清理」与「权限不足」在 UI 上不能是同一句话——前者用户无能为力，
+/// 后者用户改个权限就能救回来。
+pub fn attachment_bytes_checked(
+    state: &AppState,
+    email_id: i64,
+    attach_id: i64,
+) -> Result<(AttachView, Vec<u8>), String> {
     let root = attach_root(state);
     state.with_conn(|conn| {
         let row = conn
@@ -2996,16 +3246,22 @@ pub fn attachment_bytes(
                 },
             )
             .optional()
-            .ok()??;
+            .map_err(|err| format!("读取附件信息失败：{err}"))?
+            .ok_or_else(|| "附件不存在".to_string())?;
         let (filename, storage, file_path, data, detached, mime) = row;
         if detached {
-            return None; // 大附件文件已按策略清理（§5.1）
+            // 大附件文件已按策略清理（§5.1）
+            return Err("附件文件已被清理（可在 设置 → 存储 调整保留策略）".to_string());
         }
         let gz = match storage.as_str() {
-            "inline" => data?,
-            _ => std::fs::read(root.join(&file_path)).ok()?,
+            "inline" => data.ok_or_else(|| "附件数据缺失".to_string())?,
+            _ => read_attach_gz(&root.join(&file_path)).map_err(|e| match e {
+                AttachIo::Missing => "附件文件不存在（可能已被清理或数据目录已变更）".to_string(),
+                AttachIo::Unreadable(why) => format!("读取附件失败：{why}"),
+            })?,
         };
-        let bytes = gunzip(&gz)?;
+        let bytes =
+            gunzip(&gz).ok_or_else(|| "附件解压失败（文件可能损坏或超过体积上限）".to_string())?;
         let meta = AttachView {
             id: attach_id,
             preview_kind: preview_kind_of(&mime, &filename).into(),
@@ -3016,7 +3272,7 @@ pub fn attachment_bytes(
             storage,
             detached,
         };
-        Some((meta, bytes))
+        Ok((meta, bytes))
     })
 }
 
@@ -3028,8 +3284,8 @@ pub fn save_attachment_to(
     attach_id: i64,
     dest: &str,
 ) -> Result<String, String> {
-    let (view, bytes) = attachment_bytes(state, email_id, attach_id)
-        .ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
+    // 审计 R58：用 checked 版本，把「已清理」与「权限不足/损坏」分开报
+    let (view, bytes) = attachment_bytes_checked(state, email_id, attach_id)?;
     // 后缀推断（2026-11-11）：保存对话框里用户可能删掉后缀，且部分邮件附件
     // 本身就无后缀（发件端截断/客户端不写）——按原名后缀 → MIME → .bin 补齐，
     // 保证落盘文件能被系统按类型关联打开。补全后路径才是真正写入目标
@@ -3085,9 +3341,15 @@ pub fn save_all_attachments(
                     continue;
                 }
             },
-            _ => match file_path.and_then(|p| std::fs::read(root.join(p)).ok()) {
-                Some(b) => b,
-                None => {
+            _ => match file_path.map(|p| read_attach_gz(&root.join(p))) {
+                Some(Ok(b)) => b,
+                other => {
+                    // 审计 R58：区分「文件不在」与「读不出来」。批量另存不因
+                    // 单个文件失败而中断，但权限/损坏必须留下可查的日志，
+                    // 否则用户只看到「N 个已清理」，永远查不到真正原因
+                    if let Some(Err(AttachIo::Unreadable(why))) = other {
+                        eprintln!("[attach] 另存跳过（{filename}）：{why}");
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -3192,9 +3454,9 @@ pub fn copy_attachments(
                 }
             }
         } else {
-            match std::fs::read(root.join(file_path.unwrap_or_default())) {
-                Ok(gz) => gz,
-                Err(_) => {
+            match read_attach_file(&root.join(file_path.unwrap_or_default())) {
+                Some(gz) => gz,
+                None => {
                     skipped += 1;
                     continue;
                 }

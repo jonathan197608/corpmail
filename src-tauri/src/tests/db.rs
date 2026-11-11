@@ -620,3 +620,85 @@ fn open_sets_busy_timeout_on_every_connection() {
     drop(a);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 排序/查找索引（审计 R27）：EXPLAIN QUERY PLAN 必须命中索引，
+/// 否则「万级邮件 + 置顶排序」每次翻页都要全表扫 + 临时 B 树排序。
+/// 顺带钉住 sort_time 派生列的口径：收件按 received_at、发出按 sent_at、
+/// 草稿按 created_at，改表达式就等于改列表顺序，必须显式失败。
+#[test]
+fn sort_and_lookup_indexes_are_used() {
+    let conn = mem();
+    // 派生列口径：三类邮件分别取不同时间源
+    conn.execute_batch(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                            subject_tokens, body_tokens, created_at, received_at, sent_at)
+         VALUES ('in','inbox','received','a@x.cn','b@x.cn','收','收','收',10,100,NULL),
+                ('out','sent','sent','b@x.cn','a@x.cn','发','发','发',20,NULL,200),
+                ('out','draft','draft','b@x.cn','a@x.cn','稿','稿','稿',30,NULL,NULL);",
+    )
+    .unwrap();
+    for (id, want) in [(1, 100i64), (2, 200), (3, 30)] {
+        let got: i64 = conn
+            .query_row("SELECT sort_time FROM emails WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, want, "id={id} 的 sort_time 口径变了");
+    }
+    // 列表默认排序（folder 等值 + starred DESC + sort_time DESC + id DESC）
+    let plan = plan_of(
+        &conn,
+        "SELECT id FROM emails WHERE folder = 'inbox'
+         ORDER BY starred DESC, sort_time DESC, id DESC LIMIT 10",
+    );
+    assert!(
+        plan.contains("idx_folder_sort"),
+        "默认排序应命中 idx_folder_sort：{plan}"
+    );
+    // 回复链定位：message_id + direction
+    let plan = plan_of(
+        &conn,
+        "SELECT id FROM emails WHERE message_id = 'x@y' AND direction = 'in'",
+    );
+    assert!(
+        plan.contains("idx_message_id"),
+        "message_id 查找应命中 idx_message_id：{plan}"
+    );
+}
+
+/// 侧栏计数（审计 R63）：三个 folder 计数与收件箱未读计数都必须走索引，
+/// 旧实现在列表页 + 设置页各做一次全表 SUM，万级邮件下每次渲染都扫全表
+#[test]
+fn folder_count_queries_use_indexes() {
+    let conn = mem();
+    let plan = plan_of(&conn, "SELECT count(*) FROM emails WHERE folder = 'inbox'");
+    assert!(
+        plan.contains("idx_folder_sort") || plan.contains("idx_inbox_unread"),
+        "folder 计数应命中索引：{plan}"
+    );
+    let plan = plan_of(
+        &conn,
+        "SELECT count(*) FROM emails WHERE folder = 'inbox' AND unread = 1",
+    );
+    assert!(
+        plan.contains("idx_inbox_unread"),
+        "未读计数应命中部分索引：{plan}"
+    );
+    // 部分索引不得被"任意 folder"复用（谓词不蕴含时索引不可用）
+    let plan = plan_of(&conn, "SELECT count(*) FROM emails WHERE folder = 'sent'");
+    assert!(
+        !plan.contains("idx_inbox_unread"),
+        "非收件箱计数不应误用收件箱部分索引：{plan}"
+    );
+}
+
+/// EXPLAIN QUERY PLAN 的明细文本（每行 detail 拼接）
+fn plan_of(conn: &Connection, sql: &str) -> String {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.join(" | ")
+}

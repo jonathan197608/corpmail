@@ -26,11 +26,10 @@ const MAX_UIDS_PER_ROUND: usize = 500;
 pub const MAX_ATTEMPTS: u32 = 5;
 
 /// 第 attempt 次失败后的退避时长（60s 起翻倍，上限 10 分钟；attempt 从 1 计）。
-/// 旧实现 `60 << n` 首次失败即 120s，与「60s 起」的文档语义不符
+/// 旧实现 `60 << n` 首次失败即 120s，与「60s 起」的文档语义不符。
+/// 指数口径与收件重试共用 `mail::backoff_secs`（审计 R62：两处不能各写一套）
 pub fn backoff(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(4);
-    let secs = 60u64.saturating_mul(1u64 << shift);
-    Duration::from_secs(secs.min(600))
+    Duration::from_secs(crate::mail::backoff_secs(attempt, 60, 600))
 }
 
 /// 待回写行（id 用于清标志，uidvalidity+uid 用于 STORE）

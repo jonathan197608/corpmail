@@ -30,7 +30,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -83,6 +83,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         7 => migrate_v8(tx),
         8 => migrate_v9(tx),
         9 => migrate_v10(tx),
+        10 => migrate_v11(tx),
         _ => Ok(()),
     }
 }
@@ -129,9 +130,9 @@ fn migrate_v5(tx: &Connection) -> rusqlite::Result<()> {
 }
 
 /// v6 → v7：星标（M2-1）。starred=1 的邮件在各信箱列表置顶
-/// （ORDER BY starred DESC, 时间 DESC）。列表排序用的是
-/// COALESCE(received_at, sent_at, created_at) 表达式（t），本就无法走单列索引，
-/// 置顶前缀不额外建索引：排序器开销在桌面单机库（万级行）可忽略。
+/// （ORDER BY starred DESC, 时间 DESC）。当时排序用的是
+/// COALESCE(received_at, sent_at, created_at) 表达式（t），无法走索引，
+/// 故未为此建索引；v11 落成派生列 sort_time 后已补 idx_folder_sort。
 /// emails_au 触发器仅盯 subject/body_tokens 列，星标翻转不引发 FTS 重写。
 fn migrate_v7(tx: &Connection) -> rusqlite::Result<()> {
     if !emails_has_column(tx, "starred")? {
@@ -186,6 +187,36 @@ fn migrate_v10(tx: &Connection) -> rusqlite::Result<()> {
            created_at INTEGER NOT NULL DEFAULT 0,
            updated_at INTEGER NOT NULL DEFAULT 0
          );",
+    )
+}
+
+/// v10 → v11：排序/查找索引（审计 R27）。
+///
+/// `sort_time` 为派生列（`COALESCE(received_at, sent_at, created_at)`：
+/// 收件按收到时间、发出按发送时间、草稿按创建时间）。列表与会话都按它排，
+/// 但 ORDER BY 表达式或 SELECT 别名只能走临时 B 树排序；落成 VIRTUAL 列后
+/// ORDER BY 引列名即可命中索引（VIRTUAL 不占存储，查询时现算）。
+///
+/// 索引顺序对齐默认排序 `starred DESC, sort_time DESC, id DESC`：置顶前置
+/// 意味着只建 `(folder, sort_time)` 反而不匹配，SQLite 仍会全量排序。
+/// `starred` 写成 DESC 才与 ORDER BY 同向。
+fn migrate_v11(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "sort_time")? {
+        tx.execute_batch(
+            "ALTER TABLE emails ADD COLUMN sort_time INTEGER
+               GENERATED ALWAYS AS (COALESCE(received_at, sent_at, created_at)) VIRTUAL",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_folder_sort
+           ON emails(folder, starred DESC, sort_time DESC, id DESC);
+         -- 回复链定位（in_reply_to / message_id 查询）与按发件人过滤
+         CREATE INDEX IF NOT EXISTS idx_message_id ON emails(message_id, direction);
+         CREATE INDEX IF NOT EXISTS idx_from_addr ON emails(from_addr);
+         -- 侧栏未读角标：部分索引只收未读收件，count(*) 走索引不再全表 SUM
+         -- （审计 R63）。folder 置首列即可，行集本身已由谓词限定
+         CREATE INDEX IF NOT EXISTS idx_inbox_unread
+           ON emails(folder) WHERE folder = 'inbox' AND unread = 1;",
     )
 }
 

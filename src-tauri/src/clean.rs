@@ -224,16 +224,19 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
 }
 
 /// 预估将释放空间（只读；存储页"预计可释放"）
+///
+/// 审计 R18：锁内只跑查询，`metadata`/目录遍历全部挪到锁外。旧实现把
+/// 「过期邮件逐个 stat + 全量孤儿扫描（数万次 readdir/stat）」压在 `with_conn`
+/// 里，存储页一打开就长时间占着唯一那条 DB 连接——收取线程、发送 worker
+/// 全部在排队等锁，UI 表现为「点一下卡住几秒」。
 pub fn estimate(state: &AppState) -> Estimate {
     let p = policy(state);
     let now = now_epoch();
     let root = state.data_dir().join("attachments");
     let mut est = Estimate::default();
-    let res = state.with_conn(|conn| {
+    // 锁内：只产出「要统计什么」，不碰文件系统
+    let collected = state.with_conn(|conn| {
         let targets = detach_targets(conn, p.clean_sent_bulk_days.map(|d| cutoff(now, d)))?;
-        est.detach_files = targets.len() as u64;
-        est.bytes += targets.iter().map(|t| t.2).filter(|s| *s > 0).sum::<i64>() as u64;
-
         let ids = expire_targets(
             conn,
             (
@@ -241,26 +244,32 @@ pub fn estimate(state: &AppState) -> Estimate {
                 p.keep_sent_days.map(|d| cutoff(now, d)),
             ),
         )?;
-        est.expire_emails = ids.len() as u64;
-        for id in ids {
-            for rel in file_paths_of(conn, id)? {
-                let sz = std::fs::metadata(root.join(&rel))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                est.bytes += sz;
-            }
+        let mut files = Vec::new();
+        for id in &ids {
+            files.extend(file_paths_of(conn, *id)?);
         }
-        if let Ok(refs) = referenced_paths(conn) {
-            for (_, size) in orphan_files(&root, &refs, now) {
-                est.orphan_files += 1;
-                est.bytes += size;
-            }
-        }
-        Ok::<(), String>(())
+        // 引用集合读失败不致命：宁可少报孤儿，也不误删（与 run 同口径）
+        let refs = referenced_paths(conn).ok();
+        Ok::<_, String>((targets, ids.len(), files, refs))
     });
-    if res.is_err() {
+    let Ok((targets, expire_count, files, refs)) = collected else {
         // 预估失败不影响页面（显示 0；手动清理时仍会报错）
         return Estimate::default();
+    };
+    est.detach_files = targets.len() as u64;
+    est.bytes += targets.iter().map(|t| t.2).filter(|s| *s > 0).sum::<i64>() as u64;
+    est.expire_emails = expire_count as u64;
+    // 锁外：逐个 stat + 孤儿目录遍历（慢 I/O 不再挡住 DB 连接）
+    for rel in files {
+        est.bytes += std::fs::metadata(root.join(&rel))
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
+    if let Some(refs) = refs {
+        for (_, size) in orphan_files(&root, &refs, now) {
+            est.orphan_files += 1;
+            est.bytes += size;
+        }
     }
     est
 }
