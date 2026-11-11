@@ -719,6 +719,71 @@ fn attachments_inline_and_file_tiers() {
     cleanup(&dir);
 }
 
+/// 后缀推断（2026-11-11）：附件名后缀 > MIME 映射 > .bin；纯数字尾巴不算后缀；
+/// 用户已填后缀（含自定义）一律尊重；文件名取 basename 防目录穿越
+#[test]
+fn attachment_suffix_inference_rules() {
+    assert_eq!(suffix_of("a.pdf"), Some("pdf"));
+    assert_eq!(suffix_of("报表.XLSX"), Some("XLSX"));
+    assert_eq!(suffix_of("报表.2026"), None, "纯数字尾巴不应当后缀");
+    assert_eq!(suffix_of("无后缀"), None);
+    assert_eq!(suffix_of("x."), None);
+    assert_eq!(suffix_of("a.verylongext"), None, "超 8 位不认");
+    assert_eq!(ext_for_mime("application/pdf; name=x.pdf"), Some("pdf"));
+    assert_eq!(
+        ext_for_mime("APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.SHEET"),
+        Some("xlsx")
+    );
+    assert_eq!(ext_for_mime("application/octet-stream"), None);
+
+    assert_eq!(save_name_of("清单.xlsx", "application/octet-stream"), "清单.xlsx");
+    assert_eq!(save_name_of("清单", "application/pdf"), "清单.pdf");
+    assert_eq!(save_name_of("清单", "application/octet-stream"), "清单.bin");
+    assert_eq!(save_name_of("", "image/png"), "attachment.png");
+    assert_eq!(save_name_of("../../etc/passwd", "text/plain"), "passwd.txt");
+
+    assert_eq!(
+        with_inferred_ext("/tmp/a", "x.pdf", "application/pdf"),
+        "/tmp/a.pdf"
+    );
+    assert_eq!(
+        with_inferred_ext("/tmp/a.pdf", "x.docx", "x/y"),
+        "/tmp/a.pdf",
+        "路径已有后缀时尊重用户命名"
+    );
+    assert_eq!(
+        with_inferred_ext("/tmp/a.2026", "x", "application/pdf"),
+        "/tmp/a.2026.pdf",
+        "纯数字尾巴不算后缀，仍补 MIME 后缀"
+    );
+    assert_eq!(
+        with_inferred_ext("/tmp/a", "x", "application/octet-stream"),
+        "/tmp/a.bin"
+    );
+    // Windows 文件名清洗（参数外置，可在任意平台验证两种分支）
+    assert_eq!(os_safe_name("季度:汇总?.xlsx", true), "季度 汇总 .xlsx");
+    assert_eq!(os_safe_name("报表.", true), "报表");
+    assert_eq!(os_safe_name("报表.", false), "报表.");
+    assert_eq!(os_safe_name("??", true), "attachment");
+}
+
+/// 另存无后缀路径时按附件名补后缀，并返回实际落盘路径（提示文案据此显示）
+#[test]
+fn save_attachment_infers_missing_extension() {
+    let (state, dir) = temp_state("attach-ext");
+    let id = save_draft(&state, &draft("附件后缀", "附件体")).unwrap();
+    let src = dir.join("报表.txt");
+    std::fs::write(&src, b"data").unwrap();
+    add_attachments(&state, id, &[src.to_str().unwrap().into()]).unwrap();
+    let aid = get(&state, id).unwrap().attachments[0].id;
+    let dest = dir.join("另存无后缀");
+    let saved = save_attachment_to(&state, id, aid, dest.to_str().unwrap()).unwrap();
+    assert_eq!(saved, format!("{}.txt", dest.display()));
+    assert_eq!(std::fs::read(&saved).unwrap(), b"data");
+    assert!(!dest.exists(), "不应写到无后缀路径");
+    cleanup(&dir);
+}
+
 #[test]
 fn add_attachments_rejects_missing_file_atomically() {
     let (state, dir) = temp_state("attach-miss");
@@ -1042,52 +1107,6 @@ fn backfill_thread_keys_fills_null_keys() {
             ("".to_string(), Some("".to_string())),            // 空主题 → 空串
         ]
     );
-}
-
-/// 会话列表归组（M2-2）：同 thread_key 合并为一组（thread_count=组内件数），
-/// 代表行=组内最新一封；草稿/发送失败不入会；空主题不归组；组级按最新时间倒序
-#[test]
-fn list_threads_groups_and_excludes_drafts_failed() {
-    let (state, dir) = temp_state("threads");
-    state.with_conn(|c| {
-        c.execute_batch(
-            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
-                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
-            ('in','inbox','received','a@x.cn','b@x.cn','会议','会议','内容','会议',1,1),
-            ('out','sent','sent','b@x.cn','a@x.cn','Re: 会议','会议','内容','会议',0,2),
-            ('in','inbox','received','a@x.cn','b@x.cn','报价','报价','内容','报价',0,3),
-            ('out','draft','draft','a@x.cn','b@x.cn','会议','会议','内容','会议',0,4),
-            ('out','sent','failed','a@x.cn','b@x.cn','报价','报价','内容','报价',0,5),
-            ('in','inbox','received','a@x.cn','b@x.cn','','','','',0,6)",
-        )
-        .unwrap();
-    });
-    // 「全部」已移除（2026-11-09）：会话列表只服务收件箱（跨箱往来由会话
-    // 详情 thread_mails 承载，见下一个测试）
-    let q = ListQuery {
-        folder: "inbox".into(),
-        page: 1,
-        unread_only: false,
-        external_only: false,
-        internal_domain: "chinatelecom.cn".into(),
-        per: 50,
-        sort: SortKey::DateDesc,
-        from_filter: String::new(),
-        date_from: 0,
-        date_to: 0,
-        has_attach: false,
-    };
-    let (items, total) = list_threads(&state, &q).unwrap();
-    // 收件箱两组（各 1 封），空主题不归组；组级按最新时间倒序
-    assert_eq!(total, 2);
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].subject, "报价", "最新一封(3)在前");
-    assert_eq!(items[0].id, 3);
-    assert_eq!(items[0].thread_count, 1);
-    assert_eq!(items[1].subject, "会议");
-    assert_eq!(items[1].id, 1);
-    assert_eq!(items[1].thread_count, 1);
-    cleanup(&dir);
 }
 
 /// 会话详情（M2-2）：按 id 定位 thread_key，正序串列组内往来；空主题 id → None

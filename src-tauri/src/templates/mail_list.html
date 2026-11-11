@@ -12,7 +12,7 @@
     {% endif %}
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
-        {% if not is_thread and items %}
+        {% if items %}
         {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）；
            发件箱/草稿箱按钮精简（2026-11-09）：只保留「全选」与「跨页选择全部」，
            删除/批量操作/清空选择仅收件箱与全部视图渲染 #}
@@ -28,8 +28,8 @@
                     <a href="#" id="ba-select-all" hidden></a>
                     <button type="button" data-batch="read">标已读</button>
                     <button type="button" data-batch="unread">标未读</button>
-                    <button type="button" data-batch="star">{{ ic.icon('star-fill') }} 星标</button>
-                    <button type="button" data-batch="unstar">{{ ic.icon('star') }} 取消星标</button>
+                    <button type="button" data-batch="star">{{ ic.icon('star-fill') }} 置顶</button>
+                    <button type="button" data-batch="unstar">{{ ic.icon('star') }} 取消置顶</button>
                 </div>
             </div>
             <button type="button" class="btn small" id="ba-clear">清空选择</button>
@@ -54,15 +54,13 @@
             <input type="hidden" id="ba-total" value="{{ total }}">
         </div>
         {% endif %}
-        {# 顶栏 ⋯ 下拉（批次四）：筛选（只看未读/只看外部/会话视图）与收取新邮件
+        {# 顶栏 ⋯ 下拉（批次四）：筛选（只看未读/只看外部）与收取新邮件
            是低频操作，收进下拉，顶栏保持单行；发件箱/草稿箱无筛选/会话/收取
            需求，整个下拉不渲染（2026-11-09 按钮精简） #}
         {% if folder == 'inbox' %}
         <div class="split tb-more">
             <button type="button" class="tb-more-btn" data-split-toggle aria-label="更多：筛选、视图与收取" title="更多：筛选、视图与收取">⋯</button>
             <div class="split-menu" hidden>
-                <a class="tb-item {% if is_thread %}on{% endif %}" href="{{ thread_href }}"
-                   title="按主题归组往来邮件（会话视图）">{% if is_thread %}{{ ic.icon('mail') }} 单封视图{% else %}{{ ic.icon('chat') }} 会话视图{% endif %}</a>
                 {% if folder == 'inbox' %}
                 <a class="tb-item {% if unread_only %}on{% endif %}" href="{{ unread_href }}"
                    title="{% if unread_only %}点击取消未读筛选{% else %}只显示未读邮件{% endif %}">{% if unread_only %}{{ ic.icon('check') }} 只看未读{% else %}{{ ic.icon('dot') }} 只看未读{% endif %}</a>
@@ -83,8 +81,7 @@
             <input type="hidden" name="folder" value="{{ folder }}">
             {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
             {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
-            {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
-            {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+                        {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
             <label class="per-page" title="每页显示条数">
                 <select class="per-select" name="per" aria-label="每页显示条数" onchange="this.form.submit()">
                     <option value="10" {% if per == 10 %}selected{% endif %}>每页 10 封</option>
@@ -115,13 +112,12 @@
                     title="高级检索：发件人、日期区间、附件" aria-label="高级检索">{{ ic.icon('filter') }} 高级</button>
             {% endif %}
             <input type="hidden" name="folder" value="{{ folder }}">
-            {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
-            {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
+                        {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
             {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         </form>
     </div>
 
-    {# 高级检索面板（B1）：GET 表单，保留 folder/q/mode/per/sort；
+    {# 高级检索面板（B1）：GET 表单，保留 folder/q/per/sort；
        无激活筛选默认收起；有激活筛选（发件人/日期/附件任一）保持展开——
        2026-11-09 调整：原“即使有筛选也收起”导致点「应用筛选」后面板自动
        隐藏，用户看不到/改不了当前条件 #}
@@ -129,8 +125,7 @@
           {% if not from_filter and not df and not dt and not has_attach %}hidden{% endif %}>
         <input type="hidden" name="folder" value="{{ folder }}">
         {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
-        {% if is_thread %}<input type="hidden" name="mode" value="thread">{% endif %}
-        {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
+                {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
         {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         <label class="adv-field">发件人
             <input type="text" name="from" value="{{ from_filter }}" placeholder="地址或姓名包含">
@@ -149,57 +144,16 @@
     </form>
 
     <div class="mail-list" id="mail-list">
-    {% if is_thread %}
-        {# 会话视图（M2-2）：一行 = 一个 thread_key 归组。代表行=组内最新一封，
-           星标=组内任一；thread_count 徽标显示往来件数。批量操作不介入会话模式 #}
-        {% if threads %}
-        {% for t in threads %}
-        <div class="mail-row {% if t.starred %}starred{% endif %} {% if t.unread %}unread{% endif %}" data-mail-id="{{ t.id }}" data-mail-unread="{{ 1 if t.unread else 0 }}"
-             {% if t.starred %}title="已星标（置顶）"{% endif %}>
-            <a class="mr-link" href="/threads/{{ t.id }}{% if list_query %}?{{ list_query }}{% endif %}">
-                <div class="mr-side">
-                    <span class="mr-who-row"><span class="mr-dot" aria-hidden="true"></span><span class="mr-who">{{ t.from_display }}</span></span>
-                </div>
-                <div class="mr-main">
-                    <div class="mr-top">
-                        {% if t.from_external %}<span class="mr-ext" title="发件人为外部邮箱域名">外部</span>{% endif %}
-                        <span class="mr-subject">{% if t.subject_html %}{{ t.subject_html | safe }}{% else %}（无主题）{% endif %}</span>
-                        <span class="mr-thread" title="会话往来 {{ t.thread_count }} 封">{{ ic.icon('chat') }} {{ t.thread_count }}</span>
-                        {% if t.attach_cnt > 0 %}<span class="mr-clip" title="{{ t.attach_cnt }} 个附件">{{ ic.icon('paperclip') }} {{ t.attach_cnt }}</span>{% endif %}
-                        <span class="mr-time">{{ t.time_label }}</span>
-                    </div>
-                    <div class="mr-preview">{% if t.body_preview %}{{ t.body_preview }}{% else %}<span class="mr-no-body">（无正文）</span>{% endif %}</div>
-                </div>
-            </a>
-        </div>
-        {% endfor %}
-        {% if pages > 1 %}
-        <div class="pager">
-            {% if page > 1 %}<a class="pg" href="{{ page_base }}mode=thread&page=1" title="第 1 页">« 首页</a>{% endif %}
-            {% if page > 1 %}<a class="pg" href="{{ page_base }}mode=thread&page={{ page - 1 }}">‹ 上一页</a>{% endif %}
-            <span class="pg-cur">{{ page }} / {{ pages }}</span>
-            {% if page < pages %}<a class="pg" href="{{ page_base }}mode=thread&page={{ page + 1 }}">下一页 ›</a>{% endif %}
-            {% if page < pages %}<a class="pg" href="{{ page_base }}mode=thread&page={{ pages }}" title="第 {{ pages }} 页">末页 »</a>{% endif %}
-        </div>
-        {% endif %}
-        {% elif not list_error %}
-        <div class="card empty-state">
-            <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-12.3 7.6L4 21l1-4.2A8.5 8.5 0 1 1 21 11.5z"/><path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01"/></svg></div>
-            <h2>暂无会话</h2>
-            <p>按主题归组往来邮件，同一主题的多条收发会聚成一条会话。</p>
-            <a class="btn" href="{{ thread_href }}">返回单封视图</a>
-        </div>
-        {% endif %}
-    {% elif items %}
+    {% if items %}
         {% for m in items %}
         {# 行 = div（复选框区）+ a（内容区链接）。复选框在链接**外**：
             两者天然各管各的默认行为，无需任何 click 拦截（2026-11-03 实测）。
-            星标不再有行内按钮：以左侧脊线色区分——金=星标置顶行、蓝=未读行
-            （星标与未读同存取金，未读另有蓝点+加粗表达），翻转入口在详情页
+            置顶不再有行内按钮：以左侧脊线色区分——金=置顶行、蓝=未读行
+            （置顶与未读同存取金，未读另有蓝点+加粗表达），翻转入口在详情页
             与批量工具栏 #}
         <div class="mail-row {% if m.starred %}starred{% endif %} {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
              data-mail-id="{{ m.id }}" data-mail-unread="{{ 1 if m.unread else 0 }}"
-             {% if m.starred %}title="已星标（置顶）"{% endif %}>
+             {% if m.starred %}title="已置顶（列表排在最前）"{% endif %}>
             <label class="mbx-check">
                 <input type="checkbox" class="mbx-item" value="{{ m.id }}">
             </label>

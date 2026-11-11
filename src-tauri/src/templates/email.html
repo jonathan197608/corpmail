@@ -11,12 +11,13 @@
             <a class="back" href="{{ back_href }}">‹ 返回列表</a>
             {# 操作按钮置顶（批次四）：整行并入顶栏，按钮高度/风格与列表顶栏一致 #}
             <div class="md-actions md-actions-top tb-actions">
-                {# 星标（M2-1）：与列表行同端点；hs-swap=none + 事件翻色（详情页无重排） #}
+                {# 置顶（原「星标」，2026-11-11 文案统一）：与列表行同端点；
+                   hs-swap=none + 事件翻色（详情页无重排） #}
                 <button type="button" class="btn star-btn {% if email.starred %}on{% endif %}" data-mail-id="{{ email.id }}"
                         hx-post="/emails/{{ email.id }}/star"
                         hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
                         aria-pressed="{% if email.starred %}true{% else %}false{% endif %}"
-                        title="{% if email.starred %}取消星标（不再置顶）{% else %}星标：置顶显示{% endif %}">{% if email.starred %}{{ ic.icon('star-fill') }} 已星标{% else %}{{ ic.icon('star') }} 星标{% endif %}</button>
+                        title="{% if email.starred %}取消置顶（恢复按时间排序）{% else %}置顶显示（列表排在最前）{% endif %}">{% if email.starred %}{{ ic.icon('star-fill') }} 已置顶{% else %}{{ ic.icon('star') }} 置顶{% endif %}</button>
                 {% if email.folder == 'draft' %}
                 <a class="btn primary" href="/compose?draft_id={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
                    title="打开草稿继续编辑">{{ ic.icon('draft') }} 编辑</a>
@@ -130,6 +131,12 @@
         <div class="mail-detail card">
             {# 标题与正文合并显示（2026-11-06 重设计）：长标题在卡片内完整换行显示 #}
             <h1 class="md-title md-detail-title">{% if email.subject %}{{ email.subject }}{% else %}（无主题）{% endif %}</h1>
+            {# 会话入口（入口下沉，2026-11-11）：同主题往来 >1 封才显示；链接携带
+               列表上下文，会话页「返回详情」据此还原过滤与翻页 #}
+            {% if thread_count > 1 %}
+            <a class="thread-entry" href="/threads/{{ email.id }}{% if list_query %}?{{ list_query }}{% endif %}"
+               title="该主题下共有 {{ thread_count }} 封往来邮件，点击查看完整会话">{{ ic.icon('chat') }} 会话 · {{ thread_count }} 封往来 ›</a>
+            {% endif %}
             <div class="md-head">
                 <div class="md-row">
                     <span class="k">发件人</span>
@@ -190,8 +197,8 @@
                         <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                         {% if not a.detached %}
                         <button type="button" class="btn small"
-                                onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.filename | js_str }})"
-                                title="解压另存到本机">另存为</button>
+                                onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.save_name | js_str }})"
+                                title="解压另存到本机（后缀按附件名/MIME 自动推断）">另存为</button>
                         {% endif %}
                     </li>
                     {% endfor %}

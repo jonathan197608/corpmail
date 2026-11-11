@@ -3026,16 +3026,23 @@ form.setup-card .setup-actions {
     background: #fdf6e7;
 }
 
-/* ---- M2-2 会话视图 ---- */
-/* 会话列表行：组内往来件数徽标 */
-.mr-thread {
-    font-size: 11px;
-    color: var(--muted);
-    background: var(--accent-soft);
-    border-radius: 6px;
-    padding: 1px 6px;
-    margin-left: 6px;
-    white-space: nowrap;
+/* ---- M2-2 会话视图（入口下沉详情页，2026-11-11） ---- */
+/* 详情页会话入口：标题下方「会话 · N 封往来」（组内 >1 封才渲染） */
+.thread-entry {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--accent);
+    text-decoration: none;
+    margin: 2px 0 10px;
+}
+.thread-entry:hover {
+    text-decoration: underline;
+}
+.thread-entry svg {
+    width: 14px;
+    height: 14px;
 }
 
 /* 会话详情页：串列卡片（每封可点进单封详情） */

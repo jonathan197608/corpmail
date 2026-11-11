@@ -1223,7 +1223,7 @@ pub struct ListQuery {
     pub external_only: bool,
     /// 账号内部域（如 chinatelecom.cn；用于判定外部发件人，空 = 无内部域）
     pub internal_domain: String,
-    /// 每页条数（路由层从 settings/URL 解析并钳制；list/search/list_threads
+    /// 每页条数（路由层从 settings/URL 解析并钳制；list/search
     /// 统一以本字段作 LIMIT，不再用全局常量）
     pub per: i64,
     /// 排序键（A2；不影响命中集，只影响 ORDER BY）
@@ -1312,31 +1312,6 @@ pub struct EmailSummary {
     pub scheduled_at: i64,
     /// 定时时刻短标签（同/跨天口径同 time_label；scheduled_at=0 时为空串）
     pub sched_label: String,
-}
-
-/// 会话视图列表行（M2-2）：一行 = 一个 thread_key 归组（代表行=组内最新一封，
-/// 星标置顶取组内任一有星标；thread_count = 组内往来邮件数）。
-/// 只纳入已收/已发（草稿、发送失败不入会话）；空主题（thread_key=''）不归组
-#[derive(Serialize)]
-pub struct ThreadSummary {
-    /// 代表邮件 id（进会话详情 /threads/{id} 用）
-    pub id: i64,
-    pub folder: String,
-    pub status: String,
-    pub subject: String,
-    pub from_display: String,
-    pub body_preview: String,
-    pub attach_cnt: i64,
-    pub unread: bool,
-    /// 组内任一邮件星标即置顶 + 金★（与单封视图置顶语义一致）
-    pub starred: bool,
-    pub from_external: bool,
-    pub time_label: String,
-    /// 组内往来邮件数（会话徽标）
-    pub thread_count: i64,
-    /// 标题安全 HTML（列表为转义原文，检索命中时带 <mark> 高亮）
-    pub subject_html: String,
-    pub preview_tip: String,
 }
 
 /// 会话详情页数据（M2-2）：该 thread_key 归组的全部往来邮件，时间正序
@@ -1601,104 +1576,6 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
             .map_err(e)?;
         let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         Ok((items, total))
-    })
-}
-
-/// 会话视图列表（M2-2）：按 thread_key 归组，每组取代表行（组内最新一封，
-/// 星标优先）。复用 list_filter_sql 的行级过滤，但 unread/external/搜索仅作用于
-/// 代表行（"最新一封未读/来自外部/命中的会话"），口径与单封视图一致、实现干净。
-/// 额外排除草稿与发送失败（folder='draft' / status draft/failed 不入会话），
-/// 并排除空主题（thread_key 为空串，按行独立不归组）
-pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummary>, i64), String> {
-    let (filter_sql, ext_col) = list_filter_sql(q, "e.");
-    let ext_filter = if q.external_only { 1 } else { 0 };
-    let domain = q.internal_domain.trim();
-    let from_filter = q.from_filter.trim().to_lowercase();
-    let date_from = q.date_from;
-    let date_to = q.date_to;
-    let attach_filter = if q.has_attach { 1 } else { 0 };
-    let page = q.page.max(1);
-    // 页码来自查询串：巨大值乘法需饱和（debug 构建溢出即 panic）
-    let offset = (page - 1).saturating_mul(q.per);
-    // where_sql 作用于子查询内行（e 别名）：组级过滤沿用行级（代表行口径）
-    let where_sql = format!(
-        "WHERE 1=1{filter_sql}
-         AND e.thread_key IS NOT NULL AND e.thread_key != ''
-         AND e.folder <> 'draft' AND e.status NOT IN ('draft','failed')"
-    );
-    // 外层排序列（代表行字段）：会话按组内最新时间/最新发件人排序
-    let order = order_sql(q.sort, "");
-    state.with_conn(|conn| {
-        // 会话组总数 = 满足条件的 distinct thread_key 数
-        let total: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT count(*) FROM (
-                        SELECT e.thread_key FROM emails e {where_sql} GROUP BY e.thread_key)"
-                ),
-                rusqlite::named_params! { ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter },
-                |r| r.get(0),
-            )
-            .map_err(e)?;
-        // 每组取 rn=1 的代表行（组内最新 + 星标优先），thread_count = 组内件数
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
-                        attach_cnt, unread, t, thread_count, from_external, starred, body_html
-                 FROM (
-                    SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
-                           e.to_addrs, e.body_text, e.attach_cnt, e.unread,
-                           COALESCE(e.body_html, '') AS body_html,
-                           COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
-                           COUNT(*) OVER (PARTITION BY e.thread_key) AS thread_count,
-                           ROW_NUMBER() OVER (PARTITION BY e.thread_key
-                               ORDER BY e.starred DESC,
-                                        COALESCE(e.received_at, e.sent_at, e.created_at) DESC,
-                                        e.id DESC) AS rn,
-                           {ext_col} AS from_external, e.starred
-                    FROM emails e {where_sql}
-                 )
-                 WHERE rn = 1
-                 ORDER BY {order}
-                 LIMIT :lim OFFSET :off"
-            ))
-            .map_err(e)?;
-        let rows = stmt
-            .query_map(
-                rusqlite::named_params! {
-                    ":extf": ext_filter, ":dom": domain, ":fromf": from_filter, ":dfrom": date_from, ":dto": date_to, ":attf": attach_filter, ":lim": q.per, ":off": offset
-                },
-                thread_summary_from_row,
-            )
-            .map_err(e)?;
-        let items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
-        Ok((items, total))
-    })
-}
-
-/// 会话列表行映射（列序：id,folder,status,subject,from_addr,from_name,to_addrs,
-/// body_text,attach_cnt,unread,t,thread_count,from_external,starred,body_html）
-fn thread_summary_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
-    let subject: String = r.get(3)?;
-    let name: String = r.get(5)?;
-    let addr: String = r.get(4)?;
-    let body: String = r.get(7)?;
-    let html: String = r.get(14)?;
-    Ok(ThreadSummary {
-        id: r.get(0)?,
-        folder: r.get(1)?,
-        status: r.get(2)?,
-        subject: subject.clone(),
-        from_display: if name.is_empty() { addr } else { name },
-        body_preview: preview_text(&body, &html),
-        preview_tip: preview_tip(&body, &html),
-        attach_cnt: r.get(8)?,
-        unread: r.get::<_, i64>(9)? == 1,
-        starred: r.get::<_, i64>(13)? == 1,
-        from_external: r.get::<_, i64>(12)? == 1,
-        time_label: time_label(r.get(10)?),
-        thread_count: r.get::<_, i64>(11)?,
-        subject_html: html_escape(&subject),
     })
 }
 
@@ -2087,6 +1964,127 @@ fn flatten_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 文件名自带后缀（形态白名单：1-8 位 ASCII 字母数字且至少含一个字母）。
+/// 纯数字尾巴（如「报表.2026」）视为名称的一部分，不当后缀——避免把
+/// 「报表.2026」误认成「.2026 类型」而不再补 `.xlsx`。
+pub fn suffix_of(name: &str) -> Option<&str> {
+    let (_, ext) = name.rsplit_once('.')?;
+    let ok = !ext.is_empty()
+        && ext.len() <= 8
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && ext.chars().any(|c| c.is_ascii_alphabetic());
+    ok.then_some(ext)
+}
+
+/// MIME → 常见后缀（只覆盖邮件里真会出现的类型；未知返回 None）。
+/// 邮件附件的 Content-Type 常带参数（`application/pdf; name="x.pdf"`），先截断
+pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match m.as_str() {
+        "application/pdf" => "pdf",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tif",
+        "image/svg+xml" => "svg",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "text/html" => "html",
+        "text/markdown" => "md",
+        "text/calendar" => "ics",
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "application/zip" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/x-7z-compressed" => "7z",
+        "application/vnd.rar" | "application/x-rar-compressed" => "rar",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.oasis.opendocument.text" => "odt",
+        "application/vnd.oasis.opendocument.spreadsheet" => "ods",
+        "application/vnd.oasis.opendocument.presentation" => "odp",
+        "message/rfc822" => "eml",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => return None,
+    })
+}
+
+/// 目标平台文件名清洗：Windows 不允许 `<>:"/\\|?*`、控制字符、结尾的点/空格，
+/// 邮件里的附件名可能全部命中（RFC 2231 只约束编码不约束字符）。其他平台
+/// 原样保留（`:` 等在中性文本名里很常见，不该被改写）。
+/// windows 参数外置，便于在任意平台跑两种分支的单测
+fn os_safe_name(name: &str, windows: bool) -> String {
+    if !windows {
+        return name.to_string();
+    }
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_end_matches([' ', '.']);
+    if trimmed.trim().is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 附件落盘推荐名：原名有后缀则原样，否则按 MIME 补（未知补 .bin）。
+/// 只取 basename：邮件头里的 filename 可能带路径（脏数据/恶意），不得穿越目录；
+/// 再按当前平台清洗非法字符（Windows 会拒绝带 `:`/`?` 的文件名）
+pub fn save_name_of(filename: &str, mime: &str) -> String {
+    let base = Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .unwrap_or("attachment");
+    let base = os_safe_name(base, cfg!(windows));
+    if suffix_of(&base).is_some() {
+        return base;
+    }
+    let ext = ext_for_mime(mime).unwrap_or("bin");
+    format!("{}.{ext}", base.trim_end_matches('.'))
+}
+
+/// 落盘路径补后缀：路径本身已有可识别后缀则原样返回（尊重用户自己起的名字），
+/// 否则按「附件名后缀 → MIME 映射 → .bin」补一个。另存/全部另存/导出共用。
+pub fn with_inferred_ext(path: &str, filename: &str, mime: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    if suffix_of(name).is_some() {
+        return path.to_string();
+    }
+    let ext = suffix_of(filename)
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| ext_for_mime(mime).map(str::to_string))
+        .unwrap_or_else(|| "bin".to_string());
+    format!("{}.{ext}", path.trim_end_matches('.'))
+}
+
 /// 附件行（详情页/预览/另存；不携带 BLOB 本体）
 #[derive(Serialize)]
 pub struct AttachView {
@@ -2098,6 +2096,8 @@ pub struct AttachView {
     pub detached: bool,
     /// 预览方式（空 = 不支持内嵌预览）：img | pdf | text（text 类回显强制 text/plain 防脚本）
     pub preview_kind: String,
+    /// 另存对话框的推荐文件名（已按 MIME 补好后缀，见 save_name_of）
+    pub save_name: String,
 }
 
 /// 附件预览方式判定（M5）：MIME 优先；MIME 缺失或为 octet-stream 时按文件扩展名兜底
@@ -2258,6 +2258,7 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
             Ok(AttachView {
                 id: r.get(0)?,
                 preview_kind: preview_kind_of(&mime, &filename).into(),
+                save_name: save_name_of(&filename, &mime),
                 filename,
                 mime,
                 size_orig: r.get(3)?,
@@ -2916,6 +2917,7 @@ pub fn attachment_bytes(
         let meta = AttachView {
             id: attach_id,
             preview_kind: preview_kind_of(&mime, &filename).into(),
+            save_name: save_name_of(&filename, &mime),
             filename,
             mime,
             size_orig: bytes.len() as i64,
@@ -2933,11 +2935,16 @@ pub fn save_attachment_to(
     email_id: i64,
     attach_id: i64,
     dest: &str,
-) -> Result<(), String> {
-    guard_sensitive_path(state, dest)?;
-    let (_, bytes) = attachment_bytes(state, email_id, attach_id)
+) -> Result<String, String> {
+    let (view, bytes) = attachment_bytes(state, email_id, attach_id)
         .ok_or_else(|| "附件文件已被清理或不存在".to_string())?;
-    std::fs::write(dest, &bytes).map_err(|err| format!("另存失败：{err}"))
+    // 后缀推断（2026-11-11）：保存对话框里用户可能删掉后缀，且部分邮件附件
+    // 本身就无后缀（发件端截断/客户端不写）——按原名后缀 → MIME → .bin 补齐，
+    // 保证落盘文件能被系统按类型关联打开。补全后路径才是真正写入目标
+    let dest = with_inferred_ext(dest, &view.filename, &view.mime);
+    guard_sensitive_path(state, &dest)?;
+    std::fs::write(&dest, &bytes).map_err(|err| format!("另存失败：{err}"))?;
+    Ok(dest)
 }
 
 /// 全部另存（A4）：把邮件所有未清理的附件解压落盘到用户选择的目录。
@@ -2971,7 +2978,7 @@ pub fn save_all_attachments(
     let mut saved = 0usize;
     let mut skipped = 0usize;
     let mut used: Vec<String> = Vec::new();
-    for (filename, _mime, storage, file_path, data, detached) in rows {
+    for (filename, mime, storage, file_path, data, detached) in rows {
         if detached {
             skipped += 1;
             continue;
@@ -2996,13 +3003,10 @@ pub fn save_all_attachments(
             skipped += 1;
             continue;
         };
-        // 文件名只取 basename（历史脏数据/恶意名不得穿越目录）
-        let base = Path::new(&filename)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-            .unwrap_or("attachment");
-        let name = unique_file_name(dir, base, &used);
+        // 文件名只取 basename（历史脏数据/恶意名不得穿越目录），并按 MIME
+        // 补后缀（附件无后缀时落盘后无法关联应用打开）
+        let base = save_name_of(&filename, &mime);
+        let name = unique_file_name(dir, &base, &used);
         used.push(name.clone());
         let target = dir.join(&name);
         guard_sensitive_path(state, &target.to_string_lossy())?;

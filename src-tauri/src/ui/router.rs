@@ -242,12 +242,6 @@ struct MainCtx {
     dt: String,
     has_attach: bool,
     items: Vec<EmailSummary>,
-    /// 会话视图（M2-2）：mode=thread 时为 true；只在收件箱/全部/搜索下可用
-    is_thread: bool,
-    /// 会话列表行（is_thread 时渲染，否则为空）
-    threads: Vec<mail::ThreadSummary>,
-    /// 会话/单封视图切换链接（保留 folder/unread/external/q，翻页重置）
-    thread_href: String,
     /// 列表/检索查询失败的原因（非空时模板渲染错误条 + 重试，不再伪装成空列表）
     list_error: String,
 }
@@ -275,6 +269,9 @@ struct EmailCtx {
     export_name: String,
     /// 导出 Markdown 的推荐文件名（与 .eml 同源清洗，扩展名 .md）
     export_md_name: String,
+    /// 会话入口（入口下沉，2026-11-11）：该邮件所在主题的往来件数；
+    /// >1 时详情页标题下显示「会话 · N 封往来」（/threads/{id}），=1 不渲染
+    thread_count: i64,
 }
 
 /// 源码页（A5）：排查正文乱码、HTML 表格丢失、投递链路问题。
@@ -731,28 +728,13 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         date_to,
         has_attach,
     };
-    // 会话视图（M2-2）：mode=thread 且仅收件箱下可用（草稿/已发保持单封；
-    // 「全部」已移除，2026-11-09）；搜索下同样可切会话（命中代表行=最新一封）
-    let threadable = folder == "inbox";
-    let is_thread = threadable
-        && req
-            .query_param("mode")
-            .map(|v| v == "thread")
-            .unwrap_or(false);
     // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词回退普通列表。
-    // 会话模式按 thread_key 归组取代表行（list_threads），单封语义不变。
     // 查询失败一律显式报错：旧实现 unwrap_or_default 会把「库坏了/SQL 出错」
     // 渲染成「没有邮件」，用户以为邮件丢了（审计 P1-45）。
+    // 会话视图入口已下沉详情页（>1 封往来才显示「会话 · N 封往来」，
+    // /threads/{id} 仍可用）；列表不再提供 mode=thread 分支。
     let mut list_error = String::new();
-    let (items, threads, total) = if is_thread {
-        match mail::list_threads(state, &q) {
-            Ok((threads, total)) => (Vec::new(), threads, total),
-            Err(e) => {
-                list_error = e;
-                (Vec::new(), Vec::new(), 0)
-            }
-        }
-    } else {
+    let (items, total) = {
         let res = if q_input.is_empty() {
             mail::list(state, &q)
         } else {
@@ -765,10 +747,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
             }
         };
         match res {
-            Ok((items, total)) => (items, Vec::new(), total),
+            Ok((items, total)) => (items, total),
             Err(e) => {
                 list_error = e;
-                (Vec::new(), Vec::new(), 0)
+                (Vec::new(), 0)
             }
         }
     };
@@ -806,34 +788,21 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
     let unread_part = if unread_only { "unread=1&" } else { "" };
     let external_part = if external_only { "external=1&" } else { "" };
     let page_base = format!("{base}{unread_part}{external_part}");
-    // 筛选开关需保持当前视图（会话/单封），否则在会话视图点筛选会退回单封
-    let view_keep = if is_thread { "mode=thread&" } else { "" };
     let unread_href = if unread_only {
-        // 取消未读筛选：保留外部筛选与当前视图，回到当前页
-        format!("{base}{view_keep}{external_part}page={page}")
+        // 取消未读筛选：保留外部筛选，回到当前页
+        format!("{base}{external_part}page={page}")
     } else {
-        format!("{base}{view_keep}unread=1&{external_part}page=1")
+        format!("{base}unread=1&{external_part}page=1")
     };
     let external_href = if external_only {
-        format!("{base}{view_keep}{unread_part}page={page}")
+        format!("{base}{unread_part}page={page}")
     } else {
-        format!("{base}{view_keep}external=1&{unread_part}page=1")
+        format!("{base}external=1&{unread_part}page=1")
     };
-    // 会话/单封视图切换链接：保留 folder/unread/external/q，翻页重置（两种视图行数不同）
-    // 目标 = 当前态取反 mode；仅 threadable（收件箱/全部）时渲染切换按钮
-    let mode_part = if is_thread { "" } else { "mode=thread&" };
-    let thread_href = format!("{base}{mode_part}{unread_part}{external_part}page=1");
     // 列表完整查询串（详情往返携带；folder=inbox 且无筛选时为空 → 链接保持简洁）
     let mut list_query = String::new();
     if folder != "inbox" {
         list_query.push_str(&format!("folder={folder}"));
-    }
-    // 会话视图往返：详情页「返回列表」必须回到会话列表而非单封视图
-    if is_thread {
-        if !list_query.is_empty() {
-            list_query.push('&');
-        }
-        list_query.push_str("mode=thread");
     }
     if unread_only {
         if !list_query.is_empty() {
@@ -916,9 +885,6 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         dt: if date_to > 0 { dt_raw } else { String::new() },
         has_attach,
         items,
-        is_thread,
-        threads,
-        thread_href,
         list_error,
     };
     if req.is_htmx_request {
@@ -951,6 +917,18 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let list_query = list_query_of(req, &folder);
     let export_name = mail::eml::suggested_filename(&email.subject, email.id);
     let export_md_name = mail::md::suggested_filename(&email.subject, email.id);
+    // 会话入口（入口下沉，2026-11-11）：组内往来件数，>1 才在详情页显示
+    // 「会话 · N 封往来」。草稿/发送失败不显示（无往来语义）；口径与会话
+    // 详情页一致（thread_mails 已排除 draft/failed）
+    let thread_count = if matches!(email.status.as_str(), "draft" | "failed") {
+        0
+    } else {
+        mail::thread_mails(state, id, &domain)
+            .ok()
+            .flatten()
+            .map(|t| t.items.len() as i64)
+            .unwrap_or(0)
+    };
     Some(render_html(
         "email.html",
         &EmailCtx {
@@ -965,6 +943,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             notice,
             export_name,
             export_md_name,
+            thread_count,
         },
     ))
 }
@@ -1027,16 +1006,22 @@ fn thread_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     let d = defaults();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let detail = mail::thread_mails(state, id, &domain).ok().flatten()?;
-    // 所属文件夹取组内最新一封（正序末项；frame 高亮 + 返回列表）
+    // 所属文件夹取进入入口那封（id 对应行，frame 高亮 + 返回链接）；id 不在
+    // 组内（异常）时回落组内最新一封
     let folder = detail
         .items
-        .last()
+        .iter()
+        .find(|m| m.id == id)
+        .or_else(|| detail.items.last())
         .map(|m| m.folder.clone())
         .unwrap_or_else(|| "inbox".to_string());
-    let back_href = if folder == "inbox" {
-        "/".to_string()
+    // 会话入口已下沉详情页（2026-11-11）：返回目标 = 进入前的邮件详情页，
+    // 携带原列表上下文（详情页「返回列表」据此还原过滤与翻页）
+    let list_query = list_query_of(req, &folder);
+    let back_href = if list_query.is_empty() {
+        format!("/emails/{id}")
     } else {
-        format!("/?folder={folder}")
+        format!("/emails/{id}?{list_query}")
     };
     Some(render_html(
         "thread.html",
@@ -2758,9 +2743,10 @@ fn attachment_save(state: &AppState, req: &Req) -> Resp {
         );
     };
     match mail::save_attachment_to(state, email_id, aid, &dest) {
-        Ok(()) => Resp::html(format!(
+        // 落盘路径可能被补过后缀：提示以实际写入的文件名为准
+        Ok(saved) => Resp::html(format!(
             r#"<div id="toast" class="toast ok" hx-swap-oob="true">已另存到 {}</div>"#,
-            html_escape(&dest)
+            html_escape(&saved)
         )),
         Err(e) => Resp::html(format!(
             r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
@@ -3189,7 +3175,6 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     };
     let q = get("q");
     let page = get("page");
-    let mode = get("mode");
     let unread = get("unread");
     let external = get("external");
     let per = get("per");
@@ -3200,7 +3185,6 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
     let att = get("att");
     rebuild_list_query(
         &folder,
-        mode.as_deref(),
         unread.as_deref(),
         external.as_deref(),
         q.as_deref(),
@@ -3222,7 +3206,6 @@ fn list_query_of(req: &Req, fallback_folder: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn rebuild_list_query(
     folder: &str,
-    mode: Option<&str>,
     unread: Option<&str>,
     external: Option<&str>,
     q: Option<&str>,
@@ -3242,11 +3225,8 @@ fn rebuild_list_query(
     // 恒携带 folder（含 inbox）：发送/存草稿回跳详情页、详情页「返回列表」、
     // 列表链接都依赖 folder 明确，省略会让回跳退到邮件自身 folder 而错落
     // 草稿箱/发件箱。收件箱显式 folder=inbox 只是 URL 更明确，语义不变。
+    // mode=thread 已随会话视图入口下沉移除（旧书签携带 mode 一律忽略）
     qs.push(format!("folder={folder}"));
-    // 会话视图仅收件箱/全部可用；其他箱体即使带 mode=thread 也无意义，丢弃
-    if mode == Some("thread") && folder == "inbox" {
-        qs.push("mode=thread".into());
-    }
     if unread == Some("1") {
         qs.push("unread=1".into());
     }
@@ -3343,7 +3323,6 @@ fn form_list_query(form: &HashMap<String, String>) -> String {
     };
     rebuild_list_query(
         pick("folder").unwrap_or("inbox"),
-        pick("mode"),
         pick("unread"),
         pick("external"),
         pick("q"),

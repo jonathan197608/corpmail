@@ -210,7 +210,7 @@ fn list_page_shows_drafts_with_sidebar_counts() {
 }
 
 /// 「全部」folder 已移除（2026-11-09）：旧链接/畸形 folder 回落收件箱，
-/// 不再跨箱全量；会话视图仅收件箱可用（发件/草稿带 mode=thread 不生效）
+/// 不再跨箱全量；mode=thread 已随会话入口下沉废弃（携带也被忽略）
 #[test]
 fn removed_all_folder_falls_back_to_inbox() {
     let (state, dir) = temp_state("no-all-folder");
@@ -246,7 +246,7 @@ fn removed_all_folder_falls_back_to_inbox() {
     assert!(html.contains("收件箱"), "未知 folder 应回落收件箱：{html}");
     assert!(html.contains("收件箱邮件"), "应显示收件箱邮件：{html}");
     assert!(!html.contains("已发送邮件"), "不得再跨箱全量：{html}");
-    // 发件箱带 mode=thread：不进入会话列表（threadable 仅收件箱）
+    // 旧书签携带 mode=thread：一律忽略，按单封列表渲染（入口已下沉详情页）
     let html = body(&route(
         &state,
         &assets(),
@@ -255,7 +255,77 @@ fn removed_all_folder_falls_back_to_inbox() {
     ));
     assert!(
         !html.contains("/threads/"),
-        "发件箱不应进入会话视图：{html}"
+        "mode=thread 不应再产生会话列表：{html}"
+    );
+    cleanup(&dir);
+}
+
+/// 会话入口下沉详情页（2026-11-11）：同主题往来 >1 封 → 详情页标题下显示
+/// 「会话 · N 封往来」（/threads/{id}）；单封（无往来）不渲染入口；
+/// 会话详情页返回链接指向来源详情页并携带列表上下文
+#[test]
+fn thread_entry_on_detail_page_only_when_multiple() {
+    let (state, dir) = temp_state("thread-entry");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at, thread_key)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '会议通知','正文','会议 通知','正文',1,1,1,'会议通知'),
+                        ('out','sent','sent','demo@chinatelecom.cn','张伟','boss@x.cn',
+                         'Re: 会议通知','回复','会议 通知','回复',0,2,2,'会议通知'),
+                        ('in','inbox','received','peer@x.cn','同事','demo@chinatelecom.cn',
+                         '独立邮件','正文','独立 邮件','正文',0,3,3,'独立邮件')",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+
+    // 有往来：收件方详情带入口，链接指向会话详情（/threads/{id}）
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/1", b""), &t));
+    assert!(
+        html.contains("会话 · 2 封往来"),
+        "有往来应显示会话入口：{html}"
+    );
+    // 入口 href 写死在模板里（非变量插值），不经过自动转义
+    assert!(
+        html.contains(r#"href="/threads/1?folder=inbox""#),
+        "入口应指向 /threads/1：{html}"
+    );
+    // 已发送的回复同样带入口（往来双向可见）
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/2", b""), &t));
+    assert!(
+        html.contains("会话 · 2 封往来"),
+        "回复方详情同样显示入口：{html}"
+    );
+
+    // 无往来（组内仅 1 封）：不渲染入口
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/3", b""), &t));
+    assert!(
+        !html.contains("thread-entry"),
+        "单封不应显示会话入口：{html}"
+    );
+
+    // 会话详情返回链接 = 来源详情页，携带列表上下文
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/threads/1", "unread=1", b""),
+        &t,
+    ));
+    assert!(
+        html.contains(r#"href="&#x2f;emails&#x2f;1?folder=inbox&amp;unread=1""#),
+        "会话页应返回来源详情并携带列表上下文：{html}"
     );
     cleanup(&dir);
 }
@@ -1717,8 +1787,8 @@ fn star_endpoint_toggles_and_pins_to_top() {
         },
     ));
     assert!(
-        detail.contains("已星标") && !detail.contains('⭐'),
-        "详情页星标按钮应回显已星标文案（SVG 星形，不再用 emoji）"
+        detail.contains("已置顶") && !detail.contains('⭐'),
+        "详情页置顶按钮应回显已置顶文案（SVG 星形，不再用 emoji）"
     );
     // 再翻一次（取消）→ 置顶解除
     let resp = route(
@@ -4018,7 +4088,7 @@ fn dump_smoke_html() {
     let inbox_id = inbox_first_id;
 
     // M2-2 会话归组冒烟：发一封与首封收件同主题的回复（sent），
-    // thread_key 与首封收件一致 → 会话视图出现 count=2 的会话组
+    // thread_key 与首封收件一致 → 两封详情页均出现「会话 · 2 封往来」入口
     state
         .with_conn(|c| {
             c.execute(
@@ -4076,8 +4146,7 @@ fn dump_smoke_html() {
     dump("email-scheduled.html", get(&format!("/emails/{d2}")));
     // 既有数据沿用后的完成页（重装/换机采纳目录 → 沿用提示可见）
     dump("done-reuse.html", get("/welcome/done"));
-    // M2-2 会话视图素材：「全部」已移除（2026-11-09），仅收件箱会话列表
-    dump("main-thread.html", get_url("/?mode=thread"));
+    // M2-2 会话素材：详情页会话入口 + 会话详情（入口下沉，列表分支已删）
     dump("thread-detail.html", get(&format!("/threads/{inbox_id}")));
     dump("email-inbox.html", get(&format!("/emails/{inbox_id}")));
     // A5 源码页素材：HTML 源码 / 纯文本 / 原始信头三视图
@@ -5029,7 +5098,7 @@ fn detail_back_link_preserves_list_filters() {
         "返回列表应原样还原过滤状态（含 folder=inbox）：{html}"
     );
 
-    // 会话视图进入详情：返回链接必须保持 mode=thread（否则退回单封视图）
+    // 旧会话视图书签携带 mode=thread：详情页忽略 mode，返回链接不再携带
     let html = body(&route(
         &state,
         &assets(),
@@ -5040,8 +5109,8 @@ fn detail_back_link_preserves_list_filters() {
         },
     ));
     assert!(
-        html.contains("folder=inbox&amp;mode=thread"),
-        "会话视图详情返回列表应保持 mode=thread：{html}"
+        !html.contains("mode=thread"),
+        "mode=thread 已废弃，返回链接不应再携带：{html}"
     );
 
     // 无参数进入：回落到邮件所在 folder（sent → /?folder=sent）
@@ -7062,18 +7131,7 @@ fn list_rows_show_starred_as_spine_not_button() {
     );
     assert!(
         html.contains("data-batch=\"unstar\""),
-        "批量工具栏保留星标/取消星标操作"
-    );
-    // 会话视图同样无按钮
-    let html = body(&route(
-        &state,
-        &assets(),
-        &req_q("GET", "/", "mode=thread", b""),
-        &t,
-    ));
-    assert!(
-        !html.contains("data-mail-id=\"1\" class") || !html.contains("star-btn"),
-        "会话行无星标按钮"
+        "批量工具栏保留置顶/取消置顶操作"
     );
     cleanup(&dir);
 }

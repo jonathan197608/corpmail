@@ -134,6 +134,14 @@ function mbxRemoveKept(aid, btn) {
     btn.closest('li').remove();
 }
 
+// 保存对话框过滤器：从推荐文件名取后缀（须为 1-8 位字母数字且含字母，
+// 与 Rust 侧 suffix_of 同口径）。取不到就不加 filters，交给服务端补后缀
+function mbxExtFilter(filename, label) {
+    const m = /\.([A-Za-z0-9]{1,8})$/.exec(filename || '');
+    if (!m || !/[A-Za-z]/.test(m[1])) return undefined;
+    return [{ name: label, extensions: [m[1].toLowerCase()] }];
+}
+
 // ---------- 详情页：附件另存为（dialog 选保存路径 → htmx POST） ----------
 // 请求护栏（M5 防抖审计）：在途期间重复点击忽略
 let mbxSaveBusy = false;
@@ -142,7 +150,10 @@ async function mbxSaveAttachment(emailId, attachId, filename) {
     if (mbxSaveBusy) return;
     mbxSaveBusy = true;
     try {
-        const dest = await window.__TAURI__.dialog.save({ defaultPath: filename });
+        const dest = await window.__TAURI__.dialog.save({
+            defaultPath: filename,
+            filters: mbxExtFilter(filename, '附件')
+        });
         if (!dest) return;
         await htmx.ajax('POST', `/emails/${emailId}/attachments/${attachId}`, {
             target: '#toast',
@@ -184,7 +195,8 @@ async function mbxExportEml(emailId, filename) {
     mbxExportBusy = true;
     try {
         const dest = await window.__TAURI__.dialog.save({
-            defaultPath: filename || `corpmail-${emailId}.eml`
+            defaultPath: filename || `corpmail-${emailId}.eml`,
+            filters: [{ name: '邮件文件', extensions: ['eml'] }]
         });
         if (!dest) return;
         await htmx.ajax('POST', `/emails/${emailId}/export-eml`, {
@@ -206,7 +218,8 @@ async function mbxExportMd(emailId, filename) {
     mbxExportBusy = true;
     try {
         const dest = await window.__TAURI__.dialog.save({
-            defaultPath: filename || `corpmail-${emailId}.md`
+            defaultPath: filename || `corpmail-${emailId}.md`,
+            filters: [{ name: 'Markdown', extensions: ['md'] }]
         });
         if (!dest) return;
         await htmx.ajax('POST', `/emails/${emailId}/export-md`, {
@@ -425,10 +438,10 @@ function mbxOnFetchDone() {
 }
 document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 
-// ---------- 星标翻转（M2-1）：mbx:starDone 事件携带新态 ----------
+// ---------- 置顶翻转（M2-1，原「星标」）：mbx:starDone 事件携带新态 ----------
 // 后端 POST /emails/{id}/star 空体 + 事件头；前端按所在页面分派：
-// - 列表页：星标置顶会重排行序 → 重拉当前列表片段换入（保持过滤/页码，
-//   与收取完成同路径；侧栏计数不随星标变，一并刷新无副作用）
+// - 列表页：置顶会重排行序 → 重拉当前列表片段换入（保持过滤/页码，
+//   与收取完成同路径；侧栏计数不随置顶变，一并刷新无副作用）
 // - 详情页：无重排，就地翻转按钮态（星形图标 + on 类 + aria-pressed）
 document.body.addEventListener('mbx:starDone', function (ev) {
     var starred = !!(ev.detail && ev.detail.starred);
@@ -442,10 +455,10 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     if (!btn) return;
     btn.classList.toggle('on', starred);
     btn.setAttribute('aria-pressed', starred ? 'true' : 'false');
-    btn.title = starred ? '取消星标（不再置顶）' : '星标：置顶显示';
+    btn.title = starred ? '取消置顶（恢复按时间排序）' : '置顶显示（列表排在最前）';
     // 详情页按钮带文字（列表页按钮仅星形图标）、两形态统一一套文案
     if (btn.textContent.indexOf('星') >= 0) {
-        btn.innerHTML = starred ? MBX_IC.starFill + ' 已星标' : MBX_IC.star + ' 星标';
+        btn.innerHTML = starred ? MBX_IC.starFill + ' 已置顶' : MBX_IC.star + ' 置顶';
     } else {
         btn.innerHTML = MBX_IC.starFill;
     }

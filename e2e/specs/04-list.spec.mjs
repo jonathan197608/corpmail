@@ -184,24 +184,24 @@ describe('04 列表筛选与批量操作', () => {
     await shot('侧栏-未读角标')
   })
 
-  it('B10 批量星标/取消：全选 → 批量操作⋯ 菜单 star/unstar', async () => {
+  it('B10 批量置顶/取消：全选 → 批量操作⋯ 菜单 star/unstar', async () => {
     await goto('/')
     await waitBoot()
     await $('#batch-all').click()
-    await clickBatchMenu('星标')
+    await clickBatchMenu('置顶')
     await browser.waitUntil(
       async () => (await $$('.mail-row.starred')).length === (await $$('.mail-row')).length,
-      { timeoutMsg: '批量星标后未全部置顶标金' },
+      { timeoutMsg: '批量置顶后未全部标金排前' },
     )
-    await shot('列表-批量星标')
+    await shot('列表-批量置顶')
 
     await $('#batch-all').click()
-    await clickBatchMenu('取消星标')
+    await clickBatchMenu('取消置顶')
     await browser.waitUntil(
       async () => (await $$('.mail-row.starred')).length === 0,
-      { timeoutMsg: '批量取消星标未生效' },
+      { timeoutMsg: '批量取消置顶未生效' },
     )
-    await shot('列表-取消星标')
+    await shot('列表-取消置顶')
   })
 
   it('B15 批量标已读/标未读 + 清空选择（批量操作⋯ 菜单）', async () => {
