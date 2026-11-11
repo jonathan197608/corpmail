@@ -25,8 +25,27 @@ const KEYRING_SERVICE: &str = "corpmail";
 /// 会**挂起等待授权**而非返回错误——降级分支永远等不到，测试进程卡死。
 /// tests/secrets.rs 早已绕开 keyring 只测 keyfile 分支，但走 store/retrieve
 /// 的向导/发信/dump 测试仍会碰真实 keychain（本机授权过才碰巧能跑）。
-/// cfg!(test) 下统一直走 keyfile，消除对系统钥匙串的隐式依赖
-const TEST_SKIP_KEYCHAIN: bool = cfg!(test);
+/// 默认下统一直走 keyfile，消除对系统钥匙串的隐式依赖。
+///
+/// 环境变量 `CORPMAIL_KEYCHAIN=real` 可显式恢复真实 keychain（审计 R74：
+/// 以前是编译期常量，连手工验证「真 keychain 路径」都没有开关）。只认这一个
+/// 取值，其余（含空串/拼错）一律按默认短路处理——避免"看起来打开了其实没开"
+/// 生产构建：从不短路 keychain（环境变量只对测试构建有意义）
+#[cfg(not(test))]
+fn skip_keychain_for(_env: Option<&str>) -> bool {
+    false
+}
+
+/// 测试构建：默认短路，`CORPMAIL_KEYCHAIN=real` 时走真实 keychain
+#[cfg(test)]
+fn skip_keychain_for(env: Option<&str>) -> bool {
+    !matches!(env, Some("real"))
+}
+
+fn skip_keychain() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| skip_keychain_for(std::env::var("CORPMAIL_KEYCHAIN").ok().as_deref()))
+}
 
 /// 凭据读取结果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,14 +127,14 @@ fn cache_drop(account: &str) {
 ///
 /// `key_file`：回退密钥文件路径（锚点目录）。只有走回退分支才会被创建。
 ///
-/// 测试二进制短路 keychain（见 TEST_SKIP_KEYCHAIN）
+/// 测试二进制短路 keychain（见 `skip_keychain`）
 pub fn store(
     conn: &Connection,
     key_file: &Path,
     account: &str,
     password: &str,
 ) -> Result<bool, String> {
-    if TEST_SKIP_KEYCHAIN {
+    if skip_keychain() {
         keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
         cache_put(account, GetResult::Keyfile(password.to_string()));
         return Ok(true);
@@ -138,12 +157,12 @@ pub fn store(
 /// 读取密码：先查进程内缓存，未命中再试 keychain，keychain 不可用/无条目时
 /// 落到 keyfile 回退（平台后端异常与 NoEntry 同处处理——两者都只剩 keyfile 一条路）。
 /// Missing 不入缓存：用户可能随后在设置页补录，缓存空结果会让补录白做。
-/// 测试二进制短路 keychain（见 TEST_SKIP_KEYCHAIN）
+/// 测试二进制短路 keychain（见 `skip_keychain`）
 pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
     if let Some(hit) = cache_get(account) {
         return hit;
     }
-    if TEST_SKIP_KEYCHAIN {
+    if skip_keychain() {
         let out = keyfile_retrieve(conn, key_file, account);
         if !matches!(out, GetResult::Missing) {
             cache_put(account, out.clone());
@@ -170,7 +189,9 @@ pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult 
 /// （审计 P1-50）——行残留 + 缓存已丢，下次 retrieve 会读出已"删除"的旧密码
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn clear(conn: &Connection, account: &str) -> Result<(), String> {
-    if !TEST_SKIP_KEYCHAIN && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account) {
+    if !skip_keychain()
+        && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, account)
+    {
         let _ = entry.delete_credential();
     }
     let key = format!("enc:{account}");

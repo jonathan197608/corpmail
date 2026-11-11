@@ -45,7 +45,7 @@ cargo tauri build --target x86_64-pc-windows-gnu \
   --config '{"bundle":{"targets":["nsis"]}}'
 ```
 
-> macOS 宿主构建 NSIS 需自建 patched makensis（macOS libiconv 对 "wchar_t" 转换通道存在 EILSEQ 回归，详见设计文档 §11.4——该问题在 Linux/Windows 宿主不存在）。Linux 宿主直接 `apt install nsis` 即可。
+> macOS 宿主构建 NSIS 需自建 patched makensis：macOS 的 libiconv 在 "wchar_t" 转换通道上对 C0 控制符/CJK/BOM 返回 EILSEQ，标准版 makensis 处理任意脚本即 bad_alloc 崩溃（中文语言文件还会额外报 "Bad text encoding"）。用 `scripts/build-patched-nsis.sh` 从 NSIS 3.13 源码构建补丁版；Linux/Windows 宿主无此问题，`apt install nsis` 即可。
 
 商店 MSIX 包由 `scripts/build-msix.ps1`（WinApp CLI）在 Windows 机上构建，详见 `store-assets/`。
 
@@ -88,6 +88,42 @@ scripts/dev-macos.sh             # 构建 → 重签 → 启动
 - **Microsoft Store（MSIX）**：由 Microsoft 商店在认证与分发时签名，安装时发布者为商店登记主体。
 - **GitHub Release / 内网（NSIS 直装包）**：**不签名**。项目此前评估过第三方免费云签名（SignPath Foundation），该路线已废弃并从构建链移除。直装包首次运行会出现 SmartScreen「未知发布者」提示，请核对 Release 页给出的 SHA-256 后再安装。
 - macOS 侧见上文「macOS 本地开发」：本地自签名证书仅在开发机使用，不可用于分发。
+
+## 质量门禁与发布
+
+### 本地门禁（改动必须全绿）
+
+```bash
+cd src-tauri
+cargo clippy --all-targets -- -D warnings
+cargo test --lib -- --test-threads=1    # 单测各自持临时目录 + 钥匙串走 keyfile 分支，须串行
+cd .. && ./e2e/run.sh                   # 完整 GUI E2E（两阶段）
+```
+
+E2E 相关开关：
+
+| 变量 | 作用 |
+|---|---|
+| `E2E_SKIP_PHASE2=1` | 单点调试单个 spec 时显式允许跳过阶段二（默认缺 marker 即失败） |
+| `E2E_ALLOW_UNSIGNED=1` | 没有固定签名身份时继续（CI 用；本地默认直接退出） |
+| `CORPMAIL_SIGN_IDENTITY` | 覆盖签名身份名，默认 `CorpMail Local` |
+
+### CI
+
+| 工作流 | 触发 | 内容 |
+|---|---|---|
+| `.github/workflows/ci.yml` | push / PR | `clippy -D warnings`、全量单测、`cargo audit`、`npm audit`（审计类任务先只报告，不阻断） |
+| `.github/workflows/e2e.yml` | 手动 | macOS runner 跑完整两阶段 E2E，产物（截图/日志）作为 artifact 上传 |
+| `.github/workflows/release.yml` | 推 `v*` 标签 | macOS（ad-hoc 签名 DMG）与 Windows（未签名 NSIS）打包并挂到 Release |
+
+### 应用内更新（暂未启用）
+
+直发渠道**没有**接入 `tauri-plugin-updater`，原因有两条：
+
+1. 打开 `bundle.createUpdaterArtifacts` 之后，**每一次**本地/CI 打包都要求提供更新签名私钥，否则构建直接失败——在密钥托管方式定下来之前，这会打断现有发版流程。
+2. 更新检查要一个稳定托管的 `latest.json`（含每个平台的签名产物地址）。端点缺失或不可达时，界面上的「检查更新」只会永远报错，比没有这个按钮更糟。
+
+真要做时的最小步骤：`cargo tauri signer generate` 生成密钥对（私钥离线保管，公钥入库）→ 在 `tauri.conf.json` 配 `plugins.updater.pubkey` 与 `endpoints`（例如 GitHub Releases 的 `latest.json`）→ 打包时注入私钥并开启 `createUpdaterArtifacts` → 发布流程产出并上传 `latest.json`。商店渠道（MSIX）的更新始终由 Microsoft Store 负责，与本项无关。
 
 ## 许可证
 

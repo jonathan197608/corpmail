@@ -67,7 +67,7 @@ let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
 | 用户目录 | `wdio.conf.mjs` 里把 `HOME` 指向 `e2e/artifacts/<run>/home` | 配置、库、日志、keyfile 全落 run 目录，不碰真实数据 |
 | 邮件服务器 | `e2e/support/mockmail.py`，随机端口，明文 IMAP+SMTP | 内容可控、可断言、无外网依赖 |
 | 端口 | `embeddedPort`（默认 4445，可用 `E2E_WD_PORT` 改） | 与日常实例隔离 |
-| 单实例 | `run.sh` 先 `pkill -f target/debug/corpmail` | 否则 tauri-plugin-single-instance 会把新实例并到旧进程 |
+| 单实例 | `run.sh` 的 `stop_app`：按完整路径取候选 PID，`ps -o comm=` 复核可执行文件后发信号（10s 未退则 SIGKILL） | 否则 tauri-plugin-single-instance 会把新实例并到旧进程；不用 `pkill -f` 子串匹配是避免误杀命令行里带该路径的其他进程 |
 | 凭据 | 每 run 新账号 `e2e@corpmail.test`；`run.sh` 用固定身份重签 | 避免 keychain ACL 随 cdhash 变化弹授权框卡住自动化 |
 
 mock 服务器只实现客户端实际用到的命令（`recv.rs` / `send.rs` / `seen.rs`）：
@@ -203,8 +203,11 @@ corpmail.toml 并进向导：
 # 全量（构建 → 重签 → 清理残留 → 阶段一主链路 → 重装准备 → 阶段二复用链路）
 e2e/run.sh
 
-# 单点调试（只跑主链路某个 spec；此时不会生成 reuse marker，阶段二自动跳过）
-e2e/run.sh --spec specs/01-wizard.spec.mjs
+# 没有固定签名身份时（CI）：显式放行未签名，本地默认直接失败退出
+E2E_ALLOW_UNSIGNED=1 e2e/run.sh
+
+# 单点调试（只跑主链路某个 spec）：不会生成 reuse marker，必须显式允许跳过阶段二
+E2E_SKIP_PHASE2=1 e2e/run.sh --spec specs/01-wizard.spec.mjs
 
 # 换端口（与日常实例并存）
 E2E_WD_PORT=4455 e2e/run.sh

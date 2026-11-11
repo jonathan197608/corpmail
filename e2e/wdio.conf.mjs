@@ -35,7 +35,6 @@ export const config = {
   specs: ['./specs/*.spec.mjs'],
   maxInstances: 1,
   logLevel: 'info',
-  bail: 0,
   waitforTimeout: 15000,
   connectionRetryTimeout: 120000,
   connectionRetryCount: 2,
@@ -82,8 +81,12 @@ export const config = {
     const safe = test.title.replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 60)
     try {
       await browser.saveScreenshot(path.join(RUN_DIR, `FAIL-${safe}.png`))
-    } catch {
-      /* 窗口已关闭时忽略 */
+    } catch (shotErr) {
+      // 截图失败不能掩盖原失败（审计 R85）：旧实现 `catch {}` 静默吞掉，
+      // 报告里既没有截图也没有「为什么没有截图」。这里打印原因，并尽力把
+      // worker 进程退出码置 1（最终退出码由 wdio 汇总，主要靠日志留痕）
+      console.error(`[E2E] 失败截图保存失败（${test.title}）：${shotErr?.message || shotErr}`)
+      process.exitCode = 1
     }
   },
 

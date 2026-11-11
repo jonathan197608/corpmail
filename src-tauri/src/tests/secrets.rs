@@ -220,3 +220,17 @@ fn concurrent_key_creation_is_consistent() {
     );
     cleanup(&kf);
 }
+
+/// 审计 R74：keychain 短路开关（原为编译期常量）改为可由环境变量显式恢复。
+/// 只认 `CORPMAIL_KEYCHAIN=real`，其余取值一律保持默认短路——拼错时不能
+/// 悄悄变成"走真实钥匙串"，那会在无人值守环境里卡住等授权
+#[test]
+fn skip_keychain_only_honours_exact_real_value() {
+    assert!(!skip_keychain_for(Some("real")), "real 应恢复真实 keychain");
+    assert!(skip_keychain_for(None), "默认按测试口径短路");
+    assert!(skip_keychain_for(Some("")), "空串不生效");
+    assert!(skip_keychain_for(Some("Real")), "大小写不匹配不生效");
+    assert!(skip_keychain_for(Some("true")), "非 real 取值不生效");
+    // 生产构建（非 test）默认不短路：由 cfg!(test) 决定，这里只断言二者一致
+    assert_eq!(skip_keychain_for(None), cfg!(test));
+}

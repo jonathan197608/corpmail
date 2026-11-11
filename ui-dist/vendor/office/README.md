@@ -10,13 +10,18 @@
 | `xlsx.full.min.js` | npm `xlsx` | 0.18.5 | Apache-2.0（见 LICENSE-sheetjs.txt） | `c9506197caf809a075b6dee1da0d36fb19da7158ffe8a88e7b0c96c5d8623c99` |
 | `pptx-preview.umd.js` | npm `pptx-preview` | 1.0.7 | package.json 标注 ISC；README 声明 npm 包可免费商用、源码不公开（见下方说明） | `98bcf8fbb5efb42dff406eeea7e7b9d7497a388955582e5b1815489c63c75fe2` |
 
-## pptx-preview 合规说明
+## 各库许可与商用条件（逐条列出，不按「个人项目」概括）
 
-- 上游：<https://github.com/501351981/pptx-preview>
-- README 明确：「本项目发布的 npm 包可免费使用，自用商用均可；源码仅供个人学习」。
-- 本项目仅内嵌 npm 发布产物，不修改源码。
-- 2026-11-05 结论：CorpMail 为个人项目，按上游「npm 包免费自用/商用」条款合规使用。
-- 若未来转为对外分发且授权受限，前端将退化为「无法预览，请下载后用 PowerPoint 打开」，不影响其他格式。
+| 库 | 许可 | 商用 | 依据 |
+|---|---|---|---|
+| docx-preview | Apache-2.0 | 允许，需保留版权与许可声明 | 包内 LICENSE 原文（Apache-2.0 全文） |
+| jszip | MIT | 允许，需保留版权与许可声明 | `LICENSE-jszip.md` |
+| xlsx（SheetJS 社区版） | Apache-2.0 | 允许；**注意**社区版仅覆盖读写表格，不含 SheetJS Pro 的商业特性 | `LICENSE-sheetjs.txt` |
+| pptx-preview | package.json 标注 ISC | npm 发布产物可免费使用（含商用）；**源码不公开**，不得据其源码二次分发 | 上游 README「发布的 npm 包可免费使用，自用商用均可」 |
+
+- 本项目只内嵌各库的 **npm 发布产物**，不修改、不反编译、不再分发源码。
+- `pptx-preview` 的授权来自上游 README 的明确表述（非标准 SPDX 许可文件），因此单列在上表：若日后上游收紧条款，前端退化为「无法预览，请下载后用 PowerPoint 打开」，其余格式不受影响。
+- Apache-2.0 库的 NOTICE/版权声明随 `LICENSE-*.txt` 一并保留在本目录，随应用分发。
 
 ## 加载方式
 

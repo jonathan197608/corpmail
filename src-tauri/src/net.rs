@@ -192,4 +192,27 @@ mod tests {
         let h2 = TlsMode::Implicit.hint(465);
         assert!(h2.contains("465") && h2.contains("STARTTLS"), "{h2}");
     }
+
+    /// 审计 R74：明文**只能**显式配置，端口推断永不落到 Plain。
+    /// 这是本仓库唯一自己掌控的 TLS 语义（握手与证书校验全部在 imap/lettre +
+    /// native-tls 内，仓库里没有可测的握手代码）；一旦有人把推断改成
+    /// 「连不上就退回明文」，中间人降级就成立，所以用穷举端口把它钉死
+    #[test]
+    fn plain_is_never_inferred_from_port() {
+        use super::TlsMode;
+        for port in [0u16, 25, 110, 143, 465, 587, 993, 2525, 2000, 65535] {
+            assert_ne!(
+                TlsMode::resolve(port, "auto"),
+                TlsMode::Plain,
+                "端口 {port} 不应推断出明文"
+            );
+            assert_ne!(
+                TlsMode::resolve(port, ""),
+                TlsMode::Plain,
+                "端口 {port} 空配置不应推断出明文"
+            );
+        }
+        // 显式要求才允许明文（内网中继场景）
+        assert_eq!(TlsMode::resolve(587, "plain"), TlsMode::Plain);
+    }
 }

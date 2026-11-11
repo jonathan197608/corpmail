@@ -19,6 +19,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 
 const runDir = path.resolve(process.argv[2] || '')
 if (!runDir || !fs.existsSync(runDir)) {
@@ -43,6 +44,33 @@ if (!configured) {
 if (!fs.existsSync(anchorDb)) {
   console.log('[reuse-prep] 跳过：锚点目录没有 corpmail.db')
   process.exit(0)
+}
+// 前置 3（审计 R66）：主链路的 04-list 必须已删除「欢迎使用」邮件。
+// 阶段二 W2 的断言是「重装后它不复活」——若 04 的删除逻辑坏了，标记会照样生成，
+// 阶段二在看到历史邮件恢复之前就先因「欢迎使用又出现」失败，报错指向重装链路，
+// 而真正的原因是主链路的删除步骤。这里提前校验，把故障定位回 04。
+let welcomeCount
+try {
+  const out = execFileSync(
+    'sqlite3',
+    [anchorDb, "SELECT count(*) FROM emails WHERE subject LIKE '%欢迎使用%'"],
+    { encoding: 'utf8' },
+  )
+  welcomeCount = Number(out.trim())
+} catch (e) {
+  console.error(`[reuse-prep] 无法查询锚点库（需要 sqlite3 CLI，macOS 自带）：${e.message}`)
+  process.exit(1)
+}
+if (!Number.isFinite(welcomeCount)) {
+  console.error('[reuse-prep] 锚点库查询结果异常，拒绝生成复用状态')
+  process.exit(1)
+}
+if (welcomeCount > 0) {
+  console.error(
+    `[reuse-prep] 主链路未删除「欢迎使用」邮件（count=${welcomeCount}）：阶段二会误判为「重装链路失败」，` +
+      '请先修 specs/04-list.spec.mjs 的删除步骤',
+  )
+  process.exit(1)
 }
 
 // 1) 数据快照：db（+wal/shm，若未 checkpoint 事务都在里面）复制到 reuse-data/

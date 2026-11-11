@@ -3,7 +3,7 @@
 # CorpMail · 自建 patched NSIS 工具链（macOS 宿主）
 # ============================================================
 # brew nsis 3.13 在 macOS 上必崩：libiconv 的 "wchar_t" 转换通道对 C0 控制符/CJK/BOM
-# 返回 EILSEQ → makensis 处理任意脚本即 bad_alloc → SIGABRT（详见 docs-private/设计文档 §11.4）。
+# 返回 EILSEQ → makensis 处理任意脚本即 bad_alloc → SIGABRT（中文语言文件另报 Bad text encoding）。
 # 本脚本从 NSIS 3.13 源码构建 patched 版本，安装到用户级持久目录（不入 .temp/），
 # 供 scripts/build-windows.sh 使用。
 #

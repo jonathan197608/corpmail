@@ -21,7 +21,7 @@ store-assets/
 - **Publisher**：`CN=3DAC9C91-AE75-4F8D-A413-16DBAF29757A`（已写入 manifest）
 - **隐私政策 URL**：`https://github.com/jonathan197608/corpmail/blob/main/PRIVACY.zh-CN.md`
  （隐私文档已随仓库根目录公开）
-- 内部文档（设计稿等）位于 `docs-private/`，不公开（.gitignore 拦截）
+- 本仓库为公开发布镜像：内部设计稿与内网样例不随仓库分发（`.gitignore` 拦截 `docs-private/` 与 `design/`）。构建与上架所需步骤均已在公开文档（README、本文件、`scripts/`）里自包含说明。
 
 ## 渠道共存说明（重要，写进提交备注已备）
 

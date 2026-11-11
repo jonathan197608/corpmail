@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// settings 键名（设计 §3；新增键须同步设计文档）
+/// settings 键名。键名即持久化契约：改名等于丢配置，必须随迁移同步
 pub mod keys {
     pub const ACCOUNT_PREFIX: &str = "account_prefix";
     pub const ACCOUNT_DOMAIN: &str = "account_domain";
