@@ -399,13 +399,45 @@ fn single_top_div(s: &str) -> Option<String> {
 
 /// HTML 剥标签为纯文本（基础实体解码）：用于 HTML 正文的检索/列表预览/转发引用。
 /// 索引扫描而非吞并式迭代：未闭合 `<` 不应吞掉后文（畸形 HTML 常见）。
+/// script/style/head/title 的**内容**一并跳过（邮件 HTML 常带大段 CSS/条件注释，
+/// 剥成纯文本时会变成看不懂的"乱码"），HTML 注释整段丢弃。
 pub fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut i = 0;
     while i < html.len() {
         match html.as_bytes()[i] {
+            b'<' if html[i..].starts_with("<!--") => {
+                // 注释：找到 --> 整段跳过；未闭合则丢弃余下内容
+                match html[i + 4..].find("-->") {
+                    Some(end) => i += 4 + end + 3,
+                    None => break,
+                }
+            }
             b'<' => match html[i..].find('>') {
-                Some(rel) => i += rel + 1, // 整段标签丢弃
+                Some(rel) => {
+                    let tag = &html[i + 1..i + rel];
+                    let name = tag
+                        .trim_start_matches('/')
+                        .split(|c: char| c.is_whitespace() || c == '/')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    i += rel + 1;
+                    if matches!(name.as_str(), "script" | "style" | "head" | "title") {
+                        // 非自闭合的隐藏块：跳到对应闭合标签之后
+                        if tag.starts_with('/') {
+                            continue;
+                        }
+                        let lower = html[i..].to_ascii_lowercase();
+                        match lower.find(&format!("</{name}")) {
+                            Some(close) => match html[i + close..].find('>') {
+                                Some(gt) => i += close + gt + 1,
+                                None => break,
+                            },
+                            None => break, // 无闭合标签：余下全是隐藏块内容
+                        }
+                    }
+                }
                 None => {
                     // 未闭合：保留 '<' 与后文（不解析）
                     out.push_str(&html[i..]);
@@ -700,6 +732,94 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
     }
     tx.commit().map_err(|e| e.to_string())?;
     eprintln!("[repair] 主题 GBK 乱码修复 {fixed} 封");
+    Ok(())
+}
+
+/// 存量正文乱码一次性修复（v12）：乱码 `body_text` 优先用同源 `body_html`
+/// 派生的纯文本写回（详情页显示正常的那一列），无 HTML 时按 GB18030 逆推
+/// 还原 UTF-8；同步重算 `body_tokens` 保 FTS 检索一致。
+///
+/// 之前只修收件侧解码（e5abf2f）对新邮件有效，存量数据不会变；93c174b 又
+/// 以"应用未发布"为由移除了存量修复 → 老邮件列表预览一直乱码。显示侧
+/// `preview_text` 已能让列表立即正常，本函数把搜索/转发/MD 导出也洗干净。
+/// marker 保证只跑一次；幂等（修完不再判乱码）；失败不阻断启动。
+pub fn repair_mojibake_bodies(conn: &mut rusqlite::Connection) -> Result<(), String> {
+    const MARK: &str = "body_mojibake_v12";
+    // 标记存独立表，**不能写 settings**：store_is_empty() 用 settings 表行数
+    // 判定"空库首设"，往 settings 写标记会让首设向导误走「沿用既有库」的
+    // 归属校验并拒绝保存。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS repair_marks(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    // 标记值 = 扫描时的「行数:最大 id」：无新邮件时完全跳过；有新邮件或
+    // 数据目录被换成另一套库（id 体系变化）时重新全量扫一遍，避免空库
+    // 首次启动写死 marker 导致后来导入的存量数据永远不被修复。
+    let stamp: String = conn
+        .query_row(
+            "SELECT count(*) || ':' || COALESCE(max(id), 0) FROM emails",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let prev: String = conn
+        .query_row("SELECT v FROM repair_marks WHERE k = ?1", [MARK], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default();
+    if prev == stamp {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, body_text, COALESCE(body_html, '') FROM emails
+                 WHERE body_text IS NOT NULL AND body_text <> ''",
+            )
+            .map_err(|e| e.to_string())?;
+        let rs = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rs.filter_map(Result::ok).collect()
+    };
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut fixed = 0usize;
+    for (id, bt, bh) in rows {
+        if !looks_mojibake(&bt) {
+            continue;
+        }
+        let from_html = if bh.trim().is_empty() {
+            None
+        } else {
+            let derived = decode_entities(&strip_html(&bh)).trim().to_string();
+            (!derived.is_empty() && !looks_mojibake(&derived)).then_some(derived)
+        };
+        let Some(new_bt) = from_html.or_else(|| recover_gbk_mojibake(&bt)) else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE emails SET body_text = ?2, body_tokens = ?3 WHERE id = ?1",
+            rusqlite::params![id, new_bt, tokenize(&new_bt)],
+        )
+        .map_err(|e| e.to_string())?;
+        fixed += 1;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO repair_marks(k, v) VALUES(?1, ?2)",
+        rusqlite::params![MARK, stamp],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    if fixed > 0 {
+        eprintln!("[repair] 正文乱码修复 {fixed} 封（v12 一次性）");
+    }
     Ok(())
 }
 
@@ -1282,7 +1402,8 @@ pub fn list(state: &AppState, q: &ListQuery) -> Result<(Vec<EmailSummary>, i64),
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
                         COALESCE(received_at, sent_at, created_at) AS t,
-                        {ext_col} AS from_external, starred, scheduled_at
+                        {ext_col} AS from_external, starred, scheduled_at,
+                        COALESCE(body_html, '') AS body_html
                  FROM emails {where_sql}
                  ORDER BY {order}
                  LIMIT :lim OFFSET :off"
@@ -1341,10 +1462,11 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
-                        attach_cnt, unread, t, thread_count, from_external, starred
+                        attach_cnt, unread, t, thread_count, from_external, starred, body_html
                  FROM (
                     SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                            e.to_addrs, e.body_text, e.attach_cnt, e.unread,
+                           COALESCE(e.body_html, '') AS body_html,
                            COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
                            COUNT(*) OVER (PARTITION BY e.thread_key) AS thread_count,
                            ROW_NUMBER() OVER (PARTITION BY e.thread_key
@@ -1373,20 +1495,21 @@ pub fn list_threads(state: &AppState, q: &ListQuery) -> Result<(Vec<ThreadSummar
 }
 
 /// 会话列表行映射（列序：id,folder,status,subject,from_addr,from_name,to_addrs,
-/// body_text,attach_cnt,unread,t,thread_count,from_external,starred）
+/// body_text,attach_cnt,unread,t,thread_count,from_external,starred,body_html）
 fn thread_summary_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
     let subject: String = r.get(3)?;
     let name: String = r.get(5)?;
     let addr: String = r.get(4)?;
     let body: String = r.get(7)?;
+    let html: String = r.get(14)?;
     Ok(ThreadSummary {
         id: r.get(0)?,
         folder: r.get(1)?,
         status: r.get(2)?,
         subject: subject.clone(),
         from_display: if name.is_empty() { addr } else { name },
-        body_preview: preview(&body),
-        preview_tip: preview_tip(&body),
+        body_preview: preview_text(&body, &html),
+        preview_tip: preview_tip(&body, &html),
         attach_cnt: r.get(8)?,
         unread: r.get::<_, i64>(9)? == 1,
         starred: r.get::<_, i64>(13)? == 1,
@@ -1425,7 +1548,8 @@ pub fn thread_mails(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
                         attach_cnt, unread,
                         COALESCE(received_at, sent_at, created_at) AS t,
-                        {ext_col} AS from_external, starred, scheduled_at
+                        {ext_col} AS from_external, starred, scheduled_at,
+                        COALESCE(body_html, '') AS body_html
                  FROM emails
                  WHERE thread_key = ?1 AND folder <> 'draft'
                    AND status NOT IN ('draft','failed')
@@ -1470,8 +1594,9 @@ fn recipient_display(to_addrs: &str) -> String {
     }
 }
 
-/// 列表行映射（list/search 共用；列序：id,folder,status,subject,from_addr,from_name,
-/// to_addrs,body_text,attach_cnt,unread,t）。highlight_words=Some 时标题做命中高亮
+/// 列表行映射（list/search/thread_mails 共用；列序：id,folder,status,subject,
+/// from_addr,from_name,to_addrs,body_text,attach_cnt,unread,t,from_external,
+/// starred,scheduled_at,body_html）。highlight_words=Some 时标题做命中高亮
 fn summary_from_row(
     r: &rusqlite::Row<'_>,
     highlight_words: Option<&[String]>,
@@ -1486,6 +1611,7 @@ fn summary_from_row(
     let folder: String = r.get(1)?;
     let to_addrs: String = r.get(6)?;
     let body: String = r.get(7)?;
+    let html: String = r.get(14)?;
     let scheduled_at = r.get::<_, i64>(13)?;
     // 发件箱/草稿箱列表展示收件人（2026-11-09）：这两箱的「对方」是收件人，
     // 显示发件人（自己）没有信息量
@@ -1503,8 +1629,8 @@ fn summary_from_row(
         subject,
         from_display,
         to_addrs,
-        body_preview: preview(&body),
-        preview_tip: preview_tip(&body),
+        body_preview: preview_text(&body, &html),
+        preview_tip: preview_tip(&body, &html),
         attach_cnt: r.get(8)?,
         unread: r.get::<_, i64>(9)? == 1,
         from_external: r.get::<_, i64>(11)? == 1,
@@ -1631,7 +1757,8 @@ pub fn search(
                 "SELECT e.id, e.folder, e.status, e.subject, e.from_addr, e.from_name,
                         e.to_addrs, e.body_text, e.attach_cnt, e.unread,
                         COALESCE(e.received_at, e.sent_at, e.created_at) AS t,
-                        {ext_col} AS from_external, e.starred, e.scheduled_at
+                        {ext_col} AS from_external, e.starred, e.scheduled_at,
+                        COALESCE(e.body_html, '') AS body_html
                  FROM email_fts JOIN emails e ON e.id = email_fts.rowid
                  WHERE email_fts MATCH :match{filter_sql}
                  ORDER BY {order}
@@ -1652,23 +1779,111 @@ pub fn search(
     })
 }
 
-/// 正文摘要：解码残留实体 + 压缩空白后取前 100 字符（chars 截断防中文 panic）。
-/// 显示侧解码可同时修复存量数据里未识别的命名实体（无需迁移）
-fn preview(text: &str) -> String {
-    flatten_ws(&decode_entities(text))
+/// 正文摘要：无条件取详情同源正文（见 `preview_base`）+ 压缩空白后取前
+/// 100 字符（chars 截断防中文 panic）。
+/// 预览正文的统一来源：与详情页**无条件同源**。
+///
+/// 详情页（email.html:155）优先渲染 `body_html`（净化后的 text/html 列），
+/// 列表/会话/搜索过去读 `body_text`（text/plain 列）——同一封邮件两列内容，
+/// 历史入库的 text/plain 被错声明的 charset 解成乱码，就出现「详情正常、
+/// 列表乱码」。之前多次修复都在给 body_text 做解码兜底（实体/latin1/GBK），
+/// 既救不回存量，也挡不住下一种错声明。这里直接从详情页那一列派生纯文本：
+/// 不依赖任何乱码识别阈值，存量邮件不迁移、不重收、不重启即刻正常。
+/// 无 HTML 的纯文本邮件才退回 body_text（并清理标签残留/解实体）。
+fn preview_base(text: &str, html: &str) -> String {
+    let raw = if html.trim().is_empty() {
+        text.to_string()
+    } else {
+        strip_html(html)
+    };
+    // text/plain 被错标成 HTML 源码、或老邮件把标签当正文入库时，
+    // 预览会显示 "<div>...</div>/CSS" 这类"乱码"——同样剥掉
+    let cleaned = if has_html_markup(&raw) {
+        strip_html(&raw)
+    } else {
+        raw
+    };
+    decode_entities(&cleaned)
+}
+
+/// 正文里是否含明确的 HTML 标签痕迹（不是普通文本里的 < > 符号）
+fn has_html_markup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "<div", "<p>", "<p ", "<span", "<table", "<br", "<html", "<body", "<style",
+        "<script", "<font", "<td", "<tr", "<!--", "<b>", "<b ", "<strong", "<em>",
+        "<i>", "<u>", "<a ", "<img", "<li", "<ul", "<h1", "<h2", "<h3",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
+/// 正文摘要：详情同源修复 + 压缩空白后取前 100 字符
+fn preview_text(text: &str, html: &str) -> String {
+    flatten_ws(&preview_base(text, html))
         .chars()
         .take(100)
         .collect()
 }
 
-/// 悬停预览正文：解码残留实体 + 压缩空白 + 300 字符截断 + 超长补省略号
-fn preview_tip(text: &str) -> String {
-    let flat = flatten_ws(&decode_entities(text));
+/// 悬停预览正文：同源修复 + 压缩空白 + 300 字符截断 + 超长补省略号
+fn preview_tip(text: &str, html: &str) -> String {
+    let flat = flatten_ws(&preview_base(text, html));
     let mut tip: String = flat.chars().take(300).collect();
     if flat.chars().count() > 300 {
         tip.push('…');
     }
     tip
+}
+
+/// 文本是否疑似字符编码乱码（三道护栏，防误伤正常中文/西文）：
+/// ① 含 U+FFFD（解码丢字）；
+/// ② UTF-8 被 latin1/cp1252 解码的特征串（Ã/Â/â€ 或 C1 控制字符）；
+/// ③ 按 GB18030 逆推回字节恰为合法 UTF-8 且含 CJK（"璇—□镮囬"类）。
+/// 高位字符 <4 一律不判，短文本巧合面太大。
+pub(crate) fn looks_mojibake(text: &str) -> bool {
+    if text.contains('\u{FFFD}') {
+        return true;
+    }
+    if text.chars().filter(|c| (*c as u32) >= 0x80).count() < 4 {
+        return false;
+    }
+    let latin1 = text
+        .chars()
+        .filter(|c| ('\u{80}'..='\u{FF}').contains(c))
+        .count();
+    let latin1_markers = text.contains('Ã')
+        || text.contains('Â')
+        || text.contains("â€")
+        || text.chars().any(|c| ('\u{80}'..='\u{9F}').contains(&c))
+        // 正常西文重音字符稀疏（占比低）；latin1 误标的乱码整串都是高位字符
+        || (latin1 >= 4 && latin1 * 3 >= text.chars().count());
+    if latin1_markers {
+        return true;
+    }
+    recover_gbk_mojibake(text).is_some()
+}
+
+/// UTF-8 被按 GBK 误解码的乱码还原：文本按 GB18030 逆推回字节后恰为合法
+/// UTF-8（且含 CJK、与原文不同）即认定乱码并返回重解码结果。
+/// 误伤防护：高位字符 <4 不处理；编码不可逆（含 U+FFFD，字节已丢）放弃；
+/// 修复结果须自身不再可逆推（防多层套娃改写）。
+pub(crate) fn recover_gbk_mojibake(text: &str) -> Option<String> {
+    if text.chars().filter(|c| (*c as u32) >= 0x80).count() < 4 {
+        return None;
+    }
+    let (bytes, _, had_errors) = encoding_rs::GB18030.encode(text);
+    if had_errors {
+        return None;
+    }
+    let fixed = String::from_utf8(bytes.into_owned()).ok()?;
+    if fixed == text || !fixed.chars().any(is_cjk) {
+        return None;
+    }
+    if recover_gbk_mojibake(&fixed).is_some() {
+        return None; // 修复结果还能再"修"一层 → 疑巧合文本，不动
+    }
+    Some(fixed)
 }
 
 /// 空白折叠（连续空白/换行折叠为单空格；preview 与 preview_tip 共用）

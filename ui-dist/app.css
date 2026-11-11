@@ -2355,6 +2355,29 @@ a.btn.link.disabled {
     border-radius: 8px;
     padding: 7px 10px;
 }
+
+/* 首设向导：数据保存目录必选提示（同 .ct-guide 跨全行），星号与说明 */
+.req-mark {
+    color: #d0453b;
+    margin-left: 3px;
+    font-weight: 700;
+}
+
+.dir-hint {
+    grid-column: 1 / -1;
+    margin: 2px 0 0;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
+}
+
+.dir-hint .mono {
+    word-break: break-all;
+}
 /* 升级富文本入口：已并入撰写页 .body-tools 工具行（margin-left:auto 靠右） */
 #toolbar-container {
     border: 1px solid var(--line);

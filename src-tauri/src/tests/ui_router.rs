@@ -121,6 +121,15 @@ const WIZARD_FORM: &[(&str, &str)] = &[
     ("recv_port", "993"),
 ];
 
+/// 向导表单（2026-11-11）：首设必须显式选择数据保存目录。
+/// 默认给当前临时数据目录 = 用户点「选择…」选了默认位置；需要自定义目录的
+/// 用例再 push 一个 data_dir 覆盖（form_urlencoded 重复键由后端 HashMap 取后者）。
+fn wizard_pairs(dir: &str) -> Vec<(&str, &str)> {
+    let mut v = WIZARD_FORM.to_vec();
+    v.push(("data_dir", dir));
+    v
+}
+
 #[test]
 fn fresh_root_shows_welcome() {
     let (state, dir) = temp_state("root-fresh");
@@ -2385,6 +2394,81 @@ fn wizard_setup_form_prefills_defaults() {
         html.contains("需提前生成密码") && html.contains("需提前选择拉取范围"),
         "默认集团域名应展示两条 OA 指引"
     );
+    // 首设：数据保存目录默认为空、必填、提示用户自行选择（默认位置只作提示）
+    assert!(
+        html.contains("name=\"data_dir\" value=\"\""),
+        "首设目录输入框不得预填"
+    );
+    assert!(
+        html.contains("请先选择数据保存目录") && html.contains("data-default-dir="),
+        "首设应提示选择目录并给出默认位置参考"
+    );
+    let at = html.find("name=\"data_dir\"").expect("目录输入框");
+    let seg: String = html[at..].chars().take(300).collect();
+    assert!(seg.contains("required"), "首设目录输入框应 required");
+    cleanup(&dir);
+}
+
+#[test]
+fn wizard_save_first_run_requires_data_dir_choice() {
+    let (state, dir) = temp_state("wiz-dir-required");
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // ① 未选择目录：后端兜底拦截（页面 required 之外的第二道），不落库、不跳转
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &t,
+    );
+    assert!(
+        body(&resp).contains("请先选择数据保存目录"),
+        "未选目录应给出明确提示"
+    );
+    assert!(
+        !resp.extra_headers.iter().any(|(k, _)| k == "HX-Redirect"),
+        "未选目录不得进入完成页"
+    );
+    assert!(!state.configured(), "未选目录不得落库");
+    // ② 显式选择目录后放行（选默认位置 = 当前数据目录，行为与旧版预填一致）
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
+        &t,
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Redirect" && v == "/welcome/done"),
+        "选择目录后应正常完成配置"
+    );
+    assert!(state.configured());
+    assert_eq!(state.data_dir(), dir, "选当前目录不触发切换");
+    // ③ 非首设：回显当前值、不再强制提示（改配置/迁移场景）
+    let page = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/setup", b""),
+        &t,
+    ));
+    assert!(
+        !page.contains("请先选择数据保存目录"),
+        "已配置后不应再显示首设必选提示"
+    );
+    let marker = "name=\"data_dir\" value=\"";
+    let at = page.find(marker).expect("已配置页应有目录输入框") + marker.len();
+    let shown = &page[at..at + page[at..].find('"').expect("value 引号")];
+    // minijinja autoescape 会把 '/' 转成 &#x2f;（详情页 title 同样），还原后比对
+    let shown = shown.replace("&#x2f;", "/").replace("&#x2F;", "/");
+    assert_eq!(shown, dir.display().to_string(), "已配置后应回显当前数据目录");
+    state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
 
@@ -2444,7 +2528,7 @@ fn settings_panes_show_ct_guides_only_for_ct_domain() {
     // 设置·账号页与同步页的 OA 指引同口径：仅集团域名展示。
     // 先经向导保存自定义域名（与真实链路一致，不直接写库）
     let (state, dir) = temp_state("ct-guide-set");
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("account_domain", "@partner.example"));
     route(
         &state,
@@ -2513,7 +2597,7 @@ fn wizard_save_success_redirects_and_persists() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -2546,7 +2630,7 @@ fn wizard_save_aborts_when_any_channel_fails() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: false,
             imap_ok: true,
@@ -2578,7 +2662,7 @@ fn wizard_done_shows_summary_and_guards_unconfigured() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3113,7 +3197,7 @@ fn settings_account_save_keeps_credential_when_blank() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3168,7 +3252,7 @@ fn settings_account_save_keeps_credential_when_blank() {
 #[test]
 fn wizard_save_with_custom_domain() {
     let (state, dir) = temp_state("wiz-domain");
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("account_domain", "@custom.cn"));
     let resp = route(
         &state,
@@ -3224,7 +3308,7 @@ fn wizard_save_first_run_custom_dir_switches_immediately() {
     let target = std::env::temp_dir().join(format!("mbx-wiz-direct-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target);
 
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("first_fetch_days", "7"));
     pairs.push(("data_dir", target.to_str().unwrap()));
     let resp = route(
@@ -3309,12 +3393,12 @@ fn wizard_save_first_run_custom_dir_switches_immediately() {
         "重复提交同目录应幂等跳过并正常跳转"
     );
 
-    // 未指定目录的新库向导：无目录提示
+    // 选择默认位置（dir2 自身）的新库向导：无目录提示
     let (state2, dir2) = temp_state("wiz-direct2");
     let resp2 = route(
         &state2,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir2.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3354,7 +3438,7 @@ fn wizard_save_prefilled_current_dir_redirects() {
     // 曾导致首配必失败：返回「数据目录设置失败」片段且不跳转 done 页，
     // E2E 01-wizard 等 /welcome/done 无限轮询getUrl。
     let (state, dir) = temp_state("wiz-prefilled");
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", dir.to_str().unwrap()));
     let resp = route(
         &state,
@@ -3385,7 +3469,7 @@ fn settings_account_ignores_readonly_submissions() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3504,7 +3588,7 @@ fn settings_account_test_uses_saved_credential() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -4173,7 +4257,7 @@ fn dump_smoke_html() {
         std::fs::create_dir_all(&fresh).unwrap();
         let st = AppState::open_with_anchor(&fresh, &fresh);
         let target = root.join("first-run-target");
-        let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+        let mut pairs = wizard_pairs(fresh.to_str().unwrap());
         pairs.push(("data_dir", target.to_str().unwrap()));
         let resp = route(
             &st,
@@ -4781,7 +4865,7 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -4826,7 +4910,7 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
         .store(2, std::sync::atomic::Ordering::SeqCst);
     let target = std::env::temp_dir().join(format!("mbx-wiz-first-fetch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target);
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", target.to_str().unwrap()));
     route(
         &state,
@@ -8223,7 +8307,7 @@ fn wizard_adopts_existing_store_of_same_account() {
     let _ = std::fs::remove_dir_all(&target);
     seed_old_store(&target, "unit.router@chinatelecom.cn");
 
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("first_fetch_days", "7"));
     pairs.push(("data_dir", target.to_str().unwrap()));
     let resp = route(
@@ -8338,7 +8422,7 @@ fn wizard_rejects_existing_store_of_other_account() {
     let _ = std::fs::remove_dir_all(&target);
     seed_old_store(&target, "colleague@chinatelecom.cn");
 
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", target.to_str().unwrap()));
     let resp = route(
         &state,
@@ -8392,7 +8476,7 @@ fn wizard_rejects_existing_store_with_unknown_owner() {
         )
         .unwrap();
     }
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", target.to_str().unwrap()));
     let resp = route(
         &state,
@@ -8441,7 +8525,7 @@ fn wizard_rejects_non_corpmail_db_directory() {
     std::fs::write(target_b.join("corpmail.db"), b"this is not a database").unwrap();
 
     for target in [&target_a, &target_b] {
-        let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+        let mut pairs = wizard_pairs(dir.to_str().unwrap());
         pairs.push(("data_dir", target.to_str().unwrap()));
         let resp = route(
             &state,
@@ -8488,7 +8572,7 @@ fn wizard_reuses_current_dir_store_when_owner_matches() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -8501,7 +8585,7 @@ fn wizard_reuses_current_dir_store_when_owner_matches() {
         "归属一致的当前库数据应允许沿用并完成配置"
     );
     assert!(state.configured());
-    assert_eq!(state.data_dir(), dir, "未指定目录时数据目录不变");
+    assert_eq!(state.data_dir(), dir, "显式选择当前目录时数据目录不变");
     let (mails, marker) = state.with_conn(|c| {
         (
             c.query_row("SELECT count(*) FROM emails", [], |r| r.get::<_, i64>(0))
@@ -8550,11 +8634,11 @@ fn wizard_rejects_current_dir_store_of_other_account() {
         smtp_ok: true,
         imap_ok: true,
     };
-    // ① 不填目录（沿用默认目录）：拒绝
+    // ① 显式选择当前默认目录（页面必选后用户选默认位置）：归属校验仍应拒绝
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(WIZARD_FORM)),
+        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
         &t,
     );
     let b = body(&resp);
@@ -8567,7 +8651,7 @@ fn wizard_rejects_current_dir_store_of_other_account() {
     let target = std::env::temp_dir().join(format!("mbx-wiz-reuse-mm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target);
     std::fs::create_dir_all(&target).unwrap();
-    let mut pairs: Vec<(&str, &str)> = WIZARD_FORM.to_vec();
+    let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", target.to_str().unwrap()));
     let resp = route(
         &state,

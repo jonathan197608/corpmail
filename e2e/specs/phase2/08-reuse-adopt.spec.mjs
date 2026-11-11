@@ -33,7 +33,7 @@ async function fillWizard(accountPrefix, dataDir) {
   await $('input[name="recv_host"]').setValue('127.0.0.1')
   await $('input[name="recv_port"]').setValue(IMAP_PORT)
   await selectValue('select[name="recv_security"]', 'plain')
-  // 指向既有数据目录（预填的是锚点默认目录，setValue 整体替换）
+  // 首设向导数据目录默认为空且必填：显式填入既有数据目录（同账号沿用）
   await $('input[name="data_dir"]').setValue(dataDir)
 }
 

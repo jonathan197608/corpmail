@@ -365,8 +365,12 @@ struct SetupCtx {
     recv_security: String,
     /// 首次拉取范围（向导可设；与设置同步页一致）
     first_fetch_days: String,
-    /// 数据保存目录（当前值，供输入框回显；留空=默认）
+    /// 数据保存目录输入框的值：首设恒为空（必须由用户选择），非首设回显当前值
     data_dir: String,
+    /// 默认目录（仅作提示/可选参考，不预填输入值）
+    default_data_dir: String,
+    /// 首设：输入框 required + 展示「请选择目录」提示
+    require_data_dir: bool,
     /// 凭据保管说明（按编译平台自适应：Windows 凭据管理器 / macOS 钥匙串）
     cred_note: String,
     /// 账号域名为 chinatelecom.cn：客户端专用密码/拉取范围需 OA 预先设置，展示指引
@@ -2671,6 +2675,11 @@ fn urlencode(s: &str) -> String {
 fn wizard_setup_page(state: &AppState) -> Resp {
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
+    let first_run = !state.configured();
+    // 迁移待生效时显示目标目录，否则当前目录（与存储页同源回显）
+    let dir_now = state
+        .pending_data_dir()
+        .unwrap_or_else(|| state.data_dir().display().to_string());
     let ctx = SetupCtx {
         account_prefix: g(keys::ACCOUNT_PREFIX),
         account_domain: g(keys::ACCOUNT_DOMAIN),
@@ -2682,11 +2691,12 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         recv_port: g(keys::RECV_PORT),
         recv_security: g(keys::RECV_SECURITY),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
-        // 目录预填与设置·存储页同源：迁移待生效时显示目标目录，否则当前目录
-        //（用户反馈：向导设置的目录与设置页显示不一致）
-        data_dir: state
-            .pending_data_dir()
-            .unwrap_or_else(|| state.data_dir().display().to_string()),
+        // 首设：目录必须由用户显式选择（留空不放行，避免"没注意就用了默认位置"）。
+        // 非首设（改配置/迁移）：回显当前值，保持原有语义。
+        // 默认位置只作为提示文字给出，不预填进输入框。
+        default_data_dir: dir_now.clone(),
+        require_data_dir: first_run,
+        data_dir: if first_run { String::new() } else { dir_now },
         cred_note: cred_storage_note(),
         is_ct_domain: is_ct_mail_domain(&g(keys::ACCOUNT_DOMAIN)),
     };
@@ -2756,6 +2766,21 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
     let (Some(prefix), true) = (prefix, !password.is_empty()) else {
         return test_fragment(Vec::new(), "请填写邮箱账号与密码", false);
     };
+    // 首设强制选择数据保存目录：页面 required 拦真实用户，这里兜底挡住
+    // 绕过前端的 POST。放在双通道测试之前，避免白等 15s 才提示。
+    // 非首设（改配置/迁移）不受影响；留空沿用默认目录的旧行为仅保留在后端
+    // 非向导路径，向导 UI 已不再提供该入口。
+    if !state.configured()
+        && trimmed_field(&form, "data_dir")
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return test_fragment(
+            Vec::new(),
+            "请先选择数据保存目录（点击「选择…」指定本机目录）；未选择不能继续",
+            false,
+        );
+    }
 
     let account = full_address(&prefix, &domain);
     let smtp_host = host_or(&form, "smtp_host", state::SMTP_HOST_DEFAULT);

@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { shot, waitBoot, waitText, selectValue } from '../support/helpers.mjs'
+import { shot, waitBoot, waitText, selectValue, htmxAjax } from '../support/helpers.mjs'
 
 const IMAP_PORT = process.env.E2E_IMAP_PORT
 const SMTP_PORT = process.env.E2E_SMTP_PORT
@@ -29,6 +29,16 @@ describe('01 首启向导与首次收件', () => {
       [...document.querySelectorAll('.setup-card .ct-guide')].map((g) => !g.hidden),
     )
     expect(guides0.filter(Boolean).length).toBe(2)
+    // 首设：数据保存目录默认为空，页面提示用户自行选择
+    await expect($('input[name="data_dir"]')).toHaveValue('')
+    const required = await browser.execute(
+      () => document.querySelector('input[name="data_dir"]')?.required === true,
+    )
+    expect(required).toBe(true)
+    const hint = await browser.execute(() =>
+      document.querySelector('.dir-hint')?.textContent?.includes('请先选择数据保存目录'),
+    )
+    expect(hint).toBe(true)
     await shot('向导-默认配置')
   })
 
@@ -37,6 +47,23 @@ describe('01 首启向导与首次收件', () => {
     // 浏览器的 required 校验直接拦下，页面仍停在向导
     expect(await browser.getUrl()).toContain('/welcome/setup')
     await shot('向导-必填校验')
+  })
+
+  it('数据目录未选择：后端兜底拦截，不进入完成页', async () => {
+    await $('input[name="account_prefix"]').setValue('e2e')
+    await $('input[name="password"]').setValue('e2e-password')
+    // 绕过 required 直接 POST（模拟脚本提交），后端必须拒
+    const values = await browser.execute(() =>
+      Object.fromEntries(new FormData(document.querySelector('.setup-card')).entries()),
+    )
+    values.data_dir = ''
+    // 直发但不 swap（htmxAjax 的 outerHTML 会替换整个 #test-results 容器，
+    // 残留文案会污染下一条用例的 body 全文快速失败检测）
+    const res = await htmxAjax('POST', '/welcome/setup/save', values, '#no-swap-probe')
+    expect(res.text).toContain('请先选择数据保存目录')
+    expect(res.redirect).toBeNull()
+    expect(await browser.getUrl()).toContain('/welcome/setup')
+    await shot('向导-未选目录被拦截')
   })
 
   it('指向本机 mock 服务器后「测试并保存」通过', async () => {
@@ -61,6 +88,11 @@ describe('01 首启向导与首次收件', () => {
     await $('input[name="recv_host"]').setValue('127.0.0.1')
     await $('input[name="recv_port"]').setValue(IMAP_PORT)
     await selectValue('select[name="recv_security"]', 'plain')
+    // 首设必须显式选择数据保存目录：模拟用户点「选择…」选了默认位置
+    //（data-default-dir 是页面给出的默认位置，填入后与旧版预填行为一致）
+    const defaultDir = await $('input[name="data_dir"]').getAttribute('data-default-dir')
+    expect(defaultDir).toBeTruthy()
+    await $('input[name="data_dir"]').setValue(defaultDir)
     await shot('向导-已填写本地服务器')
 
     await $('button[type="submit"]').click()
@@ -70,7 +102,7 @@ describe('01 首启向导与首次收件', () => {
       async () => {
         if ((await browser.getUrl()).includes('/welcome/done')) return true
         const text = await $('body').getText()
-        if (/未保存|设置失败|保存失败|密码保存失败/.test(text)) {
+        if (/未保存|设置失败|保存失败|密码保存失败|请先选择数据保存目录/.test(text)) {
           throw new Error(`向导提交失败：${text.match(/[^。]{0,120}(失败[^。]{0,80})/)?.[0] ?? text.slice(0, 120)}`)
         }
         return false

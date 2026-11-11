@@ -10,7 +10,7 @@
 
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
-    mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, strip_html,
+    looks_mojibake, mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, strip_html,
     sync_attach_stats, thread_key_of, tokenize, zoned_of,
 };
 use crate::net::TlsMode;
@@ -1043,13 +1043,18 @@ fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
 
 /// 正文抽取（§6.1）：返回（纯文本, 原始 HTML）。
 /// - 纯文本优先 text/plain；仅有 HTML 时剥标签得到纯文本（检索/预览/转发用）
+/// - text/plain 疑似乱码而 HTML 正常时改用 HTML 派生：同一封邮件的两个 part
+///   常带不同 charset 声明，text/plain 的错声明会让 FTS/搜索/导出一起脏
 /// - 原始 HTML 另存一份，供 parse_incoming 净化后入库渲染（保留原版式）
 fn extract_body(mail: &mailparse::ParsedMail) -> (String, Option<String>) {
     let plain = find_inline_part(mail, "text/plain").map(body_text_repaired);
     let html = find_inline_part(mail, "text/html").map(body_text_repaired);
-    let plain_text = match &plain {
-        Some(t) => t.clone(),
-        None => html.as_deref().map(strip_html).unwrap_or_default(),
+    let from_html = html.as_deref().map(strip_html).map(|s| s.trim().to_string());
+    let plain_text = match (&plain, &from_html) {
+        (Some(t), _) if !looks_mojibake(t) => t.clone(),
+        (_, Some(h)) if !h.is_empty() => h.clone(),
+        (Some(t), _) => t.clone(), // HTML 派生不出内容：保留原值，不丢正文
+        _ => String::new(),
     };
     (plain_text, html)
 }

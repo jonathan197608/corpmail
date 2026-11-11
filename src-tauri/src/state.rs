@@ -236,6 +236,12 @@ impl AppState {
         if let Err(err) = crate::mail::repair_gbk_subjects(&mut conn) {
             eprintln!("[repair] 主题乱码修复失败（忽略）：{err}");
         }
+        // 历史正文乱码一次性修复（v12）：优先用同源 body_html 派生文本写回，
+        // 无 HTML 时按 GB18030 逆推；同步重算 body_tokens 保 FTS 一致。
+        // marker 只跑一次，失败不阻断启动（显示侧另有 preview_text 兜底）
+        if let Err(err) = crate::mail::repair_mojibake_bodies(&mut conn) {
+            eprintln!("[repair] 正文乱码修复失败（忽略）：{err}");
+        }
         // 会话归组键存量回填（v8 升级/首启）：在主题修复后执行，基于已修复 subject
         if let Err(err) = crate::mail::backfill_thread_keys(&mut conn) {
             eprintln!("[thread] 会话归组键回填失败（忽略）：{err}");

@@ -194,14 +194,14 @@ fn tokenize_words_drops_trailing_punctuation_from_ascii_words() {
 
 #[test]
 fn preview_tip_truncates_long_body_with_ellipsis() {
-    assert_eq!(preview_tip("简短 正文"), "简短 正文", "短文原样保留");
-    assert_eq!(preview_tip("a\r\n\t b"), "a b", "压缩空白");
+    assert_eq!(preview_tip("简短 正文", ""), "简短 正文", "短文原样保留");
+    assert_eq!(preview_tip("a\r\n\t b", ""), "a b", "压缩空白");
     let long: String = "字".repeat(400);
-    let tip = preview_tip(&long);
+    let tip = preview_tip(&long, "");
     assert_eq!(tip.chars().count(), 301, "300 字 + 省略号");
     assert!(tip.ends_with('…'), "超长以省略号收尾");
     assert_eq!(
-        preview_tip(""),
+        preview_tip("", ""),
         "",
         "空正文返回空串（空 data-tip 不触发气泡）"
     );
@@ -219,7 +219,107 @@ fn preview_decodes_named_entities() {
     assert_eq!(decode_entities("&nbsp;&amp;&lt;"), " &<");
     assert_eq!(decode_entities("&unknown;"), "&unknown;");
     // preview 走同一解码：中文邮件正文里的 &hellip; 不再原样显示
-    assert_eq!(preview("进度&hellip;"), "进度…");
+    assert_eq!(preview_text("进度&hellip;", ""), "进度…");
+}
+
+/// 列表预览与详情页同源：body_text 乱码（存量）而 body_html 正常时，
+/// 列表用 HTML 派生文本；正常正文不被改写；无 HTML 时不丢正文。
+#[test]
+fn preview_uses_html_source_when_plain_text_is_mojibake() {
+    let good = "会议纪要：请于本周五前提交季度报表与预算说明";
+    // 构造历史乱码：UTF-8 字节被按 GBK 解码（与 e5abf2f 用户截图同源）
+    let (garbled, _, _) = encoding_rs::GBK.decode(good.as_bytes());
+    let garbled = garbled.into_owned();
+    assert!(looks_mojibake(&garbled), "构造样本必须被判为乱码：{garbled}");
+    let html = format!("<div><p>{good}</p></div>");
+    assert_eq!(
+        preview_text(&garbled, &html),
+        good,
+        "乱码应改用同源 HTML 派生文本（详情页显示的内容）"
+    );
+    assert_eq!(preview_tip(&garbled, &html), good, "悬停预览同源");
+    // 正常正文 + HTML：仍然一律同源（不依赖乱码判定，杜绝漏判复发）
+    assert_eq!(preview_text("纯文本正文", "<p>HTML 正文</p>"), "HTML 正文");
+    // 无 HTML：退回原文本 + 实体解码，不丢正文
+    assert_eq!(preview_text("进度&hellip;", ""), "进度…");
+    // 老邮件把 HTML 源码当纯文本入库：标签/CSS 不该出现在摘要里
+    assert_eq!(
+        preview_text("<style>.x{color:red}</style><div>季度报表</div>", ""),
+        "季度报表"
+    );
+    assert_eq!(preview_text("正常 <b>加粗</b> 文本", ""), "正常 加粗 文本");
+    // 乱码判定护栏：正常中文/西文/短文本不得误判
+    assert!(!looks_mojibake(good), "正常中文不误判");
+    assert!(!looks_mojibake("Réunion déjà prévue à l'été"), "西文重音不误判");
+    assert!(!looks_mojibake("中文"), "短文本不判乱码");
+    assert!(looks_mojibake("解码\u{FFFD}失败\u{FFFD}占位"));
+    // UTF-8 字节被按 latin1 逐字节显示（含 C1 控制字符）
+    let latin1_sample: String = good.bytes().map(|b| b as char).collect();
+    assert!(looks_mojibake(&latin1_sample), "latin1 误标乱码应命中");
+}
+
+/// 存量回填：乱码正文用同源 body_html 派生文本写回，FTS 分词同步重算；
+/// 正常正文不误改；marker 生效后二次调用不再扫表。
+#[test]
+fn repair_mojibake_bodies_rewrites_from_html_and_runs_once() {
+    let dir = std::env::temp_dir().join(format!("corpmail-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    let good = "会议纪要：请于本周五前提交季度报表与预算说明";
+    let (garbled, _, _) = encoding_rs::GB18030.decode(good.as_bytes());
+    let garbled = garbled.into_owned();
+    assert!(looks_mojibake(&garbled), "构造的存量乱码应被识别");
+    let insert = "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                      body_text, body_html, subject_tokens, body_tokens, unread, created_at)
+                  VALUES ('in','inbox','received','a@x.cn','b@x.cn','会议', ?1, ?2, '会 议', ?3, 0, 1)";
+    conn.execute(
+        insert,
+        rusqlite::params![garbled, format!("<p>{good}</p>"), "乱 码"],
+    )
+    .unwrap();
+    conn.execute(
+        insert,
+        rusqlite::params!["正常正文", "", "正 常"],
+    )
+    .unwrap();
+
+    repair_mojibake_bodies(&mut conn).unwrap();
+    let (bt, tokens): (String, String) = conn
+        .query_row(
+            "SELECT body_text, body_tokens FROM emails WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(bt, good, "乱码正文应被同源 HTML 派生文本替换");
+    assert_eq!(tokens, tokenize(good), "FTS 分词需同步重算");
+    let normal: String = conn
+        .query_row("SELECT body_text FROM emails WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(normal, "正常正文", "正常正文不得误改");
+
+    // marker：回填后即便再出现乱码，二次启动也不重复扫表（幂等收敛）
+    conn.execute(
+        "UPDATE emails SET body_text = ?1 WHERE id = 1",
+        [garbled.clone()],
+    )
+    .unwrap();
+    repair_mojibake_bodies(&mut conn).unwrap();
+    let after: String = conn
+        .query_row("SELECT body_text FROM emails WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, garbled, "marker 生效后不应二次改写");
+    drop(conn);
+    cleanup(&dir);
+}
+
+/// strip_html 跳过 script/style 内容与 HTML 注释：邮件模板的 CSS 不该进摘要
+#[test]
+fn strip_html_skips_hidden_blocks_and_comments() {
+    let raw = "<style>.x{color:red}</style><!-- outlook 条件注释 --><p>正常正文</p><script>var a=1;</script>";
+    assert_eq!(strip_html(raw), "正常正文");
+    assert_eq!(strip_html("<p>未闭合"), "未闭合", "未闭合标签后文本保留");
 }
 
 #[test]
@@ -394,6 +494,47 @@ fn save_draft_rejects_missing_id() {
         ..draft("s", "b")
     };
     assert!(save_draft(&state, &input).is_err());
+    cleanup(&dir);
+}
+
+/// 端到端钉死用户症状：DB 里 body_text 是历史乱码、body_html 正常时，
+/// 列表行 body_preview / preview_tip 必须与详情页同源（不迁移、不重收）。
+#[test]
+fn list_preview_uses_html_source_for_mojibake_rows() {
+    let (state, dir) = temp_state("list-mojibake");
+    let good = "会议纪要：请于本周五前提交季度报表与预算说明";
+    let (garbled, _, _) = encoding_rs::GB18030.decode(good.as_bytes());
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, body_html, subject_tokens, body_tokens, unread, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','b@x.cn','会议', ?1, ?2,
+                         '会 议', '乱 码', 0, 1)",
+                rusqlite::params![garbled.as_ref(), format!("<p>{good}</p>")],
+            )
+            .unwrap();
+        });
+    let (items, total) = list(
+        &state,
+        &ListQuery {
+            folder: "inbox".into(),
+            page: 1,
+            unread_only: false,
+            external_only: false,
+            internal_domain: "chinatelecom.cn".into(),
+            per: 10,
+            sort: SortKey::DateDesc,
+            from_filter: String::new(),
+            date_from: 0,
+            date_to: 0,
+            has_attach: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(items[0].body_preview, good, "列表预览不得显示乱码");
+    assert_eq!(items[0].preview_tip, good, "悬停预览同源");
     cleanup(&dir);
 }
 

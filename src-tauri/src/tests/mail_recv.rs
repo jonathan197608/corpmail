@@ -473,6 +473,24 @@ fn fix_mojibake_does_not_touch_normal_western_text() {
     assert_eq!(fix_mojibake(&mangled).as_deref(), Some("原文测试"));
 }
 
+/// 同一封邮件两个 part 声明不一致：text/plain 是不可逆乱码（修复链路救不回），
+/// text/html 正常。正文纯文本须改用 HTML 派生，避免 body_tokens/FTS/转发一起脏。
+#[test]
+fn extract_body_falls_back_to_html_when_plain_is_irreversibly_mojibake() {
+    let (mangled, _, _) = encoding_rs::GBK.decode("会议纪要：请查收附件中的季度报表".as_bytes());
+    let mangled = format!("{}\u{FFFD}乱码", mangled);
+    let raw = format!(
+        "Content-Type: multipart/alternative; boundary=B\r\n\r\n\
+         --B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{mangled}\r\n\
+         --B\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>正确的中文正文</p>\r\n\
+         --B--\r\n"
+    );
+    let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+    let (body, html) = extract_body(&mail);
+    assert_eq!(body.trim(), "正确的中文正文", "乱码纯文本应改用 HTML 派生");
+    assert!(html.as_deref().unwrap_or("").contains("正确的中文正文"));
+}
+
 #[test]
 fn extract_body_prefers_plain_and_falls_back_to_html() {
     let plain_mime = b"Content-Type: text/plain; charset=utf-8\r\n\r\nplain content";
