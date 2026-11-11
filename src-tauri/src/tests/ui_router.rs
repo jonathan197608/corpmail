@@ -8811,3 +8811,38 @@ fn wizard_setup_form_uses_two_column_layout() {
     }
     cleanup(&dir);
 }
+
+#[test]
+fn private_ip_check_rejects_v4_mapped_and_special_ranges() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(100, 100, 0, 1)),
+        // ::ffff:127.0.0.1 与 ::ffff:169.254.169.254 的 V6 is_loopback() 为 false
+        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
+        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xa9fe, 0xa9fe)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        assert!(is_private_ip(ip), "{ip} 应被拒绝");
+    }
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)),
+    ] {
+        assert!(!is_private_ip(ip), "{ip} 应放行");
+    }
+}
+
+#[test]
+fn proxy_image_accepts_bitmap_mimes_only() {
+    assert!(allowed_image_mime("image/png"));
+    assert!(allowed_image_mime("image/JPEG; charset=binary"));
+    assert!(allowed_image_mime("image/avif"));
+    assert!(!allowed_image_mime("image/svg+xml"), "SVG 可携带脚本");
+    assert!(!allowed_image_mime("text/html"));
+    assert!(!allowed_image_mime(""));
+}

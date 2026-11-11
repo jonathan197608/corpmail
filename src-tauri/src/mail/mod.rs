@@ -185,6 +185,7 @@ pub fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// 邮件 HTML 正文净化（XSS 防护）：白名单过滤，移除 script/iframe/object/embed/form、
@@ -718,10 +719,13 @@ fn clean_display_name(raw: &str) -> Option<String> {
 /// 口径（与 contacts::self_addr_conn 同源：发出邮件的 From 即本人）：
 /// 1. 只在 `folder='sent' AND direction='out'` 里取；本地已发送行的 from_name
 ///    来自配置本身（配置为空即为空），不会构成自我循环。
-/// 2. 目标地址优先取登录账号；账号在发件箱从未出现时退到出现最多的 From
-///    地址（覆盖别名/换过账号前缀），避免把代发或其他人的名字算进来。
-/// 3. 该地址下按 from_name 分组取出现次数最多者，并列取时间最新（用户改过
-///    姓名时以近期为准）；不合格候选顺延到下一组。
+/// 2. 目标地址必须是登录账号。账号在发件箱从未出现时返回 None——不退回
+///    「出现最多的 From 地址」，否则用户改账号前缀但沿用旧库时会把别人的
+///    姓名写成本账号显示名（审计 C3）。
+/// 3. 该地址下按 from_name 分组，**优先取时间最新**（用户改名后以近期邮件
+///    为准），同时间并列时取出现次数多者；不合格候选顺延到下一组。
+///    时间统一用 epoch 秒列（sent_at / created_at，out 行 received_at 恒 NULL），
+///    不混入自增主键 id。
 pub fn infer_display_name_conn(conn: &rusqlite::Connection, account: &str) -> Option<String> {
     let account = account.trim().to_ascii_lowercase();
     if account.is_empty() {
@@ -742,19 +746,18 @@ pub fn infer_display_name_conn(conn: &rusqlite::Connection, account: &str) -> Op
     if addrs.is_empty() {
         return None;
     }
-    let target = if addrs.iter().any(|(a, _)| a == &account) {
-        account
-    } else {
-        addrs[0].0.clone()
-    };
+    if !addrs.iter().any(|(a, _)| a == &account) {
+        return None;
+    }
+    let target = account;
     let names: Vec<String> = conn
         .prepare(
             "SELECT from_name FROM emails
               WHERE folder = 'sent' AND direction = 'out'
                 AND lower(trim(from_addr)) = ?1 AND trim(from_name) <> ''
               GROUP BY from_name
-              ORDER BY count(*) DESC,
-                       max(coalesce(sent_at, received_at, created_at, id)) DESC,
+              ORDER BY max(coalesce(sent_at, created_at)) DESC,
+                       count(*) DESC,
                        from_name ASC",
         )
         .ok()?
@@ -2171,27 +2174,25 @@ pub fn toggle_star(state: &AppState, id: i64) -> Option<bool> {
     flipped.unwrap_or(None)
 }
 
-/// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。返回是否生效
-///
-/// `seen_pending = 1` 与 `unread = 0` 同一语句写入：业务状态与"待回写"意向一起落盘，
-/// 进程被杀后标志仍在，重启由 worker 补发（旧实现每次点击 spawn 一个线程各登录一次，
-/// 连点 N 封 = N 次 IMAP 登录，企业服务器易限流）
-pub fn mark_read(state: &AppState, id: i64) -> bool {
+/// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。
+/// 返回是否发生翻转；写库失败以 Err 传播（不再 unwrap_or(false) 静默吞）。
+pub fn mark_read(state: &AppState, id: i64) -> Result<bool, String> {
     let flipped = state.with_conn(|conn| {
-        exec_one(
-            conn,
+        conn.execute(
             "UPDATE emails SET unread = 0,
                     seen_pending = CASE
                         WHEN direction = 'in' AND remote_uid IS NOT NULL THEN 1
                         ELSE seen_pending END
              WHERE id = ?1 AND unread = 1",
-            id,
+            [id],
         )
-    });
+        .map(|n| n == 1)
+        .map_err(|e| format!("标记已读失败：{e}"))
+    })?;
     if flipped {
         state.notify_seen();
     }
-    flipped
+    Ok(flipped)
 }
 
 /// 标为未读（A5 配套）：详情页主动留待办。只改本地 unread，
@@ -2210,7 +2211,15 @@ pub fn mark_unread(state: &AppState, id: i64) -> bool {
 
 /// 单行 CAS 更新：仅当恰好影响 1 行返回 true（0 行 = 条件不满足/重复提交，幂等）
 fn exec_one(conn: &rusqlite::Connection, sql: &str, id: i64) -> bool {
-    conn.execute(sql, [id]).map(|n| n == 1).unwrap_or(false)
+    match conn.execute(sql, [id]) {
+        Ok(n) => n == 1,
+        Err(e) => {
+            // SQLITE_BUSY 等写失败不得伪装成「条件不满足」，否则 UI 显示成功
+            // 但库里没变（db::open 已给 10s busy_timeout，走到这里属真故障）
+            eprintln!("[mail] 单行更新失败（id={id}）：{e}");
+            false
+        }
+    }
 }
 
 // ---------- 删除（§5.3 硬删：行 + FTS（触发器）+ 独立附件文件） ----------

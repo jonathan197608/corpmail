@@ -1153,7 +1153,11 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
 /// 旧实现每次点击 spawn 一个线程做完整 IMAP 登录，连点 N 封 = N 次登录（企业服务器
 /// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
 fn mark_read_and_sync_seen(state: &AppState, id: i64) {
-    mail::mark_read(state, id);
+    // GET 详情页/片段渲染路径不适合因本地已读写失败整页报错；失败必须可观测，
+    // 由 db::open 的 busy_timeout 兜住绝大多数瞬时冲突，走到这里属真故障
+    if let Err(e) = mail::mark_read(state, id) {
+        eprintln!("[ui] {e}");
+    }
     state.poke_tray(); // 本地未读数变化：刷托盘角标（M4-1；调度线程兑底兑漏）
 }
 
@@ -1651,8 +1655,10 @@ fn proxy_image(req: &Req) -> Resp {
         Err(_) => return proxy_error(502, "图片拉取失败"),
     };
     let ctype = resp.header("Content-Type").unwrap_or("").to_string();
-    if !ctype.starts_with("image/") {
-        return proxy_error(400, "目标不是图片");
+    // 只回传位图：image/svg+xml 可携带脚本，附件预览已排除，两处口径必须一致
+    // （审计 P1-28）
+    if !allowed_image_mime(&ctype) {
+        return proxy_error(400, "目标不是受支持的位图");
     }
     let mut body = Vec::new();
     if resp
@@ -1673,6 +1679,21 @@ fn proxy_image(req: &Req) -> Resp {
         body,
         extra_headers: Vec::new(),
     }
+}
+
+/// Content-Type 可能带 `; charset=...` 等参数：取 MIME 主体再比白名单。
+/// SVG 可执行脚本，明确排除（与附件预览 MIME 白名单同口径）。
+fn allowed_image_mime(ctype: &str) -> bool {
+    let mime = ctype
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/avif"
+    )
 }
 
 fn proxy_error(status: u16, msg: &str) -> Resp {
@@ -1716,19 +1737,31 @@ fn resolve_public_addrs(parsed: &url::Url) -> Result<Vec<SocketAddr>, &'static s
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
+            let o = v.octets();
             v.is_private()
                 || v.is_loopback()
                 || v.is_link_local()
                 || v.is_unspecified()
                 || v.is_broadcast()
-                || v.octets()[0] == 0
-                || (v.octets()[0] == 100 && (64..=127).contains(&v.octets()[1])) // 100.64/10
+                || o[0] == 0
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+                || (o[0] == 198 && matches!(o[1], 18 | 19)) // 198.18.0.0/15
         }
         IpAddr::V6(v) => {
+            let o = v.octets();
+            // IPv4-mapped（::ffff:127.0.0.1 / ::ffff:169.254.169.254 等）在 V6 分支
+            // 的 is_loopback() 是 false，必须解出 V4 再走完整检查（审计 P1-24）
+            if o[..10].iter().all(|&b| b == 0) && o[10] == 0xff && o[11] == 0xff {
+                return is_private_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            }
             v.is_loopback()
                 || v.is_unspecified()
                 || v.is_unique_local()
                 || v.is_unicast_link_local()
+                || v.is_multicast()
         }
     }
 }
@@ -1803,6 +1836,8 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
     // 首拉（发件箱优先）完成后：显示名留空时用历史已发送邮件的 From 补齐配置。
     // just_finished 由本片段消费后清除，故每轮只在完成时触发一次
     if s.just_finished && !s.running {
+        // 新到的发件箱邮件可能带来改名后的姓名，先放行推断失败的 60s 节流
+        state.invalidate_display_name_probe();
         let _ = state.display_name();
     }
     let d = defaults();

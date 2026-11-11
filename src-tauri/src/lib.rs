@@ -58,12 +58,25 @@ pub fn run() {
             let state = app.state::<state::AppState>();
             let assets = ui::EmbeddedAssets::new(app);
             let req = ui::Req::parse_from(&request);
-            // debug 构建打印协议层请求（GUI 无控制台时也可用 stderr 日志观察）
+            // debug 构建打印协议层请求（GUI 无控制台时也可用 stderr 日志观察）。
+            // 只打 method + path + 查询参数「键名」：query 值可能含搜索词、
+            // 第三方图片 URL、错误文案，不进日志（审计 P1-30）
             #[cfg(debug_assertions)]
-            eprintln!(
-                "[ui] {} {}?{} hx={}",
-                req.method, req.path, req.query, req.is_htmx_request
-            );
+            {
+                let keys: Vec<&str> = req
+                    .query
+                    .split('&')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.split('=').next().unwrap_or(""))
+                    .collect();
+                eprintln!(
+                    "[ui] {} {} [{}] hx={}",
+                    req.method,
+                    req.path,
+                    keys.join(","),
+                    req.is_htmx_request
+                );
+            }
             ui::to_http_response(ui::route(&state, &assets, &req, &ui::RealTester))
         })
         .setup(|app| {

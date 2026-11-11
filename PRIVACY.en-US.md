@@ -8,7 +8,7 @@ CorpMail ("this app") is a local-first business mail client. Our position on you
 
 - This app contains no server components operated by the developers.
 - Your mail is delivered directly by the mail servers you configure (SMTP for sending / IMAP for receiving). The app is only a protocol client talking to those servers.
-- Apart from your mail servers, the app sends data to no network endpoint.
+- Apart from your mail servers and the remote images in messages you open (item 3 below), the app sends data to no network endpoint.
 
 ## Data stays on your device
 
@@ -16,7 +16,7 @@ CorpMail ("this app") is a local-first business mail client. Our position on you
 |---|---|---|
 | Message bodies, attachments, search index | Local database (SQLite) and attachment directory | Held in a disk directory you choose; can be moved, cleaned or deleted in-app at any time |
 | Account configuration (servers, account name, display name) | Local config file | Contains only non-sensitive fields; never contains your password |
-| Account password / authorization code | Windows Credential Manager / macOS Keychain | System-level secure storage; if the system credential service is unavailable, falls back to a locally encrypted file (key kept in the local database) — never plaintext |
+| Account password / authorization code | Windows Credential Manager / macOS Keychain | System-level secure storage; if the system credential service is unavailable, falls back to an AES-256-GCM record in the local database, with the **decryption key kept in a separate `corpmail.key` file outside the database** (same directory as the config file, mode 0600) that is never moved with the data directory — never plaintext |
 
 ## No telemetry, no analytics
 
@@ -27,8 +27,9 @@ CorpMail ("this app") is a local-first business mail client. Our position on you
 
 1. **Sending (SMTP)**: delivering the messages you compose to your configured outbound server.
 2. **Receiving (IMAP)**: fetching mail from, and syncing read state back to, your configured inbound server.
+3. **Remote images** (only when you open a message that contains external images): `http(s)` images in the body are fetched by this app acting as a proxy, from **the image's own server**, and then handed to the page. Those servers belong to the sender or their content host, not to your mail provider; the request carries only the image URL — never your account, password, or message content.
 
-Both use only the server addresses and credentials you explicitly configure.
+The first two use only the server addresses and credentials you explicitly configure.
 
 ## Uninstalling and your data
 

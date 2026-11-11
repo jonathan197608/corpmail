@@ -430,6 +430,12 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     .to_vec();
     // 签名档随账号 tab 一并保存（多行文本，空 = 不启用）
     pairs.push((keys::SIGNATURE, signature.as_str()));
+    // 用户主动清空显示名 → 写标记阻止自动推断回填；重新填写 → 清标记。
+    // 自动推断本身不写此标记（审计 C2：避免错误结果被永久固化）
+    pairs.push((
+        keys::DISPLAY_NAME_AUTO,
+        if display.is_empty() { "1" } else { "" },
+    ));
     // 1) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
         return account_pane(state, false, &format!("保存失败：{e}"));

@@ -118,8 +118,17 @@ pub(crate) type NotifyHook = std::sync::Arc<dyn Fn(i64, i64) + Send + Sync>;
 /// 托盘角标刷新钩子类型（未读数变化后调用；测试环境 None 不触发）
 pub(crate) type TrayHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// 发件显示名推断的互斥与失败节流（审计 C4）。
+/// 一个 Mutex 同时承担「check-then-act 全程互斥」与「推断失败 60s 不再扫库」，
+/// 避免 8 个触发点并发各写一次 corpmail.toml。
+struct NameProbe {
+    last_miss: Option<std::time::Instant>,
+}
+
 pub struct AppState {
     db: Mutex<Connection>,
+    /// 显示名推断互斥 + 失败节流（收件完成时由 invalidate 主动放行）
+    name_probe: Mutex<NameProbe>,
     /// 应用数据目录（库/附件根；设置·存储页展示）。
     /// 首设向导选自定义目录时可会话内直切（见 switch_data_dir_first_run）；
     /// 后台线程（收件调度/清理器）并发读 → RwLock，读方一律走 data_dir()
@@ -252,6 +261,7 @@ impl AppState {
         }
         let state = Self {
             db: Mutex::new(conn),
+            name_probe: Mutex::new(NameProbe { last_miss: None }),
             data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
             anchor_dir: anchor_dir.to_path_buf(),
             config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
@@ -1087,14 +1097,12 @@ impl AppState {
     /// 用户本人姓名，是本地最可靠的依据。命中后写回配置，后续读取直接命中
     /// 内存镜像不再扫库。写回失败不阻断业务（下次读取重试）。
     ///
-    /// `display_name_auto` 记录曾自动推断过：用户此后在设置页主动清空显示名，
-    /// 尊重其选择，不再回填。
+    /// `display_name_auto` **只由设置·账号页「用户主动清空显示名」写入**（值 "1"）：
+    /// 自动推断本身不写标记，否则一次推断错误会被永久固化、改名后也不再重试（审计 C2）。
+    /// 推断失败按 60s 节流，收件完成后 `invalidate_display_name_probe()` 主动放行。
     pub fn display_name(&self) -> String {
-        if let Some(Some(v)) = self.get(keys::DISPLAY_NAME) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return v;
-            }
+        if let Some(v) = self.configured_display_name() {
+            return v;
         }
         if self
             .get(keys::DISPLAY_NAME_AUTO)
@@ -1107,20 +1115,59 @@ impl AppState {
         if !self.configured() {
             return String::new();
         }
+        // 启动、收件完成、5 处读取点共 8 个触发点：check-then-act 全程互斥，
+        // 锁序固定 name_probe → config → db（其他路径不取 name_probe，无环）
+        let mut probe = self.name_probe.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = self.configured_display_name() {
+            return v;
+        }
+        if probe
+            .last_miss
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+        {
+            return String::new();
+        }
         let d = defaults();
         let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
         let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
-        let Some(name) = self.with_conn(|c| crate::mail::infer_display_name_conn(c, &account))
-        else {
+        let name = self.with_conn(|c| {
+            // 库被显式标记为别的账号时不得取用其姓名。只读显式 STORE_OWNER
+            // 行，不用 store_owner_conn 的 From 众数推导：别名发件是正常场景，
+            // 众数推导会把本账号库误判成他属（实测 4 封别名 + 1 封本账号）。
+            // 无标记时靠「账号必须出现在 sent.from_addr」硬匹配兜底（审计 C3）。
+            let owner = crate::db::settings::get(c, keys::STORE_OWNER)
+                .ok()
+                .flatten();
+            if owner.as_deref().is_some_and(|o| {
+                !o.trim().eq_ignore_ascii_case(account.trim())
+            }) {
+                return None;
+            }
+            crate::mail::infer_display_name_conn(c, &account)
+        });
+        let Some(name) = name else {
+            probe.last_miss = Some(std::time::Instant::now());
             return String::new();
         };
-        if let Err(e) = self.set_batch(&[
-            (keys::DISPLAY_NAME, name.as_str()),
-            (keys::DISPLAY_NAME_AUTO, name.as_str()),
-        ]) {
+        // 只写 DISPLAY_NAME：标记专属于用户主动清空动作
+        if let Err(e) = self.set_batch(&[(keys::DISPLAY_NAME, name.as_str())]) {
             eprintln!("[display] 发件显示名自动推断写回失败（忽略）：{e}");
         }
+        probe.last_miss = None;
         name
+    }
+
+    fn configured_display_name(&self) -> Option<String> {
+        match self.get(keys::DISPLAY_NAME) {
+            Some(Some(v)) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        }
+    }
+
+    /// 收件完成后调用：清掉推断失败节流，让新到的发件箱邮件立即参与推断
+    pub fn invalidate_display_name_probe(&self) {
+        let mut probe = self.name_probe.lock().unwrap_or_else(|e| e.into_inner());
+        probe.last_miss = None;
     }
 
     /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 corpmail.toml
@@ -1301,8 +1348,16 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
     let probe = dest_path.join(".corpmail-write-probe");
+    // 上次进程在清理前被杀可能残留探针：先自愈清理，失败不得静默
+    if probe.exists()
+        && let Err(e) = std::fs::remove_file(&probe)
+    {
+        eprintln!("[state] 残留写入探针清理失败（{}）：{e}", probe.display());
+    }
     std::fs::write(&probe, b"ok").map_err(|e| format!("目标目录不可写：{e}"))?;
-    let _ = std::fs::remove_file(&probe);
+    if let Err(e) = std::fs::remove_file(&probe) {
+        eprintln!("[state] 写入探针清理失败（{}）：{e}", probe.display());
+    }
     Ok(dest_path)
 }
 

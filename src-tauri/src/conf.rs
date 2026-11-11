@@ -8,6 +8,7 @@
 //! 文件缺失/为空即未配置状态（重新走向导）。
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 
 /// 配置键值表（BTreeMap：文件与内存镜像同构，序列化按键排序稳定）
@@ -80,8 +81,14 @@ pub fn save(anchor: &Path, cfg: &BTreeMap<String, String>) -> Result<(), String>
     text.push_str(&body);
     std::fs::create_dir_all(anchor).map_err(|e| format!("配置目录不可创建：{e}"))?;
     let path = anchor.join(CONFIG_FILE);
-    let tmp = anchor.join(format!("{CONFIG_FILE}.tmp"));
-    std::fs::write(&tmp, text).map_err(|e| format!("配置写入失败：{e}"))?;
+    // tmp 带 pid：并发写或多进程残留时不会互相覆盖；rename 前 sync_all 保证
+    // 掉电时不留空文件（审计 P2-5 / P1-48）
+    let tmp = anchor.join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()));
+    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("配置临时文件创建失败：{e}"))?;
+    f.write_all(text.as_bytes())
+        .map_err(|e| format!("配置写入失败：{e}"))?;
+    f.sync_all().map_err(|e| format!("配置刷盘失败：{e}"))?;
+    drop(f);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         // rename 失败（目标被占用等）：清掉临时残片，下次重试从干净状态开始
         let _ = std::fs::remove_file(&tmp);

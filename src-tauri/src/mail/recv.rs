@@ -1272,8 +1272,8 @@ pub fn store_incoming_conn(
 /// 同步语义版（单测验证回写参数）；生产路径见 seen worker（mail::seen）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn mark_seen(state: &AppState, fetcher: &dyn MailFetcher, id: i64) -> Result<(), String> {
-    // 本地置已读（幂等；无 remote_uid 时仅本地）
-    mark_read(state, id);
+    // 本地置已读（幂等；无 remote_uid 时仅本地）；写库失败直接返回，不静默继续
+    mark_read(state, id)?;
     let Some(p) = seen_params_of(state, id) else {
         return Ok(()); // 本地邮件（草稿/已发送）或凭据缺失：仅本地已读
     };

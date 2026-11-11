@@ -14,6 +14,10 @@ use std::path::Path;
 /// 幂等：`user_version` 标记 schema 版本，未升级则跳过 DDL。
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(db_path)?;
+    // 多连接并发写同一 WAL 库（主连接 + 发送 worker + 每轮收件 + 通知钩子）。
+    // 默认 busy_timeout=0 时写冲突立即返回 SQLITE_BUSY，且上层多处 unwrap_or(false)
+    // 会把它当成「条件不满足」静默吞掉；统一给 SQLite 10s 自旋等待窗口。
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;

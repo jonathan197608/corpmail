@@ -60,3 +60,28 @@ fn corrupt_config_is_backed_up() {
     assert_eq!(text, "not [ valid toml ===", "备份应是原文");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn save_uses_pid_scoped_tmp_and_does_not_touch_legacy_stub() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join(format!("{CONFIG_FILE}.tmp"));
+    std::fs::write(&legacy, b"legacy").unwrap();
+    let mut cfg = BTreeMap::new();
+    cfg.insert(keys::DISPLAY_NAME.to_string(), "张三".to_string());
+    save(&dir, &cfg).unwrap();
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        b"legacy",
+        "pid 命名的 tmp 不应覆盖旧固定名残留"
+    );
+    assert!(
+        !dir
+            .join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()))
+            .exists(),
+        "rename 成功后临时文件必须消失"
+    );
+    assert_eq!(load(&dir).get(keys::DISPLAY_NAME).map(String::as_str), Some("张三"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

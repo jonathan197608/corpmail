@@ -1569,6 +1569,11 @@ form.setup-card .adv .sfield:last-child {
     margin-bottom: 12px;
 }
 
+/* 黄条全部隐藏时容器不能再占位（grid + margin-bottom 会留 12px 空档） */
+.setup-alerts[hidden] {
+    display: none;
+}
+
 form.setup-card .ct-guide {
     margin: 0;
     padding: 7px 11px;
@@ -1600,7 +1605,8 @@ form.setup-card .setup-actions {
     margin-top: 10px;
 }
 
-@media (max-width: 820px) {
+/* 窄窗口退回单列，与账号设置页断点保持 900px 一致 */
+@media (max-width: 900px) {
     .setup-grid {
         grid-template-columns: 1fr;
     }

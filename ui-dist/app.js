@@ -78,9 +78,11 @@ document.body.addEventListener('htmx:confirm', function (evt) {
     if (boot) boot.remove();
 })();
 
+// 属性值可能用单引号包裹，' 必须一起转义（只转 " 时 ' onmouseover=… 可逃逸）
 function escapeHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
 }
 
 // ---------- 撰写页：待保存附件（dialog 选路径，存草稿时随表单提交） ----------
@@ -1956,6 +1958,10 @@ document.body.addEventListener('htmx:afterSwap', function () { mbxTplInitAll(doc
         form.querySelectorAll('.ct-guide').forEach(function (el) {
             el.hidden = !on;
         });
+        // 两条黄条全隐藏后容器仍占 gap+margin（12px 空白）。容器本身一并
+        // 隐藏，否则改成非集团域名时标题上方留一道空档。
+        var box = form.querySelector('.setup-alerts');
+        if (box) box.hidden = !on;
     }
 
     // input 事件覆盖键入/粘贴/撤销/浏览器自动填充；事件委托挂 body

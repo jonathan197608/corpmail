@@ -25,10 +25,16 @@ BIN="${TARGET}/bin"
 NSIS_VERSION="3.13"
 # SourceForge 302 重定向下载
 SRC_URL="https://downloads.sourceforge.net/project/nsis/NSIS%203/${NSIS_VERSION}/nsis-${NSIS_VERSION}-src.tar.bz2"
+# 源码包 sha256（2026-11-11 取自上述 URL 的实测值）。编译产物进签名安装包，
+# 下载必须校验：不校验等于把供应链交给 TLS 之外的一切中间环节。
+# 升级 NSIS_VERSION 时必须同步更新此值。
+NSIS_SHA256="a8ffe024602d46b6d766f9e1ce30c324ad2a24daeacd3efc2642d436a0c157ac"
 
 if [ "${1:-}" = "--force" ]; then
-    echo "[patched-nsis] --force：删除现有工具链 ${TARGET}"
-    rm -rf "${TARGET}"
+    # 只删构建产物，不整目录 rm -rf：TARGET 可能与用户数据/软链共享父目录，
+    # 递归删除越界代价过高。数据目录（share/nsis）由第 5 步覆盖写入。
+    echo "[patched-nsis] --force：删除现有 makensis 产物后重建"
+    rm -f "${BIN}/makensis" "${BIN}/makensis.bin"
 fi
 if [ -x "${BIN}/makensis" ] && [ -x "${BIN}/makensis.bin" ]; then
     echo "[patched-nsis] 工具链已存在且可用：${BIN}/makensis（跳过；--force 重建）"
@@ -42,7 +48,15 @@ mkdir -p "${BIN}"
 WORK="$(mktemp -d /tmp/nsis-build.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 echo "[patched-nsis] 下载 NSIS ${NSIS_VERSION} 源码：${SRC_URL}"
-curl -sL --max-time 120 -o "${WORK}/nsis-src.tar.bz2" "${SRC_URL}"
+curl -fsSL --max-time 120 -o "${WORK}/nsis-src.tar.bz2" "${SRC_URL}"
+ACTUAL_SHA256="$(shasum -a 256 "${WORK}/nsis-src.tar.bz2" | awk '{print $1}')"
+if [ "${ACTUAL_SHA256}" != "${NSIS_SHA256}" ]; then
+    echo "[patched-nsis] 源码包 sha256 校验失败，已中止" >&2
+    echo "  期望：${NSIS_SHA256}" >&2
+    echo "  实际：${ACTUAL_SHA256}" >&2
+    exit 1
+fi
+echo "[patched-nsis] sha256 校验通过"
 tar xjf "${WORK}/nsis-src.tar.bz2" -C "${WORK}"
 SRC="${WORK}/nsis-${NSIS_VERSION}-src"
 
@@ -117,7 +131,8 @@ SectionEnd
 EOF
 if ! "${BIN}/makensis" "${PROBE}" >/dev/null 2>&1; then
     echo "[patched-nsis] 自检失败：patched makensis 仍崩？" >&2
-    rm -rf "${TARGET}"
+    # 只清掉不可用的产物（下次运行会重新编译），不整目录删
+    rm -f "${BIN}/makensis" "${BIN}/makensis.bin"
     exit 1
 fi
 echo "[patched-nsis] 自检通过：${BIN}/makensis（可编译中文安装脚本）"

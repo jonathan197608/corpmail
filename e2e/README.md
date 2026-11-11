@@ -31,7 +31,7 @@ macOS 上的 Tauri GUI 自动化只有一条正路，原因是硬限制：
 L4 视觉回归（可选）  截图基线 + 像素/SSIM 阈值，防「功能对但样式崩」
 L3 原生外壳层        scripts/e2e-shell-macos.sh：窗口存在、Cmd+W 隐藏、进程常驻、窗口截图
 L2 GUI 功能层（主体）e2e/specs/*.spec.mjs：真实 app + 真实 WKWebView + mock 邮件服务器
-L1 单元/集成层       cargo test --lib（158 项，已有，覆盖路由/解析/游标/凭据）
+L1 单元/集成层       cargo test --lib（346 项，覆盖路由/解析/游标/凭据）
 ```
 
 要点：L2 跑的是**打包前的真二进制**（`target/debug/corpmail`），不是浏览器里的 HTML
@@ -241,7 +241,7 @@ scripts/e2e-shell-macos.sh
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0（已完成） | 构建 feature、隔离环境、mock 服务器、L2 全量用例（00–07 共 51 个 it） | `e2e/run.sh` 全绿，截图 ≈60 张 |
+| P0（已完成） | 构建 feature、隔离环境、mock 服务器、L2 全量用例（00–07 共 70 个 it，加 90 失败链路 5 个、阶段二 3 个，合计 78） | `e2e/run.sh` 全绿，截图 ≈97 张 |
 | P1 | 跑全量修选择器偏差（批量/模板/迁移的 DOM 细节以实测为准） | 全量 spec 通过 |
 | P2 | L3 外壳层接入 CI、L4 视觉基线（pixelmatch 阈值 0.1%） | 关键页截图 diff 稳定 |
 | P3 | GitHub Actions `macos-14` 跑全量（app 需 GUI 会话，先验证 runner 能力） | 每次 push 出截图 artifact |

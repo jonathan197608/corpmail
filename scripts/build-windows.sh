@@ -56,18 +56,9 @@ fi
 #    target triple 调度——这是官方交叉打包的通道。
 #    gnu 目标下 tauri-build 自动拷 WebView2Loader.dll 到产物目录，bundler 自动装入安装包。
 #
-#    SignPath 云签名（设计 §11.2）：检测到凭据才注入 bundle.windows.signCommand，
-#    使签名仅发生在正式发版构建（本地无凭据自动跳过，无需改配置）。
-#    签名点共 4 类：主程序 exe / NSIS 插件 dll / 内嵌卸载器（NSIS 编译期钩子）/ 最终安装器。
-if [ -n "${SIGNPATH_API_TOKEN:-}" ] && [ -n "${SIGNPATH_ORGANIZATION_ID:-}" ]; then
-    SIGN_SCRIPT="${ROOT}/scripts/sign-signpath.sh"
-    [ -x "${SIGN_SCRIPT}" ] || chmod +x "${SIGN_SCRIPT}"
-    echo "[build-windows] SignPath 签名已启用：${SIGN_SCRIPT}（project=${SIGNPATH_PROJECT_SLUG:-?} policy=${SIGNPATH_POLICY_SLUG:-?}）"
-    CONFIG_JSON=$(printf '{"bundle":{"targets":["nsis"],"windows":{"signCommand":{"cmd":"%s","args":["%%1"]}}}}' "${SIGN_SCRIPT}")
-else
-    echo "[build-windows] 未检测到 SIGNPATH_API_TOKEN/SIGNPATH_ORGANIZATION_ID，本构建不签名（正式发版凭据见 scripts/sign-signpath.sh 头注释）"
-    CONFIG_JSON='{"bundle":{"targets":["nsis"]}}'
-fi
+#    产物**不签名**：云签名（SignPath）路线已废弃并移除。商店渠道由 Microsoft 签名，
+#    直发 NSIS 安装器为未签名包，首次运行会触发 SmartScreen 提示。
+CONFIG_JSON='{"bundle":{"targets":["nsis"]}}'
 
 cargo tauri build --target x86_64-pc-windows-gnu \
     --config "$CONFIG_JSON" "$@"

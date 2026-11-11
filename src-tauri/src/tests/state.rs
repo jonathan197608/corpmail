@@ -791,7 +791,13 @@ fn move_data_dir_rollback_spares_preexisting_files() {
     std::fs::create_dir_all(&dest).unwrap();
     std::fs::write(dest.join("notes.txt"), b"keep-me").unwrap();
     // 让配置写入必然失败：原子保存的临时文件路径被同名目录占位
-    std::fs::create_dir_all(anchor.join(format!("{}.tmp", crate::conf::CONFIG_FILE))).unwrap();
+    // （tmp 名带 pid，见 conf::save，故按同格式构造）
+    std::fs::create_dir_all(anchor.join(format!(
+        "{}.{}.tmp",
+        crate::conf::CONFIG_FILE,
+        std::process::id()
+    )))
+    .unwrap();
 
     let err = state.move_data_dir(dest.to_str().unwrap()).unwrap_err();
     assert!(
@@ -1117,14 +1123,14 @@ fn settings_rows(s: &AppState) -> i64 {
 }
 
 #[test]
-fn display_name_inferred_from_sent_and_persisted() {
+fn display_name_prefers_latest_sent_name_and_writes_no_marker() {
     let dir = temp_dir("display-infer");
     let s = configured_state(&dir, "");
     s.with_conn(|c| {
         insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100);
         insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 200);
         insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 300);
-        // 少数派（改名/异常件）不得压过众数
+        // 改名后发出的邮件时间最新：应取新名，不因旧名出现 3 次被压过
         insert_sent_mail(c, "demo@chinatelecom.cn", "张小伟", 400);
         // 收件箱里"对方显示名"绝不能参与推断
         c.execute(
@@ -1138,18 +1144,20 @@ fn display_name_inferred_from_sent_and_persisted() {
         .unwrap();
     });
     let before = settings_rows(&s);
-    assert_eq!(s.display_name(), "张伟");
+    assert_eq!(s.display_name(), "张小伟", "用户改名后以时间最新的发件为准");
     // 写回 corpmail.toml（配置唯一持久源），且重复读取稳定
     let cfg = load(&dir);
     assert_eq!(
         cfg.get(keys::DISPLAY_NAME).map(String::as_str),
-        Some("张伟")
+        Some("张小伟")
     );
+    // 自动推断不写标记：标记只属于「用户主动清空」，否则错误结果会被永久固化
     assert_eq!(
-        cfg.get(keys::DISPLAY_NAME_AUTO).map(String::as_str),
-        Some("张伟")
+        cfg.get(keys::DISPLAY_NAME_AUTO),
+        None,
+        "自动推断不得写 display_name_auto"
     );
-    assert_eq!(s.display_name(), "张伟");
+    assert_eq!(s.display_name(), "张小伟");
     // 不得写 settings 表：store_is_empty() 以其行数判定首设空库
     assert_eq!(settings_rows(&s), before, "自动推断不得污染 settings 表");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1175,13 +1183,40 @@ fn display_name_not_refilled_after_user_clears() {
     let s = configured_state(&dir, "");
     s.with_conn(|c| insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100));
     assert_eq!(s.display_name(), "张伟", "前置：先自动推断成功");
-    // 模拟设置·账号页用户主动清空显示名
-    s.set_batch(&[(keys::DISPLAY_NAME, "")]).unwrap();
+    // 与设置·账号页 settings_account_save 同口径：清空名字时写入防回填标记
+    s.set_batch(&[(keys::DISPLAY_NAME, ""), (keys::DISPLAY_NAME_AUTO, "1")])
+        .unwrap();
     assert_eq!(s.display_name(), "", "主动清空后不得被自动回填");
     assert_eq!(
         load(&dir).get(keys::DISPLAY_NAME).map(String::as_str),
         Some("")
     );
+    assert_eq!(
+        load(&dir).get(keys::DISPLAY_NAME_AUTO).map(String::as_str),
+        Some("1")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_name_reinfers_after_user_refills_and_clears_marker() {
+    // 错误推断不被永久固化：用户重新填写名字会清标记，此后清空名字可重新推断
+    let dir = temp_dir("display-reinfer");
+    let s = configured_state(&dir, "");
+    s.with_conn(|c| insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100));
+    assert_eq!(s.display_name(), "张伟");
+    s.set_batch(&[(keys::DISPLAY_NAME, "李雷"), (keys::DISPLAY_NAME_AUTO, "")])
+        .unwrap();
+    assert_eq!(
+        load(&dir).get(keys::DISPLAY_NAME_AUTO).map(String::as_str),
+        Some(""),
+        "重新填写名字后应清掉防回填标记"
+    );
+    s.set_batch(&[(keys::DISPLAY_NAME, "")]).unwrap();
+    s.invalidate_display_name_probe();
+    // 新到的发件箱邮件带改名后的姓名，重新推断应立即生效
+    s.with_conn(|c| insert_sent_mail(c, "demo@chinatelecom.cn", "王芳", 900));
+    assert_eq!(s.display_name(), "王芳", "标记清空后应重新取最新姓名");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1206,7 +1241,7 @@ fn display_name_skips_invalid_candidates_and_breaks_ties_by_time() {
 }
 
 #[test]
-fn display_name_prefers_login_account_and_falls_back_to_alias() {
+fn display_name_prefers_login_account_and_rejects_foreign_senders() {
     let dir = temp_dir("display-alias");
     let s = configured_state(&dir, "");
     s.with_conn(|c| {
@@ -1228,8 +1263,13 @@ fn display_name_prefers_login_account_and_falls_back_to_alias() {
     });
     assert_eq!(
         s2.display_name(),
-        "别名君",
-        "登录账号从未出现时退到发件箱出现最多的 From 地址"
+        "",
+        "登录账号从未出现时不得退到 From 众数（防止换账号前缀后污染）"
+    );
+    assert_eq!(
+        load(&dir2).get(keys::DISPLAY_NAME).map(String::as_str),
+        Some(""),
+        "拒绝推断时不得写入任何显示名"
     );
     let _ = std::fs::remove_dir_all(&dir2);
 }

@@ -593,3 +593,30 @@ fn migrate_v9_to_v10_adds_raw_headers_and_templates() {
         .unwrap();
     assert_eq!(tbl, 1, "新库应直接含 templates 表");
 }
+
+#[test]
+fn open_sets_busy_timeout_on_every_connection() {
+    let dir = std::env::temp_dir().join(format!("mbx-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("corpmail.db");
+    let mut a = open(&path).unwrap();
+    let ms: i64 = a
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ms, 10_000, "所有经 db::open 的连接都要有 10s 等锁窗口");
+    // A 持写事务时 B 的写入应等待，而不是立即 SQLITE_BUSY 被上层吞掉
+    let b = open(&path).unwrap();
+    a.execute("CREATE TABLE IF NOT EXISTS t(x)", []).unwrap();
+    let tx = a.transaction().unwrap();
+    tx.execute("INSERT INTO t VALUES (1)", []).unwrap();
+    let writer = std::thread::spawn(move || b.execute("INSERT INTO t VALUES (2)", []).map(|_| ()));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    tx.commit().unwrap();
+    assert!(
+        writer.join().unwrap().is_ok(),
+        "BUSY 应在 busy_timeout 窗口内等待到锁释放"
+    );
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
+}

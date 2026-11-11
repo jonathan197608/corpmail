@@ -152,7 +152,7 @@ fn pending_count(state: &AppState) -> i64 {
 fn flush_batches_all_pending_into_single_call() {
     let (state, dir, ids) = fixture("batch", &[(42, 1), (42, 2), (42, 3)]);
     for id in &ids {
-        assert!(mark_read(&state, *id), "首次置已读应生效");
+        assert!(mark_read(&state, *id).unwrap(), "首次置已读应生效");
     }
     assert_eq!(pending_count(&state), 3, "本地已读应同时置待回写标志");
 
@@ -182,7 +182,7 @@ fn flush_batches_all_pending_into_single_call() {
 #[test]
 fn flush_keeps_flag_on_transient_failure() {
     let (state, dir, ids) = fixture("fail", &[(42, 7)]);
-    mark_read(&state, ids[0]);
+    mark_read(&state, ids[0]).unwrap();
     let fetcher = FakeFetcher::failing("回写已读失败：连接中断");
     let err = flush(&state, &fetcher).unwrap_err();
     assert!(err.contains("连接中断"), "{err}");
@@ -195,7 +195,7 @@ fn flush_keeps_flag_on_transient_failure() {
 #[test]
 fn flush_clears_flag_on_uidvalidity_change() {
     let (state, dir, ids) = fixture("uv", &[(42, 9)]);
-    mark_read(&state, ids[0]);
+    mark_read(&state, ids[0]).unwrap();
     let fetcher = FakeFetcher::failing(&format!(
         "{}，跳过回写（下次收件自动对齐）",
         ERR_UIDVALIDITY_CHANGED
@@ -212,7 +212,7 @@ fn flush_clears_flag_on_uidvalidity_change() {
 fn flush_groups_by_uidvalidity() {
     let (state, dir, ids) = fixture("group", &[(42, 1), (43, 1)]);
     for id in &ids {
-        mark_read(&state, *id);
+        mark_read(&state, *id).unwrap();
     }
     let fetcher = FakeFetcher::ok();
     assert_eq!(flush(&state, &fetcher).unwrap(), 2);
@@ -240,7 +240,7 @@ fn flush_noop_when_nothing_pending() {
 fn abandon_clears_all_pending() {
     let (state, dir, ids) = fixture("abandon", &[(42, 1), (42, 2)]);
     for id in &ids {
-        mark_read(&state, *id);
+        mark_read(&state, *id).unwrap();
     }
     assert_eq!(pending_count(&state), 2);
     abandon(&state);
@@ -280,7 +280,7 @@ fn local_mail_never_pends() {
         },
     )
     .unwrap();
-    mark_read(&state, id); // 草稿 unread=0：本来就不翻转
+    mark_read(&state, id).unwrap(); // 草稿 unread=0：本来就不翻转
     assert_eq!(pending_count(&state), 0);
     cleanup(&dir);
 }
@@ -321,7 +321,7 @@ fn malformed_remote_uid_rows_are_cleared_not_stuck() {
         })
         .unwrap()
     });
-    assert!(mark_read(&state, valid_id), "正常行应置为待回写");
+    assert!(mark_read(&state, valid_id).unwrap(), "正常行应置为待回写");
 
     let fetcher = FakeFetcher::ok();
     assert_eq!(flush(&state, &fetcher).unwrap(), 1, "只有正常行计入回写");

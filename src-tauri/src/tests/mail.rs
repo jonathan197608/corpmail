@@ -642,9 +642,9 @@ fn get_returns_detail_and_mark_read_clears_flag() {
     });
     let in_id = id + 1;
     assert!(get(&state, in_id).unwrap().unread);
-    assert!(mark_read(&state, in_id));
+    assert!(mark_read(&state, in_id).unwrap());
     assert!(!get(&state, in_id).unwrap().unread);
-    assert!(!mark_read(&state, in_id), "重复标记应无效果");
+    assert!(!mark_read(&state, in_id).unwrap(), "重复标记应无效果");
     assert!(get(&state, 404).is_none());
     cleanup(&dir);
 }
@@ -1510,4 +1510,13 @@ fn safe_filename_strips_control_chars_and_bounds_length() {
     assert!(got.chars().all(|c| c == '长'));
     // 空输入 → attachment
     assert_eq!(safe_filename(""), "attachment");
+}
+
+#[test]
+fn html_escape_also_escapes_single_quote() {
+    // 单引号属性上下文（如 hx-vals='...'）不能只靠 autoescape 二次转义
+    assert_eq!(
+        html_escape("<a href='x'>&\"</a>"),
+        "&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;"
+    );
 }

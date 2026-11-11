@@ -101,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
 
 - 认证通过默认即发布（也可选手动发布）
 - 发布后动作：
-  1. README 加商店徽章与链接（`https://apps.microsoft.com/detail/9NXXXXXXXX`）
+  1. README 加商店徽章与链接（`https://apps.microsoft.com/detail/<Store ID>`，Store ID 在 Partner Center 的产品页查看后替换此处，未上架前不写死）
   2. store-assets/msix/README.md 记录 Store ID
   3. 后续版本走同链路：bump 版本 → NSIS → MSIX → 提交（版本号必须递增）
 
