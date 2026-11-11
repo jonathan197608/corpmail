@@ -21,6 +21,63 @@ var MBX_IC = (function () {
     };
 })();
 
+// ---------- 模态焦点陷阱（审计 R51 / R80） ----------
+// WKWebView 不支持 <dialog> 的 top layer 与模态语义，页面内模态只能自己兜：
+// 打开时把 body 其余子节点设为 inert（不可点、不可 Tab 进、读屏跳过），
+// Tab/Shift+Tab 在模态内首尾回绕，关闭后解除并归还焦点。
+//   root  —— body 级容器（inert 时跳过它自己）
+//   scope —— 焦点循环范围（默认同 root；预览模态的遮罩不可聚焦，传面板）
+// 返回幂等的 release()，关闭路径调用一次即可。
+function mbxModalOpen(root, scope) {
+    if (!root || root.dataset.mbxTrap === '1') return function () {};
+    root.dataset.mbxTrap = '1';
+    scope = scope || root;
+    var prev = document.activeElement;
+    var bg = [];
+    Array.prototype.forEach.call(document.body.children, function (el) {
+        if (el === root) return;
+        if (el.hasAttribute('inert')) return;
+        el.setAttribute('inert', '');
+        bg.push(el);
+    });
+    var sel = 'a[href], button:not([disabled]), input:not([disabled]),'
+        + ' select:not([disabled]), textarea:not([disabled]), iframe,'
+        + ' [tabindex]:not([tabindex="-1"])';
+    function focusables() {
+        return Array.prototype.filter.call(scope.querySelectorAll(sel), function (el) {
+            return el.offsetWidth > 0 || el.offsetHeight > 0;
+        });
+    }
+    function onKey(ev) {
+        if (ev.key !== 'Tab') return;
+        var f = focusables();
+        if (!f.length) { ev.preventDefault(); scope.focus(); return; }
+        var first = f[0], last = f[f.length - 1];
+        if (ev.shiftKey && (document.activeElement === first || document.activeElement === scope)) {
+            ev.preventDefault();
+            last.focus();
+        } else if (!ev.shiftKey && document.activeElement === last) {
+            ev.preventDefault();
+            first.focus();
+        }
+    }
+    scope.addEventListener('keydown', onKey);
+    if (!scope.hasAttribute('tabindex')) scope.setAttribute('tabindex', '-1');
+    var f0 = focusables();
+    (f0.length ? f0[0] : scope).focus();
+    var released = false;
+    return function release() {
+        if (released) return;
+        released = true;
+        delete root.dataset.mbxTrap;
+        scope.removeEventListener('keydown', onKey);
+        bg.forEach(function (el) { el.removeAttribute('inert'); });
+        if (prev && typeof prev.focus === 'function') {
+            try { prev.focus(); } catch (e) { /* 元素已移除：忽略 */ }
+        }
+    };
+}
+
 // 通用离开确认模态：Tauri 的 macOS WKWebView（wry）未实现 JS confirm 的 UI 代理，
 // window.confirm 只会返回 false 且不弹窗，故改用页面内模态（跨平台一致）。
 // message 支持换行（CSS white-space: pre-line）；onLeave 在用户点确认按钮时调用。
@@ -41,7 +98,13 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
     mask.querySelector('[data-leave-cancel]').textContent = cancelLabel || '继续编辑';
     mask.querySelector('[data-leave-ok]').textContent = okLabel || '放弃并离开';
     document.body.appendChild(mask);
-    function close() { if (mask.parentNode) mask.remove(); }
+    // 焦点陷阱 + 背景 inert（R51/R80）：Tab 只在两个按钮间循环，
+    // 焦点回到打开模态前的元素（通常是触发删除的那个按钮）
+    var release = mbxModalOpen(mask);
+    function close() {
+        release();
+        if (mask.parentNode) mask.remove();
+    }
     mask.addEventListener('click', function (ev) {
         if (ev.target === mask) { close(); return; } // 点遮罩 = 取消
         if (ev.target.closest('[data-leave-cancel]')) { close(); return; }
@@ -51,8 +114,6 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
     mask.addEventListener('keydown', function (ev) {
         if (ev.key === 'Escape') { ev.stopPropagation(); close(); }
     });
-    var ok = mask.querySelector('[data-leave-ok]');
-    if (ok) ok.focus();
 }
 
 // htmx 2.0.6 的 hx-confirm 硬编码调用 window.confirm（不读 htmx.config.confirm）
@@ -116,7 +177,7 @@ function renderPicked() {
         const name = p.split(/[\\/]/).pop();
         return `<li class="att-row picked"><span class="att-clip">${MBX_IC.clip}</span>` +
                `<span class="att-name">${escapeHtml(name)}</span>` +
-               `<button type="button" class="btn small" onclick="mbxRemovePicked(${i})">移除</button></li>`;
+               `<button type="button" class="btn small" data-mbx-action="remove-picked" data-i="${i}">移除</button></li>`;
     }).join('');
 }
 
@@ -294,6 +355,7 @@ function mbxPreviewAttachment(url, kind, name) {
             body.textContent = '预览组件未加载，请重启应用后重试。';
         }
         modal.hidden = false;
+        mbxPreviewTrap(modal);
         return;
     }
     if (kind === 'img') {
@@ -326,11 +388,22 @@ function mbxPreviewAttachment(url, kind, name) {
         body.appendChild(tip);
     }
     modal.hidden = false;
+    mbxPreviewTrap(modal);
+}
+
+// 预览模态的焦点陷阱（R51/R80）：只在面板内循环（遮罩不可聚焦），
+// 关闭时由 mbxClosePreview 释放，焦点回到打开前的元素
+function mbxPreviewTrap(modal) {
+    var panel = modal.querySelector('.pm-panel');
+    if (!panel) return;
+    if (modal.dataset.mbxTrap === '1') return; // 已开着：不重复加
+    modal.__mbxRelease = mbxModalOpen(modal, panel);
 }
 
 function mbxClosePreview() {
     const modal = document.getElementById('preview-modal');
     if (!modal) return;
+    if (modal.__mbxRelease) { modal.__mbxRelease(); modal.__mbxRelease = null; }
     if (window.mbxOfficeReset) window.mbxOfficeReset();
     modal.hidden = true;
     const body = document.getElementById('pm-body');
@@ -341,6 +414,48 @@ function mbxClosePreview() {
 document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') mbxClosePreview();
 });
+
+// ---------- data-mbx-action 委托（审计 R7：CSP 落地前置） ----------
+// CSP `script-src 'self'` 会把模板里的 on* 属性整体拦掉（含 JS 用 innerHTML
+// 拼出来的），所以属性事件全部改为声明式 data-mbx-action + data-* 参数，
+// 在这里统一分发。参数一律取自 data-*（HTML 自动转义），不再把用户可影响的
+// 字符串拼进脚本上下文。
+document.addEventListener('click', function (ev) {
+    var el = ev.target.closest('[data-mbx-action]');
+    if (!el) return;
+    var act = el.getAttribute('data-mbx-action');
+    var d = el.dataset;
+    switch (act) {
+        case 'close-preview': mbxClosePreview(); break;
+        case 'upgrade-html': mbxUpgradeHtml(); break;
+        case 'pick-attachments': mbxPickAttachments(); break;
+        case 'remove-picked': mbxRemovePicked(Number(d.i)); break;
+        case 'remove-kept': mbxRemoveKept(Number(d.id), el); break;
+        case 'preview-attachment': mbxPreviewAttachment(d.url, d.kind, d.name); break;
+        case 'export-eml': mbxExportEml(Number(d.id), d.name); break;
+        case 'export-md': mbxExportMd(Number(d.id), d.name); break;
+        case 'print-email': mbxPrintEmail(); break;
+        case 'save-all-attachments': mbxSaveAllAttachments(Number(d.id)); break;
+        case 'save-attachment': mbxSaveAttachment(Number(d.id), Number(d.aid), d.name); break;
+        case 'move-data-dir': mbxMoveDataDir(); break;
+        case 'pick-setup-dir': mbxPickSetupDir(el); break;
+        case 'toggle-hidden': {
+            // 开关按钮：翻转自身 .on，并把对应 hidden input 写成 on/off 值
+            var on = el.classList.toggle('on');
+            var target = document.getElementById(d.target || '');
+            if (target) target.value = on ? (d.on || '1') : (d.off || '0');
+            break;
+        }
+        default: break;
+    }
+});
+
+// 下拉选择即提交（每页条数/排序/联系人筛选）：等价于原来的 onchange="this.form.submit()"
+document.addEventListener('change', function (ev) {
+    var el = ev.target.closest('[data-mbx-action="submit-form"]');
+    if (el && el.form) el.form.submit();
+});
+
 
 // 读信页操作下拉（R2/批次二）：回复▾ split 与 ⋯ 菜单
 // 事件委托：点 ▾/⋯ 切换菜单；点菜单项后收起；Esc/点击外部关闭
@@ -510,8 +625,15 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     undo.textContent = '撤销发送';
     undo.addEventListener('click', function () {
         undo.disabled = true;
-        // htmx 会跟随 HX-Redirect 整页跳到撰写页（继续编辑）
-        htmx.ajax('POST', '/emails/' + id + '/undo-send', { target: 'body', swap: 'none' });
+        // 撤销失败必须回显（审计 R50）：网络异常/服务端 409（迁移冻结期）/
+        // 撤销窗口已过时 htmx 会 reject，早先没有 .catch 时按钮永久禁用、
+        // 用户既不知道撤销没成功，也看不到「其实已经发出去了」
+        htmx.ajax('POST', '/emails/' + id + '/undo-send', { target: 'body', swap: 'none' })
+            .catch(function () {
+                undo.disabled = false;
+                undo.textContent = '撤销失败，重试';
+                if (typeof mbxToast === 'function') mbxToast('撤销发送失败，请稍后在发件箱确认', 'err', 6000);
+            });
     });
     toast.appendChild(undo);
     slot.appendChild(toast);
@@ -575,7 +697,7 @@ function mbxInitContacts() {
         box.className = 'contacts-pop';
         box.hidden = true;
         (host || document.body).appendChild(box);
-        const state = { box, items: [], active: -1, timer: 0 };
+        const state = { box, items: [], active: -1, timer: 0, seq: 0 };
 
         inp.addEventListener('input', () => {
             clearTimeout(state.timer);
@@ -587,13 +709,21 @@ function mbxInitContacts() {
     });
 }
 
+// 建议查询带请求序号（审计 R47）：输入快时会有多个请求并发（200ms 防抖
+// 只能减少、不能消除），网络抖动下旧的慢响应可能后到，把「刚输入的词」
+// 的建议框覆盖成上一个词的候选——用户按回车选中就是错的人。
+// 每次查询递增 seq，响应回来时序号不是最新就整段丢弃。
 async function mbxContactQuery(inp, state) {
     const q = mbxContactToken(inp).trim();
+    const seq = ++state.seq;
     if (!q) { state.box.hidden = true; state.items = []; return; }
     try {
         const r = await fetch('/contacts/suggest?q=' + encodeURIComponent(q), { cache: 'no-store' });
+        if (seq !== state.seq) return; // 期间又发了新查询：本次结果作废
         if (!r.ok) return;
-        state.items = await r.json();
+        const items = await r.json();
+        if (seq !== state.seq) return; // 解析期间又有新查询
+        state.items = items;
         // 默认高亮首项：输入姓名后直接回车即可选中（无需先按 ↓），
         // 与「快速输入收件人」的目标一致；Esc/Ctrl 不影响输入
         state.active = state.items.length ? 0 : -1;

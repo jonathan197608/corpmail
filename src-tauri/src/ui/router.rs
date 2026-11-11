@@ -645,6 +645,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", p) if p.starts_with("/emails/") && p.ends_with("/status") => {
             Some(email_status(state, req))
         }
+        // 详情页状态区片段（R42）：2s 轮询只换 #mail-status，不整页 outerHTML
+        ("GET", p) if p.starts_with("/emails/") && p.ends_with("/statusbar") => {
+            Some(email_status_bar(state, req))
+        }
         ("GET", p) if p.starts_with("/emails/") => email_detail_page(state, req),
         // M2-2 会话详情（GET /threads/{id}）：按组内任一邮件 id 定位 thread_key 串列
         ("GET", p) if p.starts_with("/threads/") => thread_detail_page(state, req),
@@ -2630,6 +2634,32 @@ fn email_status(state: &AppState, req: &Req) -> Resp {
         }
         Err(_) => Resp::not_found(),
     }
+}
+
+/// 详情页状态区片段（GET /emails/{id}/statusbar，审计 R42）。
+///
+/// 旧实现靠 `hx-trigger="every 2s"` + `hx-target="#page" hx-swap="outerHTML"`
+/// 整页重建：滚动位置弹回顶部、展开的 ⋯ 菜单被关掉、模板里的 load 型
+/// 「置已读」POST 每 2s 重发一次。改为只渲染状态区后，终态（sent/failed/
+/// draft）的片段不带 hx-get，轮询由服务端自然停掉。
+fn email_status_bar(state: &AppState, req: &Req) -> Resp {
+    let Some(id) = path_id(&req.path, "/emails/") else {
+        return Resp::not_found();
+    };
+    if !state.configured() {
+        return Resp::text(400, "尚未完成账号配置");
+    }
+    match mail::get(state, id) {
+        Some(email) => render_html("email_status.html", &StatusCtx { email }),
+        None => Resp::text(404, "邮件不存在或已删除"),
+    }
+}
+
+/// 状态区片段的上下文：只带 email（模板只读 status/delivered/scheduled 等字段），
+/// 不构造整个 EmailCtx——轮询路径越轻越好，也没有附件 chips 之类的开销
+#[derive(Serialize)]
+struct StatusCtx {
+    email: mail::EmailDetail,
 }
 
 /// 重发入口（POST /emails/{id}/resend §9）：failed → draft 回撰写页编辑后重发

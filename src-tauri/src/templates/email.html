@@ -1,10 +1,7 @@
 {% extends "base.html" %}
 {% import "icons.html" as ic %}
 {% block body %}
-<div class="app on" id="page"
-    {% if (email.status == 'queued' or email.status == 'sending') and not email.delivered %}
-     hx-get="/emails/{{ email.id }}" hx-trigger="every 2s" hx-target="#page" hx-swap="outerHTML"
-    {% endif %}>
+<div class="app on" id="page">
     {% include "side.html" %}
     <main class="main">
         {# 打开即阅读（审计 R34）：GET 只负责渲染，置已读由页面加载后的 POST 完成。
@@ -28,10 +25,10 @@
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
-                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">{{ ic.icon('download') }} 导出 .eml</button>
-                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                        <button type="button" data-mbx-action="export-eml" data-id="{{ email.id }}" data-name="{{ export_name }}">{{ ic.icon('download') }} 导出 .eml</button>
+                        <button type="button" data-mbx-action="export-md" data-id="{{ email.id }}" data-name="{{ export_md_name }}"
                                 title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
-                        <button type="button" onclick="mbxPrintEmail()">{{ ic.icon('printer') }} 打印</button>
+                        <button type="button" data-mbx-action="print-email">{{ ic.icon('printer') }} 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">{{ ic.icon('code') }} 源码</a>
                     </div>
                 </div>
@@ -41,10 +38,10 @@
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
-                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})">{{ ic.icon('download') }} 导出 .eml</button>
-                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                        <button type="button" data-mbx-action="export-eml" data-id="{{ email.id }}" data-name="{{ export_name }}">{{ ic.icon('download') }} 导出 .eml</button>
+                        <button type="button" data-mbx-action="export-md" data-id="{{ email.id }}" data-name="{{ export_md_name }}"
                                 title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
-                        <button type="button" onclick="mbxPrintEmail()">{{ ic.icon('printer') }} 打印</button>
+                        <button type="button" data-mbx-action="print-email">{{ ic.icon('printer') }} 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}">{{ ic.icon('code') }} 源码</a>
                     </div>
                 </div>
@@ -65,11 +62,11 @@
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
-                        <button type="button" onclick="mbxExportEml({{ email.id }}, {{ export_name | js_str }})"
+                        <button type="button" data-mbx-action="export-eml" data-id="{{ email.id }}" data-name="{{ export_name }}"
                                 title="导出为标准 .eml 文件（可归档或在其他邮件客户端打开）">{{ ic.icon('download') }} 导出 .eml</button>
-                        <button type="button" onclick="mbxExportMd({{ email.id }}, {{ export_md_name | js_str }})"
+                        <button type="button" data-mbx-action="export-md" data-id="{{ email.id }}" data-name="{{ export_md_name }}"
                                 title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>
-                        <button type="button" onclick="mbxPrintEmail()"
+                        <button type="button" data-mbx-action="print-email"
                                 title="打印当前邮件（仅输出邮件内容，隐藏界面控件）">{{ ic.icon('printer') }} 打印</button>
                         <a href="/emails/{{ email.id }}/source{% if list_query %}?{{ list_query }}{% endif %}"
                            title="查看 HTML 源码、纯文本与原始信头（排查乱码/版式问题）">{{ ic.icon('code') }} 源码</a>
@@ -94,43 +91,8 @@
 
         {% if notice %}<div class="compose-note err">{{ notice }}</div>{% endif %}
 
-        {% if email.too_large %}
-        <div class="md-status sending">{{ ic.icon('warning') }} 该邮件体积超过本地单封上限：正文与附件未下载（详情见正文说明）。可用网页邮箱查看完整内容，或在 设置 → 收件同步 中调高上限。</div>
-        {% endif %}
-        {# 定时发送（M4-2）：草稿带 scheduled_at 到点由调度线程自动入队。 #}
-        {% if email.status == 'draft' and email.scheduled_at > 0 %}
-        {% if email.scheduled_soon %}
-        {# A1 撤销窗口：8 秒内点进详情仍可拦截 #}
-        <div class="md-status sending">{{ ic.icon('hourglass') }} 即将发送（撤销窗口内）
-            <button type="button" class="btn small"
-                    hx-post="/emails/{{ email.id }}/undo-send"
-                    hx-trigger="click throttle:500ms" hx-disabled-elt="this">撤销发送</button>
-        </div>
-        {% else %}
-        <div class="md-status sending">{{ ic.icon('clock') }} 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
-        <div class="sched-tip">要修改或取消定时：编辑草稿调整时间，或清空时间后点「发送」立即发出。</div>
-        {% endif %}
-        {% endif %}
-        {% if email.status == 'queued' %}
-        <div class="md-status sending">{{ ic.icon('hourglass') }} 排队中，即将发送…</div>
-        {% elif email.status == 'sending' %}
-        {% if email.delivered %}
-        {# SMTP 已接收但本地状态没落定（写库失败/进程被杀）：事实是已投递，#}
-        {# 不能再提示"发送中"或引导重发，否则用户重发即重复投递 #}
-        <div class="md-status sending">{{ ic.icon('check') }} 已投递（本地状态修复中）。重启应用后会自动补记为已发送。</div>
-        {% else %}
-        <div class="md-status sending">{{ ic.icon('hourglass') }} 发送中…</div>
-        {% endif %}
-        {% elif email.status == 'failed' %}
-        <div class="md-status failed">{{ ic.icon('x') }} 发送失败：{{ email.error }}
-            <button type="button" class="btn small"
-                    hx-post="/emails/{{ email.id }}/resend"
-                    hx-trigger="click throttle:500ms"
-                    hx-disabled-elt="this">重新编辑发送</button>
-        </div>
-        {% elif email.status == 'sent' %}
-        <div class="md-status sent">{{ ic.icon('check') }} 已发送</div>
-        {% endif %}
+        {# 发送状态区（审计 R42）：2s 轮询只更新这一块，不整页重建 #}
+        {% include "email_status.html" %}
 
         <div class="mail-detail card">
             {# 标题与正文合并显示（2026-11-06 重设计）：长标题在卡片内完整换行显示 #}
@@ -186,7 +148,7 @@
                     {# A4 全部另存：多附件时一键选目录批量落盘（同名自动加序号） #}
                     {% if email.attach_cnt > 1 %}
                     <button type="button" class="btn small att-save-all"
-                            onclick="mbxSaveAllAttachments({{ email.id }})"
+                            data-mbx-action="save-all-attachments" data-id="{{ email.id }}"
                             title="选择目录，把全部附件一次保存（同名文件自动加序号，不覆盖）">全部另存</button>
                     {% endif %}
                 </div>
@@ -199,13 +161,15 @@
                         <span class="att-gone">已清理，无法另存</span>
                         {% else %}
                         <span class="att-name clickable"
-                              onclick="mbxPreviewAttachment('/emails/{{ email.id }}/attachments/{{ a.id }}/view', {{ a.preview_kind | js_str }}, {{ a.filename | js_str }})"
+                              data-mbx-action="preview-attachment"
+                              data-url="/emails/{{ email.id }}/attachments/{{ a.id }}/view"
+                              data-kind="{{ a.preview_kind }}" data-name="{{ a.filename }}"
                               title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
                         {% endif %}
                         <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                         {% if not a.detached %}
                         <button type="button" class="btn small"
-                                onclick="mbxSaveAttachment({{ email.id }}, {{ a.id }}, {{ a.save_name | js_str }})"
+                                data-mbx-action="save-attachment" data-id="{{ email.id }}" data-aid="{{ a.id }}" data-name="{{ a.save_name }}"
                                 title="解压另存到本机（后缀按附件名/MIME 自动推断）">另存为</button>
                         {% endif %}
                     </li>

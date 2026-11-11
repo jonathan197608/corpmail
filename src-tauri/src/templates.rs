@@ -8,7 +8,7 @@ use minijinja::value::Serde;
 use std::sync::LazyLock;
 
 /// 注册的全部模板名（测试也按此表断言）
-const TEMPLATES: &[(&str, &str)] = &[
+pub(crate) const TEMPLATES: &[(&str, &str)] = &[
     // 统一 SVG 图标宏（供各模板 {% import "icons.html" as ic %}）
     ("icons.html", include_str!("templates/icons.html")),
     ("base.html", include_str!("templates/base.html")),
@@ -23,6 +23,11 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/mail_list_rows.html"),
     ),
     ("email.html", include_str!("templates/email.html")),
+    // 详情页发送状态区（审计 R42）：2s 轮询只换这一块
+    (
+        "email_status.html",
+        include_str!("templates/email_status.html"),
+    ),
     ("compose.html", include_str!("templates/compose.html")),
     ("side.html", include_str!("templates/side.html")),
     ("settings.html", include_str!("templates/settings.html")),

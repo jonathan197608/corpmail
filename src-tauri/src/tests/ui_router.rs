@@ -2579,6 +2579,68 @@ fn compose_page_shows_send_button_and_failed_detail_shows_resend() {
     cleanup(&dir);
 }
 
+/// 详情页轮询收窄（审计 R42）：2s 轮询只换 `#mail-status`，不再整页
+/// `outerHTML`（旧实现每 2s 重建 #page：滚动位置弹回、菜单被关、
+/// load 型「置已读」POST 反复触发）。终态片段不带 hx-get，轮询自然停止。
+#[test]
+fn detail_status_polling_targets_status_region_only() {
+    let (state, dir) = temp_state("r42-statusbar");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at, sent_at)
+                 VALUES ('out','sent','queued','demo@chinatelecom.cn','peer@x.cn','排队件',
+                         '排队 件','体',1,NULL),
+                        ('out','sent','sent','demo@chinatelecom.cn','peer@x.cn','已发件',
+                         '已发 件','体',2,2)",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 详情页：轮询挂在状态区，目标是 this，不是 #page
+    let page = body(&route(&state, &assets(), &req("GET", "/emails/1", b""), &t));
+    assert!(page.contains("id=\"mail-status\""), "应有状态区容器");
+    assert!(
+        page.contains("hx-get=\"/emails/1/statusbar\"") && page.contains("hx-target=\"this\""),
+        "轮询应指向状态区片段并就地替换"
+    );
+    assert!(
+        !page.contains("hx-target=\"#page\""),
+        "不得再整页 outerHTML 重建"
+    );
+    // 状态区片段：只含状态行，不含正文/侧栏/顶栏
+    let frag = body(&route(&state, &assets(), &req("GET", "/emails/1/statusbar", b""), &t));
+    assert!(frag.trim_start().starts_with("<div id=\"mail-status\""), "片段根节点是状态区：{frag}");
+    assert!(frag.contains("排队中"), "queued 应显示排队文案：{frag}");
+    assert!(
+        frag.contains("hx-get=\"/emails/1/statusbar\""),
+        "进行中应继续自轮询：{frag}"
+    );
+    assert!(
+        !frag.contains("mail-detail") && !frag.contains("class=\"topbar\""),
+        "片段不应包含正文与顶栏：{frag}"
+    );
+    // 终态：不再带轮询属性（服务端渲染即停止逻辑）
+    let done = body(&route(&state, &assets(), &req("GET", "/emails/2/statusbar", b""), &t));
+    assert!(done.contains("已发送"), "sent 片段显示终态");
+    assert!(!done.contains("hx-get="), "终态不应再轮询：{done}");
+    // 未配置账号：拒绝（不渲染空状态区）
+    let (fresh, fresh_dir) = temp_state("r42-statusbar-empty");
+    let resp = route(&fresh, &assets(), &req("GET", "/emails/1/statusbar", b""), &t);
+    assert_eq!(resp.status, 400, "未配置时应 400");
+    cleanup(&fresh_dir);
+    cleanup(&dir);
+}
+
 #[test]
 fn wizard_setup_form_prefills_defaults() {
     let (state, dir) = temp_state("setup");
@@ -8258,8 +8320,8 @@ fn detail_page_has_print_action() {
         },
     ));
     assert!(
-        html.contains("mbxPrintEmail()"),
-        "详情页应有打印按钮：{html}"
+        html.contains("data-mbx-action=\"print-email\""),
+        "详情页应有打印按钮（data-mbx-action 委托）：{html}"
     );
     assert!(html.contains("打印</button>"), "打印按钮文案：{html}");
     cleanup(&dir);
@@ -9215,7 +9277,7 @@ fn wizard_setup_form_uses_two_column_layout() {
         "name=\"recv_host\"",
         "name=\"recv_security\"",
         "name=\"first_fetch_days\"",
-        "mbxPickSetupDir(this)",
+        "data-mbx-action=\"pick-setup-dir\"",
     ] {
         let at = html
             .find(field)

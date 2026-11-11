@@ -1,10 +1,13 @@
 {
   "$schema": "gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口能力：ui:// 自定义协议页面 + 系统文件/保存对话框（M2：附件选择与另存，设计 §2/§5.1）",
+  "description": "主窗口能力：ui:// 自定义协议页面 + 系统文件/保存对话框（M2：附件选择与另存，设计 §2/§5.1）。权限按实际调用面收窄（审计 R86）：原 core:default 会一次性放开 image/menu/resources/tray/webview 五组用不到的 API；这里只留 event（插件通道）、path、window、app 与 dialog 的 open/save",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:event:default",
+    "core:path:default",
+    "core:window:default",
+    "core:app:default",
     "dialog:allow-open",
     "dialog:allow-save"
   ]
