@@ -1,7 +1,11 @@
-{# 设置·账号 pane（上下文：SettingsCtx）#}
+{# 设置·账号 pane（上下文：SettingsCtx）
+   2026-11-11 布局：发信（SMTP）在左，收信（IMAP）+ 签名档在右。
+   原先两张 card 纵向堆叠、签名档占 4 行，整页高于常见窗口需滚动；
+   并排后纵向高度约减半。所有字段仍在同一个 form 内——保存提交与
+   app.js 的「未保存离开」基线快照只认 #settings-pane form，不依赖结构。#}
 {% import "icons.html" as ic %}
-<div class="settings-pane on" id="settings-pane">
-    <form hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
+<div class="settings-pane on account-pane" id="settings-pane">
+    <form class="account-grid" hx-post="/settings/account/save" hx-target="#settings-pane" hx-swap="outerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button">
         <div class="card settings-card">
             <h3>发信（SMTP）</h3>
             <p class="desc">服务器与账号由首次配置确定，此处仅可修改密码与发件显示名。修改密码后请重新测试连接，凭据保存在操作系统凭据保管中。</p>
@@ -37,18 +41,6 @@
                     <input type="text" name="display_name" value="{{ display_name }}">
                 </div>
             </div>
-            {# 集团邮箱指引：放 pair 之后独立全宽行（.pf 双列内放不下完整路径文案） #}
-            {% if is_ct_domain %}
-            <div class="ct-guide">{{ ic.icon('warning') }} 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</div>
-            {% endif %}
-
-            {# 签名档（M3-2）：多行纯文本，撰写新邮件时预填正文底部；空 = 不启用 #}
-            <div class="sfield">
-                <label>签名档{{ ic.tip('新邮件自动附加到正文底部；回复/转发不附加') }}</label>
-                <textarea name="signature" rows="4" id="signature-box"
-                    placeholder="张伟&#10;中国电信广州分公司 政企客户部&#10;电话：020-12345678">{{ signature }}</textarea>
-            </div>
-
             <div class="settings-actions">
                 <button type="button" class="btn" hx-post="/settings/account/test-smtp" hx-target="#smtp-result"
                     hx-swap="innerHTML" hx-disabled-elt="this">测试连接</button>
@@ -59,36 +51,45 @@
             </div>
         </div>
 
-        <div class="card settings-card">
-            <h3>收信（IMAP）</h3>
-            <p class="desc">IMAP 增量同步，本地阅读后回写已读状态。与发信共用同一账号与密码。</p>
+        <div class="acct-side">
+            <div class="card settings-card">
+                <h3>收信（IMAP）</h3>
+                <p class="desc">IMAP 增量同步，本地阅读后回写已读状态。与发信共用同一账号与密码。</p>
 
-            <div class="sfield">
-                <label>收信服务器</label>
-                <div class="port-row">
-                    <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false" disabled>
-                    <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric" disabled>
+                <div class="sfield">
+                    <label>收信服务器</label>
+                    <div class="port-row">
+                        <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false" disabled>
+                        <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric" disabled>
+                    </div>
+                </div>
+                <div class="sfield">
+                    <label>加密方式{{ ic.tip('自动 = 993 隐式 TLS、其余 STARTTLS') }}</label>
+                    <select name="recv_security" disabled>
+                        <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
+                        <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993/IMAPS）</option>
+                        <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>
+                        <option value="plain" {% if recv_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
+                    </select>
+                </div>
+
+                <div class="settings-actions">
+                    <button type="button" class="btn" hx-post="/settings/account/test-imap" hx-target="#imap-result"
+                        hx-swap="innerHTML" hx-disabled-elt="this">测试收信</button>
+                    <span id="imap-result" class="test-inline"></span>
                 </div>
             </div>
-            <div class="sfield">
-                <label>加密方式{{ ic.tip('自动 = 993 隐式 TLS、其余 STARTTLS') }}</label>
-                <select name="recv_security" disabled>
-                    <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
-                    <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993/IMAPS）</option>
-                    <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>
-                    <option value="plain" {% if recv_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
-                </select>
-            </div>
 
-            <div class="settings-actions">
-                <button type="button" class="btn" hx-post="/settings/account/test-imap" hx-target="#imap-result"
-                    hx-swap="innerHTML" hx-disabled-elt="this">测试收信</button>
-                <span id="imap-result" class="test-inline"></span>
+            {# 签名档（M3-2）：独立 card 放右栏，仍在同一个 form 内随「保存」提交 #}
+            <div class="card settings-card">
+                <h3>签名档{{ ic.tip('新邮件自动附加到正文底部；回复/转发不附加') }}</h3>
+                <textarea name="signature" rows="3" id="signature-box"
+                    placeholder="张伟&#10;中国电信广州分公司 政企客户部&#10;电话：020-12345678">{{ signature }}</textarea>
             </div>
         </div>
 
         {% if degraded %}
-        <div class="sec-note">{{ ic.icon('warning') }} 系统凭据服务不可用，密码已降级保存为本机加密文件（随数据库存储）。</div>
+        <div class="sec-note acct-wide">{{ ic.icon('warning') }} 系统凭据服务不可用，密码已降级保存为本机加密文件（随数据库存储）。</div>
         {% endif %}
     </form>
 </div>

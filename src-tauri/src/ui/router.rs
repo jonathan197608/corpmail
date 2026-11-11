@@ -367,7 +367,7 @@ struct SetupCtx {
     first_fetch_days: String,
     /// 数据保存目录输入框的值：首设恒为空（必须由用户选择），非首设回显当前值
     data_dir: String,
-    /// 默认目录（仅作提示/可选参考，不预填输入值）
+    /// 默认目录：仅写入隐藏属性 data-default-dir（自动化模拟选目录用），页面不展示、不预填输入值
     default_data_dir: String,
     /// 首设：输入框 required + 展示「请选择目录」提示
     require_data_dir: bool,
@@ -1800,6 +1800,11 @@ fn fetch_status(state: &AppState, consume: bool) -> Resp {
         );
     }
     let s = state.fetch_snapshot();
+    // 首拉（发件箱优先）完成后：显示名留空时用历史已发送邮件的 From 补齐配置。
+    // just_finished 由本片段消费后清除，故每轮只在完成时触发一次
+    if s.just_finished && !s.running {
+        let _ = state.display_name();
+    }
     let d = defaults();
     let last_sync = state
         .get_or(keys::LAST_SYNC_AT, &d)
@@ -2228,7 +2233,7 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
     let input = mail::DraftInput {
         id: draft_id,
         from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
-        from_name: g(keys::DISPLAY_NAME),
+        from_name: state.display_name(),
         to_addrs: trimmed_field(&form, "to_addrs").unwrap_or_default(),
         cc_addrs: trimmed_field(&form, "cc_addrs").unwrap_or_default(),
         bcc_addrs: trimmed_field(&form, "bcc_addrs").unwrap_or_default(),
@@ -2683,7 +2688,7 @@ fn wizard_setup_page(state: &AppState) -> Resp {
     let ctx = SetupCtx {
         account_prefix: g(keys::ACCOUNT_PREFIX),
         account_domain: g(keys::ACCOUNT_DOMAIN),
-        display_name: g(keys::DISPLAY_NAME),
+        display_name: state.display_name(),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
         smtp_security: g(keys::SMTP_SECURITY),
@@ -2693,7 +2698,7 @@ fn wizard_setup_page(state: &AppState) -> Resp {
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
         // 首设：目录必须由用户显式选择（留空不放行，避免"没注意就用了默认位置"）。
         // 非首设（改配置/迁移）：回显当前值，保持原有语义。
-        // 默认位置只作为提示文字给出，不预填进输入框。
+        // 默认位置不再展示在页面上，只写隐藏属性供自动化模拟选择目录。
         default_data_dir: dir_now.clone(),
         require_data_dir: first_run,
         data_dir: if first_run { String::new() } else { dir_now },
@@ -2740,7 +2745,7 @@ fn wizard_done(state: &AppState) -> Resp {
     });
     let ctx = DoneCtx {
         account: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
-        display_name: g(keys::DISPLAY_NAME),
+        display_name: state.display_name(),
         smtp_host: g(keys::SMTP_HOST),
         smtp_port: g(keys::SMTP_PORT),
         recv_host: g(keys::RECV_HOST),
@@ -3262,7 +3267,7 @@ fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {
     let d = defaults();
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
-    let display = state.get_or(keys::DISPLAY_NAME, &d).unwrap_or_default();
+    let display = state.display_name();
     let counts = state.folder_counts();
     frame_of(&prefix, &domain, &display, folder, &counts)
 }

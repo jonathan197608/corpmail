@@ -689,6 +689,82 @@ fn zoned_of(epoch: i64) -> Option<jiff::Zoned> {
         .map(|ts| ts.to_zoned(local_tz()))
 }
 
+// ---------- 发件显示名推断 ----------
+
+/// From 显示名候选清洗：拒绝空/超长/控制字符/被塞成邮箱地址/疑似乱码的值。
+/// From 头由 mailparse 解过 RFC2047，但历史数据仍可能带引号包裹或 GBK 乱码。
+fn clean_display_name(raw: &str) -> Option<String> {
+    let s = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .to_string();
+    if s.is_empty() || s.chars().count() > 64 {
+        return None;
+    }
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ',' | ';' | '@'))
+    {
+        return None;
+    }
+    if looks_mojibake(&s) {
+        return None;
+    }
+    Some(s)
+}
+
+/// 从「发件箱」邮件的 From 显示名推断本账号发件显示名。
+///
+/// 口径（与 contacts::self_addr_conn 同源：发出邮件的 From 即本人）：
+/// 1. 只在 `folder='sent' AND direction='out'` 里取；本地已发送行的 from_name
+///    来自配置本身（配置为空即为空），不会构成自我循环。
+/// 2. 目标地址优先取登录账号；账号在发件箱从未出现时退到出现最多的 From
+///    地址（覆盖别名/换过账号前缀），避免把代发或其他人的名字算进来。
+/// 3. 该地址下按 from_name 分组取出现次数最多者，并列取时间最新（用户改过
+///    姓名时以近期为准）；不合格候选顺延到下一组。
+pub fn infer_display_name_conn(conn: &rusqlite::Connection, account: &str) -> Option<String> {
+    let account = account.trim().to_ascii_lowercase();
+    if account.is_empty() {
+        return None;
+    }
+    let addrs: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT lower(trim(from_addr)) AS addr, count(*) AS n
+               FROM emails
+              WHERE folder = 'sent' AND direction = 'out' AND trim(from_addr) <> ''
+              GROUP BY addr ORDER BY n DESC, addr ASC",
+        )
+        .ok()?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+    let target = if addrs.iter().any(|(a, _)| a == &account) {
+        account
+    } else {
+        addrs[0].0.clone()
+    };
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT from_name FROM emails
+              WHERE folder = 'sent' AND direction = 'out'
+                AND lower(trim(from_addr)) = ?1 AND trim(from_name) <> ''
+              GROUP BY from_name
+              ORDER BY count(*) DESC,
+                       max(coalesce(sent_at, received_at, created_at, id)) DESC,
+                       from_name ASC",
+        )
+        .ok()?
+        .query_map([target.as_str()], |r| r.get::<_, String>(0))
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
+    names.iter().find_map(|s| clean_display_name(s))
+}
+
 // ---------- 草稿（撰写/存草稿/覆盖，§9） ----------
 
 /// 历史数据修复（主题乱码）：早期收件路径对未编码的原始 GBK/GB2312 主题头

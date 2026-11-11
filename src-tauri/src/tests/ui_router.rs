@@ -2394,14 +2394,35 @@ fn wizard_setup_form_prefills_defaults() {
         html.contains("需提前生成密码") && html.contains("需提前选择拉取范围"),
         "默认集团域名应展示两条 OA 指引"
     );
-    // 首设：数据保存目录默认为空、必填、提示用户自行选择（默认位置只作提示）
+    // 两条 OA 指引置顶（表单标题之前），且仍在 form 内供 app.js 域名切换显隐
+    assert_eq!(
+        html.matches("class=\"ct-guide\"").count(),
+        2,
+        "首设应有且仅有两条 OA 指引"
+    );
+    let form_at = html.find("<form").expect("向导表单");
+    let alerts_at = html.find("class=\"setup-alerts\"").expect("顶部指引块");
+    let h3_at = html.find("<h3>配置邮箱账号</h3>").expect("表单标题");
+    assert!(
+        form_at < alerts_at && alerts_at < h3_at,
+        "OA 指引应位于表单内、标题上方"
+    );
+    // 首设：数据保存目录默认为空、必填、提示用户自行选择。
+    // 默认目录不展示在页面上，只保留隐藏属性 data-default-dir 供自动化选目录。
     assert!(
         html.contains("name=\"data_dir\" value=\"\""),
         "首设目录输入框不得预填"
     );
     assert!(
         html.contains("请先选择数据保存目录") && html.contains("data-default-dir="),
-        "首设应提示选择目录并给出默认位置参考"
+        "首设应提示选择目录并保留隐藏的默认目录属性"
+    );
+    let hint_at = html.find("class=\"dir-hint\"").expect("目录提示");
+    let hint_end = hint_at + html[hint_at..].find("</p>").expect("提示结束");
+    let hint = &html[hint_at..hint_end];
+    assert!(
+        !hint.contains("默认位置") && !hint.contains("class=\"mono\""),
+        "目录提示不得展示默认目录路径：{hint}"
     );
     let at = html.find("name=\"data_dir\"").expect("目录输入框");
     let seg: String = html[at..].chars().take(300).collect();
@@ -2524,12 +2545,12 @@ fn ct_guides_hidden_when_domain_is_not_chinatelecom() {
 }
 
 #[test]
-fn settings_panes_show_ct_guides_only_for_ct_domain() {
-    // 设置·账号页与同步页的 OA 指引同口径：仅集团域名展示。
-    // 先经向导保存自定义域名（与真实链路一致，不直接写库）
-    let (state, dir) = temp_state("ct-guide-set");
-    let mut pairs = wizard_pairs(dir.to_str().unwrap());
-    pairs.push(("account_domain", "@partner.example"));
+fn settings_panes_never_show_ct_guides() {
+    // 需求（2026-11-11）：两条 OA 黄条只在首设向导顶部出现；设置页
+    //（账号/同步）与非首设向导一律不展示，集团域名也不例外。
+    let (state, dir) = temp_state("ct-guide-none");
+    // 走真实向导保存（不 push account_domain = 默认集团域名），使设置页处于已配置态
+    let pairs = wizard_pairs(dir.to_str().unwrap());
     route(
         &state,
         &assets(),
@@ -2539,33 +2560,25 @@ fn settings_panes_show_ct_guides_only_for_ct_domain() {
             imap_ok: true,
         },
     );
-    let account = route(
-        &state,
-        &assets(),
-        &req("GET", "/settings", b""),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    );
-    assert!(
-        !body(&account).contains("需提前生成密码"),
-        "自定义域名账号页不应展示密码指引"
-    );
-    let sync = route(
-        &state,
-        &assets(),
-        &req("GET", "/settings/panes/sync", b""),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    );
-    assert!(
-        !body(&sync).contains("需提前选择拉取范围"),
-        "自定义域名同步页不应展示拉取指引"
-    );
-    state.clear_password("unit.router@partner.example");
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    for path in [
+        "/settings",
+        "/settings/account",
+        "/settings/panes/sync",
+        "/welcome/setup",
+    ] {
+        let html = body(&route(&state, &assets(), &req("GET", path, b""), &t));
+        assert!(
+            !html.contains("class=\"ct-guide\"")
+                && !html.contains("需提前生成密码")
+                && !html.contains("需提前选择拉取范围"),
+            "{path} 不应展示 OA 指引"
+        );
+    }
+    state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
 
@@ -8666,5 +8679,135 @@ fn wizard_rejects_current_dir_store_of_other_account() {
     );
     assert!(!state.configured());
     let _ = std::fs::remove_dir_all(&target);
+    cleanup(&dir);
+}
+
+/// 发件显示名留空：完成页/侧栏/账号页都从发件箱 From 自动补齐并写回配置
+#[test]
+fn display_name_autofill_is_visible_in_ui() {
+    let (state, dir) = temp_state("display-ui");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::DISPLAY_NAME, ""),
+        ])
+        .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, subject, from_addr, from_name,
+                                to_addrs, subject_tokens, body_tokens, attach_cnt, attach_bytes,
+                                unread, created_at, sent_at)
+             VALUES('out','sent','sent','t','demo@chinatelecom.cn','张伟',
+                    'x@example.com','','',0,0,0,100,100)",
+            [],
+        )
+        .unwrap();
+    });
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 完成页是首设/沿用既有库后的第一屏，触发推断并写回
+    let done = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/done", b""),
+        &t,
+    ));
+    assert!(done.contains("张伟"), "完成页应展示自动补齐的显示名：{done}");
+    let saved = state.get(keys::DISPLAY_NAME).flatten();
+    assert_eq!(saved.as_deref(), Some("张伟"), "完成页应触发配置写回");
+    let side = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/side/frame", "folder=sent", b""),
+        &t,
+    ));
+    assert!(side.contains("张伟"), "侧栏应展示写回后的显示名");
+    let settings = body(&route(&state, &assets(), &req("GET", "/settings", b""), &t));
+    assert!(
+        settings.contains("value=\"张伟\""),
+        "账号页应回显写回后的显示名"
+    );
+    cleanup(&dir);
+}
+
+/// 账号页两栏布局：发信 / 收信+签名档并排，且所有字段仍在同一个 form
+#[test]
+fn account_pane_uses_two_column_layout() {
+    let (state, dir) = temp_state("acct-two-col");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/account", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("class=\"settings-pane on account-pane\""));
+    assert!(html.contains("class=\"account-grid\""), "应为两栏容器");
+    assert!(html.contains("class=\"acct-side\""), "右栏应存在");
+    assert!(html.contains("rows=\"3\""), "签名档默认 3 行以压缩高度");
+    let a = html.find("<form").unwrap();
+    let b = html.find("</form>").unwrap();
+    for field in [
+        "name=\"password\"",
+        "name=\"display_name\"",
+        "name=\"signature\"",
+        "hx-post=\"/settings/account/test-smtp\"",
+        "hx-post=\"/settings/account/test-imap\"",
+    ] {
+        let at = html
+            .find(field)
+            .unwrap_or_else(|| panic!("缺少字段 {field}"));
+        assert!(at > a && at < b, "{field} 必须留在同一个 form 内");
+    }
+    cleanup(&dir);
+}
+
+/// 首启向导两栏布局（2026-11-11）：账号凭据+数据目录在左、服务器+拉取范围在右。
+/// 所有字段仍在同一个 form.setup-card 内——htmx 提交序列化、app.js 表单锁定、
+/// 「选择…」按钮的 closest('.port-row') 都依赖这个结构。
+#[test]
+fn wizard_setup_form_uses_two_column_layout() {
+    let (state, dir) = temp_state("setup-two-col");
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/welcome/setup", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(html.contains("class=\"setup-grid\""), "应为两栏容器");
+    assert_eq!(
+        html.matches("class=\"setup-col\"").count(),
+        2,
+        "应有左右两栏"
+    );
+    let a = html.find("<form").unwrap();
+    let b = html.find("</form>").unwrap();
+    for field in [
+        "name=\"account_prefix\"",
+        "name=\"password\"",
+        "name=\"display_name\"",
+        "name=\"data_dir\"",
+        "name=\"smtp_host\"",
+        "name=\"recv_host\"",
+        "name=\"recv_security\"",
+        "name=\"first_fetch_days\"",
+        "mbxPickSetupDir(this)",
+    ] {
+        let at = html
+            .find(field)
+            .unwrap_or_else(|| panic!("缺少字段 {field}"));
+        assert!(at > a && at < b, "{field} 必须留在向导 form 内");
+    }
     cleanup(&dir);
 }

@@ -49,9 +49,6 @@
                             hx-include="closest form" hx-trigger="click" hx-disabled-elt="this">{{ ic.icon('refresh') }} 按当前范围重新拉取</button>
                     <span class="refetch-hint">重置收件游标并按上方所选范围全量重拉</span>
                 </div>
-                {% if is_ct_domain %}
-                <p class="ct-guide">{{ ic.icon('warning') }} 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
-                {% endif %}
             </div>
 
             {% if refetch_notice %}<div class="sec-note" style="color:var(--ok)">{{ ic.icon('check') }} 已按所选范围触发重新拉取，请在收件箱查看</div>{% endif %}

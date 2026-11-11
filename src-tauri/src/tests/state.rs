@@ -1083,3 +1083,167 @@ fn first_pull_done_flags_read_and_mark() {
     assert!(!first_pull_done(&conn, crate::mail::MailDest::Sent));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- 发件显示名自动推断（配置留空 → 发件箱 From 补齐） ----------
+
+fn insert_sent_mail(conn: &Connection, from_addr: &str, from_name: &str, at: i64) {
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, subject, from_addr, from_name,
+                            to_addrs, subject_tokens, body_tokens, attach_cnt, attach_bytes,
+                            unread, created_at, sent_at)
+         VALUES('out', 'sent', 'sent', 't', ?1, ?2, 'someone@example.com',
+                '', '', 0, 0, 0, ?3, ?3)",
+        rusqlite::params![from_addr, from_name, at],
+    )
+    .unwrap();
+}
+
+fn configured_state(dir: &Path, display: &str) -> AppState {
+    let s = AppState::open(dir);
+    s.set_batch(&[
+        (keys::ACCOUNT_PREFIX, "demo"),
+        (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+        (keys::DISPLAY_NAME, display),
+    ])
+    .unwrap();
+    s
+}
+
+fn settings_rows(s: &AppState) -> i64 {
+    s.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
+            .unwrap()
+    })
+}
+
+#[test]
+fn display_name_inferred_from_sent_and_persisted() {
+    let dir = temp_dir("display-infer");
+    let s = configured_state(&dir, "");
+    s.with_conn(|c| {
+        insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100);
+        insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 200);
+        insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 300);
+        // 少数派（改名/异常件）不得压过众数
+        insert_sent_mail(c, "demo@chinatelecom.cn", "张小伟", 400);
+        // 收件箱里"对方显示名"绝不能参与推断
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, subject, from_addr, from_name,
+                                to_addrs, subject_tokens, body_tokens, attach_cnt, attach_bytes,
+                                unread, created_at, received_at)
+             VALUES('in', 'inbox', 'received', 't', 'other@example.com', '外人',
+                    'demo@chinatelecom.cn', '', '', 0, 0, 0, 500, 500)",
+            [],
+        )
+        .unwrap();
+    });
+    let before = settings_rows(&s);
+    assert_eq!(s.display_name(), "张伟");
+    // 写回 corpmail.toml（配置唯一持久源），且重复读取稳定
+    let cfg = load(&dir);
+    assert_eq!(
+        cfg.get(keys::DISPLAY_NAME).map(String::as_str),
+        Some("张伟")
+    );
+    assert_eq!(
+        cfg.get(keys::DISPLAY_NAME_AUTO).map(String::as_str),
+        Some("张伟")
+    );
+    assert_eq!(s.display_name(), "张伟");
+    // 不得写 settings 表：store_is_empty() 以其行数判定首设空库
+    assert_eq!(settings_rows(&s), before, "自动推断不得污染 settings 表");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_name_not_overwritten_when_configured() {
+    let dir = temp_dir("display-keep");
+    let s = configured_state(&dir, "李雷");
+    s.with_conn(|c| insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100));
+    assert_eq!(s.display_name(), "李雷", "用户显式设置的显示名不得被覆盖");
+    assert_eq!(
+        load(&dir).get(keys::DISPLAY_NAME_AUTO),
+        None,
+        "未发生推断不应写标记"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_name_not_refilled_after_user_clears() {
+    let dir = temp_dir("display-clear");
+    let s = configured_state(&dir, "");
+    s.with_conn(|c| insert_sent_mail(c, "demo@chinatelecom.cn", "张伟", 100));
+    assert_eq!(s.display_name(), "张伟", "前置：先自动推断成功");
+    // 模拟设置·账号页用户主动清空显示名
+    s.set_batch(&[(keys::DISPLAY_NAME, "")]).unwrap();
+    assert_eq!(s.display_name(), "", "主动清空后不得被自动回填");
+    assert_eq!(
+        load(&dir).get(keys::DISPLAY_NAME).map(String::as_str),
+        Some("")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_name_skips_invalid_candidates_and_breaks_ties_by_time() {
+    let dir = temp_dir("display-clean");
+    let s = configured_state(&dir, "");
+    s.with_conn(|c| {
+        // 出现次数最多的候选是乱码，须整组跳过而不是直接采纳
+        for i in 0..5 {
+            insert_sent_mail(c, "demo@chinatelecom.cn", "ä½\u{a0}å¥½", 10 + i);
+        }
+        // 被塞成邮箱地址 / 带 CR LF 头注入
+        insert_sent_mail(c, "demo@chinatelecom.cn", "demo@chinatelecom.cn", 20);
+        insert_sent_mail(c, "demo@chinatelecom.cn", "张伟\r\nX-Injected: 1", 30);
+        // 两个合法候选各 1 次：并列取时间最新，引号包裹应被清洗
+        insert_sent_mail(c, "demo@chinatelecom.cn", "旧名字", 100);
+        insert_sent_mail(c, "demo@chinatelecom.cn", "  \"韩梅梅\"  ", 200);
+    });
+    assert_eq!(s.display_name(), "韩梅梅");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_name_prefers_login_account_and_falls_back_to_alias() {
+    let dir = temp_dir("display-alias");
+    let s = configured_state(&dir, "");
+    s.with_conn(|c| {
+        // 别名地址的邮件更多，但登录账号出现过 → 只取登录账号的显示名
+        for i in 0..4 {
+            insert_sent_mail(c, "alias@chinatelecom.cn", "别名君", 10 + i);
+        }
+        insert_sent_mail(c, "demo@chinatelecom.cn", "本人", 100);
+    });
+    assert_eq!(s.display_name(), "本人", "登录账号出现时应优先，不取别名众数");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir2 = temp_dir("display-alias-only");
+    let s2 = configured_state(&dir2, "");
+    s2.with_conn(|c| {
+        insert_sent_mail(c, "alias@chinatelecom.cn", "别名君", 100);
+        insert_sent_mail(c, "alias@chinatelecom.cn", "别名君", 200);
+        insert_sent_mail(c, "other@chinatelecom.cn", "别人的名字", 300);
+    });
+    assert_eq!(
+        s2.display_name(),
+        "别名君",
+        "登录账号从未出现时退到发件箱出现最多的 From 地址"
+    );
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn display_name_skips_when_unconfigured() {
+    let dir = temp_dir("display-unconf");
+    let s = AppState::open(&dir);
+    s.with_conn(|c| insert_sent_mail(c, "old@chinatelecom.cn", "旧账号", 100));
+    assert_eq!(
+        s.display_name(),
+        "",
+        "未配置账号时不得把历史邮件的名字写进新配置"
+    );
+    assert!(load(&dir).is_empty(), "不得产生任何配置写入");
+    let _ = std::fs::remove_dir_all(&dir);
+}

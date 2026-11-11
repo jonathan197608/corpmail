@@ -12,97 +12,112 @@
                 <span class="step"><span class="n">3</span> 完成</span>
             </div>
 
+            {# 2026-11-11 布局：单列长表单在 900px 窗口下要滚动、底部「测试并保存」被截断。
+               账号凭据+数据目录在左，服务器高级项+拉取范围在右，公共行（说明/结果/按钮）跨全宽。
+               所有字段仍在同一个 form.setup-card 内：htmx 提交序列化、app.js 锁定表单、
+               「选择…」按钮的 closest('.port-row') 都只认这个 form，不依赖 DOM 层级。#}
             <form class="setup-card" hx-post="/welcome/setup/save" hx-target="#test-results" hx-swap="innerHTML" hx-trigger="submit throttle:500ms" hx-disabled-elt="find button" hx-indicator="#setup-busy">
+                {# 首设专用：两条 OA 指引置顶（标题之前），仅首次配置渲染；
+                   改配置/迁移向导与设置页都不展示。仍在 form 内——
+                   app.js 用 form.querySelectorAll('.ct-guide') 做域名切换显隐。 #}
+                {% if require_data_dir and is_ct_domain %}
+                <div class="setup-alerts">
+                    <p class="ct-guide">{{ ic.icon('warning') }} 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
+                    <p class="ct-guide">{{ ic.icon('warning') }} 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
+                </div>
+                {% endif %}
                 <h3>配置邮箱账号</h3>
                 <p class="desc">填写后会自动测试发信与收信通道，全部通过才会保存。</p>
 
-            <div class="sfield">
-                <label>登录账号{{ ic.tip('域名可按需修改') }}</label>
-                <div class="port-row">
-                    <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
-                        autocomplete="off" autocapitalize="none" spellcheck="false">
-                    <input class="domain" type="text" name="account_domain" value="{{ account_domain }}"
-                        autocomplete="off" autocapitalize="none" spellcheck="false">
+                <div class="setup-grid">
+                    <div class="setup-col">
+                        <div class="sfield">
+                            <label>登录账号{{ ic.tip('域名可按需修改') }}</label>
+                            <div class="port-row">
+                                <input class="mono" type="text" name="account_prefix" value="{{ account_prefix }}" required
+                                    autocomplete="off" autocapitalize="none" spellcheck="false">
+                                <input class="domain" type="text" name="account_domain" value="{{ account_domain }}"
+                                    autocomplete="off" autocapitalize="none" spellcheck="false">
+                            </div>
+                        </div>
+                        <div class="sfield">
+                            <label>密码 / 授权码</label>
+                            <input type="password" name="password" required autocomplete="new-password">
+                        </div>
+                        <div class="sfield">
+                            <label>发件显示名</label>
+                            <input type="text" name="display_name" placeholder="选填，如：张伟">
+                        </div>
+                        <div class="sfield">
+                            <label>数据保存目录{% if require_data_dir %}<span class="req-mark" aria-hidden="true">*</span>{% endif %}{{ ic.tip('首次设置必须选择目录：点击「选择…」指定本机位置；也可选择已有 CorpMail 数据的目录——仅当其账号与本次登录一致时，历史邮件与收件进度直接沿用') }}</label>
+                            <div class="port-row">
+                                <input class="mono" type="text" name="data_dir" value="{{ data_dir }}" spellcheck="false"
+                                    {% if require_data_dir %}required{% endif %}
+                                    data-default-dir="{{ default_data_dir }}"
+                                    placeholder="{% if require_data_dir %}必须选择：点击右侧「选择…」指定目录{% else %}留空沿用当前目录；可填新目录或已有数据的目录（同账号沿用）{% endif %}">
+                                <button type="button" class="btn small" onclick="mbxPickSetupDir(this)"
+                                    title="浏览选择目录">选择…</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="setup-col">
+                        <div class="adv">
+                            <div class="adv-title">服务器（已按公司邮箱预填，一般无需修改）</div>
+                            <div class="sfield">
+                                <label>SMTP 发信</label>
+                                <div class="port-row">
+                                    <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false">
+                                    <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric">
+                                </div>
+                            </div>
+                            <div class="sfield">
+                                <label>SMTP 加密</label>
+                                <select name="smtp_security">
+                                    <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（465 隐式 TLS / 其余 STARTTLS）</option>
+                                    <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465）</option>
+                                    <option value="starttls" {% if smtp_security == "starttls" %}selected{% endif %}>STARTTLS（587/25）</option>
+                                    <option value="plain" {% if smtp_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
+                                </select>
+                            </div>
+                            <div class="sfield">
+                                <label>收信服务器（IMAP）</label>
+                                <div class="port-row">
+                                    <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
+                                    <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
+                                </div>
+                            </div>
+                            <div class="sfield">
+                                <label>IMAP 加密</label>
+                                <select name="recv_security">
+                                    <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（993 隐式 TLS / 其余 STARTTLS）</option>
+                                    <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993）</option>
+                                    <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>
+                                    <option value="plain" {% if recv_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="sfield">
+                            <label>首次邮件拉取范围</label>
+                            <div class="radio-row">
+                                <label class="radio"><input type="radio" name="first_fetch_days" value="7"
+                                    {% if first_fetch_days == "7" %}checked{% endif %}><span class="dot"></span>最近 7 天</label>
+                                <label class="radio"><input type="radio" name="first_fetch_days" value="30"
+                                    {% if first_fetch_days == "30" %}checked{% endif %}><span class="dot"></span>30 天</label>
+                                <label class="radio"><input type="radio" name="first_fetch_days" value="90"
+                                    {% if first_fetch_days == "90" %}checked{% endif %}><span class="dot"></span>90 天</label>
+                                <label class="radio"><input type="radio" name="first_fetch_days" value="0"
+                                    {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
+                            </div>
+                        </div>
+                    </div>
                 </div>
-            </div>
-            <div class="sfield">
-                <label>密码 / 授权码</label>
-                <input type="password" name="password" required autocomplete="new-password">
-                {% if is_ct_domain %}
-                <p class="ct-guide">{{ ic.icon('warning') }} 需提前生成密码：OA → 集团统一邮箱 → 设置 → 密码管理 → 生成客户端专用密码</p>
+
+                {# 首设：数据目录必选提示（默认目录不展示，仅保留隐藏属性 data-default-dir） #}
+                {% if require_data_dir %}
+                <p class="dir-hint">{{ ic.icon('warning') }} 请先选择数据保存目录，未选择无法进入下一步</p>
                 {% endif %}
-            </div>
-                <div class="sfield">
-                    <label>发件显示名</label>
-                    <input type="text" name="display_name" placeholder="选填，如：张伟">
-                </div>
-
-                <div class="adv">
-                    <div class="adv-title">服务器（已按公司邮箱预填，一般无需修改）</div>
-                    <div class="sfield">
-                        <label>SMTP 发信</label>
-                        <div class="port-row">
-                            <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false">
-                            <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric">
-                        </div>
-                    </div>
-                    <div class="sfield">
-                        <label>SMTP 加密</label>
-                        <select name="smtp_security">
-                            <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（465 隐式 TLS / 其余 STARTTLS）</option>
-                            <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465）</option>
-                            <option value="starttls" {% if smtp_security == "starttls" %}selected{% endif %}>STARTTLS（587/25）</option>
-                            <option value="plain" {% if smtp_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
-                        </select>
-                    </div>
-                    <div class="sfield">
-                        <label>收信服务器（IMAP）</label>
-                        <div class="port-row">
-                            <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false">
-                            <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric">
-                        </div>
-                    </div>
-                    <div class="sfield">
-                        <label>IMAP 加密</label>
-                        <select name="recv_security">
-                            <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（993 隐式 TLS / 其余 STARTTLS）</option>
-                            <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993）</option>
-                            <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>
-                            <option value="plain" {% if recv_security == "plain" %}selected{% endif %}>明文（仅可信内网）</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="sfield">
-                    <label>首次邮件拉取范围</label>
-                    <div class="radio-row">
-                        <label class="radio"><input type="radio" name="first_fetch_days" value="7"
-                            {% if first_fetch_days == "7" %}checked{% endif %}><span class="dot"></span>最近 7 天</label>
-                        <label class="radio"><input type="radio" name="first_fetch_days" value="30"
-                            {% if first_fetch_days == "30" %}checked{% endif %}><span class="dot"></span>30 天</label>
-                        <label class="radio"><input type="radio" name="first_fetch_days" value="90"
-                            {% if first_fetch_days == "90" %}checked{% endif %}><span class="dot"></span>90 天</label>
-                        <label class="radio"><input type="radio" name="first_fetch_days" value="0"
-                            {% if first_fetch_days == "0" %}checked{% endif %}><span class="dot"></span>全部</label>
-                    </div>
-                    {% if is_ct_domain %}
-                    <p class="ct-guide">{{ ic.icon('warning') }} 需提前选择拉取范围：OA → 集团统一邮箱 → 设置 → 常规设置 → POP3/IMAP/SMTP 服务 → 客户端收取选项</p>
-                    {% endif %}
-                </div>
-                <div class="sfield">
-                    <label>数据保存目录{% if require_data_dir %}<span class="req-mark" aria-hidden="true">*</span>{% endif %}{{ ic.tip('首次设置必须选择目录：点击「选择…」指定本机位置；也可选择已有 CorpMail 数据的目录——仅当其账号与本次登录一致时，历史邮件与收件进度直接沿用') }}</label>
-                    <div class="port-row">
-                        <input class="mono" type="text" name="data_dir" value="{{ data_dir }}" spellcheck="false"
-                            {% if require_data_dir %}required{% endif %}
-                            data-default-dir="{{ default_data_dir }}"
-                            placeholder="{% if require_data_dir %}必须选择：点击右侧「选择…」指定目录{% else %}留空沿用当前目录；可填新目录或已有数据的目录（同账号沿用）{% endif %}">
-                        <button type="button" class="btn small" onclick="mbxPickSetupDir(this)"
-                            title="浏览选择目录">选择…</button>
-                    </div>
-                    {% if require_data_dir %}
-                    <p class="dir-hint">{{ ic.icon('warning') }} 请先选择数据保存目录，未选择无法进入下一步。默认位置：<span class="mono">{{ default_data_dir }}</span>（也可点击「选择…」选其他目录）</p>
-                    {% endif %}
-                </div>
 
                 <div class="sec-note">{{ ic.icon('lock') }} {{ cred_note }}</div>
 

@@ -22,6 +22,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     crate::state::keys::ACCOUNT_PREFIX,
     crate::state::keys::ACCOUNT_DOMAIN,
     crate::state::keys::DISPLAY_NAME,
+    crate::state::keys::DISPLAY_NAME_AUTO,
     crate::state::keys::SMTP_HOST,
     crate::state::keys::SMTP_PORT,
     crate::state::keys::SMTP_SECURITY,

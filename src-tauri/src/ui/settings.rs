@@ -31,8 +31,6 @@ pub(super) struct SettingsCtx {
     smtp_security: String,
     account_prefix: String,
     account_domain: String,
-    /// 域名为 chinatelecom.cn：展示客户端专用密码/拉取范围 OA 指引
-    is_ct_domain: bool,
     display_name: String,
     /// 签名档（M3-2，多行纯文本）：撰写新邮件时预填正文底部
     signature: String,
@@ -179,12 +177,11 @@ pub(super) fn settings_ctx(
         None => (0, 0),
     };
     // 账号三要素一次读取：frame 与各 tab 字段复用（避免重复读配置/库锁）
-    let display = g(keys::DISPLAY_NAME);
+    let display = state.display_name();
     let prefix = g(keys::ACCOUNT_PREFIX);
     let domain = g(keys::ACCOUNT_DOMAIN);
     // 凭据降级态需在 prefix/domain 被 move 进字段前算（借用先于所有权转移）
     let degraded = state.secrets_degraded(&full_address(&prefix, &domain));
-    let is_ct_domain = crate::ui::router::is_ct_mail_domain(&domain);
     SettingsCtx {
         // 侧栏设置入口高亮（2026-11-04 迁入 folder 列表）：设置页 frame
         // folder 记 "settings"，side.html 的 .settings-entry 据此点亮
@@ -195,7 +192,6 @@ pub(super) fn settings_ctx(
         smtp_security: g(keys::SMTP_SECURITY),
         account_prefix: prefix,
         account_domain: domain,
-        is_ct_domain,
         display_name: display,
         signature: g(keys::SIGNATURE),
         recv_host: g(keys::RECV_HOST),

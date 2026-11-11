@@ -17,6 +17,10 @@ pub mod keys {
     pub const ACCOUNT_PREFIX: &str = "account_prefix";
     pub const ACCOUNT_DOMAIN: &str = "account_domain";
     pub const DISPLAY_NAME: &str = "display_name";
+    /// 曾由发件箱自动推断过显示名（值 = 推断出的名字）：用户之后在设置页
+    /// 主动清空显示名，不应在下次刷新时又被自动回填。随账号配置落在
+    /// corpmail.toml；不写 settings 表（store_is_empty() 按其行数判定空库首设）
+    pub const DISPLAY_NAME_AUTO: &str = "display_name_auto";
     pub const SMTP_HOST: &str = "smtp_host";
     pub const SMTP_PORT: &str = "smtp_port";
     /// 发信加密方式（auto|implicit|starttls|plain；auto = 按端口推断）
@@ -273,6 +277,9 @@ impl AppState {
         };
         // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
         state.try_auto_clean_empty_old_backup();
+        // 重装/换机沿用既有数据目录：启动时库里已有发件箱邮件，配置中显示名
+        // 却为空 → 立即补齐，无需等首拉或用户打开设置页
+        let _ = state.display_name();
         Ok(state)
     }
 
@@ -1072,6 +1079,48 @@ impl AppState {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| (*v).to_string())
+    }
+
+    /// 发件显示名（配置留空时从发件箱补齐，并写回 corpmail.toml）。
+    ///
+    /// 首设向导「发件显示名」选填；留空时服务器「已发送」邮件的 From 头带着
+    /// 用户本人姓名，是本地最可靠的依据。命中后写回配置，后续读取直接命中
+    /// 内存镜像不再扫库。写回失败不阻断业务（下次读取重试）。
+    ///
+    /// `display_name_auto` 记录曾自动推断过：用户此后在设置页主动清空显示名，
+    /// 尊重其选择，不再回填。
+    pub fn display_name(&self) -> String {
+        if let Some(Some(v)) = self.get(keys::DISPLAY_NAME) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        if self
+            .get(keys::DISPLAY_NAME_AUTO)
+            .flatten()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            return String::new();
+        }
+        // 未配置账号（首启向导）时不推断：库里的历史邮件可能属于别的账号
+        if !self.configured() {
+            return String::new();
+        }
+        let d = defaults();
+        let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
+        let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
+        let Some(name) = self.with_conn(|c| crate::mail::infer_display_name_conn(c, &account))
+        else {
+            return String::new();
+        };
+        if let Err(e) = self.set_batch(&[
+            (keys::DISPLAY_NAME, name.as_str()),
+            (keys::DISPLAY_NAME_AUTO, name.as_str()),
+        ]) {
+            eprintln!("[display] 发件显示名自动推断写回失败（忽略）：{e}");
+        }
+        name
     }
 
     /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 corpmail.toml

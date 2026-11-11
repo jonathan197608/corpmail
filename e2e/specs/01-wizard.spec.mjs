@@ -29,6 +29,12 @@ describe('01 首启向导与首次收件', () => {
       [...document.querySelectorAll('.setup-card .ct-guide')].map((g) => !g.hidden),
     )
     expect(guides0.filter(Boolean).length).toBe(2)
+    // 两条黄条置顶（表单第一个元素，标题之前），仅首设向导展示
+    const alertsTop = await browser.execute(() => {
+      const form = document.querySelector('form.setup-card')
+      return form?.firstElementChild?.classList.contains('setup-alerts') === true
+    })
+    expect(alertsTop).toBe(true)
     // 首设：数据保存目录默认为空，页面提示用户自行选择
     await expect($('input[name="data_dir"]')).toHaveValue('')
     const required = await browser.execute(
@@ -39,6 +45,11 @@ describe('01 首启向导与首次收件', () => {
       document.querySelector('.dir-hint')?.textContent?.includes('请先选择数据保存目录'),
     )
     expect(hint).toBe(true)
+    // 页面不再展示默认目录路径（默认位置只保留在隐藏属性 data-default-dir）
+    const hintText = await browser.execute(() =>
+      document.querySelector('.dir-hint')?.textContent || '',
+    )
+    expect(hintText).not.toContain('默认位置')
     await shot('向导-默认配置')
   })
 
@@ -89,7 +100,8 @@ describe('01 首启向导与首次收件', () => {
     await $('input[name="recv_port"]').setValue(IMAP_PORT)
     await selectValue('select[name="recv_security"]', 'plain')
     // 首设必须显式选择数据保存目录：模拟用户点「选择…」选了默认位置
-    //（data-default-dir 是页面给出的默认位置，填入后与旧版预填行为一致）
+    //（data-default-dir 是隐藏属性，仅自动化使用；页面不再展示默认目录，
+    //  填入后与旧版预填行为一致）
     const defaultDir = await $('input[name="data_dir"]').getAttribute('data-default-dir')
     expect(defaultDir).toBeTruthy()
     await $('input[name="data_dir"]').setValue(defaultDir)
