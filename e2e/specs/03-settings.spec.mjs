@@ -1,9 +1,9 @@
 import { browser, $, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText, htmxAjax, runDir, openSplit } from '../support/helpers.mjs'
-import path from 'node:path'
-import fs from 'node:fs'
+import { goto, shot, waitBoot, openSplit } from '../support/helpers.mjs'
 
-// 03：设置页签 + 收件状态条 + 连接测试 + 数据目录迁移（E1–E5 / A6 / F1）
+// 03：设置页签 + 收件状态条 + 连接测试（E1–E5 / F1）
+// 数据目录迁移（A6）已移到 95-migration：迁移成功会冻结整个进程的写入（R2），
+// 必须放在主链路最末，否则其后的 04-07 全部写不进去
 describe('03 设置与收件状态', () => {
   it('账号页签：显示当前账号与凭据保管状态', async () => {
     await goto('/settings')
@@ -62,17 +62,6 @@ describe('03 设置与收件状态', () => {
       { timeout: 15000, timeoutMsg: '保存后间隔未回显新值' },
     )
     await shot('设置-同步间隔已保存')
-  })
-
-  it('A6 数据目录迁移：POST move → 待生效目录 + 重启徽标', async () => {
-    await goto('/settings/storage')
-    const dest = path.join(runDir(), 'moved-data')
-    fs.mkdirSync(dest, { recursive: true })
-    const res = await htmxAjax('POST', '/settings/storage/move', { dest }, '#settings-pane')
-    // 单测钉过的文案（ui_router.rs:530）：徽标为「重启后生效」+ 旧目录「当前使用」注记
-    expect(res.text).toContain('重启后生效')
-    await waitText('#settings-pane', '当前使用')
-    await shot('设置-数据目录待生效')
   })
 
   it('E6 字段说明改气泡：聚焦显示、Esc 关闭（hint 小字改版回归）', async () => {

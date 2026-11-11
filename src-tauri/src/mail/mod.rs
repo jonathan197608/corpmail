@@ -148,13 +148,19 @@ pub fn thread_key_of(subject: &str) -> String {
 
 /// 尝试剥离单个回复/转发前缀（大小写不敏感），返回剥离后剩余；不匹配返回 None。
 /// 支持英文 re/fwd/fw/reply/r/aw（可带序号如 Re[2]、Re2）与中文 回复/答复/转发。
+///
+/// **必须存在分隔符（空白 / `:` / `：`）才剥离**：`转发合同请查收`、`Re会议` 这类
+/// 前缀词与正文黏连的主题不是回复标记，按整串参与归组；早期实现无分隔符时把
+/// 整串当前缀吃掉、剥成空串，而会话查询又排除空键 → 整封邮件在会话视图消失。
 fn strip_thread_prefix(subject: &str) -> Option<&str> {
     let t = subject.trim_start();
     // 词边界：到空白、英文冒号或中文冒号（：）为止
-    let end = t
-        .find(|c: char| c.is_whitespace() || c == ':' || c == '\u{FF1A}')
-        .unwrap_or(t.len());
+    let end = t.find(|c: char| c.is_whitespace() || c == ':' || c == '\u{FF1A}')?;
     let (word, rest) = t.split_at(end);
+    if rest.trim().is_empty() {
+        // 只有前缀与分隔符、没有正文（"Re:" 等）：不是可归组的回复主题
+        return None;
+    }
     // 英文前缀：提取 ASCII 字母段并小写（容忍 Re[2]、Re(2) 等序号后缀）
     let ascii: String = word
         .chars()
@@ -162,10 +168,16 @@ fn strip_thread_prefix(subject: &str) -> Option<&str> {
         .map(|c| c.to_ascii_lowercase())
         .collect();
     let is_en = matches!(ascii.as_str(), "re" | "fwd" | "fw" | "reply" | "r" | "aw");
-    // 中文前缀：word 直接命中（reply/转发等无冒号场景）
-    let is_cn = ["回复", "答复", "转发"].iter().any(|k| word.starts_with(k));
+    // 中文前缀：word 必须正好等于前缀词，或前缀词 + ASCII 序号（回复2 / 转发3）；
+    // 不能用 starts_with——"转发合同" 会被误当成 "转发" 前缀
+    let is_cn = ["回复", "答复", "转发"].iter().any(|k| {
+        word.strip_prefix(k)
+            .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
+    });
     if is_en || is_cn {
-        Some(rest.trim_start_matches(|c: char| c == ':' || c == '\u{FF1A}' || c.is_whitespace()))
+        Some(
+            rest.trim_start_matches(|c: char| c == ':' || c == '\u{FF1A}' || c.is_whitespace()),
+        )
     } else {
         None
     }
@@ -437,6 +449,13 @@ pub fn strip_html(html: &str) -> String {
                             },
                             None => break, // 无闭合标签：余下全是隐藏块内容
                         }
+                    } else if is_block_tag(&name) {
+                        // 块级标签补一个空格：`<p>金额</p><p>查收</p>` 若直接拼接会成
+                        // 「金额查收」，检索「金额」以外的跨块词全部失效（审计 P1-17）。
+                        // 连续块标签（`</p><p>`）只补一个，避免空出双空格
+                        if !out.ends_with(' ') && !out.is_empty() {
+                            out.push(' ');
+                        }
                     }
                 }
                 None => {
@@ -453,7 +472,55 @@ pub fn strip_html(html: &str) -> String {
             }
         }
     }
-    out
+    // 块级标签补的空格会在首尾留下余量（`<p>正文</p>`）、并可能连成多空格；
+    // 纯文本用于检索/预览/导出，首尾空白一律去掉（内部空白保持原样，
+    // 不做 collapse——`<pre>` 里的缩进有意义）
+    out.trim().to_string()
+}
+
+/// 块级/换行标签：剥标签时须补空格，否则相邻块的文字会粘成一个词
+/// （`<td>金额</td><td>100</td>` → 「金额 100」而非「金额100」）。
+fn is_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div"
+            | "br"
+            | "tr"
+            | "td"
+            | "th"
+            | "li"
+            | "ul"
+            | "ol"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "blockquote"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "main"
+            | "nav"
+            | "aside"
+            | "figure"
+            | "figcaption"
+            | "pre"
+            | "hr"
+            | "form"
+            | "fieldset"
+            | "legend"
+            | "address"
+            | "caption"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+    )
 }
 
 /// HTML 实体解码一步（strip_html 与 MD 导出共用）：从 `&` 起扫描到 `;`
@@ -784,7 +851,13 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
             .map_err(|e| e.to_string())?;
         rows.filter_map(Result::ok)
-            .filter(|(_, s)| s.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')))
+            // 只处理「整串都在 U+00xx 内」的主题：出现任何 >0xFF 字符（CJK、破折号、
+            // emoji）说明这串不是纯 latin1 误读，硬按 GB18030 逆推会丢字或造出
+            // 乱码（审计 P1-16：`Résumé — 会议通知` 曾被啃成半截）。
+            .filter(|(_, s)| {
+                s.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}'))
+                    && s.chars().all(|c| (c as u32) <= 0xff)
+            })
             .collect::<Vec<_>>()
     };
     if mojibake.is_empty() {
@@ -801,9 +874,11 @@ pub fn repair_gbk_subjects(conn: &mut rusqlite::Connection) -> Result<(), String
         let (cow, _, _) = encoding_rs::GB18030.decode(&bytes);
         if cow.chars().any(is_cjk) {
             let subject = cow.trim();
+            // 主题变了必须同事务重算归组键：否则会话视图仍按乱码键分组，
+            // 修好的邮件与同主题的新邮件分处两组（审计 P1-11）
             tx.execute(
-                "UPDATE emails SET subject = ?2, subject_tokens = ?3 WHERE id = ?1",
-                rusqlite::params![id, subject, tokenize(subject)],
+                "UPDATE emails SET subject = ?2, subject_tokens = ?3, thread_key = ?4 WHERE id = ?1",
+                rusqlite::params![id, subject, tokenize(subject), thread_key_of(subject)],
             )
             .map_err(|e| e.to_string())?;
             fixed += 1;
@@ -903,18 +978,38 @@ pub fn repair_mojibake_bodies(conn: &mut rusqlite::Connection) -> Result<(), Str
 }
 
 /// 会话归组键存量回填（M2-2，v8 升级/首启）：把 NULL 的 thread_key 按 subject
-/// 普通化补齐（空主题 → 空串）。幂等：`WHERE thread_key IS NULL` 只扫待补行，
-/// 补齐后空扫退出；失败不阻断启动（与联系人回填同策略）。应在主题修复后调用，
-/// 使 backfill 基于已修复的 subject 计算归组键。
+/// 普通化补齐（空主题 → 空串）。
+///
+/// v13 起兼修「键过期」行：早期主题乱码修复只改 subject 不改 thread_key，
+/// 库里留下按乱码主题算出的键（含 U+00C0–U+00FF 高位字符），会话视图会把
+/// 修好的邮件与同主题新邮件分成两组。这里对含高位字符的键重算比对，不一致即覆盖。
+/// 幂等：补齐/修正后空扫退出；失败不阻断启动（与联系人回填同策略）。
+/// 应在主题修复后调用，使 backfill 基于已修复的 subject 计算归组键。
 pub fn backfill_thread_keys(conn: &mut rusqlite::Connection) -> Result<(), String> {
     let targets: Vec<(i64, String)> = {
         let mut stmt = conn
-            .prepare("SELECT id, subject FROM emails WHERE thread_key IS NULL")
+            .prepare(
+                // GLOB 按 Unicode 码点匹配：先粗筛 null 与含高位的键，避免全表读 subject
+                "SELECT id, subject, thread_key FROM emails
+                  WHERE thread_key IS NULL OR thread_key GLOB '*[À-ÿ]*'",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
             .map_err(|e| e.to_string())?;
-        rows.filter_map(Result::ok).collect::<Vec<_>>()
+        rows.filter_map(Result::ok)
+            .filter(|(_, subject, key)| match key {
+                None => true,
+                Some(k) => k != &thread_key_of(subject),
+            })
+            .map(|(id, subject, _)| (id, subject))
+            .collect::<Vec<_>>()
     };
     if targets.is_empty() {
         return Ok(());
@@ -1030,8 +1125,8 @@ fn save_draft_impl(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
                                     cc_addrs, subject, body_text, subject_tokens, body_tokens,
                                     unread, created_at, in_reply_to, body_kind, body_html, bcc_addrs,
-                                    thread_key, scheduled_at)
-                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                    thread_key, scheduled_at, message_id)
+                 VALUES ('out', 'draft', 'draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     input.from_addr,
                     input.from_name,
@@ -1048,6 +1143,9 @@ fn save_draft_impl(
                     input.bcc_addrs,
                     tk,
                     input.scheduled_at,
+                    // 草稿期就固定 Message-ID：重发/定时重试沿用同一个，
+                    // 服务端按它去重，本地发件箱同步也靠它认领副本（审计 P1-22）
+                    send::new_message_id(&input.from_addr),
                 ],
             )
             .map_err(e)?;
@@ -1098,16 +1196,21 @@ impl SortKey {
 
 /// 排序 SQL（alias 为空或 "e."）。时间列 t 是 SELECT 别名（AS t），
 /// SQLite 不允许别名带表前缀（e.t 报 no such column），故 t 始终裸写；
-/// starred/from_*/subject 是真实列，随 alias 前缀走
+/// starred/from_*/subject 是真实列，随 alias 前缀走。
+///
+/// 每个分支都以 `id` 收尾：同一秒内多封邮件时间相同，缺 tiebreaker 时 SQLite
+/// 返回顺序不稳定，翻页会重复/漏行（同一行出现在两页或两页都不出现）。
 fn order_sql(sort: SortKey, alias: &str) -> String {
     let a = alias;
     match sort {
         SortKey::DateDesc => format!("{a}starred DESC, t DESC, {a}id DESC"),
         SortKey::DateAsc => format!("t ASC, {a}id ASC"),
         SortKey::FromAsc => {
-            format!("{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, t DESC")
+            format!(
+                "{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, t DESC, {a}id DESC"
+            )
         }
-        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, t DESC"),
+        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, t DESC, {a}id DESC"),
     }
 }
 
@@ -1916,28 +2019,42 @@ fn preview_tip(text: &str, html: &str) -> String {
 }
 
 /// 文本是否疑似字符编码乱码（三道护栏，防误伤正常中文/西文）：
-/// ① 含 U+FFFD（解码丢字）；
-/// ② UTF-8 被 latin1/cp1252 解码的特征串（Ã/Â/â€ 或 C1 控制字符）；
+/// ① 连续 U+FFFD（解码丢字，≥4 处；单个替换字符常是某个畸形字形，不算）；
+/// ② UTF-8 被 latin1/cp1252 解码的特征序列（`Ã©`/`Ã£`/`â€` 等 ≥2 处，且高位
+///    字符占比 > 30%——西文里的 `Ã`/`Â` 单点出现是正常拼写，如 `AVIAÇÃO`）；
 /// ③ 按 GB18030 逆推回字节恰为合法 UTF-8 且含 CJK（"璇—□镮囬"类）。
-/// 高位字符 <4 一律不判，短文本巧合面太大。
+/// C1 控制字符（U+0080–U+009F）是 UTF-8 按 latin1 解码的必然产物，正常文本没有。
 pub(crate) fn looks_mojibake(text: &str) -> bool {
-    if text.contains('\u{FFFD}') {
+    let total = text.chars().count();
+    // ① 解码丢字：≥4 处替换字符属实锤；短文本里 2 处（占比 >10%）同样实锤——
+    //    正常内容里的单个替换字符多是某个畸形字形，不算
+    let fffd = text.matches('\u{FFFD}').count();
+    if fffd >= 4 || (fffd >= 2 && fffd * 10 > total) {
         return true;
     }
-    if text.chars().filter(|c| (*c as u32) >= 0x80).count() < 4 {
+    let high = text.chars().filter(|c| (*c as u32) >= 0x80).count();
+    if high < 4 {
         return false;
     }
     let latin1 = text
         .chars()
         .filter(|c| ('\u{80}'..='\u{FF}').contains(c))
         .count();
-    let latin1_markers = text.contains('Ã')
-        || text.contains('Â')
-        || text.contains("â€")
-        || text.chars().any(|c| ('\u{80}'..='\u{9F}').contains(&c))
-        // 正常西文重音字符稀疏（占比低）；latin1 误标的乱码整串都是高位字符
-        || (latin1 >= 4 && latin1 * 3 >= text.chars().count());
-    if latin1_markers {
+    // UTF-8 双字节被 latin1 解成 "Ã" + 第二字节，三字节被解成 "â€" + 尾字节
+    const SEQ: [&str; 16] = [
+        "Ã©", "Ã¨", "Ã¡", "Ã\u{AD}", "Ã³", "Ãº", "Ã£", "Ãµ", "Ã§", "Ã±", "Ã ", "Â ", "Â¡", "Â¿",
+        "â€", "â‚¬",
+    ];
+    let seqs = SEQ.iter().filter(|p| text.contains(*p)).count();
+    if seqs >= 2 && latin1 * 10 > total * 3 {
+        return true;
+    }
+    if text.chars().any(|c| ('\u{80}'..='\u{9F}').contains(&c)) {
+        return true;
+    }
+    // 高位字符占绝对多数且不含任何 CJK：GBK/UTF-8 被 cp1252 类单字节编码解出的形态
+    // （正常西文重音稀疏，不会占 60% 以上）
+    if latin1 * 10 > total * 6 && !text.chars().any(is_cjk) {
         return true;
     }
     recover_gbk_mojibake(text).is_some()
@@ -2065,6 +2182,9 @@ pub struct EmailDetail {
     pub scheduled_soon: bool,
     /// 原始信头（A5；空串 = 旧版本收取或未保存）：源码页排查投递/编码问题
     pub raw_headers: String,
+    /// 服务器已确认接收（`sent_at` 非空）。状态机卡在 sending 时靠它区分
+    /// 「已投递待落定」与「发送途中」——前者绝不能提示用户重发
+    pub delivered: bool,
     pub attachments: Vec<AttachView>,
 }
 
@@ -2077,7 +2197,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                         cc_addrs, COALESCE(bcc_addrs, ''), body_text, COALESCE(body_html, ''),
                         attach_cnt, attach_bytes, unread, in_reply_to, COALESCE(error, ''),
                         COALESCE(received_at, sent_at, created_at), too_large, starred,
-                        scheduled_at, COALESCE(raw_headers, '')
+                        scheduled_at, COALESCE(raw_headers, ''), sent_at IS NOT NULL
                  FROM emails WHERE id = ?1",
                 [id],
                 |r| {
@@ -2112,6 +2232,7 @@ pub fn get(state: &AppState, id: i64) -> Option<EmailDetail> {
                             at > 0 && at <= now_epoch() + 10
                         },
                         raw_headers: r.get(20)?,
+                        delivered: r.get::<_, i64>(21)? == 1,
                         attachments: Vec::new(),
                     })
                 },

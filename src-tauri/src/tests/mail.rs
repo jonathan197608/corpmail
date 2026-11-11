@@ -961,8 +961,10 @@ fn strip_html_decodes_numeric_char_refs() {
     assert_eq!(strip_html("<p>&#20320;&#22909;</p>"), "你好");
     // 十六进制（小写 x / 大写 X）
     assert_eq!(strip_html("&#x4f60;&#X597D;"), "你好");
-    // 与命名实体混排：你 + & + 好 + 空格
-    assert_eq!(strip_html("&#20320;&amp;&#22909;&nbsp;"), "你&好 ");
+    // 与命名实体混排：你 + & + 好；`&nbsp;` 在尾部属于空白噪声，剥标签后统一 trim
+    assert_eq!(strip_html("&#20320;&amp;&#22909;&nbsp;"), "你&好");
+    // 块级标签补的空格同样受 trim 约束（R26 补空格 + 首尾裁剪）
+    assert_eq!(strip_html("<p>金额</p><p>查收</p>"), "金额 查收");
     // 非法码位：0（NUL 不可成 char）、代理区 D800、超 0x10FFFF → 原样保留
     assert_eq!(strip_html("&#0;"), "&#0;");
     assert_eq!(strip_html("&#xD800;"), "&#xD800;");

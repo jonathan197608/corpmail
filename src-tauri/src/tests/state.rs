@@ -2,9 +2,14 @@
 //! 经 #[path] 引入回原模块，use super::* 保留白盒语义）
 
 use super::*;
-use crate::conf::{load, save};
+use crate::conf::save;
 use crate::db::{open, settings};
 use crate::mail::{now_epoch, save_draft};
+
+/// 测试便捷：读取成功即展开（错误路径见 tests/conf.rs 的 Err 断言）
+fn load(p: &Path) -> std::collections::BTreeMap<String, String> {
+    crate::conf::load(p).expect("配置读取失败")
+}
 
 #[test]
 fn first_fetch_days_parses_full_zero() {
@@ -738,6 +743,11 @@ fn move_data_dir_cleans_residue_and_restores_pointer_on_save_failure() {
         err.contains("配置文件写入失败"),
         "错误信息应指明配置写入：{err}"
     );
+    // R2：失败必须解冻，否则 UI 会停在"请重启"却并没有完成迁移
+    assert!(
+        !state.migration_pending(),
+        "迁移失败必须清除冻结位，让用户继续用旧目录"
+    );
     assert!(
         !target.join("corpmail.db").exists(),
         "失败后必须清理目标快照残留，否则重试被拦（C6）"
@@ -850,11 +860,12 @@ fn start_fetch_ignored_while_running() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 挂起轮达到上限：拒绝开新轮并说明原因（不再叠加线程/TcpStream/连接）
+/// 收件名额上限：正常轮打满 → 拒绝并说明；被判死的轮打满 → 提示重启
 #[test]
 fn fetch_refuses_new_round_at_hang_cap() {
     let dir = temp_dir("fetch-cap");
     let state = AppState::open(&dir);
+    // 正常轮打满（并发 4）：本次跳过，说明原因
     state.active_rounds.store(
         MAX_CONCURRENT_FETCH_ROUNDS,
         std::sync::atomic::Ordering::SeqCst,
@@ -863,8 +874,24 @@ fn fetch_refuses_new_round_at_hang_cap() {
     let snap = state.fetch_snapshot();
     assert!(!snap.running, "达到上限时不得开新轮");
     assert!(
-        snap.last_error.contains("后台无响应"),
+        snap.last_error.contains("后台运行"),
         "应说明拒绝原因：{}",
+        snap.last_error
+    );
+    // 已被看门狗判死（detached，线程可能永不返回）的轮打满：只能重启
+    state
+        .active_rounds
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    state.detached_rounds.store(
+        MAX_DETACHED_FETCH_ROUNDS,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    state.start_fetch();
+    let snap = state.fetch_snapshot();
+    assert!(!snap.running, "detached 上限同样拒绝");
+    assert!(
+        snap.last_error.contains("后台无响应"),
+        "应提示重启：{}",
         snap.last_error
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -1285,5 +1312,87 @@ fn display_name_skips_when_unconfigured() {
         "未配置账号时不得把历史邮件的名字写进新配置"
     );
     assert!(load(&dir).is_empty(), "不得产生任何配置写入");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- R2：迁移冻结（重启前的写入必须显式失败，不能静默落旧库） ----------
+
+/// 迁移成功后：冻结位常驻、二次迁移被拒、收件与定时派发立刻收手
+#[test]
+fn move_data_dir_freezes_writes_until_restart() {
+    let base = temp_dir("mig-freeze");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    // 一封已到点的定时草稿：冻结后调度器不得把它翻成 queued
+    let due = save_draft(
+        &state,
+        &crate::mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: String::new(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "定时".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: now_epoch() - 5,
+        },
+    )
+    .unwrap();
+
+    let dest = base.join("moved");
+    state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect("首次迁移应成功");
+    assert!(
+        state.migration_pending(),
+        "迁移成功后冻结位必须保持到进程退出"
+    );
+    // 二次迁移：直接拒绝（不写新快照、不动指针）
+    let err = state.move_data_dir(dest.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("已迁移"), "二次迁移应提示重启：{err}");
+    // 收件：不启动新轮，状态条给出明确原因
+    state.start_fetch();
+    let fs = state.fetch_snapshot();
+    assert!(!fs.running, "冻结期不得启动收件轮");
+    assert!(
+        fs.last_error.contains("已迁移"),
+        "收件应提示重启：{}",
+        fs.last_error
+    );
+    // 定时派发：到点草稿保持 draft（不写旧库）
+    assert_eq!(
+        crate::mail::dispatch_due_scheduled(&state),
+        0,
+        "冻结期不得派发定时邮件"
+    );
+    let status: String = state
+        .with_conn(|c| {
+            c.query_row("SELECT status FROM emails WHERE id = ?1", [due], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    assert_eq!(status, "draft", "冻结期不得改写邮件状态");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 迁移前必须等在跑的收件轮收尾；超时返回 false（调用方据此放弃并解冻）
+#[test]
+fn wait_fetch_idle_times_out_while_round_running() {
+    let dir = temp_dir("mig-wait");
+    let state = AppState::open(&dir);
+    let epoch = state.fetch_cas_begin().expect("空闲时应能起轮");
+    // 本轮刚开始：看门狗不会判死，wait 只能靠超时退出
+    assert!(!state.wait_fetch_idle(std::time::Duration::from_millis(150)));
+    state.fetch_end(epoch, 0, "");
+    assert!(
+        state.wait_fetch_idle(std::time::Duration::from_millis(150)),
+        "空闲轮应立即放行迁移"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

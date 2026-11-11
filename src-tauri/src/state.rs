@@ -157,7 +157,23 @@ pub struct AppState {
     /// 线程本身因 imap 无网络超时仍可能卡死——达到上限即拒绝新轮，
     /// 防止挂起线程 + TcpStream + SQLite 连接无限累积（审计 P1-5）
     pub(crate) active_rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// 已被看门狗判死（detached）但仍可能挂着的轮数：独立计数，达到上限才拒绝
+    /// 新轮，正常情况下不因「上轮挂住」而让收件永久失效（审计 P1-13）
+    pub(crate) detached_rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// 当前轮的结算凭证（弱引用）：看门狗据此把判死的轮转 detached 并释放名额
+    round_ticket: Mutex<std::sync::Weak<RoundTicket>>,
+    /// 数据目录已迁移、等待重启的冻结位（审计 H2/R2）。
+    /// 迁移成功后**保持到进程退出**：此后所有写入都必须显式失败而不是静默落旧库
+    /// （重启后 resolve_start_dir 读新指针直接打开新库，冻结位随进程消失）。
+    /// Arc 是为了让收件线程/发送 worker 不持 AppState 也能读到
+    migration_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// 迁移冻结期的统一提示（路由 409 / 收件 / 发送 worker 共用同一句中文）
+pub const MIGRATION_PENDING_MSG: &str = "数据已迁移，请重启应用后继续（当前进程内的修改不会保存）";
+
+/// 迁移前等待在跑收件轮收尾的上限：超过即放弃本次迁移并提示稍后重试
+const MIGRATION_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 收件状态快照（收件按钮 spinner/禁用与状态片段共用）
 #[derive(Clone, Debug)]
@@ -191,10 +207,52 @@ pub struct FetchState {
 /// 避免收件按钮永久卡死（挂起线程自身因 epoch 失配无法再污染新一轮状态）
 const FETCH_WATCHDOG_SECS: i64 = 300;
 
-/// 同时存在的收件线程上限（含看门狗已复位但线程仍挂起的旧轮）。
-/// 取 2 = 允许一个挂起轮等网络自愈，再多即拒绝新轮——每轮占 1 个 TcpStream
-/// 与 1 个 SQLite 连接，无限重试会在网络黑洞下持续泄漏资源
-const MAX_CONCURRENT_FETCH_ROUNDS: usize = 2;
+/// 同时存在的收件线程上限（正常轮）。
+/// imap crate 无会话级读超时（`client_builder.rs` 硬编码 `TcpStream::connect`，
+/// 无注入口，`Client` 也无公开 `secure()`），黑洞丢包时一轮会永久挂起。
+/// 因此看门狗超时后把该轮标为 detached **并释放名额**，让收件继续可用：
+/// 正常轮上限 4（企业服务器偶发长响应时仍有并发余量），detached 轮独立计数
+/// 上限 8（每轮占 1 个 TcpStream + 1 个 SQLite 连接，给资源一个明确上界）。
+pub(crate) const MAX_CONCURRENT_FETCH_ROUNDS: usize = 4;
+pub(crate) const MAX_DETACHED_FETCH_ROUNDS: usize = 8;
+
+/// 一轮收件的名额凭证：正常结束归还 active，看门狗判死时转为 detached。
+/// `released` 保证两条路径只结算一次（线程最终返回时 Drop 不再重复递减）。
+struct RoundTicket {
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    detached: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl RoundTicket {
+    fn new(
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        detached: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            active,
+            detached,
+            released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 正常结束：只归还名额
+    fn release(&self) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 看门狗判死：归还名额并计入 detached（线程可能永不返回）
+    fn detach(&self) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.detached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 /// 拼接完整邮箱地址：前缀 + 域名（§8；域名可配置，缺前导 @ 自动补齐）
 pub fn full_address(prefix: &str, domain: &str) -> String {
@@ -264,7 +322,7 @@ impl AppState {
             name_probe: Mutex::new(NameProbe { last_miss: None }),
             data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
             anchor_dir: anchor_dir.to_path_buf(),
-            config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir))),
+            config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir)?)),
             send_tx: Mutex::new(None),
             seen_tx: Mutex::new(None),
             notify_hook: Mutex::new(None),
@@ -284,6 +342,9 @@ impl AppState {
                 progress_started_done: 0,
             })),
             active_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            detached_rounds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            round_ticket: Mutex::new(std::sync::Weak::<RoundTicket>::new()),
+            migration_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
         state.try_auto_clean_empty_old_backup();
@@ -308,11 +369,16 @@ impl AppState {
     /// 安全回退锚点目录——迁移前的原数据就留在那里）
     pub fn resolve_start_dir(anchor: &Path) -> PathBuf {
         let usable = |p: &str| Path::new(p).join("corpmail.db").is_file();
-        if let Some(p) = crate::conf::load(anchor)
-            .get(keys::DATA_DIR)
-            .cloned()
-            .filter(|p| usable(p))
-        {
+        // 读不到配置就按锚点目录启动（AppState::open 会再读一次并给出启动失败
+        // 提示，这里只负责别让"指针在但读不出"变成打开错误的库）
+        let cfg = match crate::conf::load(anchor) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[state] {e}");
+                return anchor.to_path_buf();
+            }
+        };
+        if let Some(p) = cfg.get(keys::DATA_DIR).cloned().filter(|p| usable(p)) {
             return PathBuf::from(p);
         }
         anchor.to_path_buf()
@@ -325,8 +391,59 @@ impl AppState {
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
     /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
     pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
+        // 已迁移待重启：再迁一次没有意义（新快照会覆盖目标库，且旧库仍在被本进程写）
+        if self.migration_pending() {
+            return Err(MIGRATION_PENDING_MSG.into());
+        }
         let cur = self.data_dir();
         let dest_path = validate_data_dir(&cur, dest)?;
+        // 冻结写入（R2）：置位后新的收件轮 / 发送派发 / HTTP 写请求一律被挡，
+        // 再等正在跑的收件轮收尾——此后 VACUUM INTO 的快照就是一致终点。
+        // 任何失败路径都必须清位，否则 UI 会停在"请重启"却并没有完成迁移
+        self.migration_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.wait_fetch_idle(MIGRATION_FETCH_WAIT) {
+            self.migration_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err("正在收取邮件，请等本轮收件结束后再迁移".into());
+        }
+        if let Err(e) = self.migrate_snapshot(&cur, &dest_path) {
+            // 迁移失败：解冻，让用户继续正常使用旧目录
+            self.migration_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(format!(
+            "数据已迁移到新目录，请重启应用后继续使用（重启前的一切修改都不会保存）。旧目录中若有邮件数据，\
+             其备份可在 设置 → 存储管理 中手动删除（旧目录无邮件时重启后将自动清理）。新目录：{}",
+            dest_path.display()
+        ))
+    }
+
+    /// 迁移冻结期判定（路由/send worker/fetch 共用）
+    pub fn migration_pending(&self) -> bool {
+        self.migration_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 等待在跑的收件轮收尾（迁移前调用）。收件线程每轮开头会检查冻结位并主动退出，
+    /// 所以通常毫秒级返回；返回 false = 超时（调用方应放弃本次迁移）
+    fn wait_fetch_idle(&self, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            // 走 fetch_snapshot：顺带跑看门狗，挂死轮会在 300s 阈值后被判死复位
+            if !self.fetch_snapshot().running {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// 迁移落盘（快照 → 附件 → 指针）。调用前必须已置冻结位并确认无在跑收件轮
+    fn migrate_snapshot(&self, cur: &Path, dest_path: &Path) -> Result<(), String> {
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
         let new_db = dest_path.join("corpmail.db");
         self.with_conn(|conn| {
@@ -381,11 +498,7 @@ impl AppState {
             return Err(e);
         }
 
-        Ok(format!(
-            "数据已迁移到新目录，重启应用后生效。旧目录中若有邮件数据，其备份可在 设置 → 存储管理 中手动删除\
-             （旧目录无邮件时重启后将自动清理）。新目录：{}",
-            dest_path.display()
-        ))
+        Ok(())
     }
 
     /// 首设专用：空库直切数据目录（会话内立即生效，不迁移、不重启）。
@@ -755,7 +868,19 @@ impl AppState {
     fn fetch_guard_hung(&self) {
         let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running && crate::mail::now_epoch() - s.started_at > FETCH_WATCHDOG_SECS {
-            eprintln!("[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，强制复位");
+            eprintln!(
+                "[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，判定挂起并释放名额"
+            );
+            // imap 无读超时，这一轮可能永不返回：把名额转成 detached，否则
+            // 两轮挂住就再也发不出新的收件请求，用户只能重启（审计 P1-13）
+            if let Some(ticket) = self
+                .round_ticket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade()
+            {
+                ticket.detach();
+            }
             s.running = false;
             s.epoch += 1;
             s.last_error = format!(
@@ -783,7 +908,12 @@ impl AppState {
     pub fn imap_params(&self) -> Option<ImapParams> {
         let d = defaults();
         let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
-        let port: u16 = g(keys::RECV_PORT).parse().unwrap_or(993);
+        // 端口 0 是合法 u16 但不是合法目标（见 send.rs 同款注释），回退默认 993
+        let port: u16 = g(keys::RECV_PORT)
+            .parse()
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(993);
         let account = full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN));
         let password = self.retrieve_password(&account).into_password()?;
         Some(ImapParams {
@@ -826,14 +956,27 @@ impl AppState {
     }
 
     pub fn start_fetch(&self) {
-        // 挂起轮上限（审计 P1-5）：看门狗只复位 UI 状态，挂起线程仍在跑。
-        // 达到上限即拒绝新轮并给出明确原因，而不是继续叠加线程
+        // 迁移冻结（R2）：快照已定格，此刻收件只会写进即将被抛弃的旧库
+        if self.migration_pending() {
+            self.set_fetch_error(MIGRATION_PENDING_MSG.to_string());
+            return;
+        }
+        // 挂起轮上限（审计 P1-5/P1-13）：看门狗已把判死的轮转为 detached 并
+        // 释放名额，所以这里只需拦「detached 累积到上限」这一种病态情况
+        let detached = self
+            .detached_rounds
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if detached >= MAX_DETACHED_FETCH_ROUNDS {
+            self.set_fetch_error(format!(
+                "已有 {detached} 轮收件在后台无响应（网络可能中断），请检查网络后重启应用"
+            ));
+            return;
+        }
         if self.active_rounds.load(std::sync::atomic::Ordering::SeqCst)
             >= MAX_CONCURRENT_FETCH_ROUNDS
         {
             self.set_fetch_error(format!(
-                "已有 {MAX_CONCURRENT_FETCH_ROUNDS} 轮收件在后台无响应（网络可能中断），\
-                 请检查网络后重启应用"
+                "已有 {MAX_CONCURRENT_FETCH_ROUNDS} 轮收件在后台运行，本次跳过"
             ));
             return;
         }
@@ -846,6 +989,12 @@ impl AppState {
         let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
         };
+        // 二次确认冻结位：与 move_data_dir 的置位存在极窄竞态窗口（它先置位再等
+        // running 归零），CAS 之后再查一次即可保证「冻结后绝不起新轮」
+        if self.migration_pending() {
+            self.fetch_end(epoch, 0, MIGRATION_PENDING_MSG);
+            return;
+        }
         let Some(conn_params) = self.imap_params() else {
             self.fetch_end(epoch, 0, "凭据缺失，请先在设置中保存密码");
             return;
@@ -858,7 +1007,17 @@ impl AppState {
         let last = self.last_cursor(crate::mail::MailDest::Inbox);
         let last_sent = self.last_cursor(crate::mail::MailDest::Sent);
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
-        let active_rounds = std::sync::Arc::clone(&self.active_rounds);
+        // 冻结位随 job 进线程：每轮 attempt 开头据此立刻收手（迁移正在等它收尾）
+        let migration_flag = std::sync::Arc::clone(&self.migration_pending);
+        // 名额凭证：正常结束 release，看门狗判死 detach（二者只结算一次）
+        let ticket = std::sync::Arc::new(RoundTicket::new(
+            std::sync::Arc::clone(&self.active_rounds),
+            std::sync::Arc::clone(&self.detached_rounds),
+        ));
+        *self
+            .round_ticket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::downgrade(&ticket);
         // 通知钩子提前 clone（spawn 要 'static，锁守卫不得跨线程）
         let notify = self
             .notify_hook
@@ -868,10 +1027,9 @@ impl AppState {
         let cur_dir = self.data_dir();
         let db_path = cur_dir.join("corpmail.db");
         let data_dir = cur_dir;
-        active_rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
             // RAII：任何退出路径（含 panic 越过 fetch_round 内部 catch_unwind）都归还名额
-            let _guard = RoundGuard(active_rounds);
+            let _guard = RoundGuard(ticket);
             fetch_round(FetchJob {
                 fetch_state,
                 db_path,
@@ -887,6 +1045,7 @@ impl AppState {
                 last_sent,
                 epoch,
                 notify,
+                migration: migration_flag,
             });
         });
     }
@@ -955,14 +1114,17 @@ impl AppState {
         let attach_root = dir.join("attachments");
         // 凭据回退密钥（锚点目录；库外文件，见 secrets::KEY_FILE）
         let key_file = self.key_file();
+        // 迁移冻结位（R2）：冻结期间不派发，邮件留在 queued 由重启后的补发扫描接手
+        let migration_flag = std::sync::Arc::clone(&self.migration_pending);
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
         // 崩溃恢复 1/2：`sending` 是仅存在于进程内的中间态，跨进程无合法含义。
         // 进程在发送中被杀（关机/崩溃/强退）后该邮件会永久停在 sending：
-        // 启动补发只查 queued、reopen_failed 只收 failed、详情页 2s 轮询永不停止，
-        // 用户既不能重发也不能删除重来。这里复位为 failed 并写明原因，把决策权交回用户
+        // 启动补发只查 queued、reopen_failed 只收 failed、详情页 2s 轮询永不停止。
+        // 按 sent_at 分开处理：已写投递时间 → 补成 sent（不能诱导重发）；
+        // 未写 → 复位 failed 并写明原因，把「是否重发」的决策交回用户
         let recovered = crate::mail::recover_interrupted_sends(&conn);
         if recovered > 0 {
-            eprintln!("[send] 启动自愈：{recovered} 封中断的 sending 邮件已复位为 failed");
+            eprintln!("[send] 启动自愈：{recovered} 封中断的 sending 邮件已按投递事实复位");
         }
         // 崩溃恢复 2/2：残留 queued 补发（按 id 升序）
         let stale: Vec<i64> = conn
@@ -974,6 +1136,12 @@ impl AppState {
             .unwrap_or_default();
         std::thread::spawn(move || {
             for id in rx {
+                // 迁移冻结（R2）：已投递事实尚未落定就可能被本进程写回旧库，
+                // 直接跳过不派发——邮件保持 queued，重启后由残留扫描补发
+                if migration_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("[send] 迁移冻结中，邮件 {id} 保持排队（重启后补发）");
+                    continue;
+                }
                 // 发送参数快照：每封派发前重读配置（corpmail.toml；改动即时生效，
                 // 不落库——验收拍板简化）
                 let smtp = {
@@ -1536,8 +1704,13 @@ fn copy_dir_recursive(src: &Path, dest: &Path, written: &mut Vec<PathBuf>) -> Re
 ///
 /// 修复：旧实现 `.parse().ok().filter(|v| *v > 0).unwrap_or(7)` 把"全部"(=0)
 /// 误判为非法并回退到 7 天，导致用户在设置里选"全部"实际只拉近 7 天邮件。
+/// 上限 3650 天（10 年）：值来自配置文件/表单，负数或天文数字只会让
+/// `now - days*86400` 溢出或扫全库，钳到合理区间。
 fn first_fetch_days_from_raw(raw: &str) -> i64 {
-    raw.parse::<i64>().unwrap_or(30)
+    raw.trim()
+        .parse::<i64>()
+        .unwrap_or(30)
+        .clamp(0, 3650)
 }
 
 /// 单封收件上限（字节）：解析失败/未配置取默认 50MB；超出区间钳制到 1..=200MB
@@ -1551,12 +1724,13 @@ pub fn max_mail_bytes_from(raw: &str) -> u64 {
     u64::from(mb) * 1024 * 1024
 }
 
-/// 收件线程名额归还（Drop 时递减：正常结束、提前 return、panic 展开均生效）
-struct RoundGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+/// 收件线程名额归还（Drop 时结算：正常结束 release，被看门狗判死则已在 detach
+/// 中结算过，这里不会重复递减）
+struct RoundGuard(std::sync::Arc<RoundTicket>);
 
 impl Drop for RoundGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.release();
     }
 }
 
@@ -1642,6 +1816,8 @@ struct FetchJob {
     epoch: u64,
     /// 新邮件通知钩子（完成且 added>0 时在本线程内触发；None = 测试/未装配）
     notify: Option<NotifyHook>,
+    /// 迁移冻结位（R2）：每轮 attempt 开头检查，已冻结则立刻收手交还名额
+    migration: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
@@ -1858,6 +2034,7 @@ fn fetch_round(job: FetchJob) {
         last_sent,
         epoch,
         notify,
+        migration,
     } = job;
     // 本轮开始时刻：完成后作为新增邮件查询窗口下界（通知用）。
     // 取在拆 job 后、首个入库前：宁可窗口稍宽（前一轮尾部重叠由进程内
@@ -1905,6 +2082,12 @@ fn fetch_round(job: FetchJob) {
         );
     }
     for attempt in 1..=FETCH_ATTEMPTS {
+        // 迁移冻结（R2）：快照已定格，本轮立即收手交还 running 名额
+        // （move_data_dir 正在等它；继续拉只会写进即将被抛弃的旧库）
+        if migration.load(std::sync::atomic::Ordering::SeqCst) {
+            finish(added as i64, MIGRATION_PENDING_MSG.to_string());
+            return;
+        }
         let (cur_sent, cur_inbox) = if attempt == 1 {
             (last_sent, last)
         } else {

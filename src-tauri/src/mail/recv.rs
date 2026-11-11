@@ -51,7 +51,7 @@ const OVER_CHUNK: usize = 200;
 ///   未拉的邮件会被增量续拉永久跳过（静默漏信）
 /// - 正常 run 双阈值：≤BATCH 封且已知累计字节 ≤BATCH_MAX_BYTES（与 flush
 ///   预算同源，单次响应体驻留内存的峰值不劣化）；大小未知时仅按封数兜底
-/// - 超限判定完全来自 prefetch_sizes 预检；预检失败 = 全按正常处理（旧行为）
+/// - 超限判定完全来自 prefetch_sizes 预检；预检失败不会走到这里（整轮已失败）
 fn plan_runs(uids: &[u32], sizes: &HashMap<u32, u32>, max_mail_bytes: u64) -> Vec<FetchRun> {
     let mut runs: Vec<FetchRun> = Vec::new();
     let mut run_uids: Vec<u32> = Vec::new();
@@ -420,29 +420,34 @@ fn uid_set(uids: &[u32]) -> String {
 }
 
 /// 大小预检：分块 `(UID RFC822.SIZE)`，返回 uid → 字节数。
-/// 预检失败不阻断收件（部分服务器对 UID 数据项支持不佳）——退化为"不知道大小"，
-/// 按旧行为整封拉取，仍受 BATCH_MAX_BYTES 分批保护。
+///
+/// **失败即整轮失败**（不静默退化为"整封拉取"）：大小未知时无法判断是否超限，
+/// 一封 500MB 的邮件会直接进内存；也不能降级成"只拉信头 + 占位"——那会在一次
+/// 瞬时网络错误后让整批邮件正文凭空消失。RFC822.SIZE 属 IMAP4rev1 基础数据项，
+/// 拿不到就是这条会话不可用，交给下一轮重试（游标未推进，不会漏信）。
 fn prefetch_sizes<T: std::io::Read + std::io::Write>(
     sess: &mut imap::Session<T>,
     uids: &[u32],
-) -> HashMap<u32, u32> {
+) -> Result<HashMap<u32, u32>, String> {
     let mut out: HashMap<u32, u32> = HashMap::new();
     for chunk in uids.chunks(SIZE_CHECK_CHUNK) {
-        match sess.uid_fetch(uid_set(chunk), "(UID RFC822.SIZE)") {
-            Ok(fetches) => {
-                for f in fetches.iter() {
-                    if let (Some(uid), Some(size)) = (f.uid, f.size) {
-                        out.insert(uid, size);
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[fetch] 大小预检失败（按整封拉取继续）：{err}");
-                break;
+        let fetches = sess
+            .uid_fetch(uid_set(chunk), "(UID RFC822.SIZE)")
+            .map_err(|e| format!("获取邮件大小失败（收信已中止，稍后重试）：{e}"))?;
+        for f in fetches.iter() {
+            if let (Some(uid), Some(size)) = (f.uid, f.size) {
+                out.insert(uid, size);
             }
         }
     }
-    out
+    // 个别 UID 未回报大小（刚被其他客户端删除等）：同样不能猜，按失败处理
+    let missing = uids.iter().filter(|u| !out.contains_key(u)).count();
+    if missing > 0 {
+        return Err(format!(
+            "有 {missing} 封邮件未返回大小信息（收信已中止，稍后重试）"
+        ));
+    }
+    Ok(out)
 }
 
 /// 建立 IMAP 连接并登录（收件拉取与已读回写共用，避免连接/登录参数漂移）。
@@ -500,8 +505,8 @@ impl RealFetcher {
         let uidvalidity = mailbox.uid_validity.unwrap_or(0);
         let uids = resolve_uids(&mut sess, first_days, last, uidvalidity)?;
         // 大小预检（审计批 0+2）：超过单封上限的只拉信头，避免整封 + 附件 + gzip
-        // 副本同时驻留内存。已知超限 → 占位入库；未知大小 → 按整封拉（旧行为）
-        let sizes = prefetch_sizes(&mut sess, &uids);
+        // 副本同时驻留内存。预检失败即整轮失败（见 prefetch_sizes 注释）
+        let sizes = prefetch_sizes(&mut sess, &uids)?;
         // 分 run 拉取：连续同类 UID 归并成一条 FETCH（大邮箱首拉从万次 RTT
         // 降到 千封/千分之一 量级）；升序不变量见 plan_runs 注释
         let runs = plan_runs(&uids, &sizes, max_mail_bytes);
@@ -1086,7 +1091,11 @@ fn collect_attachments(mail: &mailparse::ParsedMail) -> Vec<IncomingAttach> {
 fn walk_attachments(mail: &mailparse::ParsedMail, out: &mut Vec<IncomingAttach>) {
     let cd = mail.get_content_disposition();
     let named = cd.params.contains_key("filename") || mail.ctype.params.contains_key("name");
-    if cd.disposition == mailparse::DispositionType::Attachment || named {
+    // 只有「显式 attachment」或「带 filename/name 的叶子 part」才当附件。
+    // 带 name 的 multipart 容器（转发链里常见）必须继续递归，否则内层附件的
+    // 正文与文件都拿不到，整封只剩一个空壳（审计 P1-19）。
+    let leaf = mail.subparts.is_empty();
+    if cd.disposition == mailparse::DispositionType::Attachment || (named && leaf) {
         let filename = cd
             .params
             .get("filename")
@@ -1138,21 +1147,77 @@ pub fn store_incoming_conn(
     // 本账号地址（小写）：联系人采集时排除“自己”（整批只读一次 settings）
     let self_l = super::contacts::self_addr_conn(conn);
     for m in mails {
-        let remote = format!("{remote_prefix}{}:{}", m.uidvalidity, m.uid);
-        // 去重：remote_uid 唯一索引 + message_id 双保险（空串不按 message_id 去重）。
-        // message_id 限定同方向：自己发给自己的信会同时出现在 Sent 与 Inbox，
-        // 跨方向去重会吞掉其中一份。
-        let dup: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM emails WHERE remote_uid = ?1)
-                     OR (?2 <> '' AND EXISTS(
-                           SELECT 1 FROM emails WHERE message_id = ?2 AND direction = ?3))",
-                rusqlite::params![remote, m.message_id, direction],
-                |r| r.get(0),
-            )
-            .map_err(e)?;
-        if dup {
-            continue;
+        // 服务器未给 UIDVALIDITY 时不再编造 "0:uid" 键：写 NULL，只按 message_id 去重，
+        // 否则 UV 从「缺失」变成真实值后，新旧键互不命中 → 整箱重复入库
+        let remote: Option<String> =
+            (m.uidvalidity != 0).then(|| format!("{remote_prefix}{}:{}", m.uidvalidity, m.uid));
+        // 去重口径（审计 P1-12 / P1-13）：
+        // ① remote_uid 命中 → 这个 UID 已入库，跳过。
+        // ② message_id 命中「旧 UIDVALIDITY」的远端行 → 服务器重编号了：把这行的
+        //    remote_uid 迁到新值，保留已读/星标/本地附件，不重复入库。
+        // ③ message_id 命中「同一 UIDVALIDITY」的远端行但 UID 不同 → 服务器上确实
+        //    有两封同 ID 的邮件（群发副本、归档再投），属于合法重复，各存一行。
+        // ④ message_id 命中本地行（remote_uid IS NULL，本地已发送/草稿副本）→
+        //    服务器已有同一封，跳过插入。
+        if let Some(remote_uid) = remote.as_deref() {
+            let same_uid: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM emails WHERE remote_uid = ?1)",
+                    [remote_uid],
+                    |r| r.get(0),
+                )
+                .map_err(e)?;
+            if same_uid {
+                continue;
+            }
+        }
+        if !m.message_id.is_empty() {
+            let existing: Vec<(i64, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, remote_uid FROM emails
+                          WHERE message_id = ?1 AND direction = ?2 AND remote_uid IS NOT NULL",
+                    )
+                    .map_err(e)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![m.message_id, direction], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(e)?;
+                rows.filter_map(Result::ok).collect()
+            };
+            let mut remap: Option<i64> = None;
+            let mut same_uv = false;
+            for (id, ru) in existing {
+                if remote_uidvalidity(&ru) == Some(m.uidvalidity) {
+                    same_uv = true; // ③ 同 UV 的另一 UID：合法重复
+                } else {
+                    remap.get_or_insert(id); // ② 旧 UV 的同一封
+                }
+            }
+            if !same_uv
+                && let (Some(id), Some(new_remote)) = (remap, remote.as_deref())
+            {
+                conn.execute(
+                    "UPDATE emails SET remote_uid = ?2 WHERE id = ?1",
+                    rusqlite::params![id, new_remote],
+                )
+                .map_err(e)?;
+                continue;
+            }
+            // ④ 本地副本（无 remote_uid）已存在 → 不再插入
+            let local: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM emails
+                        WHERE message_id = ?1 AND direction = ?2 AND folder = ?3
+                          AND remote_uid IS NULL)",
+                    rusqlite::params![m.message_id, direction, folder],
+                    |r| r.get(0),
+                )
+                .map_err(e)?;
+            if local {
+                continue;
+            }
         }
         let st = tokenize(&m.subject);
         let bt = tokenize(&m.body_text);
@@ -1188,7 +1253,7 @@ pub fn store_incoming_conn(
                 m.attachments.len() as i64,
                 attach_bytes,
                 unread,
-                remote,
+                remote.as_deref(),
                 m.message_id,
                 now,
                 ts,
@@ -1297,6 +1362,14 @@ pub struct SeenParams {
     pub password: String,
     pub uidvalidity: u32,
     pub uid: u32,
+}
+
+/// 从 `remote_uid`（形如 `12:345` 或 `sent:12:345`）取 UIDVALIDITY 段。
+/// 格式不符返回 None（历史脏数据/被手工改过的行不参与 UV 比较）。
+fn remote_uidvalidity(remote: &str) -> Option<u32> {
+    let (head, _uid) = remote.rsplit_once(':')?;
+    let uv = head.rsplit_once(':').map(|(_, v)| v).unwrap_or(head);
+    uv.parse().ok()
 }
 
 /// 取回写参数（本地已读由 mark_read 负责；此处读 remote/服务器参数/凭据）。

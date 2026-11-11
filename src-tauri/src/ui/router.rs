@@ -13,7 +13,7 @@ use super::settings::{
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
-use crate::state::{self, AppState, defaults, full_address, keys};
+use crate::state::{self, AppState, MIGRATION_PENDING_MSG, defaults, full_address, keys};
 use crate::templates;
 use crate::ui::Assets;
 use rusqlite::OptionalExtension;
@@ -248,6 +248,8 @@ struct MainCtx {
     threads: Vec<mail::ThreadSummary>,
     /// 会话/单封视图切换链接（保留 folder/unread/external/q，翻页重置）
     thread_href: String,
+    /// 列表/检索查询失败的原因（非空时模板渲染错误条 + 重试，不再伪装成空列表）
+    list_error: String,
 }
 
 /// 邮件详情页
@@ -445,10 +447,38 @@ pub(super) fn test_view(label: &str, o: &TestOutcome) -> TestView {
 
 /// 总路由：动态路由优先，静态资源兜底，最后 404
 pub fn route<A: Assets>(state: &AppState, assets: &A, req: &Req, tester: &dyn ConnTester) -> Resp {
+    // 迁移冻结（审计 H2/R2）：数据目录已迁走、等待重启期间，任何带副作用的请求
+    // 都必须明确失败——静默写进旧库，等于用户刚做的修改在重启后凭空消失
+    if state.migration_pending() && has_side_effect(req) {
+        return migration_locked();
+    }
     if let Some(resp) = dynamic(state, req, tester) {
         return resp;
     }
     serve_asset(assets, req).unwrap_or_else(Resp::not_found)
+}
+
+/// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
+/// GET 只读放行（页面/片段仍可查看），唯一例外是手动触发收件的 GET
+fn has_side_effect(req: &Req) -> bool {
+    match req.method.as_str() {
+        "GET" => req.path == "/emails/fetch",
+        "HEAD" | "OPTIONS" => false,
+        _ => true,
+    }
+}
+
+/// 迁移冻结期的统一拒绝响应：409 + 纯文本提示。
+/// htmx 默认不 swap 4xx，前端 app.js 在 `htmx:responseError` 里把这段文本落到
+/// toast 上（否则用户看到的现象是「点了没反应」）
+fn migration_locked() -> Resp {
+    Resp {
+        status: 409,
+        content_type: "text/plain; charset=utf-8".into(),
+        cache_control: "no-store",
+        body: MIGRATION_PENDING_MSG.as_bytes().to_vec(),
+        extra_headers: Vec::new(),
+    }
 }
 
 /// 动态路由（页面与片段），未命中返回 None 交给静态资源
@@ -709,21 +739,38 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
             .query_param("mode")
             .map(|v| v == "thread")
             .unwrap_or(false);
-    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词/检索异常回退普通列表。
-    // 会话模式按 thread_key 归组取代表行（list_threads），单封语义不变
+    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词回退普通列表。
+    // 会话模式按 thread_key 归组取代表行（list_threads），单封语义不变。
+    // 查询失败一律显式报错：旧实现 unwrap_or_default 会把「库坏了/SQL 出错」
+    // 渲染成「没有邮件」，用户以为邮件丢了（审计 P1-45）。
+    let mut list_error = String::new();
     let (items, threads, total) = if is_thread {
-        let (threads, total) = mail::list_threads(state, &q).unwrap_or_default();
-        (Vec::new(), threads, total)
+        match mail::list_threads(state, &q) {
+            Ok((threads, total)) => (Vec::new(), threads, total),
+            Err(e) => {
+                list_error = e;
+                (Vec::new(), Vec::new(), 0)
+            }
+        }
     } else {
-        let (items, total) = if q_input.is_empty() {
-            mail::list(state, &q).unwrap_or_default()
+        let res = if q_input.is_empty() {
+            mail::list(state, &q)
         } else {
             match mail::search(state, &q_input, &q) {
-                Ok(Some(res)) => res,
-                Ok(None) | Err(_) => mail::list(state, &q).unwrap_or_default(),
+                Ok(Some(res)) => Ok(res),
+                // 全停用词/无有效查询项：退回普通列表（与既有口径一致）
+                Ok(None) => mail::list(state, &q),
+                // 检索本身失败不退回列表：那会把「检索不可用」显示成全部邮件
+                Err(e) => Err(e),
             }
         };
-        (items, Vec::new(), total)
+        match res {
+            Ok((items, total)) => (items, Vec::new(), total),
+            Err(e) => {
+                list_error = e;
+                (Vec::new(), Vec::new(), 0)
+            }
+        }
     };
     let pages = (total + per - 1) / per;
     // 基址 = folder + q + per（不含筛选）：两个开关各自"取反自己、保留对方"，
@@ -872,6 +919,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         is_thread,
         threads,
         thread_href,
+        list_error,
     };
     if req.is_htmx_request {
         render_html("mail_list.html", &ctx)
@@ -1153,6 +1201,10 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
 /// 旧实现每次点击 spawn 一个线程做完整 IMAP 登录，连点 N 封 = N 次登录（企业服务器
 /// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
 fn mark_read_and_sync_seen(state: &AppState, id: i64) {
+    // 迁移冻结（R2）：详情页仍可只读打开，但"已读"写入会落进即将被抛弃的旧库
+    if state.migration_pending() {
+        return;
+    }
     // GET 详情页/片段渲染路径不适合因本地已读写失败整页报错；失败必须可观测，
     // 由 db::open 的 busy_timeout 兜住绝大多数瞬时冲突，走到这里属真故障
     if let Err(e) = mail::mark_read(state, id) {
@@ -2140,6 +2192,8 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
             ctx.body_text = format!("\n\n--\n{}", signature.trim_end());
         }
     }
+    // R44：保存/发送失败回跳时携带的表单值优先级最高（覆盖草稿/签名档）
+    apply_retry_form(req, &mut ctx);
     render_html("compose.html", &ctx)
 }
 
@@ -2193,7 +2247,8 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
             "/compose?draft_id={id}&saved=1{}{ctx_suffix}",
             skipped_suffix(skipped)
         )),
-        Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
+        // 保存失败：草稿未落库，把表单值随重定向带回（否则用户刚写的内容全丢）
+        Err((draft_id, e)) => compose_retry_redirect(draft_id, &e, &ctx_qs, &form),
     }
 }
 
@@ -2356,9 +2411,12 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
     if let Some(at) = sched_epoch
         && at <= mail::now_epoch() + 60
     {
-        return redirect_compose(
+        // 校验在保存之前：库里没有任何新内容，只能靠查询串把表单值带回去
+        return compose_retry_redirect(
             form_i64(&form, "draft_id").unwrap_or(0),
             "定时时间需晚于当前时间 1 分钟以上，请重新选择",
+            &ctx_qs,
+            &form,
         );
     }
     match save_compose_form(state, req) {
@@ -2412,7 +2470,7 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             }
             Resp::hx_redirect(&target)
         }
-        Err((draft_id, e)) => redirect_compose_ctx(draft_id, &e, &ctx_qs),
+        Err((draft_id, e)) => compose_retry_redirect(draft_id, &e, &ctx_qs, &form),
     }
 }
 
@@ -2458,15 +2516,99 @@ fn redirect_compose(draft_id: i64, error: &str) -> Resp {
     ))
 }
 
-/// 同 redirect_compose，但把列表上下文带回撰写页（保存失败重试后返回链接不退化）
-fn redirect_compose_ctx(draft_id: i64, error: &str, ctx_qs: &str) -> Resp {
-    if ctx_qs.is_empty() {
-        return redirect_compose(draft_id, error);
-    }
-    Resp::hx_redirect(&format!(
-        "/compose?draft_id={draft_id}&error={}&{ctx_qs}",
+/// 保存/发送失败回撰写页：除错误原因外，把**未落库的表单值**一并带回（R44）。
+///
+/// 旧实现只带 draft_id + error，撰写页按库里的旧草稿重建——保存失败时用户
+/// 刚敲的收件人/主题/正文整段消失（htmx 走 HX-Redirect 整页导航，DOM 里的
+/// 值不会自动保留）。正文按 8KB 截断（UTF-8 安全边界）：超长邮件仍会丢尾巴，
+/// 但一段都不给才是真丢。
+fn compose_retry_redirect(draft_id: i64, error: &str, ctx_qs: &str, form: &HashMap<String, String>) -> Resp {
+    let mut url = format!(
+        "/compose?draft_id={draft_id}&error={}",
         urlencode(error)
-    ))
+    );
+    if !ctx_qs.is_empty() {
+        url.push('&');
+        url.push_str(ctx_qs);
+    }
+    url.push_str(&retry_form_qs(form));
+    Resp::hx_redirect(&url)
+}
+
+/// 未落库表单值 → 查询串（与 compose_page 的 apply_retry_form 对称）
+const RETRY_BODY_LIMIT: usize = 8 * 1024;
+
+fn retry_form_qs(form: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    for (param, field) in [
+        ("to", "to_addrs"),
+        ("cc", "cc_addrs"),
+        ("bcc", "bcc_addrs"),
+        ("subject", "subject"),
+    ] {
+        let v = form.get(field).map(|s| s.trim()).unwrap_or("");
+        if !v.is_empty() {
+            out.push_str(&format!("&{param}={}", urlencode(v)));
+        }
+    }
+    let html_mode = form.get("body_mode").map(String::as_str).unwrap_or("plain") == "html";
+    let (field, mode) = if html_mode {
+        ("body_html", "html")
+    } else {
+        ("body_text", "plain")
+    };
+    let body = form.get(field).map(String::as_str).unwrap_or("");
+    if !body.trim().is_empty() {
+        out.push_str(&format!(
+            "&body={}&mode={mode}",
+            urlencode(&truncate_utf8(body, RETRY_BODY_LIMIT))
+        ));
+    }
+    out
+}
+
+/// 按字节上限截断，落在 char 边界上（不允许切出半个 UTF-8 序列）
+fn truncate_utf8(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// 失败回填（R44）：查询串里的 to/cc/bcc/subject/body 覆盖草稿内容。
+/// HTML 正文按净化管线走一遍再进编辑器（URL 里的内容同样不可信）。
+fn apply_retry_form(req: &Req, ctx: &mut ComposeCtx) {
+    if let Some(v) = req.query_param("to") {
+        ctx.to_addrs = v;
+    }
+    if let Some(v) = req.query_param("cc") {
+        ctx.cc_addrs = v;
+    }
+    if let Some(v) = req.query_param("bcc") {
+        ctx.bcc_addrs = v;
+    }
+    if let Some(v) = req.query_param("subject") {
+        ctx.subject = v;
+    }
+    let Some(body) = req.query_param("body") else {
+        return;
+    };
+    if req.query_param("mode").as_deref() == Some("html") {
+        let clean = mail::sanitize_html(&body);
+        if !clean.trim().is_empty() {
+            ctx.body_text = mail::strip_html(&clean);
+            ctx.body_html = mail::unwrap_top_div(&clean);
+            ctx.body_mode = "html".into();
+        }
+    } else {
+        ctx.body_text = body;
+        ctx.body_html = String::new();
+        ctx.body_mode = "plain".into();
+    }
 }
 
 /// Office 预览（B8，GET /emails/{id}/attachments/{aid}/office）：
@@ -3151,7 +3293,7 @@ fn rebuild_list_query(
 fn clamp_page(raw: Option<&str>) -> i64 {
     raw.and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(1)
-        .clamp(1, 100_000)
+        .clamp(1, 10_000)
 }
 
 /// 每页条数下限（1 = 分页功能的最小可验证粒度，E2E B8 用 per=1 测翻页）

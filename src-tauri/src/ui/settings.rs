@@ -75,6 +75,8 @@ pub(super) struct SettingsCtx {
     clean_view: Option<CleanView>,
     // 待生效的数据目录（M5 迁移成功后展示，重启后消失）
     pending_dir: String,
+    /// 迁移已落盘、等待重启的冻结期（R2）：写入全被路由层拒，页面显示固定横幅
+    migration_pending: bool,
     // 旧目录迁移备份（M5：锚点中的库/附件副本；仅存储 tab 且已迁移时展示）
     has_backup: bool,
     backup_size: String,
@@ -245,6 +247,7 @@ pub(super) fn settings_ctx(
         } else {
             String::new()
         },
+        migration_pending: state.migration_pending(),
         has_backup,
         backup_size,
         backup_files,

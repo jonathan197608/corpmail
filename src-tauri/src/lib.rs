@@ -351,7 +351,10 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
         std::thread::sleep(std::time::Duration::from_secs(30));
         loop {
             let state = handle.state::<state::AppState>();
-            if let Err(err) = clean::run(&state) {
+            // 迁移冻结（R2）：清理器会删库行与附件文件，冻结期整轮跳过
+            if state.migration_pending() {
+                eprintln!("[clean] 迁移待重启，跳过本轮清理");
+            } else if let Err(err) = clean::run(&state) {
                 eprintln!("[clean] 清理器执行失败：{err}");
             }
             std::thread::sleep(std::time::Duration::from_secs(24 * 3600));

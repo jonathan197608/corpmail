@@ -37,19 +37,31 @@ pub fn is_config_key(key: &str) -> bool {
     CONFIG_KEYS.contains(&key)
 }
 
-/// 读取全部配置（文件缺失 → 空 map，即未配置状态；未知键过滤——
-/// 配置文件内仅承载 CONFIG_KEYS）。
+/// 读取全部配置（未知键过滤——配置文件内仅承载 CONFIG_KEYS）。
 ///
-/// 文件存在但解析失败（手改坏、编码损坏、磁盘写一半）时：先把原文改名留证，
-/// 再以空配置继续。旧实现直接静默降级为空 map，且下一次保存会用默认值覆盖
-/// 唯一可恢复的原文，用户表现为"账号配置凭空消失"（审计 P2-12）。
-pub fn load(anchor: &Path) -> BTreeMap<String, String> {
+/// 三种情况分开处理：
+/// - **文件不存在** → 空 map（未配置状态，正常首启）。
+/// - **IO 失败**（权限、盘掉线、路径是目录）→ `Err`：这不是"没配置"，静默按未配置
+///   启动会让用户面对空向导、甚至把默认值写回覆盖掉唯一可恢复的原文。调用方
+///   （`AppState::open`）走启动失败提示。
+/// - **解析失败**（手改坏、编码损坏、写一半）→ 原文改名备份后按未配置继续：
+///   文件已留证可人工恢复，没必要因手误挡住整个应用。
+///
+/// `broken-*` 备份只保留最近 3 份，避免反复启动把锚点目录塞满。
+pub fn load(anchor: &Path) -> Result<BTreeMap<String, String>, String> {
     let path = anchor.join(CONFIG_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return BTreeMap::new();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(format!(
+                "配置文件不可读（{}）：{e}。请检查文件权限或所在磁盘后重启",
+                path.display()
+            ));
+        }
     };
     match toml::from_str::<BTreeMap<String, String>>(&text) {
-        Ok(map) => map.into_iter().filter(|(k, _)| is_config_key(k)).collect(),
+        Ok(map) => Ok(map.into_iter().filter(|(k, _)| is_config_key(k)).collect()),
         Err(err) => {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -65,7 +77,32 @@ pub fn load(anchor: &Path) -> BTreeMap<String, String> {
                     "原文备份失败（保留原文件）".to_string()
                 }
             );
-            BTreeMap::new()
+            if kept {
+                prune_broken_backups(anchor, 3);
+            }
+            Ok(BTreeMap::new())
+        }
+    }
+}
+
+/// 只保留最近 `keep` 份 `corpmail.toml.broken-<ts>` 备份（文件名里的时间戳即排序键）。
+fn prune_broken_backups(anchor: &Path, keep: usize) {
+    let prefix = format!("{CONFIG_FILE}.broken-");
+    let Ok(entries) = std::fs::read_dir(anchor) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    names.sort(); // 时间戳等宽数字串：字典序即时间序
+    for name in &names[..names.len() - keep] {
+        if let Err(e) = std::fs::remove_file(anchor.join(name)) {
+            eprintln!("[conf] 旧备份清理失败（{name}）：{e}");
         }
     }
 }

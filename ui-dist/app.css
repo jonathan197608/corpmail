@@ -773,6 +773,27 @@ body {
     padding: 28px 24px;
 }
 
+/* 列表/检索失败条：查询出错时显示原因与重试，替代「空列表」假象 */
+.list-error {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px 0 0;
+    padding: 9px 12px;
+    border-radius: 9px;
+    border: 1px solid #f0cdc9;
+    background: #fdf3f2;
+    color: #8a2f27;
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+
+.list-error .le-msg {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
 /* 空态插画（B5-2）：浅色渐变圆底 + 主题色线条插图，替代 emoji；
    内联 SVG 无二进制资源，stroke 用 currentColor 随主题着色。 */
 .empty-art {
@@ -2675,6 +2696,13 @@ form.setup-card .setup-actions {
 .compose-note.err {
     background: #f9eef1;
     color: var(--danger);
+}
+
+/* 迁移冻结（R2）：数据已迁走、等待重启期间的固定横幅 */
+.compose-note.warn {
+    background: #fffbeb;
+    color: #b45309;
+    border: 1px solid #fde68a;
 }
 
 .attach-area {

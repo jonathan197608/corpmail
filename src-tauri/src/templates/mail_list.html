@@ -3,6 +3,13 @@
    以 #list-area 为目标整体换入，顶栏「共 N 封」计数随之更新 #}
 {% import "icons.html" as ic %}
 <div id="list-area">
+    {% if list_error %}
+    {# 查询失败不再伪装成「空列表」：给出原因与重试（重试 = 重载当前页） #}
+    <div class="list-error" role="alert">
+        <span class="le-msg">{{ ic.icon('warning') }} 邮件列表加载失败：{{ list_error }}</span>
+        <a class="btn small" href="{{ page_base }}page={{ page }}">重试</a>
+    </div>
+    {% endif %}
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub">共 {{ total }} 封</span></h1>
         {% if not is_thread and items %}
@@ -175,7 +182,7 @@
             {% if page < pages %}<a class="pg" href="{{ page_base }}mode=thread&page={{ pages }}" title="第 {{ pages }} 页">末页 »</a>{% endif %}
         </div>
         {% endif %}
-        {% else %}
+        {% elif not list_error %}
         <div class="card empty-state">
             <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-12.3 7.6L4 21l1-4.2A8.5 8.5 0 1 1 21 11.5z"/><path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01"/></svg></div>
             <h2>暂无会话</h2>
@@ -226,7 +233,7 @@
             {% if page < pages %}<a class="pg" href="{{ page_base }}page={{ pages }}" title="第 {{ pages }} 页">末页 »</a>{% endif %}
         </div>
         {% endif %}
-        {% else %}
+        {% elif not list_error %}
         <div class="card empty-state">
             {% if q %}
             <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>

@@ -4,6 +4,11 @@
 use super::*;
 use crate::state::keys;
 
+/// 测试便捷：读取成功即展开。错误路径用 `super::load` 直接断言 Err。
+fn load(p: &Path) -> BTreeMap<String, String> {
+    super::load(p).expect("配置读取失败")
+}
+
 #[test]
 fn save_load_roundtrip_and_corrupt_tolerated() {
     let dir = std::env::temp_dir().join(format!("mbx-conf-{}", std::process::id()));

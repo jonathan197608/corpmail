@@ -711,8 +711,9 @@ fn storage_move_returns_pane_with_pending_dir() {
         dest,
         "重启后应定位新目录"
     );
-    // 失败路径：目标已占用（已有 corpmail.db）→ pane 顶部错误区
-    let html2 = body(&route(
+    // 迁移后进入冻结期：再次迁移被路由层挡下（409 纯文本），而不是渲染错误 pane
+    // ——旧实现在这里靠"目标已存在 corpmail.db"报错，现在语义是"等你重启"
+    let resp = route(
         &state,
         &assets(),
         &req(
@@ -721,11 +722,21 @@ fn storage_move_returns_pane_with_pending_dir() {
             &form(&[("dest", dest.to_str().unwrap())]),
         ),
         &tester,
+    );
+    assert_eq!(resp.status, 409, "冻结期二次迁移必须被拒");
+    assert!(body(&resp).contains("已迁移"), "应提示重启：{}", body(&resp));
+    // 存储 pane：固定横幅 + 写操作按钮禁用
+    let html2 = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/panes/storage", b""),
+        &tester,
     ));
     assert!(
-        html2.contains("corpmail.db") && html2.contains("compose-note err"),
-        "失败应显示错误原因：{html2}"
+        html2.contains("重启应用后继续使用"),
+        "冻结期应显示固定横幅：{html2}"
     );
+    assert!(html2.contains("disabled"), "写操作按钮应禁用：{html2}");
     let _ = std::fs::remove_dir_all(&dest);
     cleanup(&dir);
 }
@@ -3670,8 +3681,8 @@ fn error_page_escapes_dynamic_text() {
     assert!(html.contains("&lt;script&gt;"), "{html}");
 }
 
-/// page 参数归一（审计 I3）：list_root 与 rebuild_list_query 共用 clamp_page，
-/// 口径统一 1..=100000（畸形→1，超上限→100000）
+/// page 参数归一（审计 I3/R60）：list_root 与 rebuild_list_query 共用 clamp_page，
+/// 口径统一 1..=10000（畸形→1，超上限→10000；100000 页 × 50 封属于无意义的深扫）
 #[test]
 fn clamp_page_unifies_range() {
     assert_eq!(clamp_page(None), 1, "缺省第 1 页");
@@ -3681,12 +3692,12 @@ fn clamp_page_unifies_range() {
     assert_eq!(clamp_page(Some("-5")), 1, "负数 → 下限 1");
     assert_eq!(clamp_page(Some("1")), 1);
     assert_eq!(clamp_page(Some("30")), 30, "范围内原样");
-    assert_eq!(clamp_page(Some("100000")), 100000, "恰好上限原样");
-    assert_eq!(clamp_page(Some("100001")), 100_000, "超上限钳到 100000");
+    assert_eq!(clamp_page(Some("10000")), 10_000, "恰好上限原样");
+    assert_eq!(clamp_page(Some("10001")), 10_000, "超上限钳到 10000");
     assert_eq!(
         clamp_page(Some("9999999999999")),
-        100_000,
-        "巨型值钳到 100000（防大 OFFSET 扫描）"
+        10_000,
+        "巨型值钳到 10000（防大 OFFSET 扫描）"
     );
     assert_eq!(clamp_page(Some("+3")), 3, "带符号合法值解析");
 }
@@ -4872,9 +4883,10 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     // 白盒测法：占满并发轮名额，start_fetch 走同步拒绝分支并写入确定错误，
     // 从而判断"是否被触发"，避免真实网络线程让断言不确定。
     let (state, dir) = temp_state("wiz-first-fetch");
-    state
-        .active_rounds
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    state.active_rounds.store(
+        state::MAX_CONCURRENT_FETCH_ROUNDS,
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let resp = route(
         &state,
         &assets(),
@@ -4897,7 +4909,7 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
         .last_error
         .clone();
     assert!(
-        err.contains("已有 2 轮"),
+        err.contains(&format!("已有 {} 轮", state::MAX_CONCURRENT_FETCH_ROUNDS)),
         "保存成功应触发首拉（名额占满时留下明确拒绝原因）：{err}"
     );
     state.clear_password("unit.router@chinatelecom.cn");
@@ -8845,4 +8857,122 @@ fn proxy_image_accepts_bitmap_mimes_only() {
     assert!(!allowed_image_mime("image/svg+xml"), "SVG 可携带脚本");
     assert!(!allowed_image_mime("text/html"));
     assert!(!allowed_image_mime(""));
+}
+
+/// R2 迁移冻结：写请求 409 + 纯文本提示，读页面照常放行。
+/// 迁移成功后本进程仍连着旧库，若不在路由层拦截，用户的保存会静默写进
+/// 即将被抛弃的旧库——重启后凭空消失
+#[test]
+fn migration_freeze_blocks_writes_but_allows_reads() {
+    let base = std::env::temp_dir().join(format!("mbx-router-mig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cur = base.join("cur");
+    std::fs::create_dir_all(&cur).unwrap();
+    let state = AppState::open(&cur);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let dest = base.join("moved");
+    state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect("迁移应成功");
+    assert!(state.migration_pending(), "迁移成功后进入冻结期");
+
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 写（POST）：设置保存被拒
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[("sync_interval_min", "5")]),
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 409, "冻结期写请求必须 409");
+    assert!(
+        body(&resp).contains("已迁移"),
+        "应提示重启：{}",
+        body(&resp)
+    );
+    // 带副作用的 GET：手动收件同样被拒（否则会写旧库并卡住状态条）
+    let resp = route(&state, &assets(), &req("GET", "/emails/fetch", b""), &tester);
+    assert_eq!(resp.status, 409, "冻结期手动收件必须 409");
+    // 读：列表页照常渲染（冻结只挡写）
+    let resp = route(&state, &assets(), &req("GET", "/", b""), &tester);
+    assert_eq!(resp.status, 200, "读页面不受冻结影响");
+    assert!(body(&resp).contains("收件箱"), "列表页应正常渲染");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------- R44：保存/发送失败回撰写页不丢表单值 ----------
+
+/// 保存失败（草稿 id 已被删/非草稿）→ HX-Redirect 必须带上未落库的
+/// 收件人/主题/正文，且撰写页读回这些参数后原样回填
+#[test]
+fn compose_save_failure_carries_form_values_back() {
+    let (state, dir) = temp_state("r44-retry");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                // 不存在的草稿 id → save_draft 直接拒绝，库中不会有任何新内容
+                ("draft_id", "999999"),
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "季度预算"),
+                ("body_text", "这是用户刚敲的正文"),
+            ]),
+        ),
+        &tester,
+    );
+    let loc = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .expect("失败必须回撰写页");
+    assert!(loc.contains("error="), "应带错误原因：{loc}");
+    assert!(loc.contains("to=peer%40x.cn"), "应带回收件人：{loc}");
+    assert!(loc.contains("subject="), "应带回主题：{loc}");
+    assert!(loc.contains("body="), "应带回正文：{loc}");
+
+    // 按该 URL 重新打开撰写页：值必须回填（否则用户看到的是空表单）
+    let qs = loc.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", qs, b""),
+        &tester,
+    ));
+    assert!(html.contains("这是用户刚敲的正文"), "正文应回填：{html}");
+    assert!(html.contains("peer@x.cn"), "收件人应回填");
+    assert!(html.contains("季度预算"), "主题应回填");
+    cleanup(&dir);
+}
+
+/// 正文按 8KB 截断时不得切出半个 UTF-8 序列
+#[test]
+fn retry_body_truncates_on_char_boundary() {
+    let mut f = HashMap::new();
+    f.insert("body_text".to_string(), "汉".repeat(3000)); // 9000 字节
+    let qs = retry_form_qs(&f);
+    let raw = qs
+        .split("body=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .expect("应带 body 参数");
+    let decoded: String = form_urlencoded::parse(format!("body={raw}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    assert!(decoded.len() <= RETRY_BODY_LIMIT, "超长正文按上限截断");
+    assert_eq!(decoded.len() % 3, 0, "截断点必须落在 UTF-8 字符边界");
+    assert!(decoded.chars().all(|c| c == '汉'));
 }

@@ -228,11 +228,12 @@ fn store_incoming_dedupes_and_sets_unread() {
         incoming(2, true, "已读通知", "<m-2@x.cn>"),
         // 同 uid（同 remote_uid）重复：应跳过
         incoming(1, false, "激励清单", "<m-1@x.cn>"),
-        // 新 uid 但 message_id 已存在：应跳过
+        // 同 UIDVALIDITY 下另一个 UID 却带同一 message_id：服务器上确实有两份
+        // （归档再投/群发副本），按 R22 属合法重复——有 remote_uid 时只按远端键去重
         incoming(9, false, "清单转发", "<m-1@x.cn>"),
     ];
     let added = store_incoming(&state, &mails).unwrap();
-    assert_eq!(added, 2, "去重后仅入库两封");
+    assert_eq!(added, 3, "只按远端键去重：同 UID 跳过，同 UV 异构 UID 视为两份");
     let rows: Vec<(String, bool, String)> = state.with_conn(|c| {
         c.prepare("SELECT remote_uid, unread = 1, message_id FROM emails ORDER BY id")
             .unwrap()
@@ -241,10 +242,11 @@ fn store_incoming_dedupes_and_sets_unread() {
             .filter_map(Result::ok)
             .collect()
     });
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, "42:1");
     assert!(rows[0].1, "\\Seen 缺失应置未读");
     assert!(!rows[1].1, "含 \\Seen 应置已读");
+    assert_eq!(rows[2].0, "42:9", "异构 UID 的同一 message_id 各存一行");
     // FTS 索引同步（分词影子列由触发器搬运；列限定避免正文命中干扰断言）
     let hit: i64 = state.with_conn(|c| {
         c.query_row(
@@ -266,7 +268,17 @@ fn store_incoming_dedupes_and_sets_unread() {
     };
     let added = store_incoming(&state, &[with_attach]).unwrap();
     assert_eq!(added, 1);
-    let d = get(&state, 3).unwrap();
+    // 按 message_id 取回本次插入的行（前面有多封同 message_id 的合法重复，
+    // 自增 id 不再固定为 3）
+    let new_id: i64 = state.with_conn(|c| {
+        c.query_row(
+            "SELECT id FROM emails WHERE message_id = ?1",
+            ["<m-3@x.cn>"],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    let d = get(&state, new_id).unwrap();
     assert_eq!(d.attach_cnt, 1);
     assert_eq!(d.attachments[0].filename, "清单.xlsx");
     cleanup(&dir);
@@ -475,10 +487,11 @@ fn fix_mojibake_does_not_touch_normal_western_text() {
 
 /// 同一封邮件两个 part 声明不一致：text/plain 是不可逆乱码（修复链路救不回），
 /// text/html 正常。正文纯文本须改用 HTML 派生，避免 body_tokens/FTS/转发一起脏。
+/// 注：按 R24 的护栏，单个 U+FFFD 不算实锤，这里用 4 个表达"解码已丢字"。
 #[test]
 fn extract_body_falls_back_to_html_when_plain_is_irreversibly_mojibake() {
     let (mangled, _, _) = encoding_rs::GBK.decode("会议纪要：请查收附件中的季度报表".as_bytes());
-    let mangled = format!("{}\u{FFFD}乱码", mangled);
+    let mangled = format!("{}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}乱码", mangled);
     let raw = format!(
         "Content-Type: multipart/alternative; boundary=B\r\n\r\n\
          --B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{mangled}\r\n\
@@ -854,7 +867,9 @@ fn store_incoming_dedupes_message_id_within_direction_only() {
         n += store_incoming_conn(conn, &state.data_dir(), &[again_sent], MailDest::Sent)?;
         Ok::<usize, String>(n)
     });
-    assert_eq!(added.unwrap(), 2, "跨方向各存一份，同方向重复被去重");
+    // 跨方向各存一份（方向不互吞）；同方向的重投在服务器上就是两个 UID，
+    // 按 R22「有 remote_uid 时只按远端键去重」各存一行
+    assert_eq!(added.unwrap(), 4, "跨方向不互吞，同方向异构 UID 各存一份");
     let dirs: Vec<String> = state.with_conn(|c| {
         c.prepare("SELECT direction FROM emails ORDER BY id")
             .unwrap()
@@ -863,7 +878,39 @@ fn store_incoming_dedupes_message_id_within_direction_only() {
             .filter_map(Result::ok)
             .collect()
     });
-    assert_eq!(dirs, vec!["in".to_string(), "out".to_string()]);
+    assert_eq!(
+        dirs,
+        vec![
+            "in".to_string(),
+            "out".to_string(),
+            "in".to_string(),
+            "out".to_string()
+        ]
+    );
+    cleanup(&dir);
+}
+
+/// R22 的边界：同一 message_id 的**本地副本**（remote_uid IS NULL，如自己发出的
+/// 那封在发件箱里）不重复入库；服务器重编号（UV 变化）时迁移远端键而不是新增行。
+#[test]
+fn store_incoming_remaps_remote_uid_on_uidvalidity_change() {
+    let (state, dir) = temp_state("m4-uv-remap");
+    let first = incoming(5, false, "重编号", "<m-uv@x.cn>");
+    assert_eq!(store_incoming(&state, &[first]).unwrap(), 1);
+    // UIDVALIDITY 从 42 变 7：同一封的 UID 也跟着变（10）→ 迁移，不新增
+    let mut again = incoming(10, false, "重编号", "<m-uv@x.cn>");
+    again.uidvalidity = 7;
+    assert_eq!(store_incoming(&state, &[again]).unwrap(), 0, "重编号不得重复入库");
+    let (n, remote): (i64, String) = state.with_conn(|c| {
+        (
+            c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+                .unwrap(),
+            c.query_row("SELECT remote_uid FROM emails", [], |r| r.get(0))
+                .unwrap(),
+        )
+    });
+    assert_eq!(n, 1, "行数不变");
+    assert_eq!(remote, "7:10", "远端键迁到新 UIDVALIDITY");
     cleanup(&dir);
 }
 

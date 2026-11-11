@@ -680,6 +680,31 @@ document.body.addEventListener('htmx:afterRequest', function (ev) {
     }
 });
 
+// ---------- 通用 toast + 非 2xx 提示 ----------
+// htmx 默认不 swap 4xx/5xx（responseHandling 里 4xx/5xx 是 swap:false），
+// 服务端用 text/plain 返回一句人话时，用户看到的现象是"点了没反应"。
+// 统一落到 #toast：迁移冻结（R2）的 409 就靠这条提示，其它 4xx/5xx 一并受益。
+function mbxToast(text, cls, stayMs) {
+    var slot = document.getElementById('toast');
+    if (!slot) return null;
+    var el = document.createElement('div');
+    el.className = 'toast ' + (cls || 'busy');
+    // 文案可能来自服务端响应，走 textContent 而非 innerHTML
+    el.textContent = text;
+    slot.appendChild(el);
+    if (stayMs) setTimeout(function () { el.remove(); }, stayMs);
+    return el;
+}
+
+document.body.addEventListener('htmx:responseError', function (ev) {
+    var xhr = ev.detail && ev.detail.xhr;
+    if (!xhr) return;
+    var text = (xhr.responseText || '').trim();
+    // 只回显短纯文本：错误页 HTML 塞进 toast 反而看不清
+    if (!text || text.length > 300 || text.charAt(0) === '<') return;
+    mbxToast(text, 'err', 6000);
+});
+
 // ---------- 撰写页：富文本编辑器（wangEditor 5，输出 HTML；纯文本只可单向升级） ----------
 // 挂载/工具栏由编辑器渲染；提交时经 htmx:configRequest 把 getHtml() 注入参数。
 var mbxEditor = null; // wangEditor 实例（富文本模式下存在）
@@ -728,6 +753,14 @@ function mbxBuildEditor(initial) {
         });
     } catch (e) {
         console.error('编辑器初始化失败', e);
+    }
+    // 富文本编辑走 contenteditable，不产生表单 input 事件：补发一次到隐藏域，
+    // 让"未保存"判定与自动保存防抖都能感知正文变化（2026-11-11 R45 同批）
+    if (mbxEditor) {
+        mbxEditor.on('change', function () {
+            const ta = document.getElementById('body-text');
+            if (ta) ta.dispatchEvent(new Event('input', { bubbles: true }));
+        });
     }
 }
 
@@ -1047,6 +1080,18 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     }
 });
 
+// R40：一次真实请求结束后（成功或失败）两个"已确认"标志都清掉。
+// 旧实现只在放行分支里 delete，请求失败/被后续校验拦下时标志会留在按钮上，
+// 下次点发送就静默跳过确认。取消（preventDefault，未发请求）不会进这里，
+// 但那条路径本就没置位。
+document.body.addEventListener('htmx:afterRequest', function (ev) {
+    var elt = ev.detail && ev.detail.elt;
+    if (!elt || !elt.dataset || !elt.matches) return;
+    if (!elt.matches('button[hx-post="/compose/send"]')) return;
+    delete elt.dataset.mbxBodyOk;
+    delete elt.dataset.mbxSubjOk;
+});
+
 function mbxRtInit() {
     if (!document.getElementById('editor-container')) return;
     // 富文本模式（回复/转发 HTML 邮件、HTML 草稿）：直接挂载，初始内容
@@ -1061,8 +1106,10 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
 // ---------- 设置页保存按钮：配置无变化时禁用 ----------
 // 进入/保存后按表单当前值建立基线；任一表单控件变化即启用保存，无修改则保持禁用。
 // 排除 disabled（服务端只读字段）与 submit/button/file；password 空=保持不变，
-// 清回空串视为无变化。sync 的开关改 hidden 值不走 input/change，需补 click 监听。
-// 每次 swap 后经 htmx:afterSettle 重建基线（保存结果/切 Tab 均被覆盖）。
+// 清回空串视为无变化。开关（.toggle）改的是 hidden 值：click 后补一次刷新（R43）。
+// 基线在每次 htmx:afterSettle 全量重建，且取「当前 DOM 里的表单」——切 tab 是
+// outerHTML 换整块，事件里的节点是旧的（R46）。
+// window.mbxPaneDirty：同一基线的脏判定，供离开确认复用（R45：改回原值即不脏）。
 (function () {
     var base = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
     function snapshot(form) {
@@ -1078,37 +1125,63 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         }
         return JSON.stringify(out);
     }
+    function paneForms() {
+        var p = document.getElementById('settings-pane');
+        if (!p) return [];
+        return Array.prototype.slice.call(p.querySelectorAll('form'));
+    }
     function paneForm(node) {
-        var f = node && node.closest ? node.closest('#settings-pane form') : null;
-        return f;
+        return node && node.closest ? node.closest('#settings-pane form') : null;
     }
     function refresh(form) {
         if (!base || !form) return;
         var b = form.querySelector('button[type="submit"]');
-        if (b) b.disabled = base.get(form) === snapshot(form);
+        if (!b) return;
+        // 没有基线（表单刚换入、尚未重建）时保持可点，避免把用户锁死
+        b.disabled = base.has(form) && base.get(form) === snapshot(form);
     }
-    function rebaseline(form) {
-        if (!base || !form || !form.querySelector('button[type="submit"]')) return;
-        base.set(form, snapshot(form));
-        refresh(form);
+    window.mbxPaneDirty = function () {
+        if (!base) return false;
+        return paneForms().some(function (f) {
+            return base.has(f) && base.get(f) !== snapshot(f);
+        });
+    };
+    // rebaselineAll(scope)：只重建本次 htmx 换入子树覆盖 #settings-pane 的表单。
+    // 旧实现无视 swap 来源全量重建——侧栏收取状态（every 10s 轮询）的 settle
+    // 落在「已填写、未提交」窗口时，会把已填值误存为新基线，保存按钮禁死、
+    // 提交静默失败（E2E 06 F5a 逐轮复现）。target 与 pane 有 id 关系才重建；
+    // 注意设置页 swap 都是 outerHTML，ev.detail.target 是换出前的旧节点（同
+    // id），DOM 包含关系对新节点不成立，必须按 id 判（自身/祖先/后代均可）。
+    // 换入的新表单无基线，refresh 保持可点，随后立即建好基线。
+    function rebaselineAll(scope) {
+        if (!base) return;
+        var pane = document.getElementById('settings-pane');
+        if (!pane) return;
+        if (scope) {
+            var hit = scope.id === 'settings-pane'
+                || (scope.closest && scope.closest('#settings-pane'))
+                || (scope.querySelector && scope.querySelector('#settings-pane'));
+            if (!hit) return;
+        }
+        paneForms().forEach(function (f) {
+            if (!f.querySelector('button[type="submit"]')) return;
+            base.set(f, snapshot(f));
+            refresh(f);
+        });
     }
     document.addEventListener('input', function (ev) { refresh(paneForm(ev.target)); });
     document.addEventListener('change', function (ev) { refresh(paneForm(ev.target)); });
+    // .toggle 的 onclick 先改 hidden 值，事件冒泡到这里时快照已是新值
     document.addEventListener('click', function (ev) {
         var t = ev.target;
         var f = paneForm(t);
         if (f && t.classList && t.classList.contains('toggle')) refresh(f);
     });
     document.body.addEventListener('htmx:afterSettle', function (ev) {
-        var pane = ev.detail && ev.detail.elt;
-        var f = pane
-            ? (pane.matches && pane.matches('#settings-pane form') ? pane
-               : (pane.querySelector ? pane.querySelector('#settings-pane form') : null))
-            : null;
-        rebaseline(f);
+        rebaselineAll(ev.detail && ev.detail.target);
     });
     document.addEventListener('DOMContentLoaded', function () {
-        rebaseline(document.querySelector('#settings-pane form'));
+        rebaselineAll(document.getElementById('settings-pane'));
     });
 })();
 
@@ -1538,25 +1611,17 @@ document.addEventListener('click', function (ev) {
 
 // ---------- 设置页：离开前未保存确认 ----------
 // 覆盖：切换 tab（hx-get 替换 #settings-pane）、点侧栏/其他链接离开、刷新/关闭。
-// Tauri WKWebView 不支持 window.confirm，统一用页面内模态 mbxConfirmLeave；
-// edited 标记由 pane 内输入事件置位，保存/切换后（afterSwap）清零。
+// Tauri WKWebView 不支持 window.confirm，统一用页面内模态 mbxConfirmLeave。
+// 脏判定复用上面的基线比较（window.mbxPaneDirty）：改完再改回原值即视为未修改，
+// 不再像旧实现那样用一个只涨不落的布尔（R45）；开关类控件同样计入（R43）。
 (function () {
     function paneRoot() { return document.getElementById('settings-pane'); }
     if (!paneRoot()) return; // 非设置页
 
-    var edited = false;
     var leaving = false;
     var bypass = false;
 
-    function paneEdited(ev) {
-        var p = paneRoot();
-        if (!p || !p.contains(ev.target)) return;
-        edited = true;
-    }
-    document.body.addEventListener('input', paneEdited, true);
-    document.body.addEventListener('change', paneEdited, true);
-    function isDirty() { return edited; }
-    function clearEdited() { edited = false; }
+    function isDirty() { return !!(window.mbxPaneDirty && window.mbxPaneDirty()); }
 
     // 切换 tab（span.stab：hx-get 替换 pane）——有未保存修改先确认
     document.addEventListener('click', function (ev) {
@@ -1599,10 +1664,10 @@ document.addEventListener('click', function (ev) {
         if (b) leaving = true;
     }, true);
 
-    // 保存成功 / 切换 tab 后 pane 被替换 → 清除未保存标记
+    // 保存成功 / 切换 tab 后 pane 被替换 → 基线在 afterSettle 重建，这里只复位导航开关
     document.body.addEventListener('htmx:afterSwap', function (ev) {
         var t = ev.detail && ev.detail.target;
-        if (t && t.id === 'settings-pane') { clearEdited(); leaving = false; bypass = false; }
+        if (t && t.id === 'settings-pane') { leaving = false; bypass = false; }
     });
 
     window.addEventListener('beforeunload', function (ev) {
@@ -1749,6 +1814,8 @@ function mbxTplBuild(st) {
         // 会被当有效 HTML 入库，产生空壳模板
         if (!mbxHtmlToText(h)) h = '';
         st.ta.value = h;
+        // 编辑器不产生表单 input 事件：补发一次，设置页的"保存"按钮才会由灰转亮
+        st.ta.dispatchEvent(new Event('input', { bubbles: true }));
     });
     st.mode = 'rich';
     st.ta.hidden = true;
@@ -1795,6 +1862,8 @@ function mbxTplUpgrade(st) {
     st.plainBox.hidden = true;
     st.htmlField.hidden = false;
     if (st.modeInput) st.modeInput.value = 'html';
+    // 升级本身也是一次内容变化（隐藏域从空变为 html）→ 通知保存按钮刷新
+    st.ta.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 // html 模式才需要编辑器（plain 模式升级时按需建）——供惰性挂载判定

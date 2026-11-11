@@ -151,8 +151,9 @@ fn parse_mailbox(raw: &str, name: &str) -> Result<lettre::message::Mailbox, Stri
 }
 
 /// 生成本封邮件的 Message-ID（<时间.纳秒@域名>）。
-/// 回写本地已发送行后，发件箱同步按 message_id 与服务端副本去重。
-fn new_message_id(from_addr: &str) -> String {
+/// **在存草稿时就生成并落库**，发送/重发沿用同一个：回写本地已发送行后，
+/// 发件箱同步按它与服务端副本去重；换 ID 会让服务端与本地都多出一份副本。
+pub(crate) fn new_message_id(from_addr: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -224,6 +225,11 @@ pub fn cancel_scheduled_send(state: &AppState, id: i64) -> bool {
 /// 应用关闭期间到点的邮件在下次启动立即补发。单个 enqueue 失败仅记日志
 /// （下轮重扫自然重试）
 pub fn dispatch_due_scheduled(state: &AppState) -> usize {
+    // 迁移冻结（R2）：到点草稿的 draft→queued 也是写操作，冻结期一律跳过
+    // （重启后新库里的 scheduled_at 仍在，调度线程自会补发）
+    if state.migration_pending() {
+        return 0;
+    }
     let now = now_epoch();
     let due: Vec<i64> = state.with_conn(|conn| {
         conn.prepare(
@@ -254,27 +260,41 @@ pub fn dispatch_due_scheduled(state: &AppState) -> usize {
     dispatched
 }
 
-/// 崩溃恢复：把残留 `sending` 复位为 `failed`（返回复位行数）。
+/// 崩溃恢复：把残留的 `sending` 分开处理（返回复位行数）。
 ///
-/// `sending` 是仅存在于进程内的中间态，跨进程无合法含义。进程在发送中被杀
-/// （关机/崩溃/强退）后该邮件会永久停在 sending：启动补发只查 queued、
-/// `reopen_failed` 只收 failed、详情页 2s 轮询永不停止——用户既不能重发也不能删除重来。
+/// `sending` 是仅存在于进程内的中间态，跨进程无合法含义。但崩溃点有两种，
+/// 不能一律判失败（否则已投递的邮件会变成可重发 → 用户重发即重复投递）：
+/// - `sent_at` 已写（SMTP 已成功接收，本地状态没来得及落定）→ 补成 `sent`；
+/// - `sent_at` 为空（发送途中被杀，服务器是否收到未知）→ 置 `failed` 让用户决定重发。
 pub fn recover_interrupted_sends(conn: &rusqlite::Connection) -> usize {
-    conn.execute(
-        "UPDATE emails SET status = 'failed', error = '上次发送被中断（应用异常退出），请重发'
-         WHERE status = 'sending'",
-        [],
-    )
-    .unwrap_or(0)
+    let delivered = conn
+        .execute(
+            "UPDATE emails SET status = 'sent', folder = 'sent', error = ''
+             WHERE status = 'sending' AND sent_at IS NOT NULL",
+            [],
+        )
+        .unwrap_or(0);
+    let unknown = conn
+        .execute(
+            "UPDATE emails SET status = 'failed', error = '上次发送被中断（应用异常退出），请重发'
+             WHERE status = 'sending' AND sent_at IS NULL",
+            [],
+        )
+        .unwrap_or(0);
+    if delivered > 0 {
+        eprintln!("[send] 崩溃恢复：{delivered} 封已投递邮件补记为已发送");
+    }
+    delivered + unknown
 }
 
-/// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）
+/// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）。
+/// `sent_at` 非空 = 已投递过，禁止把它退回草稿再发一次（重复投递）。
 pub fn reopen_failed(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
         exec_one(
             conn,
             "UPDATE emails SET status = 'draft', folder = 'draft', error = NULL
-             WHERE id = ?1 AND status = 'failed'",
+             WHERE id = ?1 AND status = 'failed' AND sent_at IS NULL",
             id,
         )
     })
@@ -309,7 +329,13 @@ impl SmtpConfig {
                 })
                 .unwrap_or_default()
         };
-        let port: u16 = get(keys::SMTP_PORT).parse().unwrap_or(465);
+        // 端口 0 是合法 u16 但不是合法目标：配置手改/编辑器自动补 0 时会连到
+        // 随机端口并表现为"连接超时"，按非法值回退默认端口
+        let port: u16 = get(keys::SMTP_PORT)
+            .parse()
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(465);
         Self {
             host: get(keys::SMTP_HOST),
             port,
@@ -351,7 +377,8 @@ pub fn dispatch_one(
     };
     let row = conn.query_row(
         "SELECT from_addr, COALESCE(from_name,''), to_addrs, COALESCE(cc_addrs,''),
-                COALESCE(bcc_addrs,''), subject, body_text, COALESCE(body_html,'')
+                COALESCE(bcc_addrs,''), subject, body_text, COALESCE(body_html,''),
+                COALESCE(message_id,'')
          FROM emails WHERE id = ?1",
         [id],
         |r| {
@@ -373,7 +400,7 @@ pub fn dispatch_one(
                     } else {
                         Some(body_html)
                     },
-                    message_id: String::new(),
+                    message_id: r.get(8)?,
                     attachments: Vec::new(),
                 },
                 to_raw,
@@ -402,7 +429,18 @@ pub fn dispatch_one(
     // 收件人地址本身由 lettre 地址解析器严格校验（非法即明确报错）
     msg.subject = super::head_safe(&msg.subject);
     msg.from_name = super::head_safe(&msg.from_name);
-    msg.message_id = new_message_id(&msg.from_addr);
+    // 复用库里已有的 Message-ID：排队/存草稿时生成并落库，重发沿用同一个。
+    // 每次都新生成会让服务端去重失效（用户重发 = 收件人收到两封），本地发件箱
+    // 同步也会因 ID 不匹配多出一份副本（审计 P1-22）
+    if msg.message_id.trim().is_empty() {
+        msg.message_id = new_message_id(&msg.from_addr);
+        if let Err(err) = conn.execute(
+            "UPDATE emails SET message_id = ?2 WHERE id = ?1",
+            rusqlite::params![id, msg.message_id],
+        ) {
+            eprintln!("[send] 邮件 {id} 补写 Message-ID 失败（继续发送）：{err}");
+        }
+    }
     // 纯密送是合法形态（仅 To/Cc 空但 Bcc 有收件人，lettre envelope 照常投递）
     if msg.to_addrs.is_empty() && msg.cc_addrs.is_empty() && msg.bcc_addrs.is_empty() {
         fail_or_log("收件人为空");
@@ -452,8 +490,40 @@ pub fn dispatch_one(
         msg,
     ) {
         Ok(()) => {
-            if let Err(err) = mark("sent", None) {
-                eprintln!("[send] 邮件 {id} 落定 sent 失败：{err}");
+            // ① 投递事实优先落盘：sent_at 非空 = 服务器已接收。这一列是崩溃恢复
+            // 与「禁止重发」的唯一判据——先写它，再写状态，两次写之间被杀也不会
+            // 把已投递邮件误判成未投递（审计 P1-22 / P1-23）
+            let mut fact_ok = false;
+            for attempt in 1..=3 {
+                match conn.execute(
+                    "UPDATE emails SET sent_at = ?2 WHERE id = ?1",
+                    rusqlite::params![id, now_epoch()],
+                ) {
+                    Ok(_) => {
+                        fact_ok = true;
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!("[send] 邮件 {id} 记录投递时间失败（第 {attempt} 次）：{err}");
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+            if !fact_ok {
+                eprintln!(
+                    "[send] 邮件 {id} 已投递但投递时间未能落盘：重启后会被当成「中断」处理，请勿盲目重发"
+                );
+            }
+            // ② 状态落定；三次都失败就保持 sending + sent_at，启动时
+            // recover_interrupted_sends 会补成 sent（详情页在此期间显示"已投递"）
+            for attempt in 1..=3 {
+                match mark("sent", None) {
+                    Ok(()) => break,
+                    Err(err) => {
+                        eprintln!("[send] 邮件 {id} 落定 sent 失败（第 {attempt} 次）：{err}");
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
             }
             // 回写 Message-ID（发件箱同步按它与服务端副本去重）+ 联系人采集（To/Cc/Bcc）
             if let Err(err) = conn.execute(
