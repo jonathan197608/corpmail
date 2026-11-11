@@ -7,6 +7,10 @@
     {% endif %}>
     {% include "side.html" %}
     <main class="main">
+        {# 打开即阅读（审计 R34）：GET 只负责渲染，置已读由页面加载后的 POST 完成。
+           独立元素承载 load 触发器——与 #page 的 2s 轮询触发器不能共用同一属性。
+           响应无正文，服务端只下发 mbx:sideRefresh 事件刷侧栏未读数 #}
+        <div hidden hx-post="/emails/{{ email.id }}/read" hx-trigger="load" hx-swap="none"></div>
         <div class="topbar">
             <a class="back" href="{{ back_href }}">‹ 返回列表</a>
             {# 操作按钮置顶（批次四）：整行并入顶栏，按钮高度/风格与列表顶栏一致 #}
@@ -165,6 +169,10 @@
                 {% endif %}
             </div>
 
+            {% if remote_images_blocked %}
+            {# 隐私开关（R4/R36）：默认不向第三方拉图，页面必须说明空白图位的原因 #}
+            <div class="md-status">{{ ic.icon('warning') }} 远程图片已阻止加载（不向发件方暴露你的 IP 与阅读时间）。可在此开启：<a href="/settings?tab=sync">设置 → 收件同步 → 加载邮件中的远程图片</a>，然后重新打开本邮件。</div>
+            {% endif %}
             {% if email.body_html %}
             <div class="md-body md-html">{{ email.body_html | safe }}</div>
             {% else %}

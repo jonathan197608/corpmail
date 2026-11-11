@@ -91,6 +91,13 @@ pub fn save(
     if body_text.trim().is_empty() && body_html.trim().is_empty() {
         return Err("模板内容不能为空".into());
     }
+    // 服务端二次净化（审计 R9）：路由层已净化，这里兜其他调用方（导入、
+    // 测试、将来的同步逻辑）；HTML 模板是存储型 XSS 的唯一入口，宁可重复
+    let body_html = if body_html.trim().is_empty() {
+        String::new()
+    } else {
+        super::sanitize_html(body_html)
+    };
     const MAX_BODY: usize = 100 * 1024;
     if body_text.len() > MAX_BODY || body_html.len() > MAX_BODY {
         return Err("模板内容过长（单字段上限 100KB）".into());
@@ -102,7 +109,7 @@ pub fn save(
                 .execute(
                     "UPDATE templates SET name = ?2, body_text = ?3, body_html = ?4,
                                     updated_at = ?5 WHERE id = ?1",
-                    rusqlite::params![id, name, body_text, body_html, now],
+                    rusqlite::params![id, name, body_text, body_html.as_str(), now],
                 )
                 .map_err(|e| e.to_string())?;
             if n == 0 {
@@ -114,7 +121,7 @@ pub fn save(
             conn.execute(
                 "INSERT INTO templates(name, body_text, body_html, created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?4)",
-                rusqlite::params![name, body_text, body_html, now],
+                rusqlite::params![name, body_text, body_html.as_str(), now],
             )
             .map_err(|e| e.to_string())?;
             Ok(conn.last_insert_rowid())

@@ -411,18 +411,24 @@ document.body.addEventListener('change', ev => {
 document.body.addEventListener('htmx:afterSwap', mbxRefetchToggle);
 document.addEventListener('DOMContentLoaded', mbxRefetchToggle);
 
-// 后台收取完成：刷新当前页的动态区域（列表片段 + 侧栏计数），URL 与滚动位置不动
-function mbxOnFetchDone() {
-    // 1) 列表页：按当前地址（含未读/外部/搜索/页码）取列表片段换入
-    // 列表页（含顶栏"共 N 封"）：#list-area 存在即列表页——非列表页
-    // （详情/撰写/设置）没有该容器，自动跳过，不影响正在阅读/撰写的内容
-    const list = document.getElementById('list-area');
-    if (list) {
-        htmx.ajax('GET', location.pathname + location.search, {
-            target: '#list-area', swap: 'outerHTML'
-        });
-    }
-    // 2) 侧栏（计数/高亮/状态条）：folder 取侧栏当前高亮项，避免非列表页丢失
+// 列表行定向刷新（R41）：只换 #mail-list 与顶栏计数，顶栏搜索框/高级筛选
+// 面板/每页选择器一律不动。整段换 #list-area 会把「输入了但没提交」的搜索词、
+// 光标位置、已展开的高级面板全部抹掉——后台收取完成时用户正在打字就会被清空。
+function mbxRefreshList() {
+    if (!document.getElementById('list-area')) return;
+    htmx.ajax('GET', '/list/rows' + location.search, {
+        target: '#mail-list', swap: 'outerHTML'
+    }).then(function () {
+        // 计数由响应里的 OOB 片段更新；批量栏跨页全选的 total 同步跟上
+        var list = document.getElementById('mail-list');
+        var total = document.getElementById('ba-total');
+        if (list && total && list.dataset.total) total.value = list.dataset.total;
+    });
+}
+
+// 侧栏（计数/高亮/状态条）定向刷新：folder 取侧栏当前高亮项，
+// 非列表页（详情/撰写/设置）也不会丢上下文
+function mbxRefreshSide() {
     const on = document.querySelector('aside.side .folder.on');
     let folder = 'inbox';
     if (on) {
@@ -436,7 +442,19 @@ function mbxOnFetchDone() {
         });
     }
 }
+
+// 后台收取完成：刷新当前页的动态区域（列表片段 + 侧栏计数），URL 与滚动位置不动
+function mbxOnFetchDone() {
+    // 列表页：按当前地址（含未读/外部/搜索/页码）取列表片段换入
+    // 列表页（含顶栏"共 N 封"）：#list-area 存在即列表页——非列表页
+    // （详情/撰写/设置）没有该容器，自动跳过，不影响正在阅读/撰写的内容
+    mbxRefreshList();
+    mbxRefreshSide();
+}
 document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
+// 详情/源码页打开即置已读（R34：POST 由模板 load 触发器发出），
+// 只刷侧栏未读数——列表片段在详情页不存在，不必也不该整页刷新
+document.body.addEventListener('mbx:sideRefresh', mbxRefreshSide);
 
 // ---------- 置顶翻转（M2-1，原「星标」）：mbx:starDone 事件携带新态 ----------
 // 后端 POST /emails/{id}/star 空体 + 事件头；前端按所在页面分派：
@@ -446,9 +464,7 @@ document.body.addEventListener('mbx:fetchDone', mbxOnFetchDone);
 document.body.addEventListener('mbx:starDone', function (ev) {
     var starred = !!(ev.detail && ev.detail.starred);
     if (document.getElementById('list-area')) {
-        htmx.ajax('GET', location.pathname + location.search, {
-            target: '#list-area', swap: 'outerHTML'
-        });
+        mbxRefreshList();
         return;
     }
     var btn = document.querySelector('.star-btn[data-mail-id]');

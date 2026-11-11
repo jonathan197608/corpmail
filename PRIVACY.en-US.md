@@ -8,7 +8,7 @@ CorpMail ("this app") is a local-first business mail client. Our position on you
 
 - This app contains no server components operated by the developers.
 - Your mail is delivered directly by the mail servers you configure (SMTP for sending / IMAP for receiving). The app is only a protocol client talking to those servers.
-- Apart from your mail servers and the remote images in messages you open (item 3 below), the app sends data to no network endpoint.
+- Apart from your mail servers and the remote images you explicitly opt into loading (item 3 below), the app sends data to no network endpoint.
 
 ## Data stays on your device
 
@@ -27,7 +27,7 @@ CorpMail ("this app") is a local-first business mail client. Our position on you
 
 1. **Sending (SMTP)**: delivering the messages you compose to your configured outbound server.
 2. **Receiving (IMAP)**: fetching mail from, and syncing read state back to, your configured inbound server.
-3. **Remote images** (only when you open a message that contains external images): `http(s)` images in the body are fetched by this app acting as a proxy, from **the image's own server**, and then handed to the page. Those servers belong to the sender or their content host, not to your mail provider; the request carries only the image URL — never your account, password, or message content.
+3. **Remote images** (**off by default**; active only after you enable "Load remote images" in Settings → Sync): while off, opening a message with external images produces no network requests at all and the image slots stay blank. Once enabled, `http(s)` images in the body are fetched by this app acting as a proxy, from **the image's own server**, and then handed to the page. Those servers belong to the sender or their content host, not to your mail provider; the request carries only the image URL — never your account, password, or message content — though the sender can observe your egress IP and roughly when you read the message.
 
 The first two use only the server addresses and credentials you explicitly configure.
 

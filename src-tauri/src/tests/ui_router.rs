@@ -87,7 +87,27 @@ fn req(method: &str, path: &str, body: &[u8]) -> Req {
         path: path.to_string(),
         query: String::new(),
         is_htmx_request: false,
+        // 默认无来源头 = 应用内请求（协议层来源校验放行）
+        origin: None,
+        sec_fetch_site: None,
         body: body.to_vec(),
+    }
+}
+
+/// 带来源头/htmx 标记的请求构造（R34 来源校验与副作用 GET 用例）
+fn req_hdr(
+    method: &str,
+    path: &str,
+    query: &str,
+    origin: Option<&str>,
+    site: Option<&str>,
+    htmx: bool,
+) -> Req {
+    Req {
+        origin: origin.map(str::to_string),
+        sec_fetch_site: site.map(str::to_string),
+        is_htmx_request: htmx,
+        ..req_q(method, path, query, b"")
     }
 }
 
@@ -257,6 +277,81 @@ fn removed_all_folder_falls_back_to_inbox() {
         !html.contains("/threads/"),
         "mode=thread 不应再产生会话列表：{html}"
     );
+    cleanup(&dir);
+}
+
+/// 列表行片段（审计 R41）：后台刷新（收取完成/置顶重排）走 GET /list/rows，
+/// 只回邮件行 + 顶栏计数的 OOB 片段，**不回搜索框与高级面板**——否则用户
+/// 正在输入的搜索词（未提交）与展开的筛选面板会被服务端状态覆盖。
+#[test]
+fn list_rows_fragment_keeps_search_state() {
+    let (state, dir) = temp_state("r41-list-rows");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, subject_tokens, body_tokens, unread, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','demo@chinatelecom.cn','甲','正文','甲','正文',0,10),
+                        ('in','inbox','received','b@x.cn','demo@chinatelecom.cn','乙','正文','乙','正文',0,20)",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/list/rows", "folder=inbox", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    // 行片段本体：两封邮件 + data-total
+    assert!(html.contains("data-mail-id="), "应回邮件行：{html}");
+    assert!(html.contains("甲") && html.contains("乙"), "应含两封邮件");
+    assert!(html.contains("data-total=\"2\""), "行片段应带总数：{html}");
+    // 计数走 OOB（在 #mail-list 之外，随主片段一起提交）
+    assert!(
+        html.contains("id=\"mail-count\"") && html.contains("hx-swap-oob=\"outerHTML\""),
+        "应通过 OOB 更新顶栏计数：{html}"
+    );
+    assert!(html.contains("共 2 封"), "OOB 片段应含总数文案");
+    // 顶栏/搜索框/高级面板一律不出现（状态留在 DOM 里，不被覆盖）
+    assert!(!html.contains("class=\"search\""), "不得回搜索框：{html}");
+    assert!(!html.contains("id=\"adv-panel\""), "不得回高级面板：{html}");
+    assert!(!html.contains("id=\"list-area\""), "不得回列表容器");
+    assert!(!html.contains("class=\"topbar\""), "不得回顶栏");
+    // 完整列表（htmx 片段）仍含搜索框与高级面板，两者行为分流
+    let full = body(&route(
+        &state,
+        &assets(),
+        &req_hdr("GET", "/", "folder=inbox", None, None, true),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        full.contains("class=\"search\"") && full.contains("id=\"adv-panel\""),
+        "整段列表片段仍应含搜索框与高级面板"
+    );
+    // 未配置：不渲染空列表，直接拒绝（避免把「没账号」画成「没有邮件」）
+    let (fresh, fresh_dir) = temp_state("r41-list-rows-empty");
+    let resp = route(
+        &fresh,
+        &assets(),
+        &req("GET", "/list/rows", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 400, "未配置时 /list/rows 应 400");
+    cleanup(&fresh_dir);
     cleanup(&dir);
 }
 
@@ -463,7 +558,7 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
         html.contains("q=%E6%BF%80%E5%8A%B1"),
         "分页基址应携带检索词"
     );
-    // 全停用词：回退普通列表（两封都在）
+    // 全停用词：无有效查询项 → 空结果（旧实现回落整表，看似搜索被忽略，R29）
     let html2 = body(&route(
         &state,
         &assets(),
@@ -471,8 +566,8 @@ fn root_search_highlights_and_falls_back_on_stopwords() {
         &tester,
     ));
     assert!(
-        html2.contains("无关主题邮件"),
-        "无效词应回退普通列表：{html2}"
+        !html2.contains("无关主题邮件") && html2.contains("没有匹配的邮件"),
+        "无效词应落到检索空态：{html2}"
     );
     // 无命中：空态为检索文案
     let html3 = body(&route(
@@ -1186,7 +1281,32 @@ fn detail_marks_read_and_delete_redirects() {
         c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
             .unwrap()
     });
-    assert_eq!(unread, 0, "打开详情应本地置已读");
+    assert_eq!(
+        unread, 1,
+        "GET 详情必须只读（R34）：带副作用的 GET 会被 img/预取/跨站导航利用"
+    );
+    // 页面加载后的 load 型 POST 才置已读，并派发侧栏刷新事件
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/read", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:sideRefresh")),
+        "置已读后应刷新侧栏未读数：{:?}",
+        resp.extra_headers
+    );
+    let unread: i64 = state.with_conn(|c| {
+        c.query_row("SELECT unread FROM emails WHERE id=1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(unread, 0, "POST /read 应本地置已读");
     // 删除 → HX-Redirect 列表
     let resp = route(
         &state,
@@ -1265,6 +1385,10 @@ fn delete_redirects_back_with_list_context() {
 #[test]
 fn image_proxy_rejects_private_and_non_http() {
     let (state, dir) = temp_state("proxy-guard");
+    // 远程图片默认阻止（R4/R36）：先开启，才能验到 SSRF/协议白名单这道闸
+    state
+        .set_batch(&[(keys::ALLOW_REMOTE_IMAGES, "1")])
+        .unwrap();
     // 内网地址：不发网络请求，直接 403
     let resp = route(
         &state,
@@ -2270,10 +2394,11 @@ fn fetch_flow_without_credential_shows_error_and_refresh() {
             (keys::RECV_PORT, "993"),
         ])
         .unwrap();
+    // 手动收取是副作用 GET：真实前端由 htmx 发起（带 HX-Request，R34 强制）
     let resp = route(
         &state,
         &assets(),
-        &req("GET", "/emails/fetch", b""),
+        &req_hdr("GET", "/emails/fetch", "", None, None, true),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -2777,6 +2902,12 @@ fn wizard_done_shows_summary_and_guards_unconfigured() {
         "完成页应展示完整账号"
     );
     assert!(html.contains("smtp.test.cn:465"), "完成页应展示发信服务器");
+    // R38：测试二进制强制走 keyfile 回退（TEST_SKIP_KEYCHAIN），完成页必须
+    // 明确提示密码没进系统凭据保管，而不是默默降级
+    assert!(
+        html.contains("系统凭据服务不可用"),
+        "凭据降级应在完成页提示：{html}"
+    );
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
@@ -2893,6 +3024,209 @@ fn huge_page_number_does_not_panic() {
     assert!(
         !html.contains("9223372036854775807"),
         "页码指示不得透出原始巨型值：{html}"
+    );
+    cleanup(&dir);
+}
+
+/// 协议层来源校验（审计 R34）：自定义协议没有同源策略，WebView 里被注入的
+/// 脚本或加载进来的外部页面都能直接调这些端点。浏览器自填的 Origin /
+/// Sec-Fetch-Site 是唯一可信信号：跨站一律 403，应用自身来源必须放行
+/// （放行口径含 http://ui.localhost——Windows 上 wry 就是这么暴露的）。
+#[test]
+fn protocol_rejects_foreign_origin() {
+    let (state, dir) = temp_state("origin-guard");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    // 跨站写操作（改配置）
+    let resp = route(
+        &state,
+        &assets(),
+        &req_hdr(
+            "POST",
+            "/settings/sync/save",
+            "",
+            Some("https://evil.example"),
+            None,
+            true,
+        ),
+        &t,
+    );
+    assert_eq!(resp.status, 403, "跨站写入必须拒绝");
+    assert_eq!(
+        state.get_or(keys::SYNC_ON_START, &defaults()).as_deref(),
+        Some("true"),
+        "被拒请求不得产生副作用"
+    );
+    // 跨站读页面（可用于探测/外带数据）
+    let resp = route(
+        &state,
+        &assets(),
+        &req_hdr("GET", "/", "", Some("https://evil.example"), None, true),
+        &t,
+    );
+    assert_eq!(resp.status, 403, "跨站读取同样拒绝");
+    // Origin 缺失但浏览器标注 cross-site（如 <img>/<form> 发起的请求）
+    let resp = route(
+        &state,
+        &assets(),
+        &req_hdr("GET", "/", "", None, Some("cross-site"), true),
+        &t,
+    );
+    assert_eq!(resp.status, 403, "Sec-Fetch-Site: cross-site 应拒绝");
+    // 应用自身来源与不可判定（自定义协议可能不带 Origin / 写 null）放行
+    for origin in ["http://ui.localhost", "http://tauri.localhost", "null", "ui://localhost"] {
+        let resp = route(
+            &state,
+            &assets(),
+            &req_hdr("GET", "/", "", Some(origin), Some("same-origin"), true),
+            &t,
+        );
+        assert_eq!(resp.status, 200, "{origin} 应放行");
+    }
+    cleanup(&dir);
+}
+
+/// 远程图片默认阻止（审计 R4/R36）：开关关闭时 `/proxy/image` 必须直接回
+/// 透明占位图，不解析域名、不建连——用永不解析的 `.invalid` 域名取证：
+/// 若代码试图联网，结果是 403 而不是 200。开启开关后同一 URL 才走代理路径。
+#[test]
+fn remote_images_blocked_until_enabled() {
+    let (state, dir) = temp_state("remote-img");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo")])
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let img_req = || {
+        req_q(
+            "GET",
+            "/proxy/image",
+            "url=https%3A%2F%2Fimg.invalid%2Fa.png",
+            b"",
+        )
+    };
+
+    let resp = route(&state, &assets(), &img_req(), &t);
+    assert_eq!(resp.status, 200, "默认关闭时应回占位图而非错误");
+    assert_eq!(resp.content_type, "image/png");
+    assert_eq!(resp.cache_control, "no-store", "开关一变必须立刻生效");
+    assert!(
+        resp.body.starts_with(&[0x89, b'P', b'N', b'G']) && resp.body.len() < 200,
+        "应为内置小体积 PNG 占位图"
+    );
+
+    // 打开开关（缺省其他字段保持现值），同一 URL 走真实代理：解析失败 → 403
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[
+                ("sync_on_start", "true"),
+                ("sync_interval_min", "30"),
+                ("first_fetch_days", "0"),
+                ("allow_remote_images", "1"),
+            ]),
+        ),
+        &t,
+    );
+    assert!(state.allow_remote_images(), "开关应落库");
+    let resp = route(&state, &assets(), &img_req(), &t);
+    assert_eq!(resp.status, 403, "开启后应真正进入代理网络路径");
+
+    // 未提交该字段的旧表单不得把开关冲回默认（保持现值）
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[("sync_on_start", "true")]),
+        ),
+        &t,
+    );
+    assert!(state.allow_remote_images(), "缺省字段应保持现值");
+    cleanup(&dir);
+}
+
+/// 远程图片被阻止时详情页必须说明「为什么图是空的」并给出开启入口；
+/// 打开开关后提示消失。`/settings?tab=sync` 深链要直达开关所在 pane，
+/// 否则用户点提示后落在账号页、找不到开关（审计 R4/R36）。
+#[test]
+fn remote_image_notice_and_settings_deeplink() {
+    let (state, dir) = temp_state("remote-notice");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@x.cn"),
+        ])
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, body_html, subject_tokens, body_tokens,
+                                    unread, created_at, received_at, thread_key)
+                 VALUES ('in','inbox','received','a@b.cn','A','demo@x.cn','带图','图',
+                         '<p><img src=\"/proxy/image?url=https%3A%2F%2Fimg.invalid%2Fa.png\"></p>',
+                         '带图','图',1,1,1,'带图')",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/1", b""), &t));
+    assert!(
+        html.contains("远程图片已阻止加载"),
+        "被阻止时详情页应说明原因：{html}"
+    );
+    assert!(
+        html.contains("/settings?tab=sync"),
+        "提示应直达开关所在 pane：{html}"
+    );
+
+    state
+        .set_batch(&[(keys::ALLOW_REMOTE_IMAGES, "1")])
+        .unwrap();
+    let html = body(&route(&state, &assets(), &req("GET", "/emails/1", b""), &t));
+    assert!(
+        !html.contains("远程图片已阻止加载"),
+        "开关打开后不应再提示：{html}"
+    );
+
+    // 深链：tab=sync 渲染同步 pane（含开关）；未知 tab 回落账号 pane
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/settings", "tab=sync", b""),
+        &t,
+    ));
+    assert!(
+        html.contains("allow_remote_images") && html.contains("收件同步"),
+        "深链应落在同步 pane：{html}"
+    );
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/settings", "tab=bogus", b""),
+        &t,
+    ));
+    assert!(
+        !html.contains("allow_remote_images"),
+        "未知 tab 应回落账号 pane：{html}"
     );
     cleanup(&dir);
 }
@@ -4544,11 +4878,20 @@ fn router_tolerates_malformed_requests() {
         "/emails/1",
         "/settings",
         "/welcome/done",
-        "/emails/fetch",
     ] {
         let resp = route(&fresh, &a, &req("GET", p, b""), &t);
         assert_eq!(resp.status, 200, "{p} 未配置应渲染欢迎页");
     }
+    // 副作用 GET 非 htmx 请求：400（R34）；带 HX-Request 才进业务分支
+    let resp = route(&fresh, &a, &req("GET", "/emails/fetch", b""), &t);
+    assert_eq!(resp.status, 400, "手动收取非 htmx 请求应拒绝");
+    let resp = route(
+        &fresh,
+        &a,
+        &req_hdr("GET", "/emails/fetch", "", None, None, true),
+        &t,
+    );
+    assert_eq!(resp.status, 200, "htmx 发起的手动收取应正常");
     // 4) 畸形表单体：非 UTF-8 字节 / 断半 percent 编码 / 巨参
     for body in [
         &b"subject=\xff\xfe"[..],

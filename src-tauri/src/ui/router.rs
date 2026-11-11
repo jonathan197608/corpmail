@@ -82,6 +82,10 @@ pub struct Req {
     /// 是否带 `HX-Request` 头（htmx 发起的片段请求）。
     /// 列表页按它区分整页/片段响应（片段=mail_list 单交换）
     pub is_htmx_request: bool,
+    /// `Origin` 原样（跨站来源校验，审计 R34）。测试构造为 None = 应用内请求
+    pub origin: Option<String>,
+    /// `Sec-Fetch-Site` 原样（浏览器标注的请求来源关系）
+    pub sec_fetch_site: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -94,6 +98,16 @@ impl Req {
             path: request.uri().path().to_string(),
             query: request.uri().query().unwrap_or("").to_string(),
             is_htmx_request: request.headers().get("hx-request").is_some(),
+            origin: request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            sec_fetch_site: request
+                .headers()
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
             body: request.body().clone(),
         }
     }
@@ -134,6 +148,18 @@ impl Resp {
             content_type: "application/json; charset=utf-8".into(),
             cache_control: "no-store",
             body: body.into_bytes(),
+            extra_headers: Vec::new(),
+        }
+    }
+
+    /// 纯文本响应（协议层拒绝：403 跨站来源 / 400 非 htmx 的副作用 GET）。
+    /// app.js 的 `htmx:responseError` 会把短纯文本落到 toast，用户看得到原因
+    fn text(status: u16, msg: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8".into(),
+            cache_control: "no-store",
+            body: msg.as_bytes().to_vec(),
             extra_headers: Vec::new(),
         }
     }
@@ -272,6 +298,9 @@ struct EmailCtx {
     /// 会话入口（入口下沉，2026-11-11）：该邮件所在主题的往来件数；
     /// >1 时详情页标题下显示「会话 · N 封往来」（/threads/{id}），=1 不渲染
     thread_count: i64,
+    /// 正文含远程图片且开关关闭：详情页给出「图片已阻止」提示与开启入口，
+    /// 否则用户只看到空白图位，会以为邮件正文损坏（审计 R4/R36）
+    remote_images_blocked: bool,
 }
 
 /// 源码页（A5）：排查正文乱码、HTML 表格丢失、投递链路问题。
@@ -391,6 +420,9 @@ struct DoneCtx {
     dir_changed: Option<String>,
     /// 数据目录中已有历史邮件（向导直连沿用）：提示增量续收不重新全量拉取
     reuse_note: Option<String>,
+    /// 系统凭据服务不可用、密码已降级为本机加密文件（审计 R38）：
+    /// 向导完成页必须说明，否则用户以为密码进了钥匙串/凭据管理器
+    degraded: bool,
 }
 
 /// 连接测试结果片段
@@ -444,15 +476,61 @@ pub(super) fn test_view(label: &str, o: &TestOutcome) -> TestView {
 
 /// 总路由：动态路由优先，静态资源兜底，最后 404
 pub fn route<A: Assets>(state: &AppState, assets: &A, req: &Req, tester: &dyn ConnTester) -> Resp {
+    // 协议层来源校验（审计 R34）：自定义协议没有同源策略，WebView 里任何能
+    // 发请求的上下文（被注入的脚本、加载的外部页面）都能带着本应用的
+    // UI 直接调这些端点。两个头是浏览器自填、脚本改不了的：Origin 指明
+    // 发起方来源，Sec-Fetch-Site 标注跨站。任一判定为跨站即拒。
+    if foreign_origin(req) {
+        return Resp::text(403, "拒绝跨站请求（仅允许应用内发起）");
+    }
     // 迁移冻结（审计 H2/R2）：数据目录已迁走、等待重启期间，任何带副作用的请求
     // 都必须明确失败——静默写进旧库，等于用户刚做的修改在重启后凭空消失
     if state.migration_pending() && has_side_effect(req) {
         return migration_locked();
     }
+    // 副作用 GET 必须由 htmx 发起（带 HX-Request）：`<img src="/emails/fetch">`
+    // 这类跨上下文标签请求同样能打到本协议，而浏览器不会为它们加 HX-Request
+    if req.method == "GET" && has_side_effect(req) && !req.is_htmx_request {
+        return Resp::text(400, "该操作需从应用界面发起");
+    }
     if let Some(resp) = dynamic(state, req, tester) {
         return resp;
     }
     serve_asset(assets, req).unwrap_or_else(Resp::not_found)
+}
+
+/// 是否来自非本应用来源（审计 R34）。
+///
+/// 判定口径刻意保守——只拒绝「明确是外部网页」的请求，避免误伤自定义协议：
+/// - `Origin` 为真实 http(s) 来源且主机不是应用自身（`ui.localhost` /
+///   `tauri.localhost` / `localhost`）→ 跨站。`null` 与缺失一律放行：
+///   WKWebView 对自定义协议的请求可能不带 Origin 或写 `null`，
+///   把「不可判定」当成攻击会直接打挂整个应用
+/// - `Sec-Fetch-Site: cross-site` → 跨站（浏览器自填，页面脚本无法伪造）
+fn foreign_origin(req: &Req) -> bool {
+    if let Some(site) = &req.sec_fetch_site
+        && site.trim().eq_ignore_ascii_case("cross-site")
+    {
+        return true;
+    }
+    let Some(origin) = req.origin.as_deref() else {
+        return false;
+    };
+    let o = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    if o.is_empty() || o == "null" {
+        return false;
+    }
+    if !(o.starts_with("http://") || o.starts_with("https://")) {
+        return false;
+    }
+    // 应用自身在 Windows 上就是 http://ui.localhost/（wry 约定），必须放行
+    let host = o
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split([':', '/'])
+        .next()
+        .unwrap_or("");
+    !matches!(host, "ui.localhost" | "tauri.localhost" | "localhost" | "127.0.0.1")
 }
 
 /// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
@@ -482,6 +560,8 @@ fn migration_locked() -> Resp {
 fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp> {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => Some(list_root(state, req)),
+        // 行片段（R41）：后台刷新只换邮件行 + 计数
+        ("GET", "/list/rows") => Some(list_rows(state, req)),
         ("GET", "/compose") => Some(compose_page(state, req)),
         ("POST", "/compose/draft") => Some(compose_draft_save(state, req)),
         // M3-1 草稿自动保存：与存草稿同一保存路径，返回轻量 JSON（无跳转）
@@ -523,7 +603,7 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", "/emails/batch") => Some(emails_batch(state, req)),
         ("GET", "/emails/fetch") => Some(fetch_start(state)),
         ("GET", "/emails/fetch/status") => Some(fetch_status(state, true)),
-        ("GET", "/proxy/image") => Some(proxy_image(req)),
+        ("GET", "/proxy/image") => Some(proxy_image(state, req)),
         ("GET", "/contacts/suggest") => Some(contacts_suggest(state, req)),
         // M3-3 联系人管理页：整页 + 删除（htmx 片段刷新列表）
         ("GET", "/contacts") => Some(contacts_page(state, req)),
@@ -572,7 +652,14 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/welcome/setup") => Some(wizard_setup_page(state)),
         ("POST", "/welcome/setup/save") => Some(wizard_save(state, req, tester)),
         ("GET", "/welcome/done") => Some(wizard_done(state)),
-        ("GET", "/settings") => Some(settings_page(state, "account")),
+        // ?tab=sync 等深链（详情页「远程图片已阻止」提示直达开关所在 pane）
+        ("GET", "/settings") => Some(settings_page(
+            state,
+            req.query_param("tab")
+                .filter(|t| valid_tab(t))
+                .unwrap_or_else(|| "account".into())
+                .as_str(),
+        )),
         ("GET", "/settings/account")
         | ("GET", "/settings/sync")
         | ("GET", "/settings/storage")
@@ -618,8 +705,12 @@ fn template_save(state: &AppState, req: &Req) -> Resp {
     // 纯文本插入回退），plain 模式直接用 body_text；不再把两个字段各自独立提交
     let body_mode = form.get("body_mode").map(String::as_str).unwrap_or("plain");
     let (body_text, body_html) = if body_mode == "html" {
+        // 存储型 DOM XSS（审计 R9）：模板 HTML 会被原样注入编辑器与该 pane 的
+        // 列表回显，必须与草稿/收件同口径净化后再入库——否则一条含
+        // <img onerror> 的模板可执行任意脚本（表单提交处没有任何过滤）
         let raw = form.get("body_html").cloned().unwrap_or_default();
-        (mail::strip_html(&raw), raw)
+        let clean = mail::sanitize_html(&raw);
+        (mail::strip_html(&clean), clean)
     } else {
         (
             form.get("body_text").cloned().unwrap_or_default(),
@@ -675,6 +766,36 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         // 首启未配置：配置为强制入口（设计 §8.1，无"稍后再说"）
         return render_html("welcome.html", &());
     }
+    let ctx = list_ctx(state, req);
+    if req.is_htmx_request {
+        render_html("mail_list.html", &ctx)
+    } else {
+        render_html("main.html", &ctx)
+    }
+}
+
+/// 列表行片段（GET /list/rows，审计 R41）：后台刷新（收取完成/置顶后重排）
+/// 只替换邮件行与顶栏计数，**不动顶栏搜索框与高级筛选面板**。
+///
+/// 旧实现整段换 `#list-area`：用户正在输入搜索词、光标在框内、或高级面板
+/// 已展开时，任何一次后台收取完成都会把这些状态抹回服务端状态（搜索词甚至
+/// 是「输入了但没提交」的内容，直接丢失）。
+fn list_rows(state: &AppState, req: &Req) -> Resp {
+    if !state.configured() {
+        return Resp::text(400, "尚未完成账号配置");
+    }
+    let ctx = list_ctx(state, req);
+    let total = ctx.total;
+    let mut resp = render_html("mail_list_rows.html", &ctx);
+    // 计数在行片段之外：用 OOB 一并换掉（htmx 会先摘出 OOB 元素再 swap 主片段）
+    resp.body.extend_from_slice(
+        format!("<span id=\"mail-count\" hx-swap-oob=\"outerHTML\">共 {total} 封</span>").as_bytes(),
+    );
+    resp
+}
+
+/// 列表上下文（整页/片段/行片段共用同一份查询与筛选解析）
+fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
     // folder 白名单（2026-11-09 移除「全部」）：仅收件箱/发件箱/草稿箱，未知回落收件箱
     let folder = match req.query_param("folder").as_deref() {
         Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
@@ -728,7 +849,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         date_to,
         has_attach,
     };
-    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入/全停用词回退普通列表。
+    // 全文检索（§4.3）：有有效词走 FTS+BM25；空输入回退普通列表。
     // 查询失败一律显式报错：旧实现 unwrap_or_default 会把「库坏了/SQL 出错」
     // 渲染成「没有邮件」，用户以为邮件丢了（审计 P1-45）。
     // 会话视图入口已下沉详情页（>1 封往来才显示「会话 · N 封往来」，
@@ -740,8 +861,10 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         } else {
             match mail::search(state, &q_input, &q) {
                 Ok(Some(res)) => Ok(res),
-                // 全停用词/无有效查询项：退回普通列表（与既有口径一致）
-                Ok(None) => mail::list(state, &q),
+                // 输入全为停用词/无有效查询项：检索语义上没有可匹配项 → 空集。
+                // 旧实现回落整表列表，用户搜「的了」却看到全部邮件，会以为
+                // 搜索词被忽略（审计 R29）
+                Ok(None) => Ok((Vec::new(), 0)),
                 // 检索本身失败不退回列表：那会把「检索不可用」显示成全部邮件
                 Err(e) => Err(e),
             }
@@ -864,7 +987,7 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         }
         list_query.push_str(&format!("page={page}"));
     }
-    let ctx = MainCtx {
+    MainCtx {
         frame: frame_ctx(state, &folder),
         folder: folder.clone(),
         folder_label: folder_label(&folder).into(),
@@ -886,11 +1009,6 @@ fn list_root(state: &AppState, req: &Req) -> Resp {
         has_attach,
         items,
         list_error,
-    };
-    if req.is_htmx_request {
-        render_html("mail_list.html", &ctx)
-    } else {
-        render_html("main.html", &ctx)
     }
 }
 
@@ -901,8 +1019,9 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     if !state.configured() {
         return Some(render_html("welcome.html", &()));
     }
-    // 打开详情即阅读：本地置已读 + 服务器 \Seen 异步回写（M4 §6.1）
-    mark_read_and_sync_seen(state, id);
+    // 打开详情即阅读，但**不在 GET 里写**（审计 R34）：GET 有副作用会让
+    // 任何 `<img src="/emails/1">`、预取或跨站导航都改库。改由页面加载后
+    // 发 POST /emails/{id}/read（hx-trigger="load"），语义与权限都明确
     let email = mail::get(state, id)?;
     let folder = email.folder.clone();
     // query_param 已做百分号解码，勿再 urldecode（二次解码会破坏含 %/+ 的错误文案）
@@ -920,6 +1039,8 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
     // 会话入口（入口下沉，2026-11-11）：组内往来件数，>1 才在详情页显示
     // 「会话 · N 封往来」。草稿/发送失败不显示（无往来语义）；口径与会话
     // 详情页一致（thread_mails 已排除 draft/failed）
+    let remote_images_blocked =
+        !state.allow_remote_images() && email.body_html.contains("/proxy/image?url=");
     let thread_count = if matches!(email.status.as_str(), "draft" | "failed") {
         0
     } else {
@@ -944,6 +1065,7 @@ fn email_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             export_name,
             export_md_name,
             thread_count,
+            remote_images_blocked,
         },
     ))
 }
@@ -955,7 +1077,7 @@ fn email_source(state: &AppState, req: &Req) -> Option<Resp> {
     if !state.configured() {
         return Some(render_html("welcome.html", &()));
     }
-    mark_read_and_sync_seen(state, id);
+    // 置已读同详情页：GET 保持只读，由模板里的 load 型 POST 触发（R34）
     let email = mail::get(state, id)?;
     let folder = email.folder.clone();
     let part = match req.query_param("part").as_deref() {
@@ -1097,7 +1219,7 @@ fn email_export_eml(state: &AppState, req: &Req) -> Resp {
             html_escape(msg)
         ))
     };
-    if let Err(e) = mail::guard_sensitive_path(state, &dest) {
+    if let Err(e) = mail::guard_save_dest(state, &dest) {
         return toast("err", &e);
     }
     match mail::eml::build_eml(state, id) {
@@ -1129,7 +1251,7 @@ fn email_export_md(state: &AppState, req: &Req) -> Resp {
             html_escape(msg)
         ))
     };
-    if let Err(e) = mail::guard_sensitive_path(state, &dest) {
+    if let Err(e) = mail::guard_save_dest(state, &dest) {
         return toast("err", &e);
     }
     match mail::md::build_md(state, id) {
@@ -1141,13 +1263,17 @@ fn email_export_md(state: &AppState, req: &Req) -> Resp {
     }
 }
 
-/// 标记已读（POST /emails/{id}/read）：本地置 0 + 服务器 \Seen 异步回写（§6.1，M4）
+/// 标记已读（POST /emails/{id}/read）：本地置 0 + 服务器 \Seen 异步回写（§6.1，M4）。
+///
+/// 详情/源码页用 `hx-trigger="load"` 打开即触发（审计 R34：GET 不再有副作用）。
+/// 读完必须让侧栏未读数跟着降：本次响应不带页面片段，改派发 mbx:sideRefresh
+/// 让 app.js 定向刷新边栏（整页刷新会丢阅读位置与草稿）。
 fn email_read(state: &AppState, req: &Req) -> Resp {
     let Some(id) = path_id(&req.path, "/emails/") else {
         return Resp::not_found();
     };
     mark_read_and_sync_seen(state, id);
-    Resp::html(String::new())
+    Resp::html(String::new()).with_event("mbx:sideRefresh")
 }
 
 /// 标为未读（POST /emails/{id}/unread，A5 配套）：详情页主动留待办。
@@ -1356,6 +1482,9 @@ fn reconstruct_list_req(req: &Req, form: &HashMap<String, String>) -> Req {
         path: req.path.clone(),
         query: qs.join("&"),
         is_htmx_request: true,
+        // 内部构造的请求不经过协议层/来源校验，头字段无意义
+        origin: None,
+        sec_fetch_site: None,
         body: Vec::new(),
     }
 }
@@ -1657,13 +1786,37 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
     render_html("contacts_area.html", &ctx)
 }
 
-/// 手动收取（GET /emails/fetch，§6.2）：启动一轮（已在收件中则忽略）后回进行中片段
+/// 16×16 全透明 PNG（75 字节）：远程图片被阻止时回它，而不是 404 ——
+/// 404 会让 WebView 显示破图图标，且部分客户端会把失败的 `img` 重试拉取。
+const PLACEHOLDER_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0xf3, 0xff,
+    0x61, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x18, 0x05, 0xa3,
+    0x60, 0x14, 0x8c, 0x02, 0x08, 0x00, 0x00, 0x04, 0x10, 0x00, 0x01, 0xaf, 0x45, 0x88, 0x2c, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
 /// 邮件外部图片代理（GET /proxy/image?url=…）。
 ///
 /// HTML 正文内的远程图片统一经本机拉取后回传，WebView 不直接向第三方发请求，
 /// 避免暴露 Referer/客户端指纹；同时阻断内网地址（SSRF）。只回传 image/*，
 /// 限制大小与超时，且不跟随重定向（防跳转到内网）。
-fn proxy_image(req: &Req) -> Resp {
+///
+/// 隐私开关（审计 R4/R36）：`allow_remote_images` 关闭时直接回 16×16 透明图，
+/// **不解析域名、不建连**——否则每打开一封营销邮件，发件方就能拿到本机出口
+/// IP、在线时间与阅读节奏。开关放在代理层而非正文改写层：历史邮件与 CSS
+/// 背景图一并受控，且改开关立即生效、无需重扫库。
+fn proxy_image(state: &AppState, req: &Req) -> Resp {
+    if !state.allow_remote_images() {
+        return Resp {
+            status: 200,
+            content_type: "image/png".into(),
+            // 不缓存：用户一旦开启开关，下次打开必须立刻换成真图
+            cache_control: "no-store",
+            body: PLACEHOLDER_PNG.to_vec(),
+            extra_headers: Vec::new(),
+        };
+    }
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     let Some(raw) = req.query_param("url") else {
         return proxy_error(400, "缺少 url");
@@ -2919,6 +3072,11 @@ fn wizard_done(state: &AppState) -> Resp {
         reuse_note: (mails > 0).then(|| {
             format!("数据目录中已有 {mails} 封历史邮件，已直接沿用；收件将从既有进度继续增量拉取，不重新全量收取")
         }),
+        // 与应用内账号页同一判定（缓存来源 / 库内 keyfile 记录），刷新完成页仍正确
+        degraded: state.secrets_degraded(&full_address(
+            &g(keys::ACCOUNT_PREFIX),
+            &g(keys::ACCOUNT_DOMAIN),
+        )),
     };
     render_html("done.html", &ctx)
 }

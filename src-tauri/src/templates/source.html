@@ -3,6 +3,8 @@
 <div class="app on" id="page">
     {% include "side.html" %}
     <main class="main">
+        {# 打开源码同样算读过（R34）：与详情页一致，由独立元素的 load 型 POST 置已读 #}
+        <div hidden hx-post="/emails/{{ email_id }}/read" hx-trigger="load" hx-swap="none"></div>
         <div class="topbar">
             <a class="back" href="/emails/{{ email_id }}{% if list_query %}?{{ list_query }}{% endif %}">‹ 返回邮件</a>
             <h1 class="md-title">源码 · {% if subject %}{{ subject }}{% else %}（无主题）{% endif %}</h1>

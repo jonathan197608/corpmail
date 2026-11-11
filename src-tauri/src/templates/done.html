@@ -35,6 +35,11 @@
                 <div class="kv"><span class="k">发信（SMTP）</span><b>{{ smtp_host }}:{{ smtp_port }}</b></div>
                 <div class="kv"><span class="k">收信（IMAP）</span><b>{{ recv_host }}:{{ recv_port }}</b></div>
 
+                {% if degraded %}
+                {# 凭据降级（R38）：必须说清密码没进系统凭据保管，而是本机加密文件 #}
+                <div class="sec-note dir-note"><span>{{ ic.icon('warning') }} 系统凭据服务不可用，密码已降级保存为本机加密文件（`corpmail.key` + 数据库密文），可正常收发；修复系统凭据服务后重新保存一次密码即可回到系统保管。</span></div>
+                {% endif %}
+
                 <div class="onboard-actions">
                     <a class="btn primary big" href="/">进入主界面</a>
                 </div>

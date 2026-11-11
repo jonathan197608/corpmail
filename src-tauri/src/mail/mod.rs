@@ -1754,13 +1754,21 @@ fn highlight_html(subject: &str, words: &[String]) -> String {
 
 /// 检索语句构造（§4.3）：与索引同源的 tokenize_words 分词，
 /// 每词双引号包裹后 AND 拼接（词内无语法字符，双引号隔离 FTS 注入）；
-/// 全部为停用词/无有效词 → None（调用方回退普通列表）
-#[cfg_attr(not(test), allow(dead_code))]
+/// 全部为停用词/无有效词 → None（调用方按「没有可匹配项」处理，不再回落整表）
 pub fn build_query(input: &str) -> Option<String> {
     let terms: Vec<String> = tokenize_words(input)
         .into_iter()
-        .filter(|w| !w.contains('"'))
-        .map(|w| format!("\"{w}\""))
+        // 引号转义为 FTS5 字面量（""）而不是丢弃该词：旧实现 filter(!contains('"'))
+        // 会把含引号的词整条吞掉，用户搜 `"季度报告"` 时只剩空查询（审计 R29）
+        .map(|w| {
+            let escaped = w.replace('"', "\"\"");
+            // 单字加前缀通配：`会` 命中 `会议`，`mee` 之外的单词输入仍走精确词
+            if escaped.chars().count() == 1 {
+                format!("\"{escaped}\"*")
+            } else {
+                format!("\"{escaped}\"")
+            }
+        })
         .collect();
     if terms.is_empty() {
         None
@@ -2831,7 +2839,11 @@ fn comparable_path(p: &Path) -> String {
     for (i, c) in comps.iter().enumerate() {
         acc.push(c.as_os_str());
         if !acc.exists() {
+            // 该组件不存在：它是「余下部分」的第一段，必须从前缀里退回，
+            // 否则会被 canonicalize 后的前缀与 comps[cut..] 各追加一次，
+            // 得到 `.../saved.txt/saved.txt` 这类重复路径（R35 排查时发现）
             cut = i;
+            acc.pop();
             break;
         }
     }
@@ -2874,6 +2886,86 @@ pub fn guard_sensitive_path(state: &AppState, raw: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 保存目标白名单（审计 R35）。
+///
+/// 威胁模型：`dest` / `dest_dir` 来自表单，WebView 侧一旦被注入（恶意邮件
+/// 正文、坏模板）就能伪造任意路径把攻击者可控内容写到本机任意位置；仅靠
+/// `guard_sensitive_path` 只挡住了应用自身的库/密钥/配置三个文件。
+///
+/// 规则（保持正常另存体验的前提下收口）：
+/// - 必须绝对路径，且不含 `..`（对话框从不返回相对路径/上跳）
+/// - 只能是普通文件或目录（拒绝设备/FIFO/符号链接之类）
+/// - Unix：必须落在用户主目录、系统临时目录或外部卷（`/Volumes` `/media` `/mnt`）
+/// - Windows：拒绝 `%SystemRoot%` `%ProgramFiles%` `%ProgramFiles(x86)%`
+///   `%ProgramData%`（其余盘符/用户目录照常，覆盖「存到 D 盘」的常见用法）
+pub fn guard_save_dest(state: &AppState, raw: &str) -> Result<(), String> {
+    // 应用自身的数据文件优先判定（库/密钥/配置），文案更具体
+    guard_sensitive_path(state, raw)?;
+    let p = Path::new(raw);
+    if raw.trim().is_empty() {
+        return Err("保存路径为空".to_string());
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("保存路径不能包含 ..：{raw}"));
+    }
+    if !p.is_absolute() {
+        return Err(format!("保存路径必须是绝对路径：{raw}"));
+    }
+    match std::fs::symlink_metadata(p) {
+        Ok(md) if md.is_dir() => return Ok(()), // 「全部另存」的目录目标
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(format!("目标不能是符号链接：{raw}"));
+        }
+        Ok(md) if !md.is_file() => {
+            return Err(format!("目标不是普通文件：{raw}"));
+        }
+        _ => {}
+    }
+    if !save_dest_allowed(p) {
+        return Err(format!(
+            "为安全起见，只能保存到你的用户目录、临时目录或外部磁盘：{raw}"
+        ));
+    }
+    Ok(())
+}
+
+/// 路径 `target` 是否位于 `root` 之下（含相等；两侧均已小写归一）
+fn path_within(target: &str, root: &str) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    let sep = std::path::MAIN_SEPARATOR;
+    target == root || target.starts_with(&format!("{root}{sep}"))
+}
+
+#[cfg(not(windows))]
+fn save_dest_allowed(p: &Path) -> bool {
+    let target = comparable_path(p);
+    let mut roots: Vec<String> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(comparable_path(Path::new(&home)));
+    }
+    roots.push(comparable_path(&std::env::temp_dir()));
+    // 外部卷/挂载点：允许另存到移动硬盘（macOS /Volumes、Linux /media /mnt）
+    for m in ["/Volumes", "/media", "/mnt"] {
+        roots.push(comparable_path(Path::new(m)));
+    }
+    roots.iter().any(|r| path_within(&target, r))
+}
+
+#[cfg(windows)]
+fn save_dest_allowed(p: &Path) -> bool {
+    let target = comparable_path(p);
+    let denied: Vec<String> = ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
+        .iter()
+        .filter_map(|k| std::env::var_os(k))
+        .map(|v| comparable_path(Path::new(&v)))
+        .collect();
+    !denied.iter().any(|r| path_within(&target, r))
 }
 
 /// 附件元数据 + 字节（另存为/预览；detached 或文件缺失 → None）。
@@ -2942,7 +3034,7 @@ pub fn save_attachment_to(
     // 本身就无后缀（发件端截断/客户端不写）——按原名后缀 → MIME → .bin 补齐，
     // 保证落盘文件能被系统按类型关联打开。补全后路径才是真正写入目标
     let dest = with_inferred_ext(dest, &view.filename, &view.mime);
-    guard_sensitive_path(state, &dest)?;
+    guard_save_dest(state, &dest)?;
     std::fs::write(&dest, &bytes).map_err(|err| format!("另存失败：{err}"))?;
     Ok(dest)
 }
@@ -2959,6 +3051,8 @@ pub fn save_all_attachments(
     if !dir.is_dir() {
         return Err("目标目录不存在".to_string());
     }
+    // 目录同样要过白名单（R35）：否则伪造 dest_dir=/etc 就能批量落盘
+    guard_save_dest(state, dest_dir)?;
     let root = attach_root(state);
     let rows: Vec<AttachRow> = state
         .with_conn(|conn| {

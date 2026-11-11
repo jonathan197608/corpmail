@@ -17,6 +17,11 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("done.html", include_str!("templates/done.html")),
     ("main.html", include_str!("templates/main.html")),
     ("mail_list.html", include_str!("templates/mail_list.html")),
+    // 列表行片段（审计 R41）：后台刷新只回邮件行，不覆盖顶栏搜索/筛选状态
+    (
+        "mail_list_rows.html",
+        include_str!("templates/mail_list_rows.html"),
+    ),
     ("email.html", include_str!("templates/email.html")),
     ("compose.html", include_str!("templates/compose.html")),
     ("side.html", include_str!("templates/side.html")),

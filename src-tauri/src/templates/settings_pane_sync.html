@@ -24,6 +24,15 @@
             </div>
             <div class="tline">
                 <div class="tl-main">
+                    <b>加载邮件中的远程图片</b>
+                    <span>默认关闭：不向发件方暴露你的 IP 与阅读时间。开启后由本机代理拉取，WebView 不直连第三方</span>
+                </div>
+                <input type="hidden" name="allow_remote_images" id="allow-remote-images" value="{% if allow_remote_images %}1{% else %}0{% endif %}">
+                <button type="button" class="toggle{% if allow_remote_images %} on{% endif %}"
+                    onclick="var h=document.getElementById('allow-remote-images');var on=this.classList.toggle('on');h.value=on?'1':'0';"></button>
+            </div>
+            <div class="tline">
+                <div class="tl-main">
                     <b>单封收件上限（MB）</b>
                     <span>超过该体积只拉取信头并保存占位邮件，正文与附件不下载（默认 50，范围 1–200）</span>
                 </div>

@@ -188,8 +188,12 @@ fn tokenize_words_drops_trailing_punctuation_from_ascii_words() {
         build_query("SP-2026-1023"),
         Some("\"sp-2026-1023\"".to_string())
     );
-    assert_eq!(build_query("的了 the"), None, "全停用词应回退");
-    assert_eq!(build_query("   "), None, "纯空白应回退");
+    assert_eq!(build_query("的了 the"), None, "全停用词无有效词");
+    assert_eq!(build_query("   "), None, "纯空白无有效词");
+    // R29：单字加前缀通配（中文单字在 FTS5 里是独立 token，精确词搜不到长词；
+    // 用非停用单字取样，停用字仍在分词阶段就被滤掉）
+    assert_eq!(build_query("税"), Some("\"税\"*".to_string()));
+    assert_eq!(build_query("会议"), Some("\"会议\"".to_string()));
 }
 
 #[test]
@@ -423,7 +427,7 @@ fn search_ranks_matches_and_highlights_subject() {
     // 多词 AND：两词须命中同一封
     let (items2, _) = search(&state, "激励 配案", &q).unwrap().unwrap();
     assert_eq!(items2.len(), 1);
-    // 输入全为停用词 → None 回退
+    // 输入全为停用词 → None（调用方按空结果处理，不再回落整表）
     assert!(search(&state, "的了", &q).unwrap().is_none());
     // 无命中
     let (items3, total3) = search(&state, "zzqqxy", &q).unwrap().unwrap();
@@ -765,6 +769,40 @@ fn attachment_suffix_inference_rules() {
     assert_eq!(os_safe_name("报表.", true), "报表");
     assert_eq!(os_safe_name("报表.", false), "报表.");
     assert_eq!(os_safe_name("??", true), "attachment");
+}
+
+/// 保存落点白名单（审计 R35）：前端可伪造 dest，必须拒绝系统目录、相对路径
+/// 与上跳；用户目录/临时目录/外部卷照常放行（另存到桌面/移动硬盘仍可用）
+#[cfg(not(windows))]
+#[test]
+fn save_dest_whitelist_blocks_system_paths() {
+    let (state, dir) = temp_state("dest-guard");
+    for bad in [
+        "/etc/corpmail-guard-test.eml",
+        "/usr/local/bin/x.eml",
+        "relative/x.eml",
+        "/tmp/../etc/x.eml",
+    ] {
+        assert!(
+            guard_save_dest(&state, bad).is_err(),
+            "应拒绝不安全落点：{bad}"
+        );
+    }
+    // 应用自身数据文件优先报更具体的错
+    let db = state.data_dir().join("corpmail.db");
+    let err = guard_save_dest(&state, &db.to_string_lossy()).unwrap_err();
+    assert!(err.contains("应用数据文件"), "{err}");
+    // 临时目录（测试数据目录）与用户主目录放行
+    let ok = dir.join("导出.eml");
+    assert!(guard_save_dest(&state, &ok.to_string_lossy()).is_ok());
+    if let Some(home) = std::env::var_os("HOME") {
+        let in_home = Path::new(&home).join("corpmail-guard-test.eml");
+        assert!(
+            guard_save_dest(&state, &in_home.to_string_lossy()).is_ok(),
+            "用户主目录应放行"
+        );
+    }
+    cleanup(&dir);
 }
 
 /// 另存无后缀路径时按附件名补后缀，并返回实际落盘路径（提示文案据此显示）
@@ -1406,6 +1444,29 @@ fn template_crud_and_validation() {
     templates::delete(&state, id).unwrap();
     assert!(templates::get(&state, id).is_none());
     templates::delete(&state, id).unwrap();
+    cleanup(&dir);
+}
+
+/// 模板 HTML 存储型 XSS（审计 R9）：入库前必须与草稿/收件同口径净化。
+/// 模板 body_html 会被原样注入编辑器与该设置 pane，事件属性/脚本一旦落库
+/// 就是持久化执行面；净化放在 `templates::save` 内部，任何调用方都绕不过。
+#[test]
+fn template_html_is_sanitized_on_save() {
+    use crate::mail::templates;
+    let (state, dir) = temp_state("tpl-xss");
+    let id = templates::save(
+        &state,
+        None,
+        "恶意模板",
+        "正文",
+        "<p onclick=\"alert(1)\">hi</p><script>alert(2)</script><img src=x onerror=alert(3)>",
+    )
+    .unwrap();
+    let t = templates::get(&state, id).unwrap();
+    assert!(!t.body_html.contains("onerror"), "{}", t.body_html);
+    assert!(!t.body_html.contains("<script"), "{}", t.body_html);
+    assert!(!t.body_html.contains("onclick"), "{}", t.body_html);
+    assert!(t.body_html.contains("hi"), "正文文本应保留：{}", t.body_html);
     cleanup(&dir);
 }
 

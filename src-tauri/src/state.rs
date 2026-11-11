@@ -64,6 +64,10 @@ pub mod keys {
     /// 写入；重装/换机后向导指向既有数据目录时，据此判定库能否被当前账号
     /// 直接沿用（历史更早的库无此行，退回发件 From 模式推导，见 store_owner_conn）
     pub const STORE_OWNER: &str = "store_owner";
+    /// 是否允许加载邮件正文里的远程图片（"1" = 允许，默认禁止）：关闭时
+    /// `/proxy/image` 直接回内置透明占位图，**不发起任何网络请求**——
+    /// 否则每打开一封营销邮件就把本机 IP 与阅读时间泄露给发件方（审计 R4/R36）
+    pub const ALLOW_REMOTE_IMAGES: &str = "allow_remote_images";
 
     /// 自定义数据目录指针（存独立配置文件 corpmail.toml，随锚点目录常驻）
     pub const DATA_DIR: &str = "data_dir_override";
@@ -109,6 +113,8 @@ pub fn defaults() -> Vec<(&'static str, &'static str)> {
         (keys::KEEP_SENT_DAYS, "3650"),
         (keys::SIGNATURE, ""),
         (keys::PAGE_SIZE, "10"),
+        // 远程图片默认阻止：不联网即无隐私泄露，用户按需在设置里开启
+        (keys::ALLOW_REMOTE_IMAGES, "0"),
     ]
 }
 
@@ -1246,6 +1252,16 @@ impl AppState {
         }
         let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
         crate::db::settings::get(&conn, key).ok()
+    }
+
+    /// 是否允许加载邮件正文里的远程图片（默认否，审计 R4/R36）。
+    /// `/proxy/image` 在关闭时直接回占位图、不解析域名不建连——该判断必须在
+    /// 构造任何网络客户端之前完成，故放在状态层而不是正文改写层。
+    pub fn allow_remote_images(&self) -> bool {
+        matches!(
+            self.get(keys::ALLOW_REMOTE_IMAGES),
+            Some(Some(v)) if v == "1" || v.eq_ignore_ascii_case("true")
+        )
     }
 
     /// 读键，未设置回退默认值表

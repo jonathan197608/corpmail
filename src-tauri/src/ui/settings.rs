@@ -42,6 +42,8 @@ pub(super) struct SettingsCtx {
     error: String,
     // 收件同步 tab
     sync_on_start: bool,
+    /// 是否加载正文远程图片（隐私开关，默认关闭；关时 /proxy/image 回占位图）
+    allow_remote_images: bool,
     sync_interval_min: String,
     first_fetch_days: String,
     /// 单封收件上限（MB）：超出只拉信头存占位
@@ -203,6 +205,7 @@ pub(super) fn settings_ctx(
         saved,
         error: error.into(),
         sync_on_start: g(keys::SYNC_ON_START) == "true",
+        allow_remote_images: g(keys::ALLOW_REMOTE_IMAGES) == "1",
         sync_interval_min: g(keys::SYNC_INTERVAL_MIN),
         first_fetch_days: g(keys::FIRST_FETCH_DAYS),
         max_mail_mb: g(keys::MAX_MAIL_MB),
@@ -462,6 +465,11 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         Some(v) => v == "true",
         None => cur(keys::SYNC_ON_START) == "true",
     };
+    // 远程图片开关（审计 R4/R36）：缺省字段保持现值，避免旧表单提交把它关掉
+    let allow_images = match form.get("allow_remote_images") {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        None => cur(keys::ALLOW_REMOTE_IMAGES) == "1",
+    };
     let interval = match form.get("sync_interval_min") {
         // 上限 7 天：调度线程按间隔 sleep，巨值会让定时收件永久失效（重启才恢复）
         Some(v) => match v.trim().parse::<u32>() {
@@ -497,6 +505,10 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
     }
     let mut pairs = vec![
         (keys::SYNC_ON_START, if on { "true" } else { "false" }),
+        (
+            keys::ALLOW_REMOTE_IMAGES,
+            if allow_images { "1" } else { "0" },
+        ),
         (keys::SYNC_INTERVAL_MIN, interval.as_str()),
         (keys::FIRST_FETCH_DAYS, days.as_str()),
         (keys::MAX_MAIL_MB, max_mail.as_str()),
