@@ -70,7 +70,7 @@
                         <span class="tpl-hint">插入到当前光标位置</span>
                         {% endif %}
                         <div id="plain-tools" {% if body_mode == 'html' %}hidden{% endif %}>
-                            <button type="button" class="btn small upgrade-btn" onclick="mbxUpgradeHtml()"
+                            <button type="button" class="btn small upgrade-btn" data-mbx-action="upgrade-html"
                                     title="把当前纯文本转为富文本（不可再降级）">切换为富文本 ›</button>
                         </div>
                     </div>
@@ -92,7 +92,7 @@
                 </div>
 
                 <div class="attach-area">
-                    <button type="button" class="btn" onclick="mbxPickAttachments()">{{ ic.icon('paperclip') }} 添加附件</button>
+                    <button type="button" class="btn" data-mbx-action="pick-attachments">{{ ic.icon('paperclip') }} 添加附件</button>
                     <ul id="picked-list" class="att-list"></ul>
                     {% if attachments %}
                     <div class="kept-title">已保存的附件（保存草稿时保留）</div>
@@ -101,11 +101,13 @@
                         <li class="att-row kept">
                             <span class="att-clip">{{ ic.icon('paperclip') }}</span>
                             <span class="att-name clickable"
-                                  onclick="mbxPreviewAttachment('/emails/{{ draft_id }}/attachments/{{ a.id }}/view', {{ a.preview_kind | js_str }}, {{ a.filename | js_str }})"
+                                  data-mbx-action="preview-attachment"
+                                  data-url="/emails/{{ draft_id }}/attachments/{{ a.id }}/view"
+                                  data-kind="{{ a.preview_kind }}" data-name="{{ a.filename }}"
                                   title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
                             <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                             <button type="button" class="btn small"
-                                    onclick="mbxRemoveKept({{ a.id }}, this)">移除</button>
+                                    data-mbx-action="remove-kept" data-id="{{ a.id }}">移除</button>
                         </li>
                         {% endfor %}
                     </ul>

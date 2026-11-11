@@ -13,7 +13,8 @@
                 </div>
                 <input type="hidden" name="sync_on_start" id="sync-on-start" value="{% if sync_on_start %}true{% else %}false{% endif %}">
                 <button type="button" class="toggle{% if sync_on_start %} on{% endif %}"
-                    onclick="var h=document.getElementById('sync-on-start');var on=this.classList.toggle('on');h.value=on?'true':'false';"></button>
+                    data-mbx-action="toggle-hidden" data-target="sync-on-start"
+                    data-on="true" data-off="false" aria-label="启动时自动收取"></button>
             </div>
             <div class="tline">
                 <div class="tl-main">
@@ -29,7 +30,8 @@
                 </div>
                 <input type="hidden" name="allow_remote_images" id="allow-remote-images" value="{% if allow_remote_images %}1{% else %}0{% endif %}">
                 <button type="button" class="toggle{% if allow_remote_images %} on{% endif %}"
-                    onclick="var h=document.getElementById('allow-remote-images');var on=this.classList.toggle('on');h.value=on?'1':'0';"></button>
+                    data-mbx-action="toggle-hidden" data-target="allow-remote-images"
+                    data-on="1" data-off="0" aria-label="加载邮件中的远程图片"></button>
             </div>
             <div class="tline">
                 <div class="tl-main">

@@ -10,7 +10,7 @@
         <form class="per-form" method="get" action="/contacts" title="列表显示设置">
             {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
             <label class="per-page" title="每页显示条数">
-                <select class="per-select" name="per" aria-label="每页显示条数" onchange="this.form.submit()">
+                <select class="per-select" name="per" aria-label="每页显示条数" data-mbx-action="submit-form">
                     <option value="10" {% if per == 10 %}selected{% endif %}>每页 10 人</option>
                     <option value="20" {% if per == 20 %}selected{% endif %}>每页 20 人</option>
                     <option value="50" {% if per == 50 %}selected{% endif %}>每页 50 人</option>
@@ -18,7 +18,7 @@
                 </select>
             </label>
             <label class="per-page" title="列表排序">
-                <select class="per-select" name="sort" aria-label="列表排序" onchange="this.form.submit()">
+                <select class="per-select" name="sort" aria-label="列表排序" data-mbx-action="submit-form">
                     <option value="recent" {% if sort == 'recent' %}selected{% endif %}>最近联系</option>
                     <option value="hits" {% if sort == 'hits' %}selected{% endif %}>联系最多</option>
                     <option value="name" {% if sort == 'name' %}selected{% endif %}>姓名</option>

@@ -23,7 +23,7 @@
                 <span class="kv-val">
                     <span class="mono dir-path" title="{{ data_dir }}">{{ data_dir }}</span>
                     {% if data_dir_pending %}<span class="dir-badge">重启后生效</span>{% endif %}
-                    <button type="button" class="btn small" onclick="mbxMoveDataDir()"
+                    <button type="button" class="btn small" data-mbx-action="move-data-dir"
                             {% if migration_pending %}disabled title="数据已迁移，请重启应用后再操作"
                             {% else %}title="选择新目录并迁移数据"{% endif %}>更换位置</button>
                 </span>

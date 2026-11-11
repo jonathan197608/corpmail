@@ -83,7 +83,7 @@
             {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
                         {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
             <label class="per-page" title="每页显示条数">
-                <select class="per-select" name="per" aria-label="每页显示条数" onchange="this.form.submit()">
+                <select class="per-select" name="per" aria-label="每页显示条数" data-mbx-action="submit-form">
                     <option value="10" {% if per == 10 %}selected{% endif %}>每页 10 封</option>
                     <option value="20" {% if per == 20 %}selected{% endif %}>每页 20 封</option>
                     <option value="50" {% if per == 50 %}selected{% endif %}>每页 50 封</option>
@@ -91,7 +91,7 @@
                 </select>
             </label>
             <label class="per-page" title="列表排序">
-                <select class="per-select" name="sort" aria-label="列表排序" onchange="this.form.submit()">
+                <select class="per-select" name="sort" aria-label="列表排序" data-mbx-action="submit-form">
                     <option value="date_desc" {% if sort == 'date_desc' %}selected{% endif %}>最新优先</option>
                     <option value="date_asc" {% if sort == 'date_asc' %}selected{% endif %}>最早优先</option>
                     <option value="from_asc" {% if sort == 'from_asc' %}selected{% endif %}>发件人</option>

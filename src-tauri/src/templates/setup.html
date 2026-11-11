@@ -55,7 +55,7 @@
                                     {% if require_data_dir %}required{% endif %}
                                     data-default-dir="{{ default_data_dir }}"
                                     placeholder="{% if require_data_dir %}必须选择：点击右侧「选择…」指定目录{% else %}留空沿用当前目录；可填新目录或已有数据的目录（同账号沿用）{% endif %}">
-                                <button type="button" class="btn small" onclick="mbxPickSetupDir(this)"
+                                <button type="button" class="btn small" data-mbx-action="pick-setup-dir"
                                     title="浏览选择目录">选择…</button>
                             </div>
                         </div>
