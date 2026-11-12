@@ -653,9 +653,18 @@ pub(super) fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
     match state.start_migration(&dest) {
         // 后台迁移已启动（生产）：协议回调立即返回轻量片段，前端据此开阻塞模态，
         // 进度/结果经事件回传（不再在协议回调内同步执行 VACUUM/附件复制）
-        Ok(MigrateOutcome::Background) => Resp::html(
-            "<div class=\"settings-pane\" id=\"settings-pane\"><p class=\"desc\">数据迁移正在进行中，请稍候…</p></div>".into(),
-        ),
+        Ok(MigrateOutcome::Background) => {
+            let mut resp = Resp::html(
+                "<div class=\"settings-pane\" id=\"settings-pane\"><p class=\"desc\">数据迁移正在进行中，请稍候…</p></div>".into(),
+            );
+            // 前端 fetch 用此头区分「后台已启动（等事件）」与「同步完成/校验失败
+            // （回的是完整 pane，须渲染并关模态）」；缺了它 A1 的死锁会复现
+            resp.extra_headers.push((
+                super::MIGRATION_BACKGROUND_HEADER.to_string(),
+                "background".to_string(),
+            ));
+            resp
+        }
         // 同步完成（单元测试 / 未注入 executor）：保持既有 pane 返回语义
         Ok(MigrateOutcome::Done) => render_html(
             &pane_template("storage"),

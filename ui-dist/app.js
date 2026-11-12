@@ -309,19 +309,46 @@ async function mbxMoveDataDir() {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
         // 先弹模态并注册事件监听（避免后台完成事件在监听前发出被丢）
-        mbxMigOpen('准备迁移…');
+        mbxMigOpen();
         await mbxMigListen();
-        await fetch('/settings/storage/move', {
+        const res = await fetch('/settings/storage/move', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ dest: dir }).toString(),
         });
+        const text = await res.text();
+        if (res.ok && res.headers.get('X-CorpMail-Migration') === 'background') {
+            // 生产后台分支：模态继续等 migration-progress / done / error 事件
+            return;
+        }
+        if (res.ok && mbxMigApplyPane(text)) {
+            // 同步完成（未注入 executor）或启动校验失败：后端已回完整存储 pane，
+            // 结果/错误都在 pane 里，替换后关闭模态，不留悬挂的阻塞遮罩
+            mbxMigCloseModal();
+            return;
+        }
+        // 409（冻结期）等非 2xx：纯文本提示，走失败态 + 「返回」
+        mbxMigShowError(res.ok ? '迁移结果无法显示，请刷新存储页确认'
+            : (text.trim() || ('HTTP ' + res.status)));
     } catch (e) {
         console.error('[mbx] 迁移启动失败', e);
         mbxMigShowError('迁移启动失败：' + (e && e.message ? e.message : e));
     } finally {
         mbxMoveBusy = false;
     }
+}
+
+// 把后端返回的存储 pane 片段替换进页面（fetch 不经 htmx，需手动 process 新节点）
+function mbxMigApplyPane(html) {
+    const old = document.getElementById('settings-pane');
+    if (!old || !html || !html.trim()) return false;
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html.trim();
+    const next = tpl.content.firstElementChild;
+    if (!next) return false;
+    old.replaceWith(next);
+    if (window.htmx && typeof window.htmx.process === 'function') window.htmx.process(next);
+    return true;
 }
 
 // ---------- 迁移阻塞进度模态 ----------
@@ -388,10 +415,12 @@ function mbxMigCloseModal() {
     }
 }
 
-// 注册迁移事件监听（返回 Promise 就绪，避免 done 在监听前被丢）
+// 注册迁移事件监听（返回 Promise 就绪，避免 done 在监听前被丢）。
+// unlisten 收集器在首个 await 之前就挂到全局：注册中途抛错也能解绑已注册的那几个。
 async function mbxMigListen() {
     if (mbxMigUnlisten) return;
-    var unlist = [];
+    const unlist = [];
+    mbxMigUnlisten = function () { unlist.forEach(function (f) { if (f) f(); }); };
     var add = function (name, fn) {
         return window.__TAURI__.event.listen(name, function (e) {
             try { fn(e); } catch (err) { console.error('[mbx] 迁移事件处理失败', err); }
@@ -408,7 +437,6 @@ async function mbxMigListen() {
     await add('migration-error', function (e) {
         mbxMigShowError(typeof e.payload === 'string' ? e.payload : '迁移失败，请重试');
     });
-    mbxMigUnlisten = function () { unlist.forEach(function (f) { if (f) f(); }); };
 }
 
 // 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——

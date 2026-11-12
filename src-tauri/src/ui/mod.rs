@@ -13,6 +13,10 @@ use tauri::http::{Response, StatusCode, header};
 pub use assets::{Assets, EmbeddedAssets};
 pub use router::{MAX_REQUEST_BODY, RealTester, Req, Resp, route};
 
+/// 后台迁移已启动的响应标记：前端据此保留阻塞模态等事件；未带此头的 200
+/// 响应一律是完整 pane（同步完成或启动校验失败），必须渲染后关模态（审计 A1）。
+pub const MIGRATION_BACKGROUND_HEADER: &str = "X-CorpMail-Migration";
+
 /// 内容安全策略（审计 R7）。
 ///
 /// 与 `tauri.conf.json` 的 `app.security.csp` 必须逐字一致——单测
@@ -48,3 +52,7 @@ pub fn to_http_response(resp: Resp) -> Response<Cow<'static, [u8]>> {
 #[cfg(test)]
 #[path = "../tests/ui_csp.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/ui_migration.rs"]
+mod migration_tests;

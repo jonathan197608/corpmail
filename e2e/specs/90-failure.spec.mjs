@@ -83,6 +83,50 @@ describe('90 失败链路', () => {
     await shot('失败-迁移三连拒')
   })
 
+  it('F3b 点击式迁移失败：错误可见且阻塞模态自动关闭', async () => {
+    // A1/A2 回归：F3 用 htmxAjax 直发 URL 只看响应文本，绕过了真实按钮链。
+    // 这里 mock 目录对话框（选一个已有 corpmail.db 的非法目标，不改应用状态），
+    // 走 mbxMoveDataDir → fetch → 响应处理 → 关模态的完整链路。
+    await goto('/settings/storage')
+    await waitBoot()
+    const occupied = path.join(runDir(), 'occupied-data')
+    fs.mkdirSync(occupied, { recursive: true })
+    fs.writeFileSync(path.join(occupied, 'corpmail.db'), 'not a real db')
+
+    const started = await browser.execute((dir) => {
+      const t = window.__TAURI__
+      if (!t || !t.dialog) return false
+      window.__MBX_DIALOG_ORIG__ = t.dialog.open
+      const stub = async () => dir
+      t.dialog.open = stub
+      if (t.dialog.open !== stub) return false
+      const btn = document.querySelector('[data-mbx-action="move-data-dir"]')
+      if (!btn) return false
+      btn.click()
+      return true
+    }, occupied)
+    expect(started).toBe(true)
+
+    try {
+      // 启动校验失败 → 后端回完整 pane → 前端渲染错误并关闭模态
+      await browser.waitUntil(async () => {
+        const pane = await $('#settings-pane')
+        return (await pane.getText()).includes('corpmail.db')
+      }, { timeout: 8000, timeoutMsg: '启动失败的错误文案未渲染到存储 pane' })
+      // hidden 必须真的生效（A2：作者样式 display:flex 会压过 UA [hidden]）
+      const mask = await $('#migrate-mask')
+      expect(await mask.isDisplayed()).toBe(false)
+      await shot('失败-点击式迁移错误可见且模态已关')
+    } finally {
+      await browser.execute(() => {
+        if (window.__TAURI__ && window.__MBX_DIALOG_ORIG__) {
+          window.__TAURI__.dialog.open = window.__MBX_DIALOG_ORIG__
+          delete window.__MBX_DIALOG_ORIG__
+        }
+      })
+    }
+  })
+
   it('F4 发送失败链路：fail@ 550 拒收 → failed 状态 → 重发回撰写页', async () => {
     await goto('/compose')
     await waitBoot()

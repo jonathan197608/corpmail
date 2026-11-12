@@ -3890,6 +3890,12 @@ form.setup-card .setup-actions {
 }
 
 /* ---------- 数据迁移阻塞模态（M5 后台化，2026-11-10） ---------- */
+/* 作者样式 display:flex / inline-flex 会压过 UA 的 [hidden]:none（见上文
+   .tpl-editor 同坑），遮罩与「返回」按钮必须显式补 [hidden]，否则关不掉。 */
+.migrate-mask[hidden],
+.migrate-card .btn[hidden] {
+    display: none;
+}
 .migrate-mask {
     position: fixed;
     inset: 0;
