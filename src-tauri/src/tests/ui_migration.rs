@@ -6,6 +6,7 @@
 //! 钉住「响应必须被消费」「[hidden] 必须显式补」「事件名前后端一致」三件事。
 
 use super::MIGRATION_BACKGROUND_HEADER;
+use super::{Resp, to_http_response};
 
 const APP_JS: &str = include_str!("../../../ui-dist/app.js");
 const APP_CSS: &str = include_str!("../../../ui-dist/app.css");
@@ -182,6 +183,47 @@ fn production_migration_runs_through_injected_executor() {
     assert!(
         STATE_RS.contains("fn migration_guard("),
         "生产后台链必须有 RAII guard"
+    );
+}
+
+#[test]
+fn extra_headers_reach_the_http_response() {
+    // R12：A1 契约三段是 ① settings.rs 塞 extra_headers → ② to_http_response
+    // 写进协议层响应 → ③ app.js 读头分支。R5 的用例只测到 ①，
+    // 若 ② 的循环被重构掉，R5 仍绿而生产直接复现 A1 死锁（模态等一个永不到来的事件）
+    let resp = Resp {
+        status: 200,
+        content_type: "text/html; charset=utf-8".into(),
+        cache_control: "no-store",
+        body: b"<div id=\"settings-pane\"></div>".to_vec(),
+        extra_headers: vec![(MIGRATION_BACKGROUND_HEADER.to_string(), "background".to_string())],
+    };
+    let http = to_http_response(resp);
+    assert_eq!(
+        http.headers()
+            .get(MIGRATION_BACKGROUND_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("background"),
+        "附加头必须真的落到 HTTP 响应上"
+    );
+    assert!(
+        http.headers().contains_key("content-security-policy"),
+        "附加头不得挤掉 CSP（同一 builder 上顺序追加）"
+    );
+    // 非 HTML 响应同样透传：该标记与内容类型无关
+    let plain = to_http_response(Resp {
+        status: 409,
+        content_type: "text/plain; charset=utf-8".into(),
+        cache_control: "no-store",
+        body: b"x".to_vec(),
+        extra_headers: vec![(MIGRATION_BACKGROUND_HEADER.to_string(), "background".to_string())],
+    });
+    assert_eq!(
+        plain
+            .headers()
+            .get(MIGRATION_BACKGROUND_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("background")
     );
 }
 
