@@ -1075,8 +1075,9 @@ fn switch_data_dir_first_run_refuses_nonempty_store_and_bad_targets() {
 
 #[test]
 fn rebind_send_worker_rebuilds_on_new_dir() {
-    // 发送 worker 持有旧库连接与旧附件根；直切后必须重绑到新目录，
-    // 否则发送线程会把待发邮件读旧库、附件读旧目录
+    // 发送 worker 持有旧库连接与旧附件根；直切（swap_store：停旧等退出 →
+    // 同锁换库/目录 → 新目录重启）后必须重绑到新目录，否则发送线程会把
+    // 待发邮件读旧库、附件读旧目录
     let anchor = temp_dir("rebind-anchor");
     let state = AppState::open_with_anchor(&anchor, &anchor);
     state.start_send_worker(); // 模拟 lib.rs 装配（旧 worker 绑旧目录）
@@ -1473,5 +1474,170 @@ fn adopt_fails_when_owner_mark_cannot_be_written() {
     );
     // 失败后不得改动指针：当前目录仍是 cur
     assert_eq!(state.data_dir(), cur);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// set_batch 双通道互回滚（审计 R10）：库键写入失败时，已写进 corpmail.toml
+/// 的配置键必须一并回滚到旧值——否则 host/端口/账号这类配置静默半生效，
+/// 文件显示新值、库与运行行为却是旧的
+#[test]
+fn set_batch_rolls_back_config_file_when_db_write_fails() {
+    let dir = temp_dir("r10");
+    let state = AppState::open(&dir);
+    // 旧值先落文件
+    state.set_batch(&[(keys::SMTP_PORT, "25")]).unwrap();
+    assert_eq!(
+        crate::conf::load(&dir).unwrap().get(keys::SMTP_PORT).map(String::as_str),
+        Some("25")
+    );
+    // 挡死库键写入（settings 一律 ABORT，模拟库损坏/只读）
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER block_set BEFORE INSERT ON settings
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+    let err = state
+        .set_batch(&[
+            (keys::SMTP_PORT, "587"),  // 配置键（文件）
+            (keys::PAGE_SIZE, "100"),  // 库键（settings，被触发器挡死）
+        ])
+        .expect_err("库键失败必须整体报错");
+    assert!(err.contains("blocked") || err.contains("写入"), "{err}");
+    // 文件与内存镜像都不得带上 587
+    assert_eq!(
+        crate::conf::load(&dir).unwrap().get(keys::SMTP_PORT).map(String::as_str),
+        Some("25"),
+        "文件必须回滚到旧值"
+    );
+    assert_eq!(
+        state.get(keys::SMTP_PORT).flatten().as_deref(),
+        Some("25"),
+        "镜像必须回滚到旧值"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// reset_and_fetch（审计 R14）：收件进行中 → Busy 且游标保持原值。
+/// 旧 check-then-act 实现在此场景会先清游标再被运行轮写回，重拉意图丢失
+#[test]
+fn reset_and_fetch_busy_keeps_cursors() {
+    let dir = temp_dir("r14-busy");
+    let state = AppState::open(&dir);
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::LAST_UID, "123"),
+        ])
+        .unwrap();
+    // 注入运行中（同路由层 C5 测试口径）
+    {
+        let mut s = state.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.running = true;
+    }
+    match state.reset_and_fetch(&[(keys::LAST_UID, "0")]) {
+        Err(ResetFetchError::Busy) => {}
+        other => panic!("收件进行中应返回 Busy：{other:?}"),
+    }
+    assert_eq!(
+        state.get(keys::LAST_UID).flatten().as_deref(),
+        Some("123"),
+        "Busy 时游标不得被清"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// reset_and_fetch（审计 R14）：空闲 → 清游标 + 起新轮原子完成。
+/// 凭据缺失会让派发段立刻收尾成错误状态（fetch_end 复位 running），
+/// 这正是「清了游标但没拉到」的兜底语义——下轮手动收取按首拉全量补
+#[test]
+fn reset_and_fetch_clears_cursors_and_begins_round() {
+    let dir = temp_dir("r14-ok");
+    let state = AppState::open(&dir);
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::ACCOUNT_DOMAIN, "@chinatelecom.cn"),
+            (keys::LAST_UID, "123"),
+            (keys::LAST_UIDVALIDITY, "9"),
+        ])
+        .unwrap();
+    state
+        .reset_and_fetch(&[(keys::LAST_UID, "0"), (keys::LAST_UIDVALIDITY, "0")])
+        .expect("空闲时应成功");
+    assert_eq!(
+        state.get(keys::LAST_UID).flatten().as_deref(),
+        Some("0"),
+        "游标应已被清"
+    );
+    let snap = state.fetch_snapshot();
+    assert!(snap.epoch >= 1, "应已开过新轮（epoch 递增）");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 切库前静默收件轮（审计 R16）：quiesce_fetch_rounds 作废在跑轮
+/// （epoch+1，旧轮迟到的 fetch_end 结算因凭证失配被丢弃），
+/// 名额归零后复位 running——否则 UI 停在「收取中」且新轮被 CAS 拒绝
+#[test]
+fn swap_quiesce_bumps_epoch_to_invalidate_running_round() {
+    let dir = temp_dir("r16-quiesce");
+    let state = AppState::open(&dir);
+    {
+        let mut s = state.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.running = true;
+        s.epoch = 7;
+        s.started_at = now_epoch();
+    }
+    let before = state.fetch_snapshot();
+    state.quiesce_fetch_rounds(); // active_rounds == 0：立即返回
+    let after = state.fetch_snapshot();
+    assert_eq!(after.epoch, before.epoch + 1, "在跑轮必须被作废");
+    assert!(!after.running, "名额归零后 running 必须复位（不留 300s 卡死）");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 采纳库（R17）：归属标记写失败时指针一个字节都不动。
+/// 新顺序「标记预写 → 指针提交」下，标记失败发生在指针之前——
+/// 在指针目标上断言 DATA_DIR 仍未写入，防顺序回退
+#[test]
+fn adopt_owner_mark_failure_leaves_pointer_untouched() {
+    let base = temp_dir("adopt-ptr");
+    let cur = base.join("cur");
+    let dest = base.join("dest");
+    std::fs::create_dir_all(&cur).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    // 目标库：已属于本账号（走 UPDATE 分支），但 settings 更新被触发器挡死
+    {
+        let d = AppState::open(&dest);
+        d.set_batch(&[
+            (keys::STORE_OWNER, "demo@chinatelecom.cn"),
+            (keys::ACCOUNT_PREFIX, "demo"),
+        ])
+        .unwrap();
+        d.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER block_owner BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'readonly'); END;",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    }
+    let state = AppState::open(&cur);
+    let err = state
+        .adopt_data_dir_existing(dest.to_str().unwrap(), "demo@chinatelecom.cn")
+        .expect_err("归属标记写不进去必须失败");
+    assert!(err.contains("归属标记"), "{err}");
+    assert_eq!(state.data_dir(), cur);
+    // 指针未写入：镜像里没有 DATA_DIR
+    assert!(
+        state.get(keys::DATA_DIR).flatten().is_none(),
+        "标记失败发生在指针提交之前，指针必须未动"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

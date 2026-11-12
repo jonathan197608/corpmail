@@ -154,10 +154,36 @@ pub fn store(
     }
 }
 
+/// 只探 keychain（不碰库、不碰缓存读取；`AppState::retrieve_password` 在取
+/// DB 锁之前调用——授权窗口可能等用户几秒到无限久，绝不能带着库锁进来）。
+/// 命中返回 Keychain 结果并写入缓存；无条目/后端异常/测试短路返回 None
+/// （统一由调用方走 keyfile 回退段）。Missing 语义不属于 keychain 段
+pub fn keychain_get(account: &str) -> Option<GetResult> {
+    if skip_keychain() {
+        return None;
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).ok()?;
+    let password = entry.get_password().ok()?;
+    let out = GetResult::Keychain(password);
+    cache_put(account, out.clone());
+    Some(out)
+}
+
+/// keychain 未命中后的库内段：keyfile 回退 + 缓存写入（Missing 不入缓存）。
+/// 与 `keychain_get` 配对，供两段式的 `AppState::retrieve_password` 使用
+pub fn retrieve_fallback(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
+    let out = keyfile_retrieve(conn, key_file, account);
+    if !matches!(out, GetResult::Missing) {
+        cache_put(account, out.clone());
+    }
+    out
+}
+
 /// 读取密码：先查进程内缓存，未命中再试 keychain，keychain 不可用/无条目时
 /// 落到 keyfile 回退（平台后端异常与 NoEntry 同处处理——两者都只剩 keyfile 一条路）。
 /// Missing 不入缓存：用户可能随后在设置页补录，缓存空结果会让补录白做。
-/// 测试二进制短路 keychain（见 `skip_keychain`）
+/// 测试二进制短路 keychain（见 `skip_keychain`）。
+/// 取锁路径见 `AppState::retrieve_password`（两段式，keychain 段不持库锁）
 pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult {
     if let Some(hit) = cache_get(account) {
         return hit;

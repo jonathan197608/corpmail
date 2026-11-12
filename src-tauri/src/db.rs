@@ -30,7 +30,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -84,6 +84,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         8 => migrate_v9(tx),
         9 => migrate_v10(tx),
         10 => migrate_v11(tx),
+        11 => migrate_v12(tx),
         _ => Ok(()),
     }
 }
@@ -218,6 +219,18 @@ fn migrate_v11(tx: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_inbox_unread
            ON emails(folder) WHERE folder = 'inbox' AND unread = 1;",
     )
+}
+
+/// v11 → v12：已读回写归属账号（审计 R13）。
+/// `seen_account` = 置 seen_pending 标志时的登录账号：worker 只回写当前账号的
+/// 行——换账号后旧账号的 UID 在新账号邮箱里没有意义（会误标别人的邮件为已读），
+/// 留在库里等切回原账号再回写。NULL（存量行）视为当前账号：判定不出归属，
+/// 按旧行为处理，不留悬挂标志
+fn migrate_v12(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "seen_account")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN seen_account TEXT")?;
+    }
+    Ok(())
 }
 
 /// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁，

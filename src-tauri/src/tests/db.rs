@@ -702,3 +702,47 @@ fn plan_of(conn: &Connection, sql: &str) -> String {
         .unwrap();
     rows.join(" | ")
 }
+
+/// v11 → v12 增量（审计 R13）：emails 增加 seen_account 列（置 seen_pending
+/// 时的登录账号，worker 只回写当前账号的行）；存量行 NULL = 按当前账号处理
+#[test]
+fn migrate_v11_to_v12_adds_seen_account_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    // 建到 v11：v1 + v3..v11 各列（只列迁移新增项，够跑 v12 即可）
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE emails ADD COLUMN too_large INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN seen_pending INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX idx_seen_pending ON emails(seen_pending) WHERE seen_pending = 1;
+         ALTER TABLE emails ADD COLUMN body_html TEXT;
+         ALTER TABLE emails ADD COLUMN bcc_addrs TEXT NOT NULL DEFAULT '';
+         ALTER TABLE emails ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN thread_key TEXT;
+         ALTER TABLE emails ADD COLUMN scheduled_at INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE emails ADD COLUMN raw_headers TEXT NOT NULL DEFAULT '';
+         ALTER TABLE emails ADD COLUMN sort_time INTEGER
+           GENERATED ALWAYS AS (COALESCE(received_at, sent_at, created_at)) VIRTUAL;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 11i64).unwrap();
+    conn.execute(
+        "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, created_at)
+         VALUES ('in', 'inbox', 'received', 'a@x.cn', 'b@x.cn', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&mut conn).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+    let account: Option<String> = conn
+        .query_row("SELECT seen_account FROM emails", [], |r| r.get(0))
+        .unwrap();
+    assert!(account.is_none(), "存量行应为 NULL（按当前账号处理）");
+    // 幂等
+    migrate(&mut conn).unwrap();
+}

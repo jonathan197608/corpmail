@@ -2502,14 +2502,20 @@ pub fn toggle_star(state: &AppState, id: i64) -> Option<bool> {
 /// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。
 /// 返回是否发生翻转；写库失败以 Err 传播（不再 unwrap_or(false) 静默吞）。
 pub fn mark_read(state: &AppState, id: i64) -> Result<bool, String> {
+    // R13：置标志同时记录归属账号（配置读取，无凭据/网络）——换账号后
+    // worker 只回写当前账号的行，旧账号的 UID 不拿到新账号连接上 STORE
+    let account = state.current_account();
     let flipped = state.with_conn(|conn| {
         conn.execute(
             "UPDATE emails SET unread = 0,
                     seen_pending = CASE
                         WHEN direction = 'in' AND remote_uid IS NOT NULL THEN 1
-                        ELSE seen_pending END
+                        ELSE seen_pending END,
+                    seen_account = CASE
+                        WHEN direction = 'in' AND remote_uid IS NOT NULL THEN ?2
+                        ELSE seen_account END
              WHERE id = ?1 AND unread = 1",
-            [id],
+            rusqlite::params![id, account],
         )
         .map(|n| n == 1)
         .map_err(|e| format!("标记已读失败：{e}"))

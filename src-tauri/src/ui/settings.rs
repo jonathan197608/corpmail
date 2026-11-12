@@ -10,7 +10,7 @@ use super::router::{
     human_bytes, parse_form, render_html, render_pane_with_sidebar_refresh, security_or,
     test_fragment, test_view, trimmed_field,
 };
-use crate::state::{self, AppState, defaults, full_address, keys};
+use crate::state::{self, AppState, ResetFetchError, defaults, full_address, keys};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -496,14 +496,44 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
     // 手动收取提示没有新邮件"。变化即清双箱游标（走首拉分支全量重拉，入库
     // 按 remote_uid 去重，已有邮件不会重复），并立即触发收取。
     let days_changed = days != cur(keys::FIRST_FETCH_DAYS);
-    if days_changed && state.fetch_snapshot().running {
-        // C5（同 refetch）：运行轮收尾会把游标写回库，此刻清了也会被覆盖；
-        // 拒绝保存本轮并提示等待（其余参数随本次一并保存会误导"范围已生效"）
-        let mut ctx = settings_ctx(state, "sync", false, "", None, None);
-        ctx.refetch_busy = true;
-        return render_html(&pane_template("sync"), &ctx);
+    if days_changed {
+        // R14：范围变更（清双箱游标 + 按新范围重拉）与后台收件轮必须互斥——
+        // 「判空闲 → 清游标 → 起新轮」在 reset_and_fetch 里持 fetch_state 锁
+        // 原子完成。旧 check-then-act 会被恰好起跑的调度轮反写游标，范围
+        // 改动静默失效。其余参数与游标同批落库：失败整体回滚（R10 两通道互回滚）
+        let pairs = vec![
+            (keys::SYNC_ON_START, if on { "true" } else { "false" }),
+            (
+                keys::ALLOW_REMOTE_IMAGES,
+                if allow_images { "1" } else { "0" },
+            ),
+            (keys::SYNC_INTERVAL_MIN, interval.as_str()),
+            (keys::FIRST_FETCH_DAYS, days.as_str()),
+            (keys::MAX_MAIL_MB, max_mail.as_str()),
+            (keys::LAST_UIDVALIDITY, "0"),
+            (keys::LAST_UID, "0"),
+            (keys::LAST_UIDVALIDITY_SENT, "0"),
+            (keys::LAST_UID_SENT, "0"),
+            // 首拉阶段化标志一并清除：范围重拉重新进入「先发件箱后收件箱」串行模式
+            (keys::FIRST_PULL_DONE_SENT, "0"),
+            (keys::FIRST_PULL_DONE_INBOX, "0"),
+        ];
+        return match state.reset_and_fetch(&pairs) {
+            Err(ResetFetchError::Busy) => {
+                // 运行轮收尾会把游标写回，此刻清了也会被覆盖：拒绝保存本轮并
+                // 提示等待（其余参数随本次一并保存会误导"范围已生效"）
+                let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+                ctx.refetch_busy = true;
+                render_html(&pane_template("sync"), &ctx)
+            }
+            Err(ResetFetchError::Other(e)) => {
+                eprintln!("[settings] 范围变更保存失败：{e}");
+                sync_pane(state, false)
+            }
+            Ok(()) => sync_pane(state, true),
+        };
     }
-    let mut pairs = vec![
+    let pairs = vec![
         (keys::SYNC_ON_START, if on { "true" } else { "false" }),
         (
             keys::ALLOW_REMOTE_IMAGES,
@@ -513,22 +543,9 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         (keys::FIRST_FETCH_DAYS, days.as_str()),
         (keys::MAX_MAIL_MB, max_mail.as_str()),
     ];
-    if days_changed {
-        pairs.push((keys::LAST_UIDVALIDITY, "0"));
-        pairs.push((keys::LAST_UID, "0"));
-        pairs.push((keys::LAST_UIDVALIDITY_SENT, "0"));
-        pairs.push((keys::LAST_UID_SENT, "0"));
-        // 首拉阶段化标志一并清除：范围重拉重新进入「先发件箱后收件箱」串行模式
-        pairs.push((keys::FIRST_PULL_DONE_SENT, "0"));
-        pairs.push((keys::FIRST_PULL_DONE_INBOX, "0"));
-    }
     if state.set_batch(&pairs).is_err() {
         // 保存失败回渲染当前值，用户重试（库错误在此无更优交互）
         return sync_pane(state, false);
-    }
-    // 范围变化立即按新范围拉取（未配置凭据等失败由状态条展示）
-    if days_changed {
-        state.start_fetch();
     }
     sync_pane(state, true)
 }
@@ -538,14 +555,6 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
 /// 清游标让下次 fetch 走进「无游标→首拉」分支，按新范围（全部/天数）全量重拉，
 /// 解决"改首拉范围后历史不补拉"的缺口。
 pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
-    // C5：收件进行中直接拒绝——运行轮每批会把游标写回库，叠加 start_fetch 防抖
-    // （CAS 失败静默忽略），若不拒绝，用户点「重新拉取」实际既清不掉游标也不拉，
-    // 重拉意图丢失且无任何反馈。等待当前收取完成后重试即可。
-    if state.fetch_snapshot().running {
-        let mut ctx = settings_ctx(state, "sync", false, "", None, None);
-        ctx.refetch_busy = true;
-        return render_html(&pane_template("sync"), &ctx);
-    }
     let form = parse_form(&req.body);
     let d = defaults();
     let days = match form.get("first_fetch_days") {
@@ -564,13 +573,26 @@ pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
         (keys::FIRST_PULL_DONE_SENT, "0"),
         (keys::FIRST_PULL_DONE_INBOX, "0"),
     ];
-    if state.set_batch(&pairs).is_err() {
-        return sync_pane(state, false);
+    // C5 + R14：「判空闲 → 清游标 → 起新轮」原子完成（reset_and_fetch 持
+    // fetch_state 锁）。收件进行中返回 Busy：运行轮每批会把游标写回库，
+    // 不拒绝的话用户点「重新拉取」实际既清不掉游标也不拉，重拉意图丢失
+    // 且无任何反馈——等待当前收取完成后重试即可
+    match state.reset_and_fetch(&pairs) {
+        Err(ResetFetchError::Busy) => {
+            let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+            ctx.refetch_busy = true;
+            render_html(&pane_template("sync"), &ctx)
+        }
+        Err(ResetFetchError::Other(e)) => {
+            eprintln!("[settings] 重新拉取启动失败：{e}");
+            sync_pane(state, false)
+        }
+        Ok(()) => {
+            let mut ctx = settings_ctx(state, "sync", false, "", None, None);
+            ctx.refetch_notice = true;
+            render_html(&pane_template("sync"), &ctx)
+        }
     }
-    state.start_fetch(); // 后台立即拉取；已在收件中则防抖忽略
-    let mut ctx = settings_ctx(state, "sync", false, "", None, None);
-    ctx.refetch_notice = true;
-    render_html(&pane_template("sync"), &ctx)
 }
 
 /// 设置·存储管理 tab：保存（清理参数在 M5 清理器实施时生效）

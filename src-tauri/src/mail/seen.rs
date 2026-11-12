@@ -6,7 +6,8 @@
 //!
 //! 现方案：
 //! - 本地置已读时同事务写 `seen_pending = 1`（业务状态与"待回写"意向一次落盘，
-//!   崩溃后标志仍在，重启由 worker 补发）
+//!   崩溃后标志仍在，重启由 worker 补发）；同时记录归属账号 `seen_account`
+//!   （审计 R13）：worker 只回写当前账号的行，换账号不拿旧 UID 去误标新邮箱
 //! - worker 单线程：1.5s 合并窗口把连点合成一批，单次连接 + 单条 STORE 覆盖多个 UID
 //! - uidvalidity 不匹配 → 清标志放弃（UID 空间已重排，旧 UID 可能指向别的邮件，
 //!   绝不写入）；网络等其他失败 → 保留标志，指数退避重试，5 次后放弃并记日志
@@ -40,19 +41,28 @@ struct Pending {
 }
 
 /// 读待回写行（按 id 升序；单轮上限 MAX_UIDS_PER_ROUND）。
+/// 只取当前账号的行（审计 R13）：pending 标志在置位时记下归属账号，
+/// 换账号后旧账号的 UID 在新账号邮箱里没有意义（STORE 会误标别人的邮件），
+/// 留在库里等切回原账号再回写。NULL（v12 之前的存量行）按当前账号处理：
+/// 判定不出归属，不留悬挂标志。
 /// remote_uid 解析失败的行直接清标志：它们永远不具回写能力，保留只会占用
 /// LIMIT 窗口（畸形行排前时正常行永远选不中）并造成每轮自唤醒空转
 fn pending_rows(state: &AppState) -> Result<Vec<Pending>, String> {
+    let account = state.current_account();
     let rows: Vec<(i64, String)> = state.with_conn(|conn| -> Result<Vec<_>, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, remote_uid FROM emails
                  WHERE seen_pending = 1 AND direction = 'in' AND remote_uid IS NOT NULL
-                 ORDER BY id LIMIT ?1",
+                   AND (seen_account IS NULL OR seen_account = ?1)
+                 ORDER BY id LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
         let out = stmt
-            .query_map([MAX_UIDS_PER_ROUND as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map(
+                rusqlite::params![account, MAX_UIDS_PER_ROUND as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
             .collect();

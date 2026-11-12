@@ -338,3 +338,48 @@ fn malformed_remote_uid_rows_are_cleared_not_stuck() {
     assert_eq!(stuck, 0, "畸形行与正常行的标志都应清零");
     cleanup(&dir);
 }
+
+/// R13：换账号后旧账号的 pending 行不参与回写——旧 UID 在新账号邮箱里
+/// 没有意义（STORE 会误标别人的邮件）；标志保留，切回原账号后照常回写
+#[test]
+fn flush_skips_other_accounts_pending_rows() {
+    let (state, dir, ids) = fixture("acct", &[(42, 1)]);
+    mark_read(&state, ids[0]).unwrap();
+    assert_eq!(pending_count(&state), 1);
+
+    // 换账号（只改配置）：旧账号的行不得被选中
+    state
+        .set_batch(&[(crate::state::keys::ACCOUNT_PREFIX, "other")])
+        .unwrap();
+    let fetcher = FakeFetcher::ok();
+    assert_eq!(flush(&state, &fetcher).unwrap(), 0, "旧账号的行不得回写");
+    assert!(fetcher.calls().is_empty(), "不得发起任何 IMAP 调用");
+    assert_eq!(pending_count(&state), 1, "标志保留：等切回原账号再回写");
+
+    // 切回原账号：回写恢复
+    state
+        .set_batch(&[(crate::state::keys::ACCOUNT_PREFIX, "demo")])
+        .unwrap();
+    assert_eq!(flush(&state, &fetcher).unwrap(), 1);
+    assert_eq!(pending_count(&state), 0);
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// R13：置标志时记录归属账号（mark_read 同一 UPDATE 写入）
+#[test]
+fn mark_read_records_account_on_pending_rows() {
+    let (state, dir, ids) = fixture("acct-rec", &[(42, 5)]);
+    mark_read(&state, ids[0]).unwrap();
+    let account: Option<String> = state.with_conn(|c| {
+        c.query_row(
+            "SELECT seen_account FROM emails WHERE id = ?1",
+            [ids[0]],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(account.as_deref(), Some("demo@chinatelecom.cn"));
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}

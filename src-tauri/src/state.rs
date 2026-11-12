@@ -7,7 +7,7 @@
 //! 中毒只说明某次持锁写入被 panic 打断，锁内数据本身通常仍可用；沿用 `.expect`
 //! 会让一次 panic 演变为全应用连锁 panic（审计 P2-11）。
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -131,14 +131,24 @@ struct NameProbe {
     last_miss: Option<std::time::Instant>,
 }
 
+/// AppState 的库与目录载体（审计 R19：db 连接与数据目录同一把锁绑定，
+/// 见 AppState.store 字段注释——换库与换目录必须原子，读者不得见到错配组合）
+struct Store {
+    db: Connection,
+    data_dir: PathBuf,
+}
+
 pub struct AppState {
-    db: Mutex<Connection>,
+    /// 数据库连接 + 数据目录，同一把锁绑定（审计 R19）。
+    /// 旧实现两把独立锁，swap_store 分两段换：中间窗口里并发读者会看到
+    /// 「新库 + 旧目录」（附件写进旧目录、库行却记新路径）。合并后两者
+    /// 只能在同一次加锁内一起换。用 Mutex 而非 RwLock：rusqlite 的
+    /// Connection 含 RefCell（!Sync），RwLock 共享读需要 Store: Sync，
+    /// 不成立；db 访问本就互斥，Mutex 对写方零损失，data_dir() 读方
+    /// 会与库操作互斥（库查询都是毫秒级，换取换库原子性）
+    store: Mutex<Store>,
     /// 显示名推断互斥 + 失败节流（收件完成时由 invalidate 主动放行）
     name_probe: Mutex<NameProbe>,
-    /// 应用数据目录（库/附件根；设置·存储页展示）。
-    /// 首设向导选自定义目录时可会话内直切（见 switch_data_dir_first_run）；
-    /// 后台线程（收件调度/清理器）并发读 → RwLock，读方一律走 data_dir()
-    data_dir: std::sync::RwLock<PathBuf>,
     /// 锚点目录（系统默认应用数据目录）：独立配置文件 corpmail.toml 在此，
     /// 不随数据目录迁移、不被备份删除影响（resolve_start_dir 亦从此定位）
     anchor_dir: PathBuf,
@@ -147,6 +157,8 @@ pub struct AppState {
     config: std::sync::Arc<Mutex<crate::conf::ConfigMap>>,
     /// 发送队列入口（M3：lib.rs 装配 start_send_worker 后有值；测试/无 worker 时为 None，仅状态机流转）
     send_tx: Mutex<Option<std::sync::mpsc::Sender<i64>>>,
+    /// 发送 worker 的退出确认位（R16：worker 退出时置位；stop_send_worker 等它）
+    send_worker_exited: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// 已读服务器回写唤醒口（seen worker；None = 未装配/测试环境，本地已读照常生效）
     seen_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// 新邮件通知钩子（收件线程完成后调用，参数 (本轮开始时刻, 本轮新增数)）。
@@ -180,8 +192,22 @@ pub struct AppState {
 /// 迁移冻结期的统一提示（路由 409 / 收件 / 发送 worker 共用同一句中文）
 pub const MIGRATION_PENDING_MSG: &str = "数据已迁移，请重启应用后继续（当前进程内的修改不会保存）";
 
+/// `reset_and_fetch` 的失败分类（路由据此选回显：Busy → 「收取进行中」提示，
+/// 其余按保存失败处理）。可枚举场景用枚举，不用魔法串比对
+#[derive(Debug)]
+pub enum ResetFetchError {
+    /// 一轮收件正在运行：清游标会立刻被运行轮写回，必须等本轮结束
+    Busy,
+    /// 其余失败（迁移冻结 / 未配置 / 落库失败）：附原因
+    Other(String),
+}
+
 /// 迁移前等待在跑收件轮收尾的上限：超过即放弃本次迁移并提示稍后重试
 const MIGRATION_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 切库前等待旧发送 worker 退出的上限（R16）：慢速 SMTP 发送可能超过它，
+/// 超时留痕继续切换（旧 worker 此后写旧库文件，重启由补发扫描自愈）
+const SEND_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 收件状态快照（收件按钮 spinner/禁用与状态片段共用）
 #[derive(Clone, Debug)]
@@ -209,6 +235,23 @@ pub struct FetchState {
     pub progress_updated_at: i64,
     /// progress_started_at 时刻已完成数：ETA = 剩余 /（已增量 / 计时跨度）
     pub progress_started_done: usize,
+}
+
+/// 置一轮收件为进行中并返回新 epoch（fetch_cas_begin 与 reset_and_fetch
+/// 共用；调用方必须已持有 fetch_state 锁）。返回该轮结算凭证
+fn begin_round(s: &mut FetchState) -> u64 {
+    s.running = true;
+    s.just_finished = false;
+    s.epoch += 1;
+    s.started_at = crate::mail::now_epoch();
+    s.last_error.clear();
+    s.fetch_done = 0;
+    s.fetch_total = 0;
+    s.phase.clear();
+    s.progress_started_at = 0;
+    s.progress_updated_at = 0;
+    s.progress_started_done = 0;
+    s.epoch
 }
 
 /// 收件轮看门狗上限（秒）：imap 无网络超时，挂起轮超过此时长由轮询链复位，
@@ -330,12 +373,15 @@ impl AppState {
             eprintln!("[thread] 会话归组键回填失败（忽略）：{err}");
         }
         let state = Self {
-            db: Mutex::new(conn),
+            store: Mutex::new(Store {
+                db: conn,
+                data_dir: data_dir.to_path_buf(),
+            }),
             name_probe: Mutex::new(NameProbe { last_miss: None }),
-            data_dir: std::sync::RwLock::new(data_dir.to_path_buf()),
             anchor_dir: anchor_dir.to_path_buf(),
             config: std::sync::Arc::new(Mutex::new(crate::conf::load(anchor_dir)?)),
             send_tx: Mutex::new(None),
+            send_worker_exited: Mutex::new(None),
             seen_tx: Mutex::new(None),
             notify_hook: Mutex::new(None),
             tray_hook: Mutex::new(None),
@@ -627,9 +673,19 @@ impl AppState {
         if let Err(err) = crate::mail::contacts::repair_stats(&mut new_conn) {
             eprintln!("[contacts] 采纳库统计修复失败（忽略）：{err}");
         }
-        // 归属标记写入被采纳的库：此后无论哪个版本重装指向该目录，都能精确比对。
-        // 写失败必须中止（审计 P1-50）：标记是下次判定归属的唯一依据，吞掉后
-        // 本次看似成功，重装/换机会落到 StoreOwner::Unknown 被拒绝使用
+        // 归属标记预写 + 指针提交（审计 P1-50 + R17）：先改目标库、指针是
+        // 唯一提交点。指针写失败必须把目标库的归属标记还原——否则目标目录
+        // 带上本账号标记却未被使用，他账号此后采纳该目录会被误拒（标记是
+        // 归属判定的唯一精确依据）。标记写入失败则直接中止（指针未动、
+        // 目标库原值未变）
+        let owner_prev: Option<Option<String>> = new_conn
+            .query_row(
+                "SELECT v FROM settings WHERE k = ?1",
+                [keys::STORE_OWNER],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("目标数据库无法读取（可能已损坏）：{e}"))?;
         new_conn
             .execute(
                 "INSERT INTO settings(k, v) VALUES (?1, ?2)
@@ -637,8 +693,21 @@ impl AppState {
                 rusqlite::params![keys::STORE_OWNER, account_l],
             )
             .map_err(|e| format!("目标目录写入归属标记失败（可能只读或已损坏）：{e}"))?;
-        // 指针先行：写失败仅回滚镜像（目标库是被采纳的既有文件，绝不能删除）
-        self.point_data_dir(&dest_path)?;
+        if let Err(e) = self.point_data_dir(&dest_path) {
+            // 提交失败：回滚目标库归属标记（尽力；再失败留痕——标记残留的
+            // 影响是他账号采纳被误拒，好过误收）
+            let rollback = match &owner_prev {
+                Some(v) => new_conn.execute(
+                    "UPDATE settings SET v = ?1 WHERE k = ?2",
+                    rusqlite::params![v, keys::STORE_OWNER],
+                ),
+                None => new_conn.execute("DELETE FROM settings WHERE k = ?1", [keys::STORE_OWNER]),
+            };
+            if let Err(rb) = rollback {
+                eprintln!("[state] 归属标记回滚失败（目标库标记可能残留）：{rb}");
+            }
+            return Err(e);
+        }
         self.swap_store(new_conn, &dest_path);
         clean_empty_legacy_db(&cur, &self.anchor_dir);
         Ok(format!(
@@ -675,16 +744,62 @@ impl AppState {
         Ok(())
     }
 
-    /// 换库换目录（直切/采纳共用）：先替换连接（旧连接 drop、文件句柄关闭），
-    /// 再改路径并重绑发送 worker。此后 set_batch/收件/附件全部落新目录，无需重启。
+    /// 换库换目录（直切/采纳共用，审计 R16 + R19）：
+    /// 1) 作废在跑收件轮并等收尾（epoch+1：其迟到结算因凭证失配被丢弃；
+    ///    等名额归零上限 30s——imap 无读超时可能挂死，超时留痕继续）；
+    /// 2) 旧发送 worker 退出确认（它持旧库独立连接与旧附件根，切库后
+    ///    继续派发会把待发邮件写进旧库）；
+    /// 3) 同一把写锁内换 db 与 data_dir（读者不会见到「新库 + 旧目录」）；
+    /// 4) 按新目录重启发送 worker。
+    ///
+    /// 此后 set_batch/收件/附件全部落新目录，无需重启
     fn swap_store(&self, new_conn: Connection, dest_path: &Path) {
+        self.quiesce_fetch_rounds();
+        self.stop_send_worker();
         {
-            let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            *db = new_conn;
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            store.db = new_conn;
+            store.data_dir = dest_path.to_path_buf();
         }
-        *self.data_dir.write().unwrap_or_else(|e| e.into_inner()) = dest_path.to_path_buf();
-        // 发送 worker 重绑：旧 worker 持有旧库连接与旧附件根，不重绑会写错库
-        self.rebind_send_worker();
+        self.start_send_worker();
+    }
+
+    /// 切库前静默收件轮（审计 R16）。收尾后 `clean_empty_legacy_db` 才安全执行
+    /// （调用方紧随 swap_store 调它）——在跑轮持自己的旧库连接，换库瞬间
+    /// 仍可能写旧库文件；归零等待保证它们全部收手
+    fn quiesce_fetch_rounds(&self) {
+        let bumped = {
+            let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+            // 作废在跑轮：结算凭证失效（fetch_end / 批次推进都按 epoch 匹配，
+            // C4 口径下批间自终止），running 由本函数在名额归零后复位
+            s.epoch += 1;
+            s.epoch
+        };
+        let deadline = std::time::Instant::now() + MIGRATION_FETCH_WAIT;
+        while self
+            .active_rounds
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[state] 切换数据目录前等待收件轮收尾超时（{}s，可能有挂死轮），继续切换",
+                    MIGRATION_FETCH_WAIT.as_secs()
+                );
+                // 挂死轮：running 留给看门狗 300s 复位，这里不动
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // 名额归零：被作废轮的迟到结算已全部丢弃（epoch 失配），running 仍为
+        // true——不复位的话 UI 停在「收取中」且新轮被 CAS 拒绝，最长卡 300s。
+        // epoch 未再前进（== bumped）保证这之间没有新一轮合法开始（CAS 要求
+        // running=false，而 running 一直为 true，双向互证）
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.running && s.epoch == bumped {
+            s.running = false;
+            s.phase.clear();
+        }
     }
 
     /// 库内是否无任何用户数据（emails 与 settings 均为 0 行）。
@@ -701,22 +816,42 @@ impl AppState {
         })
     }
 
-    /// 数据目录切换后重建发送 worker：旧 worker 持旧库连接 + 旧附件根，
-    /// 继续用会把待发邮件读旧库/附件读旧目录。取走旧通道（sender 全部
-    /// drop → worker 下一轮 recv 得 Err 自行退出）后按新目录重启。
-    pub fn rebind_send_worker(&self) {
-        {
+    /// 停止发送 worker 并等退出确认（审计 R16）：取走通道（sender 全部
+    /// drop → worker 下一轮 recv 得 Err 自行退出并置 exited 位）。上限
+    /// SEND_STOP_WAIT：卡在慢速 SMTP 发送上时不再等（留痕后旧 worker 可能
+    /// 继续写旧库文件——与切库前收件轮超时同一取舍，重启后由补发扫描自愈）
+    fn stop_send_worker(&self) {
+        let flag = {
             let mut guard = self.send_tx.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = None;
+            *guard = None; // drop 全部 sender → worker 的 recv 返回 Err
+            self.send_worker_exited
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        let Some(flag) = flag else {
+            return; // 未装配（测试环境）：无事可停
+        };
+        let deadline = std::time::Instant::now() + SEND_STOP_WAIT;
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[send] 旧发送 worker 未在 {}s 内退出（可能在慢速发送中），继续切换",
+                    SEND_STOP_WAIT.as_secs()
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        self.start_send_worker();
     }
 
-    /// 当前数据目录快照（首设直切后会话内变化；读方一律经此取，不直接碰字段）
+    /// 当前数据目录快照（首设直切后会话内变化；读方一律经此取，不直接碰字段）。
+    /// 与库操作互斥（同一把 Store 锁，审计 R19）——换库期间目录读取短暂等待
     pub fn data_dir(&self) -> PathBuf {
-        self.data_dir
-            .read()
+        self.store
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .data_dir
             .clone()
     }
 
@@ -1006,10 +1141,70 @@ impl AppState {
         let Some(epoch) = self.fetch_cas_begin() else {
             return; // 已在收件中（防抖 §6.2）
         };
+        self.dispatch_fetch_round(epoch);
+    }
+
+    /// 「清游标 + 起新轮」的原子入口（审计 R14，设置页范围变更/重新拉取用）。
+    /// 旧实现是 check-then-act：先读快照判空闲 → 写库清游标 → start_fetch；
+    /// 调度线程恰在判空闲与清游标之间起轮时，运行轮收尾会把游标写回旧值——
+    /// 用户改了范围/点了重拉，实际既没清也没拉，且无任何反馈。
+    /// 现在「判空闲 → 清游标 → 置 running」整段持有 fetch_state 锁：调度线程
+    /// 的 start_fetch 只能在整段之前或之后完整发生。写库失败由 set_batch
+    /// 的事务/回滚保证整体未清，游标保持原值
+    pub fn reset_and_fetch(&self, pairs: &[(&str, &str)]) -> Result<(), ResetFetchError> {
+        if self.migration_pending() {
+            return Err(ResetFetchError::Other(MIGRATION_PENDING_MSG.into()));
+        }
+        let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.running {
+            return Err(ResetFetchError::Busy);
+        }
+        // 游标/参数落库：失败即整体未动（db 键单事务；配置键两通道互回滚）
+        self.set_batch(pairs)
+            .map_err(ResetFetchError::Other)?;
+        let epoch = begin_round(&mut s);
+        drop(s);
+        self.dispatch_fetch_round(epoch);
+        Ok(())
+    }
+
+    /// CAS 之后的派发段（start_fetch 与 reset_and_fetch 共用）。
+    /// 任何失败路径必须 fetch_end 复位 running（CAS 已置位），否则状态永久
+    /// 卡在进行中；成功路径读取游标快照后 spawn 收件线程
+    fn dispatch_fetch_round(&self, epoch: u64) {
         // 二次确认冻结位：与 move_data_dir 的置位存在极窄竞态窗口（它先置位再等
         // running 归零），CAS 之后再查一次即可保证「冻结后绝不起新轮」
         if self.migration_pending() {
             self.fetch_end(epoch, 0, MIGRATION_PENDING_MSG);
+            return;
+        }
+        // 挂起轮/并发轮上限（原子入口跳过了 CAS 前检查，这里统一兜住；
+        // start_fetch 路径重复检查无害——原子读）
+        let detached = self
+            .detached_rounds
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if detached >= MAX_DETACHED_FETCH_ROUNDS {
+            self.fetch_end(
+                epoch,
+                0,
+                &format!("已有 {detached} 轮收件在后台无响应（网络可能中断），请检查网络后重启应用"),
+            );
+            return;
+        }
+        if self.active_rounds.load(std::sync::atomic::Ordering::SeqCst)
+            >= MAX_CONCURRENT_FETCH_ROUNDS
+        {
+            self.fetch_end(
+                epoch,
+                0,
+                &format!("已有 {MAX_CONCURRENT_FETCH_ROUNDS} 轮收件在后台运行，本次跳过"),
+            );
+            return;
+        }
+        // 未配置静默收尾（不写错误：向导前改范围/点重拉不该在状态条留
+        // 「凭据缺失」假错误，配置完成后下轮收取自然按已清的游标走首拉）
+        if !self.configured() {
+            self.fetch_end(epoch, 0, "");
             return;
         }
         let Some(conn_params) = self.imap_params() else {
@@ -1084,18 +1279,7 @@ impl AppState {
         if s.running {
             return None;
         }
-        s.running = true;
-        s.just_finished = false;
-        s.epoch += 1;
-        s.started_at = crate::mail::now_epoch();
-        s.last_error.clear();
-        s.fetch_done = 0;
-        s.fetch_total = 0;
-        s.phase.clear();
-        s.progress_started_at = 0;
-        s.progress_updated_at = 0;
-        s.progress_started_done = 0;
-        Some(s.epoch)
+        Some(begin_round(&mut s))
     }
 
     /// 收件结束（凭据缺失等同步失败路径；线程路径在闭包内直接更新 Arc）
@@ -1134,6 +1318,12 @@ impl AppState {
         // 迁移冻结位（R2）：冻结期间不派发，邮件留在 queued 由重启后的补发扫描接手
         let migration_flag = std::sync::Arc::clone(&self.migration_pending);
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
+        // 退出确认位（R16）：worker 线程退出时置位，stop_send_worker 据此等待
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self
+            .send_worker_exited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::clone(&exited));
         // 崩溃恢复 1/2：`sending` 是仅存在于进程内的中间态，跨进程无合法含义。
         // 进程在发送中被杀（关机/崩溃/强退）后该邮件会永久停在 sending：
         // 启动补发只查 queued、reopen_failed 只收 failed、详情页 2s 轮询永不停止。
@@ -1201,6 +1391,8 @@ impl AppState {
                     }
                 }
             }
+            // 通道关闭（所有 sender 已 drop）：置退出位供 stop_send_worker 确认
+            exited.store(true, std::sync::atomic::Ordering::Release);
         });
         for id in stale {
             let _ = tx.send(id);
@@ -1238,6 +1430,14 @@ impl AppState {
         }
     }
 
+    /// 当前登录账号（完整地址，只读配置、不触凭据）。
+    /// seen 回写的归属口径（审计 R13）：mark_read 记账号、worker 按账号筛行
+    pub fn current_account(&self) -> String {
+        let d = defaults();
+        let g = |k: &str| self.get_or(k, &d).unwrap_or_default();
+        full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN))
+    }
+
     /// 是否已完成首启配置（向导判定依据：账号前缀已写入）
     pub fn configured(&self) -> bool {
         self.get(keys::ACCOUNT_PREFIX)
@@ -1245,10 +1445,12 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// 借出连接执行闭包（邮件存储层 mail 模块使用；锁随闭包返回释放）
+    /// 借出连接执行闭包（邮件存储层 mail 模块使用；锁随闭包返回释放）。
+    /// 锁覆盖 db+data_dir 两者：闭包内不得再调用 `self.data_dir()`
+    /// （同线程重入会死锁；目录快照先在闭包外取好）
     pub fn with_conn<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
-        let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut conn)
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut store.db)
     }
 
     /// 配置镜像快照（外部线程/测试读 corpmail.toml 内存镜像用；worker 线程直接持 Arc）
@@ -1267,8 +1469,9 @@ impl AppState {
             let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             return Some(cfg.get(key).cloned());
         }
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::db::settings::get(&conn, key).ok()
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        crate::db::settings::get(conn, key).ok()
     }
 
     /// 是否允许加载邮件正文里的远程图片（默认否，审计 R4/R36）。
@@ -1372,7 +1575,12 @@ impl AppState {
     }
 
     /// 批量写。路由拆分（验收拍板简化）：配置键仅写独立配置文件 corpmail.toml
-    /// （先写文件，成功后才处理库键）；非配置键走库单事务（全库单一写入口不变）
+    /// （先写文件，成功后才处理库键）；非配置键走库单事务（全库单一写入口不变）。
+    ///
+    /// 两通道一体失败语义（审计 R10）：文件段在一次 config 锁内完成
+    /// read-modify-write（旧实现拿三段锁，中间可被并发写插入造成镜像与文件漂移）；
+    /// 库事务失败时同步回滚文件与内存镜像，不留「文件已改、库没改」的分裂态。
+    /// 向导混合键（配置 + 库键同批）保持一次调用，原子性与本方法一致
     pub fn set_batch(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
         let cfg_pairs: Vec<(&str, &str)> = pairs
             .iter()
@@ -1384,54 +1592,83 @@ impl AppState {
             .copied()
             .filter(|(k, _)| !crate::conf::is_config_key(k))
             .collect();
-        if !cfg_pairs.is_empty() {
-            // 写前快照旧值：文件写失败时恢复原镜像（覆盖写失败不得丢掉旧值）
-            let prev: Vec<(String, Option<String>)> = {
-                let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-                cfg_pairs
-                    .iter()
-                    .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
-                    .collect()
-            };
-            {
-                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, v) in &cfg_pairs {
-                    cfg.insert((*k).to_string(), (*v).to_string());
-                }
+        if cfg_pairs.is_empty() {
+            return self.write_db_pairs(&db_pairs);
+        }
+        // 文件段：单锁 read-modify-write——快照旧值、改镜像、落文件一气呵成
+        let (prev, save_res) = {
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            let prev: Vec<(String, Option<String>)> = cfg_pairs
+                .iter()
+                .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
+                .collect();
+            for (k, v) in &cfg_pairs {
+                cfg.insert((*k).to_string(), (*v).to_string());
             }
-            let save_res = {
-                let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-                crate::conf::save(&self.anchor_dir, &cfg)
-            };
-            if let Err(e) = save_res {
-                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, old) in prev {
-                    match old {
-                        Some(v) => {
-                            cfg.insert(k, v);
-                        }
-                        None => {
-                            cfg.remove(&k);
-                        }
+            let snapshot = cfg.clone();
+            (prev, crate::conf::save(&self.anchor_dir, &snapshot))
+        };
+        if let Err(e) = save_res {
+            // 文件没写进去：只还原镜像（文件在盘上的内容未变）
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, old) in prev {
+                match old {
+                    Some(v) => {
+                        cfg.insert(k, v);
+                    }
+                    None => {
+                        cfg.remove(&k);
                     }
                 }
-                return Err(format!("配置文件写入失败：{e}"));
             }
+            return Err(format!("配置文件写入失败：{e}"));
         }
-        if !db_pairs.is_empty() {
-            let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            for (k, v) in &db_pairs {
-                tx.execute(
-                    "INSERT INTO settings(k, v) VALUES (?1, ?2)
-                     ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                    [k, v],
-                )
-                .map_err(|e| e.to_string())?;
+        if !db_pairs.is_empty() && let Err(e) = self.write_db_pairs(&db_pairs) {
+            // 库键失败：文件已带新值——必须把 prev 写回镜像与文件，否则
+            // 配置面（host/账号/目录指针这类关键字段）静默半生效
+            if let Err(rb) = self.restore_config_to(&prev) {
+                eprintln!("[state] 配置回滚失败（corpmail.toml 可能与库不一致，请人工检查）：{rb}");
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            return Err(e);
         }
         Ok(())
+    }
+
+    /// 库键写入段（单事务：全成或全败，无需额外回滚）
+    fn write_db_pairs(&self, db_pairs: &[(&str, &str)]) -> Result<(), String> {
+        if db_pairs.is_empty() {
+            return Ok(());
+        }
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &mut store.db;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (k, v) in db_pairs {
+            tx.execute(
+                "INSERT INTO settings(k, v) VALUES (?1, ?2)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [k, v],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// 把配置镜像恢复到 prev 快照并写回文件（set_batch 库段失败回滚用）。
+    /// 再失败只返回错误交调用方留痕：文件 IO 已坏时没有更优动作
+    fn restore_config_to(&self, prev: &[(String, Option<String>)]) -> Result<(), String> {
+        let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, old) in prev {
+            match old {
+                Some(v) => {
+                    cfg.insert(k.clone(), v.clone());
+                }
+                None => {
+                    cfg.remove(k);
+                }
+            }
+        }
+        let snapshot = cfg.clone();
+        crate::conf::save(&self.anchor_dir, &snapshot)
     }
 
     /// 数据库文件大小（字节；设置·存储页"邮箱数据库大小"；含 WAL 与索引开销）
@@ -1451,8 +1688,9 @@ impl AppState {
     /// 返回上次成功值**而不是清零——角标突然变 0 会被理解成"邮件被删了"
     /// （审计 R63）
     pub fn folder_counts(&self) -> HashMap<&'static str, i64> {
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        match Self::count_mailboxes(&conn) {
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        match Self::count_mailboxes(conn) {
             Ok(counts) => {
                 *self
                     .counts_cache
@@ -1509,19 +1747,28 @@ fn zero_counts() -> HashMap<&'static str, i64> {
     /// 存密码（secrets 封装；返回是否发生 keyfile 降级）
     pub fn store_password(&self, account: &str, password: &str) -> Result<bool, String> {
         let key_file = self.key_file();
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::store(&conn, &key_file, account, password)
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        crate::secrets::store(conn, &key_file, account, password)
     }
 
     /// 读密码（keychain 优先，keyfile 回退）。
-    /// 命中进程内缓存时不取 DB 锁：keychain 授权窗口可能长等，不能连带阻塞 UI
+    /// 命中进程内缓存时不取 DB 锁：keychain 授权窗口可能长等，不能连带阻塞 UI。
+    /// 未命中时同样不得带着 DB 锁进 keychain（审计 R15）——两段式：
+    /// 先无锁探 keychain，命中直接返回；未命中再取锁做 keyfile 回退与缓存写入
     pub fn retrieve_password(&self, account: &str) -> crate::secrets::GetResult {
         if let Some(hit) = crate::secrets::cached(account) {
             return hit;
         }
         let key_file = self.key_file();
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::retrieve(&conn, &key_file, account)
+        // keychain 段：不碰库。授权弹窗期间数据库照常可读写
+        if let Some(hit) = crate::secrets::keychain_get(account) {
+            return hit;
+        }
+        // keyfile 段：需要库连接（密文行在 settings 里），此时才取锁
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        crate::secrets::retrieve_fallback(conn, &key_file, account)
     }
 
     /// 清除已存凭据（测试清理用；设置页账号只读化后生产路径暂不触达，
@@ -1530,8 +1777,9 @@ fn zero_counts() -> HashMap<&'static str, i64> {
     /// 没有可回显的界面（接线到"退出账号"时再改为 Result 向上传播）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_password(&self, account: &str) {
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(err) = crate::secrets::clear(&conn, account) {
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        if let Err(err) = crate::secrets::clear(conn, account) {
             eprintln!("[secrets] 账号 {account} 密码清除失败：{err}");
         }
     }
@@ -1539,8 +1787,9 @@ fn zero_counts() -> HashMap<&'static str, i64> {
     /// keychain 是否处于 keyfile 降级态（设置·账号提示用）
     pub fn secrets_degraded(&self, account: &str) -> bool {
         let key_file = self.key_file();
-        let conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        crate::secrets::degraded(&conn, &key_file, account)
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = &store.db;
+        crate::secrets::degraded(conn, &key_file, account)
     }
 
     /// 待生效的数据目录（M5 迁移）：读 corpmail.toml 指针；
