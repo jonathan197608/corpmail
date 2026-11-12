@@ -27,6 +27,18 @@ pub(crate) fn err<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// panic payload → 可读文本（`panic!("…")` 与 `panic!("{}", x)` 两种常见形态）。
+/// 迁移线程的 `catch_unwind` 用它把 panic 变成一条能显示给用户的错误
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic".to_string()
+    }
+}
+
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 主窗口入口 URL：自定义协议 `ui` 的根路径。
@@ -152,8 +164,23 @@ pub fn run() {
                                 let s = app.state::<state::AppState>();
                                 // A5：RAII 复位「进行中」，panic 展开也不会把标志卡死
                                 let _guard = s.migration_guard();
-                                let result = s.move_data_dir_progress(&dest, &|p: &state::MigrationProgress| {
-                                    let _ = app.emit("migration-progress", p);
+                                // R10：panic 不会自己走进 Err 分支——不兜这一下，前端
+                                // 模态既无进度也无出口，只能强杀。guard 仍负责复位标志
+                                let result = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        s.move_data_dir_progress(
+                                            &dest,
+                                            &|p: &state::MigrationProgress| {
+                                                let _ = app.emit("migration-progress", p);
+                                            },
+                                        )
+                                    }),
+                                )
+                                .unwrap_or_else(|payload| {
+                                    Err(format!(
+                                        "迁移线程异常中止（{}）。数据未被修改，可返回后重试。",
+                                        panic_text(payload.as_ref())
+                                    ))
                                 });
                                 match result {
                                     Ok(msg) => {

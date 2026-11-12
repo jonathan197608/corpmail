@@ -187,6 +187,45 @@ fn production_migration_runs_through_injected_executor() {
 }
 
 #[test]
+fn migration_modal_has_stall_watchdog() {
+    // R10：后端 panic 或被不可靠挂载卡死时前端收不到任何事件。旧实现只有三个
+    // 事件处理器、没有定时器，模态会永久停在最后一帧，用户只能强杀。
+    assert!(
+        APP_JS.contains("MBX_MIG_STALL_MS"),
+        "无进展阈值必须是具名常量"
+    );
+    assert!(
+        APP_JS.contains("setInterval(") && APP_JS.contains("mbxMigWatchdog"),
+        "必须起看门狗定时器"
+    );
+    assert!(
+        APP_JS.contains("长时间无进展"),
+        "超时必须切到可关闭的失败态并说明后台仍在跑"
+    );
+    let progress = APP_JS
+        .find("add('migration-progress'")
+        .expect("progress 监听存在");
+    let rest = &APP_JS[progress..];
+    assert!(
+        rest.contains("mbxMigLastEvent = Date.now();"),
+        "每个事件都要重置看门狗计时"
+    );
+    // 后端兜底：panic 不走 Err 分支，必须 catch_unwind 后 emit migration-error
+    assert!(
+        LIB_RS.contains("std::panic::catch_unwind("),
+        "后台迁移线程必须捕获 panic"
+    );
+    assert!(
+        LIB_RS.contains("panic_text(payload.as_ref())"),
+        "panic 必须转成可显示的迁移错误"
+    );
+    assert!(
+        LIB_RS.contains("fn panic_text("),
+        "panic payload 提取必须抽成函数（&str/String 两种形态）"
+    );
+}
+
+#[test]
 fn extra_headers_reach_the_http_response() {
     // R12：A1 契约三段是 ① settings.rs 塞 extra_headers → ② to_http_response
     // 写进协议层响应 → ③ app.js 读头分支。R5 的用例只测到 ①，

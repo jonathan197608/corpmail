@@ -301,6 +301,11 @@ async function mbxExportMd(emailId, filename) {
 // 请求护栏（防抖）：弹窗+请求全程只允许一次在途。
 let mbxMoveBusy = false;
 let mbxMigUnlisten = null;
+// R10：看门狗状态（后端 panic / 目标目录卡死时前端没有任何事件可等）
+let mbxMigWatchdog = null;
+let mbxMigLastEvent = 0;
+// 无进展阈值：附件复制期间进度事件最密，60s 一条都没到说明线程已卡死
+const MBX_MIG_STALL_MS = 60000;
 
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
@@ -402,6 +407,14 @@ function mbxMigPhasePct(p) {
     }
 }
 
+// 停止无进展看门狗（关闭模态 / 收到终态事件时调用）
+function mbxMigStopWatchdog() {
+    if (mbxMigWatchdog) {
+        clearInterval(mbxMigWatchdog);
+        mbxMigWatchdog = null;
+    }
+}
+
 // 失败态：显示错误 + 「返回」按钮（隐藏模式，用户可关回到存储页）
 function mbxMigShowError(msg) {
     var mask = document.getElementById('migrate-mask');
@@ -414,6 +427,7 @@ function mbxMigShowError(msg) {
 // 关闭迁移模态（data-mbx-action=migration-close）：释放焦点陷阱 + 解除监听。
 // R11：先解绑再判遮罩——早退在前会让「遮罩已被移除」时监听永久泄漏
 function mbxMigCloseModal() {
+    mbxMigStopWatchdog();
     if (mbxMigUnlisten) {
         try { mbxMigUnlisten(); } catch (e) { /* 已解绑 */ }
         mbxMigUnlisten = null;
@@ -436,10 +450,13 @@ async function mbxMigListen() {
         }).then(function (f) { unlist.push(f); });
     };
     await add('migration-progress', function (e) {
+        mbxMigLastEvent = Date.now();
         var p = e.payload || {};
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
     await add('migration-done', function (e) {
+        // R10：拿到终态就不再看门狗（应用随后自动退出）
+        mbxMigStopWatchdog();
         // A11：渲染后端完整成功文案（新目录路径、旧备份可删），别丢掉 payload
         var msg = (e && typeof e.payload === 'string' && e.payload.trim())
             ? e.payload.trim()
@@ -448,8 +465,22 @@ async function mbxMigListen() {
         mbxMigSet(100, msg + '\n\n应用即将自动退出；若窗口未关闭，请手动重启后使用新目录。');
     });
     await add('migration-error', function (e) {
+        mbxMigLastEvent = Date.now();
+        mbxMigStopWatchdog();
         mbxMigShowError(typeof e.payload === 'string' ? e.payload : '迁移失败，请重试');
     });
+    // R10：看门狗——后端线程 panic（旧实现只有 let _ = emit 的 Err 分支兜不住）
+    // 或目标目录是不可靠挂载（SMB/休眠中 USB）时，fs::copy 会在内核里无限阻塞，
+    // 前端一条事件都收不到，模态永久停在最后一帧。超过阈值切失败态并允许关闭；
+    // 关闭只关窗口，后台线程仍在跑（文案写清，别让用户以为已经中止）
+    mbxMigLastEvent = Date.now();
+    mbxMigStopWatchdog();
+    mbxMigWatchdog = setInterval(function () {
+        if (Date.now() - mbxMigLastEvent < MBX_MIG_STALL_MS) return;
+        mbxMigStopWatchdog();
+        mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
+            + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
+    }, 1000);
 }
 
 // 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——
