@@ -2134,3 +2134,77 @@ fn migration_rejects_attachment_tree_beyond_depth_limit() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn freeze_guard_does_not_thaw_another_running_migration() {
+    // R7（复查审计）：两个同步迁移并发时，后来者失败不得清掉先到者的冻结位
+    // （旧实现两个 guard 各自 Drop 无条件 store(false)，任一失败就解冻另一个）
+    let base = temp_dir("mig-freeze-ownership");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    {
+        let _first = FreezeGuard::new(&state);
+        assert!(state.migration_pending(), "首个 guard 构造即冻结");
+        {
+            let second = FreezeGuard::new(&state);
+            assert!(!second.owns, "后来者不拥有冻结位");
+            drop(second); // 模拟后来者失败
+        }
+        assert!(
+            state.migration_pending(),
+            "后来者失败不得解冻先到者正在进行的迁移"
+        );
+    }
+    assert!(!state.migration_pending(), "拥有者 drop 必须解冻");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn freeze_guard_keep_restores_freeze_after_earlier_failure() {
+    // 并发：先到者失败解冻后，后到者成功 keep 必须把冻结补回——
+    // 成功终态必须是「冻结到重启」，否则会继续写旧库
+    let base = temp_dir("mig-freeze-keep");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let first = FreezeGuard::new(&state);
+    let mut second = FreezeGuard::new(&state);
+    assert!(!second.owns);
+    drop(first); // 先到者失败 → 解冻
+    assert!(!state.migration_pending());
+    second.keep(); // 后到者成功
+    drop(second);
+    assert!(
+        state.migration_pending(),
+        "成功者 keep 必须把冻结位补回（终态冻结）"
+    );
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn freeze_guard_owns_early_freeze_of_background_migration() {
+    // A6 场景：协议线程提前置 pending + in_progress=true，后台线程的 guard
+    // 必须认领这次冻结——否则失败路径不敢解冻，应用永久只读
+    let base = temp_dir("mig-freeze-early-own");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state
+        .migration_in_progress
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .migration_pending
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let guard = FreezeGuard::new(&state);
+        assert!(guard.owns, "A6 提前冻结必须归本次后台迁移所有");
+        assert!(state.migration_pending());
+    }
+    assert!(!state.migration_pending(), "后台迁移失败必须解冻");
+    state.mark_migration_finished();
+    let _ = std::fs::remove_dir_all(&base);
+}

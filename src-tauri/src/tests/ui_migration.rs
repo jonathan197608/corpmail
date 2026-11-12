@@ -157,13 +157,26 @@ fn stats_cache_is_invalidated_on_store_swap() {
 }
 
 #[test]
-fn e2e_build_keeps_synchronous_migration_path() {
-    // A3 覆盖策略：e2e 不注入 executor（95 冻结 / 阶段二复用依赖同步进程内状态），
-    // 生产后台链由 tests/state.rs 的 background_executor_* 单测 + 本文件断言钉住。
-    // 若将来给 e2e 也注入 executor，必须先改 95/90 spec 的响应文本断言
+fn production_migration_runs_through_injected_executor() {
+    // R6（复查审计）：原断言要求 `cfg!(not(feature = "e2e"))` 必须存在，
+    // 等于把「A3 未修（e2e 只能同步）」固化成测试保护，与审计方向相反。
+    // 改为钉住生产契约本身：执行器注入点存在、跑在后台线程、成功回传 done 后退出；
+    // 将来给 e2e 也注入 executor 时本测试不会挡路
     assert!(
-        LIB_RS.contains("cfg!(not(feature = \"e2e\"))"),
-        "e2e 仍走同步分支；改动时同步调整 E2E spec"
+        LIB_RS.contains("set_migration_executor("),
+        "生产必须注入迁移执行器"
+    );
+    assert!(
+        LIB_RS.contains("std::thread::Builder::new()"),
+        "执行器必须在后台线程执行（协议回调不阻塞）"
+    );
+    assert!(
+        LIB_RS.contains("app.emit(\"migration-done\""),
+        "成功分支必须回传 done 事件"
+    );
+    assert!(
+        LIB_RS.contains("app.exit(0);"),
+        "成功分支必须自动退出"
     );
     assert!(
         STATE_RS.contains("fn migration_guard("),

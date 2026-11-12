@@ -180,24 +180,40 @@ impl Drop for MigrationGuard {
 struct FreezeGuard<'a> {
     state: &'a AppState,
     keep: bool,
+    /// 本 guard 是否「拥有」这次冻结（复查审计 R7）：首次置位与 A6 提前置位
+    /// 都算拥有；只有并发同步迁移的后来者（prev=true 且未在后台进行中）不拥有
+    /// ——它失败时不得把先到者正在用的冻结位清掉。
+    /// A6 判据不能省：后台迁移由协议线程提前置 pending 且 in_progress=true，
+    /// 若按「prev 已置位就不拥有」处理，失败将永不 FR 解冻 → 应用永久只读。
+    owns: bool,
 }
 
 impl<'a> FreezeGuard<'a> {
     fn new(state: &'a AppState) -> Self {
-        state
+        let prev = state
             .migration_pending
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Self { state, keep: false }
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        let owns = !prev || state.migration_in_progress();
+        Self {
+            state,
+            keep: false,
+            owns,
+        }
     }
 
     fn keep(&mut self) {
         self.keep = true;
+        // 成功终态必须是冻结：并发场景下先失败者（拥有者）可能已解冻，
+        // 这里幂等补回，避免「迁移成功却没冻结」导致继续写旧库
+        self.state
+            .migration_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl Drop for FreezeGuard<'_> {
     fn drop(&mut self) {
-        if !self.keep {
+        if !self.keep && self.owns {
             self.state
                 .migration_pending
                 .store(false, std::sync::atomic::Ordering::SeqCst);

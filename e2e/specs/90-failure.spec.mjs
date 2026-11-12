@@ -93,19 +93,33 @@ describe('90 失败链路', () => {
     fs.mkdirSync(occupied, { recursive: true })
     fs.writeFileSync(path.join(occupied, 'corpmail.db'), 'not a real db')
 
-    const started = await browser.execute((dir) => {
+    const armed = await browser.execute((dir) => {
       const t = window.__TAURI__
-      if (!t || !t.dialog) return false
+      if (!t || !t.dialog) return 'no-tauri'
       window.__MBX_DIALOG_ORIG__ = t.dialog.open
       const stub = async () => dir
       t.dialog.open = stub
-      if (t.dialog.open !== stub) return false
+      if (t.dialog.open !== stub) return 'no-stub'
       const btn = document.querySelector('[data-mbx-action="move-data-dir"]')
-      if (!btn) return false
+      if (!btn) return 'no-btn'
+
+      // R6（复查审计）：遮罩由 mbxMigOpen 动态创建，且发生在 await dialog.open
+      // 之后——点击瞬间同步读取必然拿不到（no-mask）。装 MutationObserver
+      // 记录「是否曾经可见」：只要出现过就置位，不依赖轮询时序
+      window.__MBX_MASK_SEEN__ = false
+      const check = () => {
+        const m = document.getElementById('migrate-mask')
+        if (m && !m.hidden && getComputedStyle(m).display !== 'none') {
+          window.__MBX_MASK_SEEN__ = true
+        }
+      }
+      const obs = new MutationObserver(check)
+      obs.observe(document.body, { childList: true, subtree: true, attributes: true })
+      window.__MBX_MASK_OBS__ = obs
       btn.click()
-      return true
+      return 'clicked'
     }, occupied)
-    expect(started).toBe(true)
+    expect(armed).toBe('clicked')
 
     try {
       // 启动校验失败 → 后端回完整 pane → 前端渲染错误并关闭模态
@@ -113,12 +127,20 @@ describe('90 失败链路', () => {
         const pane = await $('#settings-pane')
         return (await pane.getText()).includes('corpmail.db')
       }, { timeout: 8000, timeoutMsg: '启动失败的错误文案未渲染到存储 pane' })
+      // 两段式第一段（R6）：模态必须真的出现过——旧断言只看「最终不可见」，
+      // 模态从未创建时同样为 false，属假阳性
+      expect(await browser.execute(() => window.__MBX_MASK_SEEN__ === true)).toBe(true)
       // hidden 必须真的生效（A2：作者样式 display:flex 会压过 UA [hidden]）
       const mask = await $('#migrate-mask')
       expect(await mask.isDisplayed()).toBe(false)
       await shot('失败-点击式迁移错误可见且模态已关')
     } finally {
       await browser.execute(() => {
+        if (window.__MBX_MASK_OBS__) {
+          window.__MBX_MASK_OBS__.disconnect()
+          delete window.__MBX_MASK_OBS__
+        }
+        delete window.__MBX_MASK_SEEN__
         if (window.__TAURI__ && window.__MBX_DIALOG_ORIG__) {
           window.__TAURI__.dialog.open = window.__MBX_DIALOG_ORIG__
           delete window.__MBX_DIALOG_ORIG__

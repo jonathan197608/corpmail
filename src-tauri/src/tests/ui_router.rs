@@ -865,6 +865,48 @@ fn storage_pane_shows_estimate_and_clean_runs() {
 }
 
 #[test]
+fn storage_move_background_branch_carries_header_and_placeholder() {
+    // R5（复查审计）：A1 的三段契约（settings 打头 → ui 写进 Response →
+    // app.js 读头分支）此前零自动化验证——E2E 走同步分支永远拿不到该头。
+    // 这里注入 no-op executor 走真实路由，钉住后端两段：标记头 + 等待占位片段
+    let (state, dir) = temp_state("m5-move-bg-header");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let dest = std::env::temp_dir().join(format!("mbx-bg-header-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/storage/move",
+            &form(&[("dest", dest.to_str().unwrap())]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(resp.status, 200, "后台分支是 200 + 自定义头，不是错误状态");
+    assert!(
+        resp.extra_headers.iter().any(|(k, v)| {
+            k == crate::ui::MIGRATION_BACKGROUND_HEADER && v == "background"
+        }),
+        "缺头会让前端把占位 pane 渲染进页面并关模态，永久停在「准备迁移…」（A1 复现）：{:?}",
+        resp.extra_headers
+    );
+    let text = body(&resp);
+    assert!(text.contains("数据迁移正在进行中"), "应为等待占位：{text}");
+    assert!(
+        text.contains("id=\"settings-pane\""),
+        "前端按 pane 片段替换进设置面板：{text}"
+    );
+    state.mark_migration_finished();
+    let _ = std::fs::remove_dir_all(&dest);
+    cleanup(&dir);
+}
+
+#[test]
 fn storage_move_returns_pane_with_pending_dir() {
     let (state, dir) = temp_state("m5-move");
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
