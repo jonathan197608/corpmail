@@ -13,6 +13,7 @@ const SETTINGS_RS: &str = include_str!("../ui/settings.rs");
 const ROUTER_RS: &str = include_str!("../ui/router.rs");
 const STATE_RS: &str = include_str!("../state.rs");
 const LIB_RS: &str = include_str!("../lib.rs");
+const STORAGE_TPL: &str = include_str!("../templates/settings_pane_storage.html");
 
 #[test]
 fn migration_start_response_is_fully_consumed() {
@@ -182,6 +183,60 @@ fn production_migration_runs_through_injected_executor() {
         STATE_RS.contains("fn migration_guard("),
         "生产后台链必须有 RAII guard"
     );
+}
+
+#[test]
+fn migration_phase_reaches_storage_pane() {
+    // R9：后台迁移期间 migration_pending 也为 true，模板若只看它就会宣告
+    // 「已迁移，请重启」——必须另有 migration_running 分支（稍候文案）
+    assert!(
+        SETTINGS_RS.contains("migration_running:"),
+        "SettingsCtx 必须携带进行中标志"
+    );
+    assert!(
+        STORAGE_TPL.contains("{% if migration_running %}"),
+        "存储页 banner 必须先判进行中"
+    );
+    let running = STORAGE_TPL
+        .find("{% if migration_running %}")
+        .expect("running 分支存在");
+    let pending = STORAGE_TPL
+        .find("{% elif migration_pending %}")
+        .expect("pending 分支存在");
+    assert!(running < pending, "进行中分支必须排在待重启之前");
+    assert!(
+        STORAGE_TPL.matches("{% if migration_running %}").count() >= 3,
+        "banner 与「更换位置」「立即清理」两处禁用提示都要区分阶段"
+    );
+}
+
+#[test]
+fn migration_modal_resets_previous_failure_state() {
+    // R11：复用遮罩时必须复位上一轮的进度条/文案/「返回」按钮，
+    // 否则二次发起会带着错误态进场，用户一点就关掉正在跑的迁移遮罩
+    let open = APP_JS
+        .find("function mbxMigOpen()")
+        .expect("mbxMigOpen 存在");
+    let rest = &APP_JS[open..];
+    let body = &rest[..rest.find("// 更新进度条").expect("下一段注释存在")];
+    assert!(body.contains("bar.style.width = '0%'"), "进度条必须归零");
+    assert!(
+        body.contains("detail.textContent = '准备迁移…'"),
+        "详情必须复位为初始文案"
+    );
+    assert!(body.contains("btn.hidden = true"), "「返回」必须重新隐藏");
+
+    // R11 附带：关模态先解绑监听再判遮罩，避免早退导致监听泄漏
+    let close = APP_JS
+        .find("function mbxMigCloseModal()")
+        .expect("mbxMigCloseModal 存在");
+    let cbody = &APP_JS[close..];
+    let cbody = &cbody[..cbody.find("async function mbxMigListen()").expect("下一函数存在")];
+    let unlisten = cbody
+        .find("if (mbxMigUnlisten)")
+        .expect("解绑段存在");
+    let guard = cbody.find("if (!mask) return;").expect("遮罩判空存在");
+    assert!(unlisten < guard, "必须先解绑监听再判遮罩");
 }
 
 #[test]

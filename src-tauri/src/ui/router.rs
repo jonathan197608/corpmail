@@ -13,7 +13,9 @@ use super::settings::{
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
-use crate::state::{self, AppState, MIGRATION_PENDING_MSG, defaults, full_address, keys};
+use crate::state::{
+    self, AppState, MIGRATION_PENDING_MSG, MigrationPhase, defaults, full_address, keys,
+};
 use crate::templates;
 use crate::ui::Assets;
 use rusqlite::OptionalExtension;
@@ -503,7 +505,7 @@ pub fn route<A: Assets>(state: &AppState, assets: &A, req: &Req, tester: &dyn Co
     // 迁移冻结（审计 H2/R2）：数据目录已迁走、等待重启期间，任何带副作用的请求
     // 都必须明确失败——静默写进旧库，等于用户刚做的修改在重启后凭空消失
     if state.migration_pending() && has_side_effect(req) {
-        return migration_locked();
+        return migration_locked(state);
     }
     // 副作用 GET 必须由 htmx 发起（带 HX-Request）：`<img src="/emails/fetch">`
     // 这类跨上下文标签请求同样能打到本协议，而浏览器不会为它们加 HX-Request
@@ -565,13 +567,21 @@ fn has_side_effect(req: &Req) -> bool {
 
 /// 迁移冻结期的统一拒绝响应：409 + 纯文本提示。
 /// htmx 默认不 swap 4xx，前端 app.js 在 `htmx:responseError` 里把这段文本落到
-/// toast 上（否则用户看到的现象是「点了没反应」）
-fn migration_locked() -> Resp {
+/// toast 上（否则用户看到的现象是「点了没反应」）。
+///
+/// 文案按阶段分（审计 R9）：迁移进行中回「正在迁移，请稍候」，只有真的
+/// 落盘完成待重启才回「请重启」——后者会诱导用户中断一次仍在跑的复制。
+fn migration_locked(state: &AppState) -> Resp {
+    let msg = match state.migration_phase() {
+        MigrationPhase::Running => state::MIGRATION_RUNNING_MSG,
+        // Idle 在调用侧已判过冻结位，走到这里只可能是极窄竞态，按原义回提示
+        _ => MIGRATION_PENDING_MSG,
+    };
     Resp {
         status: 409,
         content_type: "text/plain; charset=utf-8".into(),
         cache_control: "no-store",
-        body: MIGRATION_PENDING_MSG.as_bytes().to_vec(),
+        body: msg.as_bytes().to_vec(),
         extra_headers: Vec::new(),
     }
 }

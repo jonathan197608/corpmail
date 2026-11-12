@@ -1815,6 +1815,49 @@ fn start_migration_background_freezes_before_return() {
 }
 
 #[test]
+fn migration_phase_separates_running_from_pending_restart() {
+    // R9：A6 在协议线程提前置 migration_pending，于是「进行中」也表现为
+    // pending=true。下游只读 pending 会把迁移跑着说成「已迁移，请重启」。
+    let base = temp_dir("mig-phase");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    assert_eq!(state.migration_phase(), MigrationPhase::Idle);
+
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let dest = base.join("moved");
+    assert!(matches!(
+        state.start_migration(dest.to_str().unwrap()).unwrap(),
+        MigrateOutcome::Background
+    ));
+    assert_eq!(
+        state.migration_phase(),
+        MigrationPhase::Running,
+        "两位同真时必须判进行中（in_progress 优先）"
+    );
+    // 收件状态条：进行中说「暂不收取」，不能催重启
+    state.start_fetch();
+    assert_eq!(
+        state.fetch_snapshot().last_error,
+        MIGRATION_RUNNING_FETCH_MSG
+    );
+
+    // 后台线程收尾（成功路径只清进行中、冻结保留到重启）→ 待重启
+    state.mark_migration_finished();
+    assert_eq!(state.migration_phase(), MigrationPhase::PendingRestart);
+    state.start_fetch();
+    assert_eq!(state.fetch_snapshot().last_error, MIGRATION_PENDING_MSG);
+
+    // 失败路径（FreezeGuard 已解冻）的等价终态：完全空闲
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(state.migration_phase(), MigrationPhase::Idle);
+    assert_eq!(state.migration_block_msg(), MIGRATION_PENDING_MSG);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn migration_guards_reset_flags_on_panic() {
     // A5：后台线程在进度回调里 panic，两个 RAII guard 都必须复位，
     // 否则应用永久只读 + 迁移永久提示「进行中」

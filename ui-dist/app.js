@@ -368,6 +368,14 @@ function mbxMigOpen() {
             + '</div>';
         document.body.appendChild(mask);
     }
+    // R11：复用旧 DOM 必须复位失败态，否则二次发起时会带着上一轮的错误文案、
+    // 进度条与「返回」按钮进场——用户以为还在失败态，一点就把正在跑的迁移遮罩关掉
+    var bar = document.getElementById('migrate-bar');
+    if (bar) bar.style.width = '0%';
+    var detail = document.getElementById('migrate-detail');
+    if (detail) detail.textContent = '准备迁移…';
+    var btn = mask.querySelector('[data-mbx-action="migration-close"]');
+    if (btn) btn.hidden = true;
     mask.hidden = false;
     mask.__mbxRelease = mbxModalOpen(mask, mask.querySelector('.migrate-card'));
 }
@@ -403,16 +411,17 @@ function mbxMigShowError(msg) {
     if (btn) btn.hidden = false;
 }
 
-// 关闭迁移模态（data-mbx-action=migration-close）：释放焦点陷阱 + 解除监听
+// 关闭迁移模态（data-mbx-action=migration-close）：释放焦点陷阱 + 解除监听。
+// R11：先解绑再判遮罩——早退在前会让「遮罩已被移除」时监听永久泄漏
 function mbxMigCloseModal() {
-    var mask = document.getElementById('migrate-mask');
-    if (!mask) return;
-    if (typeof mask.__mbxRelease === 'function') mask.__mbxRelease();
-    mask.hidden = true;
     if (mbxMigUnlisten) {
         try { mbxMigUnlisten(); } catch (e) { /* 已解绑 */ }
         mbxMigUnlisten = null;
     }
+    var mask = document.getElementById('migrate-mask');
+    if (!mask) return;
+    if (typeof mask.__mbxRelease === 'function') mask.__mbxRelease();
+    mask.hidden = true;
 }
 
 // 注册迁移事件监听（返回 Promise 就绪，避免 done 在监听前被丢）。

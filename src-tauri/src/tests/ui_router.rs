@@ -9533,8 +9533,76 @@ fn migration_freeze_blocks_writes_but_allows_reads() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-// ---------- R44：保存/发送失败回撰写页不丢表单值 ----------
+// ---------- R9：迁移「进行中」与「待重启」文案必须分开 ----------
 
+/// R9：后台迁移期间 migration_pending 与 migration_in_progress 同时为 true。
+/// 若 409 一律回「数据已迁移，请重启」，用户会主动中断一次仍在跑的复制。
+#[test]
+fn migration_running_and_pending_restart_have_distinct_409_text() {
+    let base = std::env::temp_dir().join(format!("mbx-router-mig-phase-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cur = base.join("cur");
+    std::fs::create_dir_all(&cur).unwrap();
+    let state = AppState::open(&cur);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    // 注入 no-op executor：start_migration 返回 Background 且提前冻结，
+    // 正好复现「进行中」的双位同真状态
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let dest = base.join("moved");
+    assert!(matches!(
+        state.start_migration(dest.to_str().unwrap()).unwrap(),
+        state::MigrateOutcome::Background
+    ));
+    assert!(state.migration_pending() && state.migration_in_progress());
+
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[("sync_interval_min", "5")]),
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 409, "进行中也必须拦写");
+    assert!(
+        body(&resp).contains("正在进行中"),
+        "进行中必须回「稍候」而非「请重启」：{}",
+        body(&resp)
+    );
+    assert!(
+        !body(&resp).contains("请重启"),
+        "进行中不得催重启：{}",
+        body(&resp)
+    );
+
+    // 后台线程收尾（成功路径只清进行中、保留冻结）→ 此后才是「请重启」
+    state.mark_migration_finished();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[("sync_interval_min", "5")]),
+        ),
+        &tester,
+    );
+    assert_eq!(resp.status, 409);
+    assert!(
+        body(&resp).contains("请重启"),
+        "落盘完成待重启必须提示重启：{}",
+        body(&resp)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------- R44：保存/发送失败回撰写页不丢表单值 ----------
 /// 保存失败（草稿 id 已被删/非草稿）→ HX-Redirect 必须带上未落库的
 /// 收件人/主题/正文，且撰写页读回这些参数后原样回填
 #[test]

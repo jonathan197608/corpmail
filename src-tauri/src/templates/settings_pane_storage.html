@@ -4,7 +4,9 @@
     {% if error %}
     <div class="card compose-note err">{{ ic.icon('x') }} {{ error }}</div>
     {% endif %}
-    {% if migration_pending %}
+    {% if migration_running %}
+    <div class="card compose-note warn">{{ ic.icon('warning') }} 正在迁移数据到新目录，请稍候…迁移期间无法修改内容，完成后应用会自动重启。</div>
+    {% elif migration_pending %}
     <div class="card compose-note warn">{{ ic.icon('warning') }} 数据已迁移，请重启应用后继续使用。重启前的一切修改都不会保存（写入已被拒绝）。</div>
     {% elif pending_dir %}
     <div class="card compose-note ok">{{ ic.icon('check') }} 数据已迁移，重启应用后启用新目录（旧目录备份可在下方手动删除）</div>
@@ -24,7 +26,8 @@
                     <span class="mono dir-path" title="{{ data_dir }}">{{ data_dir }}</span>
                     {% if data_dir_pending %}<span class="dir-badge">重启后生效</span>{% endif %}
                     <button type="button" class="btn small" data-mbx-action="move-data-dir"
-                            {% if migration_pending %}disabled title="数据已迁移，请重启应用后再操作"
+                            {% if migration_running %}disabled title="数据迁移进行中，请稍候…"
+                            {% elif migration_pending %}disabled title="数据已迁移，请重启应用后再操作"
                             {% else %}title="选择新目录并迁移数据"{% endif %}>更换位置</button>
                 </span>
             </div>
@@ -138,7 +141,7 @@
         <div class="settings-actions">
             <button type="button" class="btn"
                     {% if not can_clean or migration_pending %}disabled
-                    {% if migration_pending %}title="数据已迁移，请重启应用后再操作"{% else %}title="当前没有可释放的空间"{% endif %}{% else %}title="按上方策略立即执行清理"{% endif %}
+                    {% if migration_running %}title="数据迁移进行中，请稍候…"{% elif migration_pending %}title="数据已迁移，请重启应用后再操作"{% else %}title="当前没有可释放的空间"{% endif %}{% else %}title="按上方策略立即执行清理"{% endif %}
                     hx-post="/settings/storage/clean"
                     hx-target="#settings-pane" hx-swap="outerHTML"
                     hx-confirm="立即执行清理？超期的附件文件与过期邮件将被删除，草稿不受影响。"

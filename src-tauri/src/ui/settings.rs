@@ -79,6 +79,9 @@ pub(super) struct SettingsCtx {
     pending_dir: String,
     /// 迁移已落盘、等待重启的冻结期（R2）：写入全被路由层拒，页面显示固定横幅
     migration_pending: bool,
+    /// 后台迁移正在进行中（审计 R9）：横幅/按钮文案要说「稍候」而不是「请重启」。
+    /// 迁移期间 migration_pending 同样为 true（A6 提前冻结），故不能用它代替
+    migration_running: bool,
     // 旧目录迁移备份（M5：锚点中的库/附件副本；仅存储 tab 且已迁移时展示）
     has_backup: bool,
     backup_size: String,
@@ -255,7 +258,10 @@ pub(super) fn settings_ctx(
         } else {
             String::new()
         },
+        // R9：pending 与 running 必须分开传——后台迁移期间两位同为 true，
+        // 模板若只看 pending 会宣告「已迁移，请重启」，诱导用户中断迁移
         migration_pending: state.migration_pending(),
+        migration_running: state.migration_phase() == state::MigrationPhase::Running,
         has_backup,
         backup_size,
         backup_files,

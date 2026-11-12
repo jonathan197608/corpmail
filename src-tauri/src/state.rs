@@ -317,6 +317,31 @@ pub struct AppState {
 /// 迁移冻结期的统一提示（路由 409 / 收件 / 发送 worker 共用同一句中文）
 pub const MIGRATION_PENDING_MSG: &str = "数据已迁移，请重启应用后继续（当前进程内的修改不会保存）";
 
+/// 后台迁移进行中的统一提示（审计 R9）。
+///
+/// `migration_pending` 一位置两义：A6 在协议线程提前置它来消写丢失窗口，于是
+/// 「进行中」也表现为 pending=true。下游若一律按 pending 写文案，就会在迁移
+/// 还跑着时告诉用户「已迁移，请重启」——诱导用户主动中断一次未完成的迁移。
+/// 两句话必须分开，判定统一走 `migration_phase()`。
+pub const MIGRATION_RUNNING_MSG: &str = "数据迁移正在进行中，请稍候…";
+
+/// 迁移进行的收件拦截图示（与重启文案区分：此刻不该催重启，该说「暂不收取」）
+pub const MIGRATION_RUNNING_FETCH_MSG: &str = "数据迁移进行中，暂不收取邮件";
+
+/// 迁移阶段（审计 R9）：两个原子位组合出的三态。
+///
+/// 注意判定顺序——后台迁移期间 `in_progress` 与 `pending` 同时为 true，
+/// 必须 `in_progress` 优先，否则 Running 永远判不出来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationPhase {
+    /// 无迁移活动，写入正常
+    Idle,
+    /// 后台迁移进行中（数据尚未落盘完成，写入已被提前冻结）
+    Running,
+    /// 迁移已完成、等待重启（新库已就绪，重启前写入一律拒绝）
+    PendingRestart,
+}
+
 /// `reset_and_fetch` 的失败分类（路由据此选回显：Busy → 「收取进行中」提示，
 /// 其余按保存失败处理）。可枚举场景用枚举，不用魔法串比对
 #[derive(Debug)]
@@ -638,10 +663,31 @@ impl AppState {
         ))
     }
 
-    /// 迁移冻结期判定（路由/send worker/fetch 共用）
+    /// 迁移冻结期判定（路由/send worker/fetch 共用）。
+    /// 只回答「写入是否被冻结」；要区分「进行中 / 待重启」用 `migration_phase()`
     pub fn migration_pending(&self) -> bool {
         self.migration_pending
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 冻结期的用户提示（路由 409 / 收件共用）：进行中说「稍候」，待重启才说「请重启」
+    pub fn migration_block_msg(&self) -> &'static str {
+        match self.migration_phase() {
+            MigrationPhase::Running => MIGRATION_RUNNING_MSG,
+            _ => MIGRATION_PENDING_MSG,
+        }
+    }
+
+    /// 迁移阶段（审计 R9）：下游文案的唯一依据。
+    /// `in_progress` 优先——后台迁移期间两位同为 true（A6 提前冻结）
+    pub fn migration_phase(&self) -> MigrationPhase {
+        if self.migration_in_progress() {
+            MigrationPhase::Running
+        } else if self.migration_pending() {
+            MigrationPhase::PendingRestart
+        } else {
+            MigrationPhase::Idle
+        }
     }
 
     /// 注入后台迁移执行器（lib.rs setup 调用；未注入 = 单元测试，start_migration 走同步）
@@ -683,7 +729,7 @@ impl AppState {
         // 「后台正在跑」优先于「已迁移待重启」：A6 在协议线程提前置了冻结位，
         // 重复点击时用户该看到「进行中」，而不是误导性的「请重启」
         if self.migration_in_progress() {
-            return Err("数据迁移正在进行中，请稍候…".into());
+            return Err(MIGRATION_RUNNING_MSG.into());
         }
         if self.migration_pending() {
             return Err(MIGRATION_PENDING_MSG.into());
@@ -711,7 +757,7 @@ impl AppState {
             )
             .is_err()
         {
-            return Err("数据迁移正在进行中，请稍候…".into());
+            return Err(MIGRATION_RUNNING_MSG.into());
         }
         // A6：在协议线程内立即冻结。旧实现要等后台线程调度到 migrate_impl 才置位，
         // 这段窗口内通过路由的写请求会落旧库、赶不上 VACUUM INTO 快照。
@@ -1530,9 +1576,13 @@ impl AppState {
     }
 
     pub fn start_fetch(&self) {
-        // 迁移冻结（R2）：快照已定格，此刻收件只会写进即将被抛弃的旧库
+        // 迁移冻结（R2）：快照已定格，此刻收件只会写进即将被抛弃的旧库。
+        // R9：进行中与待重启分开报——迁移跑着时催用户「重启」会中断本次复制
         if self.migration_pending() {
-            self.set_fetch_error(MIGRATION_PENDING_MSG.to_string());
+            self.set_fetch_error(match self.migration_phase() {
+                MigrationPhase::Running => MIGRATION_RUNNING_FETCH_MSG.to_string(),
+                _ => MIGRATION_PENDING_MSG.to_string(),
+            });
             return;
         }
         // 挂起轮上限（审计 P1-5/P1-13）：看门狗已把判死的轮转为 detached 并
@@ -1575,7 +1625,7 @@ impl AppState {
     /// 的事务/回滚保证整体未清，游标保持原值
     pub fn reset_and_fetch(&self, pairs: &[(&str, &str)]) -> Result<(), ResetFetchError> {
         if self.migration_pending() {
-            return Err(ResetFetchError::Other(MIGRATION_PENDING_MSG.into()));
+            return Err(ResetFetchError::Other(self.migration_block_msg().into()));
         }
         let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running {
@@ -1596,7 +1646,8 @@ impl AppState {
         // 二次确认冻结位：与 move_data_dir 的置位存在极窄竞态窗口（它先置位再等
         // running 归零），CAS 之后再查一次即可保证「冻结后绝不起新轮」
         if self.migration_pending() {
-            self.fetch_end(epoch, 0, MIGRATION_PENDING_MSG);
+            let msg = self.migration_block_msg();
+            self.fetch_end(epoch, 0, msg);
             return;
         }
         // 挂起轮/并发轮上限（原子入口跳过了 CAS 前检查，这里统一兜住；
