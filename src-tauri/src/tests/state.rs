@@ -1815,6 +1815,50 @@ fn start_migration_background_freezes_before_return() {
 }
 
 #[test]
+fn snapshot_db_copies_live_wal_database_from_readonly_conn() {
+    // R13：快照改走独立只读连接（不再经 with_conn 持全局 store 锁）。
+    // 这里验证只读连接在 WAL 库上确实能产出可用副本——否则迁移主链路直接断
+    let dir = temp_dir("snapshot-ro");
+    let state = AppState::open(&dir);
+    // 用一个「非配置键」：配置键落 corpmail.toml 不进库（那样测不到 WAL 内容）
+    state.set_batch(&[("snapshot_probe", "1")]).unwrap();
+    let db = dir.join("corpmail.db");
+    let copy = dir.join("copy.db");
+    snapshot_db(&db, &copy).expect("只读连接快照应成功");
+
+    let conn = Connection::open(&copy).expect("副本可打开");
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(tables > 0, "副本必须含 schema，否则重启后是空库");
+    // 关键：必须读到仍在 -wal 里、尚未 checkpoint 的已提交数据。
+    // 若只读连接没有认到 -shm/-wal，会静默产出「旧快照」——那等于迁移丢信
+    let got = settings::get(&conn, "snapshot_probe").unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some("1"),
+        "副本必须含最后一个已提交快照（含 WAL 中的未 checkpoint 内容）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn snapshot_db_fails_loudly_on_missing_database() {
+    // 只读连接不能「顺手建库」：源库不存在必须报错，而不是产出空副本
+    let dir = temp_dir("snapshot-missing");
+    let missing = dir.join("nope.db");
+    let copy = dir.join("out.db");
+    let err = snapshot_db(&missing, &copy).expect_err("源库不存在必须失败");
+    assert!(err.contains("数据库快照失败"), "错误必须可辨识：{err}");
+    assert!(!copy.exists(), "失败不得留下副本文件");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn migration_phase_separates_running_from_pending_restart() {
     // R9：A6 在协议线程提前置 migration_pending，于是「进行中」也表现为
     // pending=true。下游只读 pending 会把迁移跑着说成「已迁移，请重启」。

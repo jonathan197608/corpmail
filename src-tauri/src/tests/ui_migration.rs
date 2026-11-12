@@ -187,6 +187,33 @@ fn production_migration_runs_through_injected_executor() {
 }
 
 #[test]
+fn snapshot_does_not_hold_the_store_lock() {
+    // R13：VACUUM INTO 曾在 with_conn 闭包里跑——快照期间全局 store 锁被独占，
+    // 状态条轮询/estimate/边栏计数全部排队。只读连接快照必须留在锁外
+    let at = STATE_RS
+        .find("fn migrate_snapshot(")
+        .expect("migrate_snapshot 存在");
+    let rest = &STATE_RS[at..];
+    let body = &rest[..rest
+        .find("fn switch_data_dir_first_run(")
+        .expect("下一函数存在")];
+    assert!(
+        body.contains("snapshot_db(&cur.join(\"corpmail.db\"), &new_db)"),
+        "快照必须走独立连接的 snapshot_db"
+    );
+    // 匹配调用形态而非裸词：注释里讨论「VACUUM INTO」是允许的（本文件踩过
+    // 「负向断言被自己的注释触发」的坑）
+    assert!(
+        !body.contains("execute(\"VACUUM INTO"),
+        "VACUUM 不得回到 with_conn 借出的连接上（会重新独占 store 锁）"
+    );
+    assert!(
+        STATE_RS.contains("SQLITE_OPEN_READ_ONLY"),
+        "快照连接必须是只读标志"
+    );
+}
+
+#[test]
 fn migration_modal_has_stall_watchdog() {
     // R10：后端 panic 或被不可靠挂载卡死时前端收不到任何事件。旧实现只有三个
     // 事件处理器、没有定时器，模态会永久停在最后一帧，用户只能强杀。

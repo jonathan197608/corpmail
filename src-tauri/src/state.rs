@@ -873,10 +873,9 @@ impl AppState {
         let migrated: Result<(), String> = (|| {
             // 快照也走闭包（复查审计 R4）：VACUUM 失败原先在回滚块之前 `?` 返回，
             // marker 与半成品快照库会静默残留；并入后由下面的精确回滚统一收尾
-            self.with_conn(|conn| {
-                conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
-                    .map_err(|e| format!("数据库快照失败：{e}"))
-            })?;
+            // R13：改走独立只读连接——`with_conn` 在整个 VACUUM 期间持全局 store
+            // 锁，GB 级库要几十秒，期间状态条轮询/estimate/边栏计数全部排队
+            snapshot_db(&cur.join("corpmail.db"), &new_db)?;
             if src_att.is_dir() {
                 let total = count_attachment_files(&src_att);
                 emit(
@@ -2321,6 +2320,27 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
 /// `attachments`，因此带标记时这两处必定是上次迁移写出的，不会误伤用户文件。
 /// R3（复查审计）：`MIGRATION_DONE_MARKER` 在场 = 上次迁移**已成功**（marker
 /// 删除失败的残留），库与附件是有效数据——只清两个标记，绝不删数据。
+/// 数据库在线快照（审计 R13）：用独立**只读连接**执行 `VACUUM INTO`。
+///
+/// 旧实现走 `self.with_conn`，整个 VACUUM 期间持着全局 store 锁——快照耗时与
+/// 库体积成正比（GB 级十秒以上），期间列表状态条 10s 轮询、详情 2s 轮询、
+/// `clean::estimate`、边栏计数全部排队；后台化只解放了「发起请求」那一下。
+///
+/// 一致性：冻结位已挡住所有写入，收件轮也已 `wait_fetch_idle` 收尾，
+/// 只读连接读到的是最后一个已提交快照，与持锁读等价（WAL 语义）。
+/// 只读连接不持写锁，故快照期间其他读路径照常返回。
+fn snapshot_db(db: &Path, dest: &Path) -> Result<(), String> {
+    let conn = Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("数据库快照失败（只读连接打开失败：{}）：{e}", db.display()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])
+        .map_err(|e| format!("数据库快照失败：{e}"))?;
+    Ok(())
+}
+
 fn recover_incomplete_migration(dest: &Path) -> Result<(), String> {
     let marker = dest.join(MIGRATION_MARKER);
     let done = dest.join(MIGRATION_DONE_MARKER);
