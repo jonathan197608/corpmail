@@ -157,11 +157,18 @@ pub fn run() {
                                 });
                                 match result {
                                     Ok(msg) => {
-                                        // 迁移完成：先提示前端（模态显示"即将退出"），
-                                        // 短暂停留后自动退出，用户重开即用新目录
+                                        // A10/A11：完整成功文案（新目录路径、旧备份可删）
+                                        // 交给前端显示，并写明「未自动退出请手动重启」兜底。
+                                        // 先给前端 1.5s 渲染，再置停止位让常驻线程收手，
+                                        // 最后才关闭窗口：避免退出瞬间与它们抢 SQLite 写锁。
                                         let _ = app.emit("migration-done", msg);
-                                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                                        app.exit(0);
+                                        if wait_or_stop(
+                                            std::time::Duration::from_millis(1500),
+                                            std::time::Duration::from_millis(100),
+                                        ) {
+                                            request_shutdown();
+                                            app.exit(0);
+                                        }
                                     }
                                     Err(e) => {
                                         // 迁移失败：解冻由 FreezeGuard 完成，回传错误

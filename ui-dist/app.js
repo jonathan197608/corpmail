@@ -430,9 +430,13 @@ async function mbxMigListen() {
         var p = e.payload || {};
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
-    await add('migration-done', function () {
-        // 后端将在短暂停留后自动退出（重开即用新目录）
-        mbxMigSet(100, '迁移完成，即将自动退出应用，请重新打开以使用新目录');
+    await add('migration-done', function (e) {
+        // A11：渲染后端完整成功文案（新目录路径、旧备份可删），别丢掉 payload
+        var msg = (e && typeof e.payload === 'string' && e.payload.trim())
+            ? e.payload.trim()
+            : '数据迁移已完成';
+        // A10：exit 未生效时给手动重启兜底，避免永久停在 100% 的冻结态
+        mbxMigSet(100, msg + '\n\n应用即将自动退出；若窗口未关闭，请手动重启后使用新目录。');
     });
     await add('migration-error', function (e) {
         mbxMigShowError(typeof e.payload === 'string' ? e.payload : '迁移失败，请重试');

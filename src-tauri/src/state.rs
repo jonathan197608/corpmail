@@ -213,6 +213,9 @@ struct StorageStatsCache {
     /// 附件目录占用（审计 A9）：`dir_stats` 是全目录递归，原先每次打开任意
     /// 设置页都跑一遍，不在缓存里等于没优化
     attach: (u64, u64),
+    /// 缓存归属的数据目录（审计 A12）：只看 TTL 时，`swap_store` 切库后
+    /// 15s 内仍会把旧目录的统计显示在新目录页面上
+    data_dir: PathBuf,
 }
 
 /// 存储页统计缓存有效期：库量会随收件变化，给短 TTL 容忍短暂旧值，
@@ -222,6 +225,10 @@ const STORAGE_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_s
 /// 附件复制进度的最小回传间隔（审计 A7）：按文件逐个 emit 会在 10 万附件量级
 /// 打出 10 万次 IPC + DOM 写，反而拖住前端。最后一个文件强制补齐终值。
 const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 目录递归深度上限（审计 A13）：附件正常只有 {YYYY-MM}/{email_id}/ 两级，
+/// 超过说明目录被污染或存在环，继续递归会栈溢出 / 无限循环
+const MAX_DIR_DEPTH: usize = 16;
 
 /// 迁移中断标记（审计 A8）：落盘开始前写入目标目录，成功后删除。进程被强杀
 /// 时它留在原地，下次 `validate_data_dir` 据此识别「上次未完成的本应用产物」
@@ -725,6 +732,18 @@ impl AppState {
         dest_path: &Path,
         cb: Option<&(dyn Fn(&MigrationProgress) + Sync)>,
     ) -> Result<(), String> {
+        // A13：附件根目录本身若是符号链接，整个复制会跑到目录外去。
+        // 放在写 marker 之前校验，失败不留下需要自愈的残留
+        let src_att = cur.join("attachments");
+        if std::fs::symlink_metadata(&src_att)
+            .map(|m| m.is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "附件根目录是符号链接（{}），拒绝迁移",
+                src_att.display()
+            ));
+        }
         // 进度快照透传（cb 为 None 时即同步 no-op，保持既有行为）
         let emit = |phase: &'static str, detail: String, done: usize, total: Option<usize>| {
             if let Some(cb) = cb {
@@ -736,21 +755,27 @@ impl AppState {
                 });
             }
         };
-        // 附件阶段按时间节流（A7）；锁外调 cb，避免 emit 期间占着锁
-        let last_emit = Mutex::new(
+        // 附件阶段按时间节流（A7）；锁外调 cb，避免 emit 期间占着锁。
+        // (上次发出时间, 上次发出的文件数)：终值只补一次（A13 跳过符号链接后
+        // 真实 copied 可能小于 total，不能靠「最后一个文件」凑齐 100%）
+        let progress = Mutex::new((
             std::time::Instant::now()
                 .checked_sub(PROGRESS_THROTTLE)
                 .unwrap_or_else(std::time::Instant::now),
-        );
+            0usize,
+        ));
         let emit_files = |done: usize, total: usize| {
             if let Some(cb) = cb {
                 let now = std::time::Instant::now();
+                let force = done >= total;
                 let should_emit = {
-                    let mut last = last_emit.lock().unwrap_or_else(|e| e.into_inner());
-                    if done < total && now.duration_since(*last) < PROGRESS_THROTTLE {
-                        false
+                    let mut st = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    if (force && st.1 >= total)
+                        || (!force && now.duration_since(st.0) < PROGRESS_THROTTLE)
+                    {
+                        false // 终值已补过，或普通进度还在节流窗口内
                     } else {
-                        *last = now;
+                        *st = (now, done);
                         true
                     }
                 };
@@ -777,7 +802,6 @@ impl AppState {
         // 2) 附件复制 + 3) 指针写入：任一步失败都回滚已产出物（快照库/附件副本），
         //    并恢复内存镜像中的指针——保证调用方（向导/存储页）原地重试不被
         //    "目标已存在 corpmail.db"拦截（C6 半保存态修复）
-        let src_att = cur.join("attachments");
         // 本次实际写入的文件清单：回滚只删这些，不碰目标目录里任何既有内容
         let mut written: Vec<PathBuf> = Vec::new();
         // 附件复制进度计数（copy_dir_recursive 递归内共享）
@@ -798,8 +822,12 @@ impl AppState {
                     &copied,
                     total,
                     &emit_files,
+                    0,
                 )
                 .map_err(|e| format!("附件目录复制失败：{e}"))?;
+                // 强制补齐终值：跳过符号链接/深度截断时 copied < total，
+                // 否则进度条会停在不到 100% 而迁移其实已成功
+                emit_files(total, total);
             }
             emit(
                 "pointer",
@@ -1070,6 +1098,8 @@ impl AppState {
             store.data_dir = dest_path.to_path_buf();
         }
         self.start_send_worker();
+        // A12：数据目录换了，TTL 内的旧目录统计必须立即作废
+        self.invalidate_stats_cache();
     }
 
     /// 切库前静默收件轮（审计 R16）。收尾后 `clean_empty_legacy_db` 才安全执行
@@ -1256,12 +1286,15 @@ impl AppState {
         (u64, u64),
     ) {
         let now = std::time::Instant::now();
+        // 先取目录快照：不要把 data_dir() 放进 stats_cache 锁的作用域里
+        let dir = self.data_dir();
         if let Some(c) = self
             .stats_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             && now.duration_since(c.at) < STORAGE_STATS_CACHE_TTL
+            && c.data_dir == dir
         {
             return (c.estimate.clone(), c.backup, c.attach);
         }
@@ -1276,6 +1309,7 @@ impl AppState {
                 estimate: estimate.clone(),
                 backup,
                 attach,
+                data_dir: dir,
             });
         (estimate, backup, attach)
     }
@@ -2337,27 +2371,35 @@ pub(crate) fn check_store_owner_conn(conn: &Connection, account: &str) -> StoreO
     }
 }
 
-/// 目录递归统计：(字节, 文件数)；目录不存在 → (0, 0)（附件占用与迁移备份共用）
+/// 目录递归统计：(字节, 文件数)；目录不存在 → (0, 0)（附件占用与迁移备份共用）。
+/// 符号链接一律跳过、深度封顶（A13）：`metadata()` 会解引用，可能把目录外
+/// 的文件算进来，遇到自指链接还会无限递归
 fn dir_stats(p: &Path) -> (u64, u64) {
-    let mut bytes = 0;
-    let mut files = 0;
-    if let Ok(rd) = std::fs::read_dir(p) {
-        for e in rd.flatten() {
-            match e.metadata() {
-                Ok(m) if m.is_file() => {
-                    bytes += m.len();
-                    files += 1;
+    fn walk(p: &Path, depth: usize) -> (u64, u64) {
+        if depth > MAX_DIR_DEPTH {
+            return (0, 0);
+        }
+        let mut bytes = 0;
+        let mut files = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                match std::fs::symlink_metadata(e.path()) {
+                    Ok(m) if m.is_file() => {
+                        bytes += m.len();
+                        files += 1;
+                    }
+                    Ok(m) if m.is_dir() => {
+                        let (b, f) = walk(&e.path(), depth + 1);
+                        bytes += b;
+                        files += f;
+                    }
+                    _ => {}
                 }
-                Ok(m) if m.is_dir() => {
-                    let (b, f) = dir_stats(&e.path());
-                    bytes += b;
-                    files += f;
-                }
-                _ => {}
             }
         }
+        (bytes, files)
     }
-    (bytes, files)
+    walk(p, 0)
 }
 
 /// 递归复制目录（M5 迁移用：附件目录两级结构 {YYYY-MM}/{email_id}/ 文件）；
@@ -2370,17 +2412,30 @@ fn copy_dir_recursive(
     copied: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     total: usize,
     emit_files: &(dyn Fn(usize, usize) + Sync),
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > MAX_DIR_DEPTH {
+        return Err(format!(
+            "附件目录层级超过 {MAX_DIR_DEPTH} 层（{}），拒绝继续复制",
+            src.display()
+        ));
+    }
     std::fs::create_dir_all(dest).map_err(|e| format!("创建目录失败：{e}"))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
         let entry = entry.map_err(|e| format!("遍历失败：{e}"))?;
-        let ty = entry
-            .file_type()
+        // A13：symlink_metadata 不解引用。符号链接（文件或目录）一律跳过，
+        // 否则 std::fs::copy 会把链接目标的内容带进新目录，链接环还会失控递归
+        let md = entry
+            .path()
+            .symlink_metadata()
             .map_err(|e| format!("读取类型失败：{e}"))?;
+        if md.is_symlink() {
+            continue;
+        }
         let to = dest.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &to, written, copied, total, emit_files)?;
-        } else {
+        if md.is_dir() {
+            copy_dir_recursive(&entry.path(), &to, written, copied, total, emit_files, depth + 1)?;
+        } else if md.is_file() {
             std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
             let n = copied.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             // 节流策略在调用方闭包里（A7）：这里只报当前计数
@@ -2391,19 +2446,27 @@ fn copy_dir_recursive(
     Ok(())
 }
 
-/// 统计目录内文件总数（附件复制进度用；失败目录按 0 处理，不影响复制本体）
+/// 统计目录内文件总数（附件复制进度用；失败目录按 0 处理，不影响复制本体）。
+/// 口径必须与 `copy_dir_recursive` 一致：同样跳符号链接、同样深度封顶，
+/// 否则进度条的 total 与实际复制数对不上
 fn count_attachment_files(dir: &Path) -> usize {
-    let mut n = 0;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                n += count_attachment_files(&e.path());
-            } else {
-                n += 1;
+    fn walk(dir: &Path, depth: usize) -> usize {
+        if depth > MAX_DIR_DEPTH {
+            return 0;
+        }
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                match std::fs::symlink_metadata(e.path()) {
+                    Ok(m) if m.is_dir() => n += walk(&e.path(), depth + 1),
+                    Ok(m) if m.is_file() => n += 1,
+                    _ => {}
+                }
             }
         }
+        n
     }
-    n
+    walk(dir, 0)
 }
 
 /// 首拉天数解析：0 = 全部（UID SEARCH ALL，合法值，不得作非法过滤）；

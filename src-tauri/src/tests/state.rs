@@ -1972,3 +1972,89 @@ fn storage_stats_cache_covers_attachment_dir_scan() {
     assert_eq!(fresh, (12, 2), "失效后应重新扫描");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn storage_stats_cache_is_keyed_by_data_dir() {
+    // A12：切库后 TTL 内的旧目录统计不能继续显示。直接改 Store.data_dir
+    // 模拟 swap_store 之后的目录变化（db 连接不动，只验缓存键）
+    let base = temp_dir("mig-cache-key");
+    let anchor = base.join("anchor");
+    let att = anchor.join("attachments");
+    std::fs::create_dir_all(&att).unwrap();
+    std::fs::write(att.join("a"), b"12345").unwrap();
+    let state = AppState::open(&anchor);
+    let (_, _, first) = state.storage_stats();
+    assert_eq!(first, (5, 1));
+    let other = base.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    state
+        .store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .data_dir = other;
+    let (_, _, after_swap) = state.storage_stats();
+    assert_eq!(after_swap, (0, 0), "换目录后必须重算，不能沿用旧缓存");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migration_skips_symlinked_attachment_files() {
+    // A13：符号链接不得被 std::fs::copy 解引用带进新目录；
+    // 且 total 与 copied 口径一致，进度终值必须补齐到 100%
+    let base = temp_dir("mig-symlink");
+    let anchor = base.join("anchor");
+    let dir = anchor.join("attachments/2026-01/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("real.bin"), b"real").unwrap();
+    let secret = base.join("secret.bin");
+    std::fs::write(&secret, b"SECRET-OUTSIDE").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, dir.join("link.bin")).unwrap();
+    let state = AppState::open(&anchor);
+    let events = Mutex::new(Vec::<(usize, Option<usize>)>::new());
+    let dest = base.join("moved");
+    state
+        .move_data_dir_progress(dest.to_str().unwrap(), &|p: &MigrationProgress| {
+            if p.phase == "attachments" {
+                events.lock().unwrap().push((p.files_done, p.files_total));
+            }
+        })
+        .unwrap();
+    let copied_real = dest.join("attachments/2026-01/1/real.bin");
+    assert_eq!(std::fs::read(&copied_real).unwrap(), b"real");
+    assert!(
+        !dest.join("attachments/2026-01/1/link.bin").exists(),
+        "符号链接不得被复制为实体文件"
+    );
+    #[cfg(unix)]
+    {
+        let ev = events.lock().unwrap();
+        assert_eq!(ev.last().copied(), Some((1, Some(1))), "终值必须补齐：{ev:?}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migration_rejects_attachment_tree_beyond_depth_limit() {
+    // A13：深层/成环目录不得无限递归；失败必须回滚目标目录产物
+    let base = temp_dir("mig-deep");
+    let anchor = base.join("anchor");
+    let mut deep = anchor.join("attachments");
+    for i in 0..20 {
+        deep = deep.join(format!("d{i}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("payload"), b"x").unwrap();
+    let state = AppState::open(&anchor);
+    let dest = base.join("moved");
+    let err = state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect_err("超过深度上限必须拒绝");
+    assert!(err.contains("层级"), "{err}");
+    assert!(!dest.join("corpmail.db").exists(), "失败后快照库必须回滚");
+    assert!(
+        !dest.join(MIGRATION_MARKER).exists(),
+        "回滚干净后迁移标记必须删除"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

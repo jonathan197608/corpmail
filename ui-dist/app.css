@@ -3937,6 +3937,8 @@ form.setup-card .setup-actions {
     color: #6b7280;
     line-height: 1.6;
     min-height: 20px;
+    /* A11：成功文案含换行（新目录 / 旧备份 / 手动重启兜底），须保留换行 */
+    white-space: pre-line;
 }
 .migrate-card .btn {
     margin-top: 12px;
