@@ -10,6 +10,7 @@ use super::MIGRATION_BACKGROUND_HEADER;
 const APP_JS: &str = include_str!("../../../ui-dist/app.js");
 const APP_CSS: &str = include_str!("../../../ui-dist/app.css");
 const SETTINGS_RS: &str = include_str!("../ui/settings.rs");
+const ROUTER_RS: &str = include_str!("../ui/router.rs");
 const STATE_RS: &str = include_str!("../state.rs");
 const LIB_RS: &str = include_str!("../lib.rs");
 
@@ -115,15 +116,28 @@ fn migration_done_renders_backend_message_and_manual_restart_hint() {
 
 #[test]
 fn migration_exit_stops_background_threads_first() {
-    // A10：退出前置停止位，避免与收件/发送/清理线程抢 SQLite 写锁
+    // R1（复查审计）：成功分支不得直接调 request_shutdown——SHUTDOWN 无复位
+    // 路径，exit(0) 未生效时提前置位会让常驻线程停在检查点不再恢复（僵尸态）。
+    // 停止位唯一合法来源是 app.run 的 ExitRequested|Exit（R62 已有）。
     let success = LIB_RS.find("Ok(msg) =>").expect("成功分支存在");
     // 用下一个 match 臂做边界：两端都是 find 结果（char boundary），
     // 不能写 success+900——中文注释会把切片切进 UTF-8 字符中间
     let rest = &LIB_RS[success..];
     let body = &rest[..rest.find("Err(e) =>").expect("失败分支存在")];
-    assert!(body.contains("request_shutdown();"), "退出前必须置停止位");
+    assert!(
+        !body.contains("request_shutdown();"),
+        "迁移成功分支不得手动置停止位（交给退出事件）"
+    );
     assert!(body.contains("wait_or_stop("), "给前端留渲染时间且可中断");
     assert!(body.contains("app.exit(0);"), "仍要自动退出");
+    // 退出事件里的置位必须存在（唯一的合法置位点）
+    let run = LIB_RS.find("app.run(").expect("事件循环存在");
+    let run_rest = &LIB_RS[run..];
+    let run_body = &run_rest[..run_rest.find("Reopen").unwrap_or(run_rest.len())];
+    assert!(
+        run_body.contains("request_shutdown();"),
+        "ExitRequested|Exit 必须置停止位（R62）"
+    );
 }
 
 #[test]
@@ -154,5 +168,21 @@ fn e2e_build_keeps_synchronous_migration_path() {
     assert!(
         STATE_RS.contains("fn migration_guard("),
         "生产后台链必须有 RAII guard"
+    );
+}
+
+#[test]
+fn wizard_path_does_not_call_migration_directly() {
+    // R2（复查审计）：向导是协议回调线程，路由层不得再直呼同步迁移
+    // （大库 VACUUM 会卡死「保存中…」）。唯一的迁移入口是 settings.rs 的
+    // start_migration（后台 executor 链）。匹配调用形态 `.move_data_dir(`
+    // 而非裸标识符——注释里允许讨论它
+    assert!(
+        !ROUTER_RS.contains(".move_data_dir("),
+        "router.rs 不得直接调用同步迁移；向导走引导文案，迁移走设置页"
+    );
+    assert!(
+        ROUTER_RS.contains("存储管理"),
+        "向导引导文案必须指向 设置 → 存储管理"
     );
 }

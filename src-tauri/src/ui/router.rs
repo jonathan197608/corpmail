@@ -3286,13 +3286,10 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                 return test_fragment(Vec::new(), &e, false);
             }
         }
-        // C2/C6：配置与密码先落库，迁移最后执行——
-        // C2：first_fetch_days 存 DB（非 corpmail.toml 键），若迁移在前，快照发生于
-        //     落库之前，重启后新目录丢首拉范围回退默认 30；先保存再迁移，VACUUM
-        //     快照即包含最新值；
-        // C6：迁移最后执行，失败时账号配置已完整保存（无半保存态），指针未推进，
-        //     目标残留已被 move_data_dir 清理，可清空目录字段重提或稍后在
-        //     设置→存储管理 重试更换位置
+        // C2/C6：配置与密码先落库（无半保存态），失败即返回、指针不动。
+        // C2：first_fetch_days 存 DB（非 corpmail.toml 键），先保存后迁移，
+        //     保证（设置页发起的）迁移快照包含最新值；
+        // C6：保存失败时账号配置已完整保存，指针未推进，可原地重试
         // （首设直切路径：以下落库写入的就是新目录的库）
         if let Err(e) = state.set_batch(&pairs) {
             return test_fragment(Vec::new(), &format!("保存失败：{e}"), false);
@@ -3300,8 +3297,13 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
         if let Err(e) = state.store_password(&account, &password) {
             return test_fragment(Vec::new(), &format!("密码保存失败：{e}"), false);
         }
-        // 数据保存目录（非首设路径）：非空且不同于当前时迁移；
-        // 已是"迁移完成待重启"或"首设已直切"状态则跳过
+        // 数据保存目录（非首设路径）：非空且不同于当前时——
+        // R2（复查审计）：向导是协议回调线程，这里直接同步 move_data_dir 会
+        // 在大库 VACUUM + 全量附件复制期间把「保存中…」卡死（无进度/无取消/
+        // 无后台线程），绕过了设置页那条 executor/CAS/提前冻结/进度事件的
+        // 后台链。改为明确引导：账号已保存、指针未动，用户去设置页发起迁移，
+        // 或清空目录字段重提完成向导（与旧失败分支同语义）。
+        // 「指针已指向 want 且库文件已存在 = 迁移待重启或直切已完成」仍幂等跳过
         if !first_run_fresh && !data_dir_input.is_empty() {
             let cur = state
                 .data_dir()
@@ -3312,21 +3314,15 @@ fn wizard_save(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Resp {
                 .trim()
                 .trim_end_matches(['/', '\\'])
                 .to_string();
-            // 指针已指向 want 且库文件已存在 = 迁移待重启或直切已完成 → 幂等跳过
             let already_settled = state
                 .get(keys::DATA_DIR)
                 .flatten()
                 .is_some_and(|p| p.trim_end_matches(['/', '\\']) == want)
                 && std::path::Path::new(&want).join("corpmail.db").is_file();
-            if want != cur
-                && !already_settled
-                && let Err(e) = state.move_data_dir(&data_dir_input)
-            {
+            if want != cur && !already_settled {
                 return test_fragment(
                     Vec::new(),
-                    &format!(
-                        "账号已保存，但数据目录迁移失败：{e}（可清空目录后重新提交，或稍后在 设置 → 存储管理 更换位置）"
-                    ),
+                    "账号已保存，但数据目录未变更：当前库已有数据，向导内不执行目录迁移（耗时较长）。请完成后在 设置 → 存储管理 中「更换位置」（后台执行、有进度提示）；或清空数据目录字段后重新提交完成向导",
                     false,
                 );
             }

@@ -5472,29 +5472,31 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 
-    // 库非空（历史数据）+ 未配置 → 不满足“空库直切”条件，走迁移路径：
-    // 迁移待生效期间跳过首拉（否则本轮会写进旧目录，重启后白拉）
+    // 库非空（历史数据）+ 未配置 + 填了不同目录 → R2（复查审计）：向导不再
+    // 同步迁移（协议线程里 VACUUM + 全量附件复制会卡死「保存中…」，绕过
+    // 设置页的后台迁移链），改为返回引导文案；账号已保存、指针未动、
+    // 目标目录零产物、不触发首拉（未配置完成，不写旧目录）
+    // 注意 to_addrs 必须是登录账号本身：归属校验（first_run && !fresh）
+    // 会先于目录分支执行——旧版素材写 demo@ 导致请求被归属拒绝，
+    // 旧断言 err.is_empty() 在被拒时同样成立（假通过），迁移路径从未真覆盖
     let (state, dir) = temp_state("wiz-first-fetch-pending");
     state.with_conn(|c| {
         c.execute(
             "INSERT INTO emails(direction, folder, status, from_addr, to_addrs,
                                     subject, body_text, subject_tokens, body_tokens, unread,
                                     created_at, received_at)
-                 VALUES ('in','inbox','received','old@x.cn','demo@chinatelecom.cn',
+                 VALUES ('in','inbox','received','old@x.cn','unit.router@chinatelecom.cn',
                          '历史邮件','旧正文','历史 邮件','旧 正文',0,1,1)",
             [],
         )
         .unwrap();
     });
-    assert!(!state.store_is_empty(), "前置：库非空才走迁移分支");
-    state
-        .active_rounds
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    assert!(!state.store_is_empty(), "前置：库非空才走引导分支");
     let target = std::env::temp_dir().join(format!("mbx-wiz-first-fetch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target);
     let mut pairs = wizard_pairs(dir.to_str().unwrap());
     pairs.push(("data_dir", target.to_str().unwrap()));
-    route(
+    let resp = route(
         &state,
         &assets(),
         &req("POST", "/welcome/setup/save", &form(&pairs)),
@@ -5503,6 +5505,26 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
             imap_ok: true,
         },
     );
+    let text = body(&resp);
+    assert!(
+        resp.extra_headers
+            .iter()
+            .all(|(k, _)| k != "HX-Redirect"),
+        "引导分支不得跳转完成页"
+    );
+    assert!(text.contains("存储管理"), "应引导去设置页发起迁移：{text}");
+    assert!(
+        text.contains("清空数据目录"),
+        "应说明可清空目录重提完成向导：{text}"
+    );
+    assert!(state.configured(), "账号配置已保存（C6 半保存语义）");
+    assert_eq!(state.data_dir(), dir, "数据目录指针不得在向导内推进");
+    assert!(
+        !target.join("corpmail.db").exists(),
+        "向导内不得执行迁移（目标零产物）"
+    );
+    assert!(state.pending_data_dir().is_none(), "无待重启目录");
+    assert!(!state.migration_pending(), "未进入冻结期");
     let err = state
         .fetch_state
         .lock()
@@ -5511,7 +5533,7 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
         .clone();
     assert!(
         err.is_empty(),
-        "迁移待生效时不得触发首拉，避免写旧目录：{err}"
+        "引导分支停在向导页，不应触发首拉写旧目录：{err}"
     );
     state.clear_password("unit.router@chinatelecom.cn");
     let _ = std::fs::remove_dir_all(&target);

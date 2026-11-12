@@ -1950,6 +1950,82 @@ fn incomplete_migration_leftovers_are_recovered_but_foreign_db_is_rejected() {
     assert!(msg.contains("新目录"), "{msg}");
     assert!(dest.join("corpmail.db").exists());
     assert!(!dest.join(MIGRATION_MARKER).exists(), "成功后标记必须删除");
+    assert!(
+        dest.join(MIGRATION_DONE_MARKER).exists(),
+        "成功后必须写入终态哨兵（R3）"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migration_done_marker_prevents_recovery_from_deleting_migrated_data() {
+    // R3：成功迁移后 marker 删除失败（残留 incomplete + 新写 done）的目录，
+    // 再次成为迁移目标时 recover 只清标记、绝不删库/附件；
+    // 数据保留后由「目标已存在 corpmail.db」明确拒绝
+    let base = temp_dir("mig-done-guard");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+
+    let dest = base.join("moved");
+    std::fs::create_dir_all(dest.join("attachments/2026-01/1")).unwrap();
+    std::fs::write(dest.join("corpmail.db"), b"valid migrated db").unwrap();
+    std::fs::write(dest.join("attachments/2026-01/1/a.bin"), b"valid data").unwrap();
+    // 成功路径的产物：done 哨兵在场，incomplete marker 因删除失败残留
+    std::fs::write(dest.join(MIGRATION_DONE_MARKER), dest.to_string_lossy().as_bytes()).unwrap();
+    std::fs::write(dest.join(MIGRATION_MARKER), b"incomplete").unwrap();
+
+    let err = state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect_err("已含有效库的目标必须拒绝");
+    assert!(err.contains("corpmail.db"), "{err}");
+    // 数据必须原样保留（不可逆误删是 R3 的核心风险）
+    assert_eq!(
+        std::fs::read(dest.join("corpmail.db")).unwrap(),
+        b"valid migrated db"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("attachments/2026-01/1/a.bin")).unwrap(),
+        b"valid data"
+    );
+    // 两个标记都应被清掉
+    assert!(!dest.join(MIGRATION_MARKER).exists());
+    assert!(!dest.join(MIGRATION_DONE_MARKER).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+#[cfg(unix)]
+fn vacuum_failure_rolls_back_marker_and_snapshot() {
+    // R4：VACUUM INTO 失败必须走回滚块——marker 删除、半成品快照清掉、
+    // 错误如实上报，不能静默残留等下次自愈。
+    // 注入手法：dest/corpmail.db 指向不存在路径的 dangling 符号链接，
+    // exists() 跟随链接为 false（validate 放行），SQLite 打开写入时
+    // CANTOPEN → 快照失败
+    let base = temp_dir("mig-vacuum-fail");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+
+    let dest = base.join("moved");
+    std::fs::create_dir_all(&dest).unwrap();
+    let ghost = base.join("ghost-dir-not-exist");
+    std::os::unix::fs::symlink(ghost.join("corpmail.db"), dest.join("corpmail.db")).unwrap();
+
+    let err = state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect_err("VACUUM 必须失败");
+    assert!(err.contains("数据库快照失败"), "{err}");
+    // 回滚块收尾：dangling 链接本身也要清掉（remove_file 删链接，不是 exists() 先判）
+    assert!(
+        dest.join("corpmail.db").symlink_metadata().is_err(),
+        "半成品快照（含 dangling 链接）必须回滚删除"
+    );
+    assert!(
+        !dest.join(MIGRATION_MARKER).exists(),
+        "VACUUM 失败后不得残留 incomplete 标记（会放大 R3 误删面）"
+    );
+    assert!(!dest.join(MIGRATION_DONE_MARKER).exists());
     let _ = std::fs::remove_dir_all(&base);
 }
 

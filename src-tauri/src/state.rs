@@ -230,10 +230,16 @@ const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(
 /// 超过说明目录被污染或存在环，继续递归会栈溢出 / 无限循环
 const MAX_DIR_DEPTH: usize = 16;
 
-/// 迁移中断标记（审计 A8）：落盘开始前写入目标目录，成功后删除。进程被强杀
-/// 时它留在原地，下次 `validate_data_dir` 据此识别「上次未完成的本应用产物」
-/// 并安全清理，而不是笼统报「目标目录已存在 corpmail.db」。
+/// 迁移中断标记（审计 A8）：落盘开始前写入目标目录，成功后改写为终态哨兵。
+/// 进程被强杀时它留在原地，下次 `validate_data_dir` 据此识别「上次未完成的
+/// 本应用产物」并安全清理，而不是笼统报「目标目录已存在 corpmail.db」。
 const MIGRATION_MARKER: &str = ".corpmail-migration-incomplete";
+
+/// 迁移成功终态哨兵（复查审计 R3）：成功后写入目标目录。`recover` 见到它
+/// 就知道目录里的 `corpmail.db` / `attachments` 是**已完成的有效迁移产物**，
+/// 绝不能按半成品清理——防止「成功后 marker 删除失败、残留的 incomplete
+/// 标记把好库当半成品误删」这一不可逆事故。两个标记都清空后才算收尾。
+const MIGRATION_DONE_MARKER: &str = ".corpmail-migration-done";
 
 pub struct AppState {
     /// 数据库连接 + 数据目录，同一把锁绑定（审计 R19）。
@@ -794,10 +800,6 @@ impl AppState {
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
         emit("snapshot", "正在快照数据库…".into(), 0, None);
         let new_db = dest_path.join("corpmail.db");
-        self.with_conn(|conn| {
-            conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
-                .map_err(|e| format!("数据库快照失败：{e}"))
-        })?;
 
         // 2) 附件复制 + 3) 指针写入：任一步失败都回滚已产出物（快照库/附件副本），
         //    并恢复内存镜像中的指针——保证调用方（向导/存储页）原地重试不被
@@ -807,6 +809,12 @@ impl AppState {
         // 附件复制进度计数（copy_dir_recursive 递归内共享）
         let copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let migrated: Result<(), String> = (|| {
+            // 快照也走闭包（复查审计 R4）：VACUUM 失败原先在回滚块之前 `?` 返回，
+            // marker 与半成品快照库会静默残留；并入后由下面的精确回滚统一收尾
+            self.with_conn(|conn| {
+                conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
+                    .map_err(|e| format!("数据库快照失败：{e}"))
+            })?;
             if src_att.is_dir() {
                 let total = count_attachment_files(&src_att);
                 emit(
@@ -865,8 +873,11 @@ impl AppState {
             // 原有的附件会被连带删除（指针写入失败即触发，破坏不可逆）。
             // 删不掉的必须上报（A8），并保留 marker 供下次 validate 自愈。
             let mut rollback_errors = Vec::new();
-            if new_db.exists()
-                && let Err(rb) = std::fs::remove_file(&new_db)
+            // 直接 remove_file 而非先 exists()：VACUUM 失败可能留下 dangling
+            // 符号链接（exists() 跟随链接看不到），remove_file 对不存在文件
+            // 报 NotFound 可忽略（R4）
+            if let Err(rb) = std::fs::remove_file(&new_db)
+                && rb.kind() != std::io::ErrorKind::NotFound
             {
                 rollback_errors.push(format!("快照库 {}：{rb}", new_db.display()));
             }
@@ -891,7 +902,24 @@ impl AppState {
                 rollback_errors.join("；")
             ));
         }
-        let _ = std::fs::remove_file(&marker);
+        // R3（复查审计）：成功后不直接删 marker 了事——写入终态哨兵。若 marker
+        // 删除失败（磁盘错误/权限/占用），残留的 incomplete 标记会让
+        // recover_incomplete_migration 把**已迁移的库与附件**当半成品删掉；
+        // done 哨兵在场时 recover 只清标记、绝不碰数据。写哨兵失败要留痕
+        // （此时目录可写已过 probe，失败属罕见环境问题）
+        let done_marker = dest_path.join(MIGRATION_DONE_MARKER);
+        if let Err(e) = std::fs::write(&done_marker, dest_path.to_string_lossy().as_bytes()) {
+            eprintln!(
+                "[state] 迁移成功但终态哨兵写入失败（{}）：{e}",
+                done_marker.display()
+            );
+        }
+        if let Err(e) = std::fs::remove_file(&marker) {
+            eprintln!(
+                "[state] 迁移成功但中断标记删除失败（{}）：{e}（终态哨兵已写入，recover 只清标记不删数据）",
+                marker.display()
+            );
+        }
 
         Ok(())
     }
@@ -2224,9 +2252,38 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
 /// 自愈上次中断的迁移产物（审计 A8）。只有本应用写的 `MIGRATION_MARKER`
 /// 存在时才动手；`validate_data_dir` 本就要求目标不含 `corpmail.db` /
 /// `attachments`，因此带标记时这两处必定是上次迁移写出的，不会误伤用户文件。
+/// R3（复查审计）：`MIGRATION_DONE_MARKER` 在场 = 上次迁移**已成功**（marker
+/// 删除失败的残留），库与附件是有效数据——只清两个标记，绝不删数据。
 fn recover_incomplete_migration(dest: &Path) -> Result<(), String> {
     let marker = dest.join(MIGRATION_MARKER);
+    let done = dest.join(MIGRATION_DONE_MARKER);
     if !marker.exists() {
+        // 无 incomplete 标记：顺手清掉孤立的 done 哨兵（上次成功迁移后目录
+        // 未被复用，哨兵失去意义；清不掉只留痕，不影响判定）
+        if done.exists()
+            && let Err(e) = std::fs::remove_file(&done)
+        {
+            eprintln!("[state] 终态哨兵清理失败（{}）：{e}", done.display());
+        }
+        return Ok(());
+    }
+    if done.exists() {
+        // 迁移成功过：只清标记，数据必须保留。清不掉要报错——不能带着
+        // incomplete 标记放行，否则下次会被当半成品清理
+        let mut errs = Vec::new();
+        if let Err(e) = std::fs::remove_file(&marker) {
+            errs.push(format!("迁移标记清理失败（{}）：{e}", marker.display()));
+        }
+        if let Err(e) = std::fs::remove_file(&done) {
+            errs.push(format!("终态哨兵清理失败（{}）：{e}", done.display()));
+        }
+        if !errs.is_empty() {
+            return Err(errs.join("；"));
+        }
+        eprintln!(
+            "[state] 目标目录为已完成的迁移（终态哨兵在场），仅清理标记：{}",
+            dest.display()
+        );
         return Ok(());
     }
     let db = dest.join("corpmail.db");

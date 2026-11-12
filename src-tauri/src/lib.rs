@@ -159,14 +159,18 @@ pub fn run() {
                                     Ok(msg) => {
                                         // A10/A11：完整成功文案（新目录路径、旧备份可删）
                                         // 交给前端显示，并写明「未自动退出请手动重启」兜底。
-                                        // 先给前端 1.5s 渲染，再置停止位让常驻线程收手，
-                                        // 最后才关闭窗口：避免退出瞬间与它们抢 SQLite 写锁。
+                                        // R1（复查审计）：停止位只由 app.run 的
+                                        // ExitRequested|Exit 置位（那里 R62 已有）；
+                                        // 这里不再手动 request_shutdown——SHUTDOWN 无复位
+                                        // 路径，若 exit(0) 未终止事件循环，提前置位会让
+                                        // 四个常驻线程停在检查点不再恢复（僵尸态）。
+                                        // exit 触发退出事件时自然置位，常驻线程与退出
+                                        // 之间仍隔着 1.5s 的 wait_or_stop 缓冲。
                                         let _ = app.emit("migration-done", msg);
                                         if wait_or_stop(
                                             std::time::Duration::from_millis(1500),
                                             std::time::Duration::from_millis(100),
                                         ) {
-                                            request_shutdown();
                                             app.exit(0);
                                         }
                                     }
