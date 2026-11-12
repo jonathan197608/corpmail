@@ -1885,3 +1885,90 @@ fn background_executor_completes_full_migration_with_early_freeze() {
     assert!(state.migration_pending(), "迁移成功后冻结应保持到重启");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn migration_progress_is_throttled_for_many_attachments() {
+    // A7：300 个附件不能打出 300 次进度事件；末值必须补齐
+    let base = temp_dir("mig-throttle");
+    let anchor = base.join("anchor");
+    let att = anchor.join("attachments/2026-01/1");
+    std::fs::create_dir_all(&att).unwrap();
+    for i in 0..300 {
+        std::fs::write(att.join(format!("f{i}")), b"x").unwrap();
+    }
+    let state = AppState::open(&anchor);
+    let events = Mutex::new(Vec::<(String, usize, Option<usize>)>::new());
+    let dest = base.join("moved");
+    state
+        .move_data_dir_progress(dest.to_str().unwrap(), &|p: &MigrationProgress| {
+            events
+                .lock()
+                .unwrap()
+                .push((p.phase.to_string(), p.files_done, p.files_total));
+        })
+        .unwrap();
+    let events = events.into_inner().unwrap();
+    let att_events: Vec<_> = events
+        .iter()
+        .filter(|(phase, _, _)| phase == "attachments")
+        .collect();
+    assert!(
+        att_events.len() <= 20,
+        "进度事件应节流，实际 {} 条",
+        att_events.len()
+    );
+    assert_eq!(
+        att_events.last().map(|(_, done, _)| *done),
+        Some(300),
+        "末次事件必须补齐终值"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn incomplete_migration_leftovers_are_recovered_but_foreign_db_is_rejected() {
+    // A8：带本应用标记 → 自动清理后重试成功；无标记的用户库 → 仍然拒绝
+    let base = temp_dir("mig-leftover");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+
+    let occupied = base.join("occupied");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("corpmail.db"), b"not ours").unwrap();
+    let err = state
+        .move_data_dir(occupied.to_str().unwrap())
+        .expect_err("无标记的既有库必须拒绝");
+    assert!(err.contains("corpmail.db"), "{err}");
+
+    let dest = base.join("moved");
+    std::fs::create_dir_all(dest.join("attachments")).unwrap();
+    std::fs::write(dest.join("corpmail.db"), b"stale snapshot").unwrap();
+    std::fs::write(dest.join("attachments/stale"), b"x").unwrap();
+    std::fs::write(dest.join(MIGRATION_MARKER), b"incomplete").unwrap();
+    let msg = state.move_data_dir(dest.to_str().unwrap()).unwrap();
+    assert!(msg.contains("新目录"), "{msg}");
+    assert!(dest.join("corpmail.db").exists());
+    assert!(!dest.join(MIGRATION_MARKER).exists(), "成功后标记必须删除");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn storage_stats_cache_covers_attachment_dir_scan() {
+    // A9：TTL 内命中缓存（附件目录不再重复递归）；失效后重新统计
+    let base = temp_dir("mig-stats-cache");
+    let anchor = base.join("anchor");
+    let att = anchor.join("attachments");
+    std::fs::create_dir_all(&att).unwrap();
+    std::fs::write(att.join("a"), b"12345").unwrap();
+    let state = AppState::open(&anchor);
+    let (_, _, first) = state.storage_stats();
+    assert_eq!(first, (5, 1));
+    std::fs::write(att.join("b"), b"1234567").unwrap();
+    let (_, _, cached) = state.storage_stats();
+    assert_eq!(cached, first, "TTL 内必须命中缓存");
+    state.invalidate_stats_cache();
+    let (_, _, fresh) = state.storage_stats();
+    assert_eq!(fresh, (12, 2), "失效后应重新扫描");
+    let _ = std::fs::remove_dir_all(&base);
+}

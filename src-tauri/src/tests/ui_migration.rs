@@ -84,3 +84,13 @@ fn background_thread_holds_the_migration_guard() {
         "线程创建失败必须能回传 Err 供 start_migration 复位"
     );
 }
+
+#[test]
+fn storage_pane_uses_cached_attachment_stats() {
+    // A9：不能在每个 tab 的 settings_ctx 里重新全目录递归
+    assert!(
+        !SETTINGS_RS.contains("state.attachments_stats()"),
+        "附件占用必须走 storage_stats 缓存"
+    );
+    assert!(SETTINGS_RS.contains("storage_stats"));
+}

@@ -210,11 +210,23 @@ struct StorageStatsCache {
     at: std::time::Instant,
     estimate: crate::clean::Estimate,
     backup: Option<(u64, u64)>,
+    /// 附件目录占用（审计 A9）：`dir_stats` 是全目录递归，原先每次打开任意
+    /// 设置页都跑一遍，不在缓存里等于没优化
+    attach: (u64, u64),
 }
 
 /// 存储页统计缓存有效期：库量会随收件变化，给短 TTL 容忍短暂旧值，
 /// 换取打开存储页/迁移返回不重复全库扫描
 const STORAGE_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 附件复制进度的最小回传间隔（审计 A7）：按文件逐个 emit 会在 10 万附件量级
+/// 打出 10 万次 IPC + DOM 写，反而拖住前端。最后一个文件强制补齐终值。
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 迁移中断标记（审计 A8）：落盘开始前写入目标目录，成功后删除。进程被强杀
+/// 时它留在原地，下次 `validate_data_dir` 据此识别「上次未完成的本应用产物」
+/// 并安全清理，而不是笼统报「目标目录已存在 corpmail.db」。
+const MIGRATION_MARKER: &str = ".corpmail-migration-incomplete";
 
 pub struct AppState {
     /// 数据库连接 + 数据目录，同一把锁绑定（审计 R19）。
@@ -724,6 +736,36 @@ impl AppState {
                 });
             }
         };
+        // 附件阶段按时间节流（A7）；锁外调 cb，避免 emit 期间占着锁
+        let last_emit = Mutex::new(
+            std::time::Instant::now()
+                .checked_sub(PROGRESS_THROTTLE)
+                .unwrap_or_else(std::time::Instant::now),
+        );
+        let emit_files = |done: usize, total: usize| {
+            if let Some(cb) = cb {
+                let now = std::time::Instant::now();
+                let should_emit = {
+                    let mut last = last_emit.lock().unwrap_or_else(|e| e.into_inner());
+                    if done < total && now.duration_since(*last) < PROGRESS_THROTTLE {
+                        false
+                    } else {
+                        *last = now;
+                        true
+                    }
+                };
+                if should_emit {
+                    cb(&MigrationProgress {
+                        phase: "attachments",
+                        detail: format!("复制附件 {done}/{total}"),
+                        files_done: done,
+                        files_total: Some(total),
+                    });
+                }
+            }
+        };
+        let marker = dest_path.join(MIGRATION_MARKER);
+        std::fs::write(&marker, b"incomplete").map_err(|e| format!("迁移标记写入失败：{e}"))?;
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
         emit("snapshot", "正在快照数据库…".into(), 0, None);
         let new_db = dest_path.join("corpmail.db");
@@ -755,7 +797,7 @@ impl AppState {
                     &mut written,
                     &copied,
                     total,
-                    cb,
+                    &emit_files,
                 )
                 .map_err(|e| format!("附件目录复制失败：{e}"))?;
             }
@@ -790,16 +832,38 @@ impl AppState {
             })
         })();
         if let Err(e) = migrated {
-            let _ = std::fs::remove_file(&new_db);
             // 精确回滚：只删本次复制出的文件，再回收本次创建的空目录。
             // 旧实现对 dest/attachments 直接 remove_dir_all——目标目录里用户
-            // 原有的附件会被连带删除（指针写入失败即触发，破坏不可逆）
+            // 原有的附件会被连带删除（指针写入失败即触发，破坏不可逆）。
+            // 删不掉的必须上报（A8），并保留 marker 供下次 validate 自愈。
+            let mut rollback_errors = Vec::new();
+            if new_db.exists()
+                && let Err(rb) = std::fs::remove_file(&new_db)
+            {
+                rollback_errors.push(format!("快照库 {}：{rb}", new_db.display()));
+            }
             for f in &written {
-                let _ = std::fs::remove_file(f);
+                if f.exists()
+                    && let Err(rb) = std::fs::remove_file(f)
+                {
+                    rollback_errors.push(format!("附件 {}：{rb}", f.display()));
+                }
             }
             crate::mail::prune_empty_dirs(&dest_path.join("attachments"));
-            return Err(e);
+            if rollback_errors.is_empty() {
+                let _ = std::fs::remove_file(&marker);
+                return Err(e);
+            }
+            eprintln!(
+                "[state] 迁移回滚未完成，保留标记供下次自愈：{}",
+                marker.display()
+            );
+            return Err(format!(
+                "{e}；回滚未完成：{}（下次重试会自动清理残留）",
+                rollback_errors.join("；")
+            ));
         }
+        let _ = std::fs::remove_file(&marker);
 
         Ok(())
     }
@@ -1182,9 +1246,15 @@ impl AppState {
         }
     }
 
-    /// 存储页统计（clean::estimate + 旧目录备份）：短 TTL 缓存，避免每次打开
-    /// 存储页/迁移返回时重复全库扫描（大库下全库扫描可达秒级）
-    pub fn storage_stats(&self) -> (crate::clean::Estimate, Option<(u64, u64)>) {
+    /// 存储页统计（clean::estimate + 旧目录备份 + 附件占用）：短 TTL 缓存，
+    /// 避免每次打开存储页/迁移返回时重复全库扫描（大库下可达秒级）
+    pub fn storage_stats(
+        &self,
+    ) -> (
+        crate::clean::Estimate,
+        Option<(u64, u64)>,
+        (u64, u64),
+    ) {
         let now = std::time::Instant::now();
         if let Some(c) = self
             .stats_cache
@@ -1193,10 +1263,11 @@ impl AppState {
             .as_ref()
             && now.duration_since(c.at) < STORAGE_STATS_CACHE_TTL
         {
-            return (c.estimate.clone(), c.backup);
+            return (c.estimate.clone(), c.backup, c.attach);
         }
         let estimate = crate::clean::estimate(self);
         let backup = self.old_backup_stats();
+        let attach = self.attachments_stats();
         self.stats_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1204,8 +1275,9 @@ impl AppState {
                 at: now,
                 estimate: estimate.clone(),
                 backup,
+                attach,
             });
-        (estimate, backup)
+        (estimate, backup, attach)
     }
 
     /// 存储统计变化（清理/迁移）后失效缓存，下次打开重新计算
@@ -2091,13 +2163,16 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
     if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
         return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
     }
+    std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
+    // A8：上次进程被强杀留下的半成品，凭本应用自己写的标记安全清理。
+    // 必须放在「目标须为空」检查之前，否则用户会被「请选择空目录」卡死在原目录
+    recover_incomplete_migration(&dest_path)?;
     if dest_path.join("corpmail.db").exists() {
         return Err("目标目录已存在 corpmail.db，请选择空目录".into());
     }
     if dest_path.join("attachments").exists() {
         return Err("目标目录已存在 attachments 目录，为免与已有文件混同请选择空目录".into());
     }
-    std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
     let probe = dest_path.join(".corpmail-write-probe");
     // 上次进程在清理前被杀可能残留探针：先自愈清理，失败不得静默
     if probe.exists()
@@ -2110,6 +2185,30 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
         eprintln!("[state] 写入探针清理失败（{}）：{e}", probe.display());
     }
     Ok(dest_path)
+}
+
+/// 自愈上次中断的迁移产物（审计 A8）。只有本应用写的 `MIGRATION_MARKER`
+/// 存在时才动手；`validate_data_dir` 本就要求目标不含 `corpmail.db` /
+/// `attachments`，因此带标记时这两处必定是上次迁移写出的，不会误伤用户文件。
+fn recover_incomplete_migration(dest: &Path) -> Result<(), String> {
+    let marker = dest.join(MIGRATION_MARKER);
+    if !marker.exists() {
+        return Ok(());
+    }
+    let db = dest.join("corpmail.db");
+    if db.exists() {
+        std::fs::remove_file(&db)
+            .map_err(|e| format!("上次迁移残留库清理失败（{}）：{e}", db.display()))?;
+    }
+    let att = dest.join("attachments");
+    if att.is_dir() {
+        std::fs::remove_dir_all(&att)
+            .map_err(|e| format!("上次迁移残留附件清理失败（{}）：{e}", att.display()))?;
+    }
+    std::fs::remove_file(&marker)
+        .map_err(|e| format!("迁移标记清理失败（{}）：{e}", marker.display()))?;
+    eprintln!("[state] 已清理上次未完成的迁移残留：{}", dest.display());
+    Ok(())
 }
 
 /// 数据目录目标路径归一化：去首尾空白与尾斜杠（Windows "C:" 盘符根带反斜杠
@@ -2270,7 +2369,7 @@ fn copy_dir_recursive(
     written: &mut Vec<PathBuf>,
     copied: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     total: usize,
-    cb: Option<&(dyn Fn(&MigrationProgress) + Sync)>,
+    emit_files: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("创建目录失败：{e}"))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
@@ -2280,18 +2379,12 @@ fn copy_dir_recursive(
             .map_err(|e| format!("读取类型失败：{e}"))?;
         let to = dest.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &to, written, copied, total, cb)?;
+            copy_dir_recursive(&entry.path(), &to, written, copied, total, emit_files)?;
         } else {
             std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
             let n = copied.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if let Some(cb) = cb {
-                cb(&MigrationProgress {
-                    phase: "attachments",
-                    detail: format!("复制附件 {n}/{total}"),
-                    files_done: n,
-                    files_total: Some(total),
-                });
-            }
+            // 节流策略在调用方闭包里（A7）：这里只报当前计数
+            emit_files(n, total);
             written.push(to);
         }
     }

@@ -136,13 +136,13 @@ pub(super) fn settings_ctx(
     clean: Option<CleanView>,
     backup: Option<BackupDeleteView>,
 ) -> SettingsCtx {
-    // 存储页统计（estimate + 旧目录备份）一次取回（带缓存，避免打开存储页反复
-    // 全库扫描）；其他 tab 不触发。迁移后台分支也走同一缓存避免返回时扫描
+    // 存储页统计（estimate + 旧目录备份 + 附件占用）一次取回（带缓存，避免打开
+    // 存储页反复全库扫描）；其他 tab 不触发。迁移后台分支也走同一缓存避免返回时扫描
     let storage_stats = (tab == "storage").then(|| state.storage_stats());
     // M5 旧目录迁移备份：仅存储 tab（锚点附件）
     let (has_backup, backup_size, backup_files) = match storage_stats.as_ref() {
-        Some((_, Some((b, n)))) => (true, human_bytes(*b), *n),
-        Some((_, None)) => (false, String::new(), 0),
+        Some((_, Some((b, n)), _)) => (true, human_bytes(*b), *n),
+        Some((_, None, _)) => (false, String::new(), 0),
         None => (false, String::new(), 0),
     };
     let d = defaults();
@@ -150,7 +150,7 @@ pub(super) fn settings_ctx(
     let counts = state.folder_counts();
     // M5 清理预估：仅存储 tab（含孤儿 fs 扫描，其他 tab 免开销）
     let (est_bytes, est_detail, can_clean) = match storage_stats.as_ref() {
-        Some((est, _)) => {
+        Some((est, _, _)) => {
             let mut parts: Vec<String> = Vec::new();
             if est.detach_files > 0 {
                 parts.push(format!("大附件 {} 个", est.detach_files));
@@ -169,7 +169,12 @@ pub(super) fn settings_ctx(
         }
         None => (human_bytes(0), String::new(), false),
     };
-    let (attach_bytes, attach_files) = state.attachments_stats();
+    // A9：附件占用跟着统计缓存走，非 storage tab 不再全目录递归（这些数值
+    // 只在存储 pane 渲染）。`db_size_bytes` 只是 metadata，保留每次读取。
+    let (attach_bytes, attach_files) = storage_stats
+        .as_ref()
+        .map(|(_, _, a)| *a)
+        .unwrap_or((0, 0));
     let db_bytes = state.db_size_bytes();
     let total = db_bytes + attach_bytes;
     // 空库时两段占比均为 0（不能把 100% 错记到附件段）
