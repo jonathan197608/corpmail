@@ -164,6 +164,47 @@ pub enum MigrateOutcome {
     Background,
 }
 
+/// 后台迁移「进行中」标志的 RAII 复位（审计 A5）。后台线程持有它，
+/// 任何提前 return / panic 展开都会 Drop，标志不会永久卡在 true。
+pub struct MigrationGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        self.0
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 迁移冻结位的 RAII 复位（审计 A5）：构造即冻结，只有落盘成功后 `keep()`
+/// 才把冻结保留到重启；任何失败或 panic 展开都自动解冻，用户可原地重试。
+struct FreezeGuard<'a> {
+    state: &'a AppState,
+    keep: bool,
+}
+
+impl<'a> FreezeGuard<'a> {
+    fn new(state: &'a AppState) -> Self {
+        state
+            .migration_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Self { state, keep: false }
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for FreezeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.state
+                .migration_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// 存储页统计缓存项（clean::estimate + 旧目录备份，避免反复全库扫描）
 struct StorageStatsCache {
     at: std::time::Instant,
@@ -523,34 +564,32 @@ impl AppState {
         dest: &str,
         cb: &(dyn Fn(&MigrationProgress) + Sync),
     ) -> Result<String, String> {
-        // 已迁移待重启：再迁一次没有意义（新快照会覆盖目标库，且旧库仍在被本进程写）
-        if self.migration_pending() {
+        // 已迁移待重启：再迁一次没有意义（新快照会覆盖目标库，且旧库仍在被本进程写）。
+        // 例外：`migration_in_progress` 为 true 说明冻结位是本次后台迁移在协议线程
+        // 里提前置的（审计 A6），不是上一次遗留的待重启状态，允许继续。
+        if self.migration_pending() && !self.migration_in_progress() {
             return Err(MIGRATION_PENDING_MSG.into());
         }
-        let cur = self.data_dir();
-        let dest_path = validate_data_dir(&cur, dest)?;
         // 冻结写入（R2）：置位后新的收件轮 / 发送派发 / HTTP 写请求一律被挡，
         // 再等正在跑的收件轮收尾——此后 VACUUM INTO 的快照就是一致终点。
-        // 任何失败路径都必须清位，否则 UI 会停在"请重启"却并没有完成迁移
+        // FreezeGuard 覆盖此后所有失败路径（含进度回调 panic）：未 keep 即解冻，
+        // 否则 UI 会停在"请重启"却并没有完成迁移
+        let mut freeze = FreezeGuard::new(self);
+        let cur = self.data_dir();
+        let dest_path = validate_data_dir(&cur, dest)?;
         cb(&MigrationProgress {
             phase: "attach",
             detail: "等待当前收取结束…".into(),
             files_done: 0,
             files_total: None,
         });
-        self.migration_pending
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         if !self.wait_fetch_idle(MIGRATION_FETCH_WAIT) {
-            self.migration_pending
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err("正在收取邮件，请等本轮收件结束后再迁移".into());
         }
-        if let Err(e) = self.migrate_snapshot(&cur, &dest_path, Some(cb)) {
-            // 迁移失败：解冻，让用户继续正常使用旧目录
-            self.migration_pending
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err(e);
-        }
+        // 落盘失败由 FreezeGuard 自动解冻，调用方只需透传错误
+        self.migrate_snapshot(&cur, &dest_path, Some(cb))?;
+        // 落盘已完成、指针已写：冻结必须保留到重启（R2）
+        freeze.keep();
         Ok(format!(
             "数据已迁移到新目录，请重启应用后继续使用（重启前的一切修改都不会保存）。旧目录中若有邮件数据，\
              其备份可在 设置 → 存储管理 中手动删除（旧目录无邮件时重启后将自动清理）。新目录：{}",
@@ -584,6 +623,11 @@ impl AppState {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// 取「进行中」标志的 RAII 复位器：后台线程开头持有，panic 也能复位（审计 A5）
+    pub fn migration_guard(&self) -> MigrationGuard {
+        MigrationGuard(std::sync::Arc::clone(&self.migration_in_progress))
+    }
+
     /// 启动数据目录迁移。
     /// - 已注入 executor（生产）→ 后台执行，立即返回 `Background`（协议回调据此秒回，
     ///   进度/结果经事件回传前端）；
@@ -595,33 +639,55 @@ impl AppState {
         if dest.trim().is_empty() {
             return Err("未选择目标目录".into());
         }
-        if self.migration_pending() {
-            return Err(MIGRATION_PENDING_MSG.into());
-        }
+        // 「后台正在跑」优先于「已迁移待重启」：A6 在协议线程提前置了冻结位，
+        // 重复点击时用户该看到「进行中」，而不是误导性的「请重启」
         if self.migration_in_progress() {
             return Err("数据迁移正在进行中，请稍候…".into());
         }
-        // 预校验目标目录（executor 后台线程内会再校验一次，幂等）
-        validate_data_dir(&self.data_dir(), dest)?;
+        if self.migration_pending() {
+            return Err(MIGRATION_PENDING_MSG.into());
+        }
+        // 读取执行器：未注入（单元测试 / e2e）走同步；注入了（生产）才需要判占与提前冻结
         let exec = self
             .migration_executor
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(exec) = exec {
-            // 后台：先置进行中，交给 executor 闭包（内部 spawn 线程 + 事件回传）
-            self.migration_in_progress
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Err(e) = exec(dest) {
-                self.mark_migration_finished();
-                return Err(e);
-            }
-            Ok(MigrateOutcome::Background)
-        } else {
-            // 同步（测试）：保持既有行为
+        let Some(exec) = exec else {
+            // 同步（测试 / e2e）：保持既有行为，不占后台标志
             self.move_data_dir(dest)?;
-            Ok(MigrateOutcome::Done)
+            return Ok(MigrateOutcome::Done);
+        };
+        // A4：原子判占。旧实现 load + store 之间隔着 validate，两个并发协议回调
+        // 可同时通过 → 两次 spawn 打同一目标库并互删回滚产物。
+        if self
+            .migration_in_progress
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err("数据迁移正在进行中，请稍候…".into());
         }
+        // A6：在协议线程内立即冻结。旧实现要等后台线程调度到 migrate_impl 才置位，
+        // 这段窗口内通过路由的写请求会落旧库、赶不上 VACUUM INTO 快照。
+        self.migration_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = (|| {
+            validate_data_dir(&self.data_dir(), dest)?;
+            exec(dest)
+        })();
+        if let Err(e) = started {
+            // 启动失败：两个标志都复位，用户可原地重试（成功的复位由后台线程 guard 负责）
+            self.migration_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.mark_migration_finished();
+            return Err(e);
+        }
+        Ok(MigrateOutcome::Background)
     }
 
     /// 等待在跑的收件轮收尾（迁移前调用）。收件线程每轮开头会检查冻结位并主动退出，

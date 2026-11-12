@@ -1752,3 +1752,136 @@ fn move_data_dir_progress_reports_phases() {
     assert!(dest.join("corpmail.db").exists(), "库应已迁走");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn start_migration_concurrent_only_one_background() {
+    // A4：两个协议回调同时进来，compare_exchange 必须只放行一个。
+    // 旧实现 load + store 之间隔着 validate，两个线程可同时通过 → 双 VACUUM。
+    let base = temp_dir("mig-concurrent");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = std::sync::Arc::new(AppState::open(&anchor));
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let dest = base.join("moved");
+    let dest_str = dest.to_str().unwrap().to_string();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results = Mutex::new(Vec::<bool>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let s = std::sync::Arc::clone(&state);
+            let d = dest_str.clone();
+            let b = std::sync::Arc::clone(&barrier);
+            let r = &results;
+            scope.spawn(move || {
+                b.wait();
+                let out = s.start_migration(&d);
+                r.lock()
+                    .unwrap()
+                    .push(matches!(out, Ok(MigrateOutcome::Background)));
+            });
+        }
+    });
+    let ok_count = results
+        .into_inner()
+        .unwrap()
+        .iter()
+        .filter(|started| **started)
+        .count();
+    assert_eq!(ok_count, 1, "并发只允许一个后台迁移启动");
+    assert!(state.migration_in_progress());
+    state.mark_migration_finished();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn start_migration_background_freezes_before_return() {
+    // A6：返回 Background 时冻结位必须已在协议线程置好，
+    // 不能等后台线程调度到 migrate_impl——那段窗口内的写会落旧库且赶不上快照
+    let base = temp_dir("mig-freeze-early");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let dest = base.join("moved");
+    let out = state.start_migration(dest.to_str().unwrap()).unwrap();
+    assert!(matches!(out, MigrateOutcome::Background));
+    assert!(state.migration_pending(), "返回时冻结位必须已置");
+    assert!(state.migration_in_progress());
+    state.mark_migration_finished();
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migration_guards_reset_flags_on_panic() {
+    // A5：后台线程在进度回调里 panic，两个 RAII guard 都必须复位，
+    // 否则应用永久只读 + 迁移永久提示「进行中」
+    let base = temp_dir("mig-panic");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state
+        .migration_in_progress
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let dest = base.join("moved");
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = state.migration_guard();
+        state
+            .move_data_dir_progress(dest.to_str().unwrap(), &|_p| {
+                if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    panic!("progress callback boom");
+                }
+            })
+            .map(|_| ())
+    }));
+    assert!(out.is_err(), "回调 panic 应沿栈展开");
+    assert!(
+        !state.migration_in_progress(),
+        "MigrationGuard 必须复位进行中标志"
+    );
+    assert!(!state.migration_pending(), "FreezeGuard 必须解冻");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn background_executor_completes_full_migration_with_early_freeze() {
+    // A3/A6：模拟生产后台线程（注入 executor + 提前冻结）跑完整落盘链，
+    // 验证 migrate_impl 认得「本次自己置的冻结位」、事件序列完整、guard 复位。
+    // lib.rs 的 Tauri emit/exit 本身需运行时，由 ui_migration.rs 静态断言钉住。
+    let base = temp_dir("mig-bg-full");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = std::sync::Arc::new(AppState::open(&anchor));
+    let events = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+    let worker = std::sync::Arc::clone(&state);
+    let sink = std::sync::Arc::clone(&events);
+    state.set_migration_executor(std::sync::Arc::new(move |dest: &str| {
+        let _guard = worker.migration_guard();
+        let result = worker.move_data_dir_progress(dest, &|p: &MigrationProgress| {
+            sink.lock().unwrap().push(p.phase.to_string());
+        });
+        let mut ev = sink.lock().unwrap();
+        match result {
+            Ok(_) => ev.push("done".into()),
+            Err(e) => ev.push(format!("error:{e}")),
+        }
+        Ok(())
+    }));
+    let dest = base.join("moved");
+    let out = state.start_migration(dest.to_str().unwrap()).unwrap();
+    assert!(matches!(out, MigrateOutcome::Background));
+    {
+        let ev = events.lock().unwrap();
+        for need in ["attach", "snapshot", "pointer"] {
+            assert!(ev.iter().any(|p| p == need), "进度缺 {need}：{ev:?}");
+        }
+        assert_eq!(ev.last().map(String::as_str), Some("done"));
+    }
+    assert!(dest.join("corpmail.db").exists(), "后台链必须真的落盘");
+    assert!(!state.migration_in_progress(), "guard 必须复位进行中标志");
+    assert!(state.migration_pending(), "迁移成功后冻结应保持到重启");
+    let _ = std::fs::remove_dir_all(&base);
+}

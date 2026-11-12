@@ -71,3 +71,16 @@ fn migration_unlisten_is_registered_before_first_await() {
     let first_await = APP_JS[listen..].find("await add(").expect("存在注册 await");
     assert!(assign < first_await, "解绑收集器必须先于首个 await 赋值");
 }
+
+#[test]
+fn background_thread_holds_the_migration_guard() {
+    // A5：生产后台线程必须持有 RAII guard，否则 panic 会把进行中标志卡死
+    assert!(
+        LIB_RS.contains("let _guard = s.migration_guard();"),
+        "后台线程开头必须取 MigrationGuard"
+    );
+    assert!(
+        LIB_RS.contains("std::thread::Builder::new()"),
+        "线程创建失败必须能回传 Err 供 start_migration 复位"
+    );
+}

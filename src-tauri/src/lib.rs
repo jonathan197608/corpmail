@@ -146,28 +146,31 @@ pub fn run() {
                     .set_migration_executor(std::sync::Arc::new(move |dest| {
                         let app = handle.clone();
                         let dest = dest.to_string();
-                        std::thread::spawn(move || {
-                            let s = app.state::<state::AppState>();
-                            let result =
-                                s.move_data_dir_progress(&dest, &|p: &state::MigrationProgress| {
+                        std::thread::Builder::new()
+                            .name("corpmail-migration".into())
+                            .spawn(move || {
+                                let s = app.state::<state::AppState>();
+                                // A5：RAII 复位「进行中」，panic 展开也不会把标志卡死
+                                let _guard = s.migration_guard();
+                                let result = s.move_data_dir_progress(&dest, &|p: &state::MigrationProgress| {
                                     let _ = app.emit("migration-progress", p);
                                 });
-                            match result {
-                                Ok(msg) => {
-                                    // 迁移完成：先提示前端（模态显示"即将退出"），
-                                    // 短暂停留后自动退出，用户重开即用新目录
-                                    let _ = app.emit("migration-done", msg);
-                                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                                    app.exit(0);
+                                match result {
+                                    Ok(msg) => {
+                                        // 迁移完成：先提示前端（模态显示"即将退出"），
+                                        // 短暂停留后自动退出，用户重开即用新目录
+                                        let _ = app.emit("migration-done", msg);
+                                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                                        app.exit(0);
+                                    }
+                                    Err(e) => {
+                                        // 迁移失败：解冻由 FreezeGuard 完成，回传错误
+                                        let _ = app.emit("migration-error", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    // 迁移失败：解冻已完成（move_data_dir 内部），回传错误
-                                    let _ = app.emit("migration-error", e);
-                                }
-                            }
-                            s.mark_migration_finished();
-                        });
-                        Ok(())
+                            })
+                            .map(|_| ())
+                            .map_err(|e| format!("后台迁移线程启动失败：{e}"))
                     }));
             }
 
