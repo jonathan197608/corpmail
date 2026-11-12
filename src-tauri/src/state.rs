@@ -139,7 +139,9 @@ struct Store {
 }
 
 /// 迁移进度快照（后台迁移期间经事件回传前端展示）。
-/// phase 语义：`attach`=等待收件收尾 `snapshot`=数据库快照(VACUUM) `attachments`=附件复制 `pointer`=写指针 `done`
+/// phase 语义：`attach`=等待收件收尾 `snapshot`=数据库快照(VACUUM) `attachments`=附件复制
+/// `pointer`=写指针。**没有 `done` 阶段**：100% 由 `migration-done` 事件直接驱动
+/// （R17：前端曾留 `case 'done'` 死分支，已删）
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MigrationProgress {
     pub phase: &'static str,
@@ -193,6 +195,13 @@ impl<'a> FreezeGuard<'a> {
         let prev = state
             .migration_pending
             .swap(true, std::sync::atomic::Ordering::SeqCst);
+        // R15：新一次迁移开始（prev=false）要把「已提交」位清零，否则上一轮的
+        // 成功终态会让本轮失败者不敢解冻。prev=true 的并发后来者不得清零
+        if !prev {
+            state
+                .migration_committed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         let owns = !prev || state.migration_in_progress();
         Self {
             state,
@@ -208,12 +217,22 @@ impl<'a> FreezeGuard<'a> {
         self.state
             .migration_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // R15：落「已提交」位——此后任何 owns 的 guard（哪怕是先到者）Drop
+        // 都不得把这次成功的冻结清掉（反向顺序：先 keep 后 drop 旧 guard）
+        self.state
+            .migration_committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl Drop for FreezeGuard<'_> {
     fn drop(&mut self) {
-        if !self.keep && self.owns {
+        // R15：已提交的冻结位不可被任何 guard 复位（无论 Drop 顺序）
+        let committed = self
+            .state
+            .migration_committed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !self.keep && self.owns && !committed {
             self.state
                 .migration_pending
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -256,6 +275,10 @@ const MIGRATION_MARKER: &str = ".corpmail-migration-incomplete";
 /// 绝不能按半成品清理——防止「成功后 marker 删除失败、残留的 incomplete
 /// 标记把好库当半成品误删」这一不可逆事故。两个标记都清空后才算收尾。
 const MIGRATION_DONE_MARKER: &str = ".corpmail-migration-done";
+
+/// 迁移目标记录（审计 R16）：迁移开始时写进锚点目录，进程被强杀后下次启动
+/// 据此找到「无主残留」目录并清扫。启动时读一次即删，不参与配置、不随数据迁移。
+const MIGRATION_TARGET_FILE: &str = ".corpmail-migration-target";
 
 pub struct AppState {
     /// 数据库连接 + 数据目录，同一把锁绑定（审计 R19）。
@@ -310,6 +333,10 @@ pub struct AppState {
     migration_executor: Mutex<Option<MigrationExecutor>>,
     /// 后台迁移进行中（幂等防重复触发；进程内跨线程可见）
     migration_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 本次迁移是否已提交（R15）：`keep()` 置位，此后任何 FreezeGuard 的 Drop
+    /// 都不得复位冻结位——与 Drop 顺序无关（生产由 CAS 串行化，理论上不可达，
+    /// 但把「终态必冻结」做成结构不变量比依赖顺序更可靠）
+    migration_committed: std::sync::atomic::AtomicBool,
     /// 存储页统计缓存（estimate + 旧目录备份；避免每次打开存储页反复全库扫描）
     stats_cache: Mutex<Option<StorageStatsCache>>,
 }
@@ -564,10 +591,13 @@ impl AppState {
             counts_cache: Mutex::new(None),
             migration_executor: Mutex::new(None),
             migration_in_progress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            migration_committed: std::sync::atomic::AtomicBool::new(false),
             stats_cache: Mutex::new(None),
         };
         // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
         state.try_auto_clean_empty_old_backup();
+        // R16：上次进程若在迁移中途被强杀，目标目录留有未完成的残副本，此处清扫
+        state.cleanup_stale_migration_target();
         // 重装/换机沿用既有数据目录：启动时库里已有发件箱邮件，配置中显示名
         // 却为空 → 立即补齐，无需等首拉或用户打开设置页
         let _ = state.display_name();
@@ -643,6 +673,9 @@ impl AppState {
         let mut freeze = FreezeGuard::new(self);
         let cur = self.data_dir();
         let dest_path = validate_data_dir(&cur, dest)?;
+        // R16：先把目标记在锚点目录，进程若在复制中途被强杀，下次启动能清扫
+        // 这份无主残副本（否则只有「再选同一目录迁移」才自愈，用户放弃即永久占盘）
+        self.record_migration_target(&dest_path);
         cb(&MigrationProgress {
             phase: "attach",
             detail: "等待当前收取结束…".into(),
@@ -770,6 +803,8 @@ impl AppState {
         if let Err(e) = started {
             // 启动失败：两个标志都复位，用户可原地重试（成功的复位由后台线程 guard 负责）
             self.migration_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.migration_committed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             self.mark_migration_finished();
             return Err(e);
@@ -983,6 +1018,56 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    /// 记录本次迁移目标（R16）。写失败只留痕——它只影响「强杀后能否自动清扫」，
+    /// 不影响迁移本身
+    fn record_migration_target(&self, dest: &Path) {
+        let f = self.anchor_dir.join(MIGRATION_TARGET_FILE);
+        if let Err(e) = std::fs::write(&f, dest.to_string_lossy().as_bytes()) {
+            eprintln!("[state] 迁移目标记录写入失败（{}）：{e}", f.display());
+        }
+    }
+
+    /// 启动清扫无主迁移残留（R16）：上次进程在迁移中途被强杀（崩溃/挂死后强杀）时，
+    /// 目标目录会留下 incomplete 标记 + 已复制的部分副本。旧实现只有「再次把该目录
+    /// 选为迁移目标」才会自愈；用户放弃那次迁移的话，这份可能 GB 级的副本会永久占盘
+    /// 且没有任何提示。
+    ///
+    /// 三重保险，误删风险为零：① 只认自己写的目标记录；② 目录必须是当前数据目录
+    /// 之外；③ 必须带 incomplete 中断标记（`recover` 见到 done 哨兵只清标记不删数据）。
+    fn cleanup_stale_migration_target(&self) {
+        let f = self.anchor_dir.join(MIGRATION_TARGET_FILE);
+        let Ok(raw) = std::fs::read_to_string(&f) else {
+            return;
+        };
+        // 记录只用一次：无论能否清扫都先删，避免每次启动重复尝试
+        if let Err(e) = std::fs::remove_file(&f) {
+            eprintln!("[state] 迁移目标记录清理失败（{}）：{e}", f.display());
+        }
+        let target = PathBuf::from(raw.trim());
+        if target.as_os_str().is_empty() {
+            return;
+        }
+        // 绝不动当前正在使用的数据目录（迁移成功后的目标正是它）
+        let cur = self.data_dir();
+        let same = match (std::fs::canonicalize(&target), std::fs::canonicalize(&cur)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => target == cur,
+        };
+        if same {
+            return;
+        }
+        if !target.join(MIGRATION_MARKER).exists() {
+            return; // 无中断标记 = 不是我们的半成品，一个字节都不碰
+        }
+        match recover_incomplete_migration(&target) {
+            Ok(()) => eprintln!(
+                "[state] 已清理上次被中断的迁移残留：{}",
+                target.display()
+            ),
+            Err(e) => eprintln!("[state] 清理上次迁移残留失败：{e}"),
+        }
     }
 
     /// 首设专用：空库直切数据目录（会话内立即生效，不迁移、不重启）。

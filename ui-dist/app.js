@@ -393,7 +393,9 @@ function mbxMigSet(pct, detail) {
     if (d) d.textContent = detail;
 }
 
-// 阶段 → 进度百分比（VACUUM 无精确进度：快照给固定段，附件按文件数）
+// 阶段 → 进度百分比（VACUUM 无精确进度：快照给固定段，附件按文件数）。
+// R17：不再映射 phase==='done'——后端从不 emit 该阶段（只有 attach/snapshot/
+// attachments/pointer），100% 由 migration-done 处理器直接写入
 function mbxMigPhasePct(p) {
     var t = p && p.files_total ? p.files_total : 0;
     var d = p && p.files_done ? p.files_done : 0;
@@ -402,7 +404,6 @@ function mbxMigPhasePct(p) {
         case 'snapshot': return 40;
         case 'attachments': return t ? 40 + Math.round(d / t * 50) : 60;
         case 'pointer': return 90;
-        case 'done': return 100;
         default: return 0;
     }
 }

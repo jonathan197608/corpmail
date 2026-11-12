@@ -391,6 +391,13 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                 while rx.try_recv().is_ok() {}
             }
             let state = worker_handle.state::<state::AppState>();
+            // R14：迁移冻结期（进行中或待重启）不连 IMAP，也不写即将被抛弃的旧库。
+            // 跳过零损失——seen_pending 标志留在库里，重启后 worker 自唤醒补发
+            if state.migration_pending() {
+                eprintln!("[seen] 迁移冻结中，跳过本轮已读回写（重启后补发）");
+                failures = 0;
+                continue;
+            }
             match mail::seen::flush(&state, &mail::RealFetcher) {
                 Ok(n) => {
                     if n > 0 {

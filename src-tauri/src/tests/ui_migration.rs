@@ -187,6 +187,41 @@ fn production_migration_runs_through_injected_executor() {
 }
 
 #[test]
+fn seen_worker_respects_migration_freeze() {
+    // R14：seen worker 是唯一不查冻结位的常驻线程——冻结期连 IMAP 并写旧库，
+    // 重启后这次回写丢失（幂等，但白连一次）。必须跳过且不清标志
+    let at = LIB_RS.find("fn spawn_seen_worker").expect("seen worker 存在");
+    let rest = &LIB_RS[at..];
+    let body = &rest[..rest
+        .find("fn spawn_fetch_scheduler")
+        .expect("下一函数存在")];
+    let guard = body
+        .find("if state.migration_pending()")
+        .expect("必须查冻结位");
+    let flush = body.find("mail::seen::flush(").expect("flush 调用存在");
+    assert!(guard < flush, "冻结判定必须在 flush 之前");
+    assert!(
+        body.contains("跳过本轮已读回写"),
+        "跳过要留痕（便于线上定位）"
+    );
+}
+
+#[test]
+fn progress_phase_has_no_dead_done_branch() {
+    // R17：后端从不 emit phase="done"（100% 由 migration-done 直写），
+    // 前端留 `case 'done'` 只会误导后续改动
+    let at = APP_JS
+        .find("function mbxMigPhasePct(")
+        .expect("阶段换算函数存在");
+    let rest = &APP_JS[at..];
+    let body = &rest[..rest.find("// 失败态").expect("下一段存在")];
+    assert!(!body.contains("'done'"), "不得再有 done 死分支");
+    for phase in ["attach", "snapshot", "attachments", "pointer"] {
+        assert!(body.contains(phase), "阶段 {phase} 必须仍被映射");
+    }
+}
+
+#[test]
 fn snapshot_does_not_hold_the_store_lock() {
     // R13：VACUUM INTO 曾在 with_conn 闭包里跑——快照期间全局 store 锁被独占，
     // 状态条轮询/estimate/边栏计数全部排队。只读连接快照必须留在锁外

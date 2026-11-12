@@ -1859,6 +1859,121 @@ fn snapshot_db_fails_loudly_on_missing_database() {
 }
 
 #[test]
+fn freeze_guard_committed_flag_survives_reverse_drop_order() {
+    // R15：「成功终态必冻结」原先只在「先失败 → 后成功」顺序成立。
+    // 反向顺序（先到者 owns 且后 drop，后到者已 keep）会把已提交的冻结位清掉。
+    // 生产被 CAS 串行化，理论上不可达，但让不变量与顺序无关更可靠
+    let base = temp_dir("mig-freeze-reverse");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let first = FreezeGuard::new(&state);
+    let mut second = FreezeGuard::new(&state);
+    assert!(!second.owns, "后来者不拥有冻结位");
+    second.keep(); // 后到者成功提交
+    drop(first); // 反向顺序：先到者此时才 Drop
+    assert!(
+        state.migration_pending(),
+        "已提交的冻结位不得被先到者的 Drop 复位"
+    );
+    drop(second);
+    assert!(state.migration_pending(), "keep 的 guard drop 后仍应冻结");
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn startup_cleans_orphan_migration_leftover() {
+    // R16：迁移中途被强杀 → 目标目录留下 marker + 半成品。旧实现只有「再选
+    // 同一目录迁移」才自愈；用户放弃那次迁移时副本会永久占盘。启动时按记录清扫
+    let base = temp_dir("mig-orphan");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    drop(AppState::open(&anchor)); // 正常启动过一次
+
+    let orphan = base.join("orphan");
+    std::fs::create_dir_all(orphan.join("attachments")).unwrap();
+    std::fs::write(orphan.join(MIGRATION_MARKER), b"incomplete").unwrap();
+    std::fs::write(orphan.join("corpmail.db"), b"half-written").unwrap();
+    std::fs::write(orphan.join("attachments").join("a.eml"), b"x").unwrap();
+    std::fs::write(
+        anchor.join(MIGRATION_TARGET_FILE),
+        orphan.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+
+    let _state = AppState::open(&anchor);
+    assert!(
+        !orphan.join("corpmail.db").exists(),
+        "半成品快照库必须被清扫"
+    );
+    assert!(
+        !orphan.join("attachments").exists(),
+        "半成品附件副本必须被清扫"
+    );
+    assert!(!orphan.join(MIGRATION_MARKER).exists(), "中断标记必须清除");
+    assert!(
+        !anchor.join(MIGRATION_TARGET_FILE).exists(),
+        "目标记录只用一次，必须删除"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn startup_never_cleans_the_active_data_dir() {
+    // R16 的安全阀：记录里的目标就是当前数据目录（迁移成功后的正常形态）时，
+    // 即使目录里有残留 marker（成功后删 marker 失败），也绝不能删正在用的库
+    let base = temp_dir("mig-orphan-active");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    {
+        let _state = AppState::open(&anchor);
+        std::fs::write(anchor.join(MIGRATION_MARKER), b"incomplete").unwrap();
+        std::fs::write(
+            anchor.join(MIGRATION_TARGET_FILE),
+            anchor.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    }
+    let _state = AppState::open(&anchor);
+    assert!(
+        anchor.join("corpmail.db").exists(),
+        "活动数据目录的库不得被当残副本删除"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn startup_ignores_foreign_directory_without_marker() {
+    // R16：记录指向的目录若没有中断标记，说明不是我们的半成品——一个字节都不碰
+    let base = temp_dir("mig-orphan-foreign");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    drop(AppState::open(&anchor));
+    let foreign = base.join("user-files");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("corpmail.db"), b"not-ours").unwrap();
+    std::fs::write(
+        anchor.join(MIGRATION_TARGET_FILE),
+        foreign.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+
+    let _state = AppState::open(&anchor);
+    assert!(
+        foreign.join("corpmail.db").exists(),
+        "无中断标记的目录不得被清理"
+    );
+    assert!(
+        !anchor.join(MIGRATION_TARGET_FILE).exists(),
+        "记录仍然只用一次"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn migration_phase_separates_running_from_pending_restart() {
     // R9：A6 在协议线程提前置 migration_pending，于是「进行中」也表现为
     // pending=true。下游只读 pending 会把迁移跑着说成「已迁移，请重启」。
