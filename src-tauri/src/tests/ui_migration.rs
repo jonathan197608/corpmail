@@ -261,8 +261,9 @@ fn migration_modal_has_stall_watchdog() {
         "必须起看门狗定时器"
     );
     assert!(
-        APP_JS.contains("MBX_MIG_SNAPSHOT_STALL_MS"),
-        "快照阶段要单独放宽阈值：VACUUM 是一次性阻塞、期间零事件，60s 会自伤"
+        APP_JS.contains("MBX_MIG_SNAPSHOT_STALL_MS = 1800000"),
+        "快照阶段要单独放宽阈值到 30 分钟：VACUUM 是一次性阻塞、期间零事件，\
+         且机械盘/网络盘写入过慢时远超常速估计，60s 甚至 5 分钟都会自伤"
     );
     assert!(
         APP_JS.contains("长时间无进展"),
@@ -288,6 +289,80 @@ fn migration_modal_has_stall_watchdog() {
     assert!(
         LIB_RS.contains("fn panic_text("),
         "panic payload 提取必须抽成函数（&str/String 两种形态）"
+    );
+}
+
+#[test]
+fn migration_snapshot_stall_asks_user_before_failing() {
+    // R10 收紧：快照是单次阻塞调用，磁盘过慢时 30 分钟也可能不够。超时不得直接
+    // 判死切失败态——必须提醒用户，由用户决定是否继续等下一个 30 分钟。
+    // （直接判死 = 把仍在正常写的慢盘迁移显示成失败，用户会去重启/重试，本次迁移作废）
+    assert!(
+        APP_JS.contains("function mbxMigPromptStall()"),
+        "快照超时必须有独立的确认态函数（走失败态就错了）"
+    );
+    let prompt = APP_JS
+        .find("function mbxMigPromptStall()")
+        .expect("mbxMigPromptStall 存在");
+    let pbody = &APP_JS[prompt..];
+    let pbody = &pbody[..pbody.find("function mbxMigKeepWaiting()").expect("下一函数存在")];
+    assert!(
+        pbody.contains("超过 30 分钟") && pbody.contains("继续等待"),
+        "确认文案要写清超时时长与两个出口"
+    );
+    assert!(
+        pbody.contains("关闭窗口不会中止"),
+        "必须说明关窗不中止后台迁移，别让用户以为点「返回」就是取消"
+    );
+    // 「继续等待」按钮存在且默认隐藏（只在确认态出现）
+    assert!(
+        APP_JS.contains("data-mbx-action=\"migration-keep-waiting\""),
+        "模态骨架要有「继续等待」按钮"
+    );
+    // 点击「继续等待」必须复位计时并重启看门狗（否则一次确认后看门狗永久失效）
+    let keep = APP_JS
+        .find("function mbxMigKeepWaiting()")
+        .expect("mbxMigKeepWaiting 存在");
+    let kbody = &APP_JS[keep..];
+    let kbody = &kbody[..kbody
+        .find("async function mbxPickSetupDir(")
+        .expect("下一函数存在")];
+    assert!(
+        kbody.contains("mbxMigLastEvent = Date.now();"),
+        "继续等待必须复位无进展计时"
+    );
+    assert!(
+        kbody.contains("mbxMigStartWatchdog();"),
+        "继续等待必须重启看门狗（30 分钟后再问一次）"
+    );
+    // 委托分发接上
+    assert!(
+        APP_JS.contains("case 'migration-keep-waiting': mbxMigKeepWaiting();"),
+        "data-mbx-action 委托必须分发 migration-keep-waiting"
+    );
+    // 看门狗超时分支：快照走确认态，其余阶段才走失败态
+    let start = APP_JS
+        .find("function mbxMigStartWatchdog()")
+        .expect("mbxMigStartWatchdog 存在");
+    let sbody = &APP_JS[start..];
+    let sbody = &sbody[..sbody.find("function mbxMigPromptStall()").expect("下一函数存在")];
+    assert!(
+        sbody.contains("mbxMigPromptStall();"),
+        "快照阶段超时要走确认态"
+    );
+    assert!(
+        sbody.contains("mbxMigShowError("),
+        "非快照阶段超时仍走失败态（60s 卡死判定不变）"
+    );
+    // 阶段推进后确认按钮必须收起（提醒失效，避免误点重置计时）
+    let progress = APP_JS
+        .find("add('migration-progress'")
+        .expect("progress 监听存在");
+    let pbody2 = &APP_JS[progress..];
+    let pbody2 = &pbody2[..pbody2.find("add('migration-done'").expect("done 监听存在")];
+    assert!(
+        pbody2.contains("keep.hidden = true"),
+        "收到新进度事件必须收起「继续等待」按钮"
     );
 }
 
@@ -372,6 +447,10 @@ fn migration_modal_resets_previous_failure_state() {
         "详情必须复位为初始文案"
     );
     assert!(body.contains("btn.hidden = true"), "「返回」必须重新隐藏");
+    assert!(
+        body.contains("keep.hidden = true"),
+        "「继续等待」也必须重新隐藏（上一轮确认态不得带进新一轮）"
+    );
 
     // R11 附带：关模态先解绑监听再判遮罩，避免早退导致监听泄漏
     let close = APP_JS

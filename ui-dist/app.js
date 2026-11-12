@@ -309,8 +309,9 @@ let mbxMigPhase = '';
 // 无进展阈值：附件复制期间进度事件最密，60s 一条都没到说明线程已卡死
 const MBX_MIG_STALL_MS = 60000;
 // 快照阶段（VACUUM INTO）是**一次性阻塞调用、期间零事件**：GB 级库几十秒到几分钟
-// 都属正常，用 60s 会把「正在快照」误判成卡死（看门狗自伤）。单给 5 分钟。
-const MBX_MIG_SNAPSHOT_STALL_MS = 300000;
+// 都属正常；机械盘 / 网络盘写入过慢时甚至远超常速估计。放宽到 30 分钟，且到点
+// 不直接判死——先提醒用户，由用户决定是否继续等下一个 30 分钟（见 mbxMigPromptStall）
+const MBX_MIG_SNAPSHOT_STALL_MS = 1800000;
 
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
@@ -363,7 +364,8 @@ function mbxMigApplyPane(html) {
 
 // ---------- 迁移阻塞进度模态 ----------
 // 迁移期间全屏遮罩 + 居中卡片 + 进度条；无关闭按钮（用户只能等待），
-// 完成由后端自动退出，失败才出现「返回」按钮。CSP 禁内联脚本，交互走 data-mbx-action 委托。
+// 完成由后端自动退出；失败才出现「返回」；快照超时时额外给「继续等待」（R10 收紧）。
+// CSP 禁内联脚本，交互走 data-mbx-action 委托。
 function mbxMigOpen() {
     let mask = document.getElementById('migrate-mask');
     if (!mask) {
@@ -374,7 +376,10 @@ function mbxMigOpen() {
             + '<div class="migrate-title">数据迁移</div>'
             + '<div class="migrate-bar"><div class="migrate-bar-fill" id="migrate-bar"></div></div>'
             + '<div class="migrate-detail" id="migrate-detail">准备迁移…</div>'
+            + '<div class="migrate-actions">'
+            + '<button type="button" class="btn" data-mbx-action="migration-keep-waiting" hidden>继续等待</button>'
             + '<button type="button" class="btn" data-mbx-action="migration-close" hidden>返回</button>'
+            + '</div>'
             + '</div>';
         document.body.appendChild(mask);
     }
@@ -386,6 +391,8 @@ function mbxMigOpen() {
     if (detail) detail.textContent = '准备迁移…';
     var btn = mask.querySelector('[data-mbx-action="migration-close"]');
     if (btn) btn.hidden = true;
+    var keep = mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
+    if (keep) keep.hidden = true;
     mask.hidden = false;
     mask.__mbxRelease = mbxModalOpen(mask, mask.querySelector('.migrate-card'));
 }
@@ -459,6 +466,10 @@ async function mbxMigListen() {
         mbxMigLastEvent = Date.now();
         var p = e.payload || {};
         mbxMigPhase = p.phase || '';
+        // 阶段推进说明快照已过：确认态的「继续等待」按钮收起，避免误点重启计时
+        var mask = document.getElementById('migrate-mask');
+        var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
+        if (keep && !keep.hidden) keep.hidden = true;
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
     await add('migration-done', function (e) {
@@ -478,18 +489,53 @@ async function mbxMigListen() {
     });
     // R10：看门狗——后端线程 panic（旧实现只有 let _ = emit 的 Err 分支兜不住）
     // 或目标目录是不可靠挂载（SMB/休眠中 USB）时，fs::copy 会在内核里无限阻塞，
-    // 前端一条事件都收不到，模态永久停在最后一帧。超过阈值切失败态并允许关闭；
-    // 关闭只关窗口，后台线程仍在跑（文案写清，别让用户以为已经中止）
+    // 前端一条事件都收不到，模态永久停在最后一帧。超时后：
+    //   快照阶段 → 只提醒不判死（磁盘过慢属正常），由用户决定是否再等 30 分钟；
+    //   其余阶段 → 切失败态并允许关闭（关闭只关窗口，后台线程仍在跑，文案写清）
     mbxMigLastEvent = Date.now();
     mbxMigPhase = '';
+    mbxMigStartWatchdog();
+}
+
+// 起看门狗（首次注册与「继续等待」复用同一段逻辑）
+function mbxMigStartWatchdog() {
     mbxMigStopWatchdog();
     mbxMigWatchdog = setInterval(function () {
         var limit = mbxMigPhase === 'snapshot' ? MBX_MIG_SNAPSHOT_STALL_MS : MBX_MIG_STALL_MS;
         if (Date.now() - mbxMigLastEvent < limit) return;
         mbxMigStopWatchdog();
-        mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
-            + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
+        if (mbxMigPhase === 'snapshot') {
+            mbxMigPromptStall();
+        } else {
+            mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
+                + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
+        }
     }, 1000);
+}
+
+// 快照超时的确认态（非失败）：VACUUM 写慢盘可能远超 30 分钟，到点先问用户。
+// 两个出口：继续等待（再等一个完整窗口）/ 返回（关窗口，后台不中止）
+function mbxMigPromptStall() {
+    var d = document.getElementById('migrate-detail');
+    if (d) d.textContent = '数据库快照已连续运行超过 30 分钟，目标磁盘写入可能较慢。\n\n'
+        + '后台迁移仍在进行，关闭窗口不会中止。\n'
+        + '是否继续等待下一个 30 分钟？';
+    var mask = document.getElementById('migrate-mask');
+    var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
+    if (keep) keep.hidden = false;
+    var back = mask && mask.querySelector('[data-mbx-action="migration-close"]');
+    if (back) back.hidden = false;
+}
+
+// 「继续等待」：复位计时、收起提醒按钮并重启看门狗（30 分钟后再问一次）
+function mbxMigKeepWaiting() {
+    var d = document.getElementById('migrate-detail');
+    if (d) d.textContent = '继续等待…（快照阶段可能持续较久）';
+    var mask = document.getElementById('migrate-mask');
+    var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
+    if (keep) keep.hidden = true;
+    mbxMigLastEvent = Date.now();
+    mbxMigStartWatchdog();
 }
 
 // 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——
@@ -613,6 +659,7 @@ document.addEventListener('click', function (ev) {
         case 'save-attachment': mbxSaveAttachment(Number(d.id), Number(d.aid), d.name); break;
         case 'move-data-dir': mbxMoveDataDir(); break;
         case 'migration-close': mbxMigCloseModal(); break;
+        case 'migration-keep-waiting': mbxMigKeepWaiting(); break;
         case 'pick-setup-dir': mbxPickSetupDir(el); break;
         case 'toggle-hidden': {
             // 开关按钮：翻转自身 .on，并把对应 hidden input 写成 on/off 值

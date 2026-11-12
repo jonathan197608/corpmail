@@ -3943,3 +3943,14 @@ form.setup-card .setup-actions {
 .migrate-card .btn {
     margin-top: 12px;
 }
+/* 快照超时确认态的两个出口（继续等待 / 返回）横排居中；
+   [hidden] 由上面的 .migrate-card .btn[hidden] 显式规则兜底 */
+.migrate-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-top: 12px;
+}
+.migrate-actions .btn {
+    margin-top: 0;
+}
