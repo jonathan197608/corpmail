@@ -138,6 +138,43 @@ struct Store {
     data_dir: PathBuf,
 }
 
+/// 迁移进度快照（后台迁移期间经事件回传前端展示）。
+/// phase 语义：`attach`=等待收件收尾 `snapshot`=数据库快照(VACUUM) `attachments`=附件复制 `pointer`=写指针 `done`
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MigrationProgress {
+    pub phase: &'static str,
+    pub detail: String,
+    /// 附件已复制文件数（非附件阶段恒 0）
+    pub files_done: usize,
+    /// 附件文件总数（snapshot/pointer 阶段为 None）
+    pub files_total: Option<usize>,
+}
+
+/// 迁移执行器：由 setup 注入后台执行闭包（捕获 AppHandle：spawn 后台线程、
+/// 事件回传、完成自动退出）。**未注入时（单元测试）start_migration 走同步执行**，
+/// 保持既有测试语义。闭包返回 Err 表示「未启动」（如校验失败由调用方统一处理）
+pub type MigrationExecutor = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// 迁移启动结果
+#[derive(Debug)]
+pub enum MigrateOutcome {
+    /// 同步完成（未注入 executor，测试路径）
+    Done,
+    /// 后台迁移已启动（协议回调应立即返回，进度/结果经事件回传）
+    Background,
+}
+
+/// 存储页统计缓存项（clean::estimate + 旧目录备份，避免反复全库扫描）
+struct StorageStatsCache {
+    at: std::time::Instant,
+    estimate: crate::clean::Estimate,
+    backup: Option<(u64, u64)>,
+}
+
+/// 存储页统计缓存有效期：库量会随收件变化，给短 TTL 容忍短暂旧值，
+/// 换取打开存储页/迁移返回不重复全库扫描
+const STORAGE_STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct AppState {
     /// 数据库连接 + 数据目录，同一把锁绑定（审计 R19）。
     /// 旧实现两把独立锁，swap_store 分两段换：中间窗口里并发读者会看到
@@ -187,6 +224,12 @@ pub struct AppState {
     migration_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 侧栏计数的上次成功值（读库失败时兜底，不清零；审计 R63）
     counts_cache: Mutex<Option<HashMap<&'static str, i64>>>,
+    /// 迁移执行器（setup 注入；未注入 = 测试，start_migration 走同步）
+    migration_executor: Mutex<Option<MigrationExecutor>>,
+    /// 后台迁移进行中（幂等防重复触发；进程内跨线程可见）
+    migration_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 存储页统计缓存（estimate + 旧目录备份；避免每次打开存储页反复全库扫描）
+    stats_cache: Mutex<Option<StorageStatsCache>>,
 }
 
 /// 迁移冻结期的统一提示（路由 409 / 收件 / 发送 worker 共用同一句中文）
@@ -290,15 +333,23 @@ impl RoundTicket {
 
     /// 正常结束：只归还名额
     fn release(&self) {
-        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// 看门狗判死：归还名额并计入 detached（线程可能永不返回）
     fn detach(&self) {
-        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             self.detached
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -404,6 +455,9 @@ impl AppState {
             round_ticket: Mutex::new(std::sync::Weak::<RoundTicket>::new()),
             migration_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             counts_cache: Mutex::new(None),
+            migration_executor: Mutex::new(None),
+            migration_in_progress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stats_cache: Mutex::new(None),
         };
         // 迁移后首次重启：旧目录遗留空库自动清理（见方法注释；有邮件则保留手动删）
         state.try_auto_clean_empty_old_backup();
@@ -450,6 +504,25 @@ impl AppState {
     /// 迁移期间收件线程可能写入新附件导致极小竞态窗口（附件文件缺失但元数据在），
     /// 重启后孤儿回收不会破坏元数据，重收件可补——概率极低，取舍见设计 §5.2 注记
     pub fn move_data_dir(&self, dest: &str) -> Result<String, String> {
+        // 同步路径（无进度回调）：单元测试 / 未注入 executor 使用，保持既有行为
+        self.migrate_impl(dest, &|_| {})
+    }
+
+    /// 带进度回传的迁移（后台执行器使用）：与 move_data_dir 同一落盘逻辑，仅透传进度回调
+    pub fn move_data_dir_progress(
+        &self,
+        dest: &str,
+        cb: &(dyn Fn(&MigrationProgress) + Sync),
+    ) -> Result<String, String> {
+        self.migrate_impl(dest, cb)
+    }
+
+    /// 迁移落盘统一实现（冻结 → 等收件轮 → 快照/附件/指针）；`cb` 为进度回调（可 no-op）
+    fn migrate_impl(
+        &self,
+        dest: &str,
+        cb: &(dyn Fn(&MigrationProgress) + Sync),
+    ) -> Result<String, String> {
         // 已迁移待重启：再迁一次没有意义（新快照会覆盖目标库，且旧库仍在被本进程写）
         if self.migration_pending() {
             return Err(MIGRATION_PENDING_MSG.into());
@@ -459,6 +532,12 @@ impl AppState {
         // 冻结写入（R2）：置位后新的收件轮 / 发送派发 / HTTP 写请求一律被挡，
         // 再等正在跑的收件轮收尾——此后 VACUUM INTO 的快照就是一致终点。
         // 任何失败路径都必须清位，否则 UI 会停在"请重启"却并没有完成迁移
+        cb(&MigrationProgress {
+            phase: "attach",
+            detail: "等待当前收取结束…".into(),
+            files_done: 0,
+            files_total: None,
+        });
         self.migration_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if !self.wait_fetch_idle(MIGRATION_FETCH_WAIT) {
@@ -466,7 +545,7 @@ impl AppState {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err("正在收取邮件，请等本轮收件结束后再迁移".into());
         }
-        if let Err(e) = self.migrate_snapshot(&cur, &dest_path) {
+        if let Err(e) = self.migrate_snapshot(&cur, &dest_path, Some(cb)) {
             // 迁移失败：解冻，让用户继续正常使用旧目录
             self.migration_pending
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -483,6 +562,66 @@ impl AppState {
     pub fn migration_pending(&self) -> bool {
         self.migration_pending
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 注入后台迁移执行器（lib.rs setup 调用；未注入 = 单元测试，start_migration 走同步）
+    pub fn set_migration_executor(&self, exec: MigrationExecutor) {
+        self.migration_executor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(exec);
+    }
+
+    /// 后台迁移是否进行中（前端/路由幂等护栏；executor 后台线程结束后清位）
+    pub fn migration_in_progress(&self) -> bool {
+        self.migration_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 后台迁移结束（成功/失败）后清进行中标志（executor 后台线程调用）
+    pub fn mark_migration_finished(&self) {
+        self.migration_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 启动数据目录迁移。
+    /// - 已注入 executor（生产）→ 后台执行，立即返回 `Background`（协议回调据此秒回，
+    ///   进度/结果经事件回传前端）；
+    /// - 未注入（单元测试）→ 同步执行，返回 `Done`（保持既有测试语义）。
+    pub fn start_migration(&self, dest: &str) -> Result<MigrateOutcome, String> {
+        // 未选择目标目录：最前置的输入校验（表单留空即报此文案；validate_data_dir
+        // 对空串会落到「请选择绝对路径目录」，语义不如「未选择」准确，且后台线程
+        // 预校验同样需要此拦截——统一在入口判定）
+        if dest.trim().is_empty() {
+            return Err("未选择目标目录".into());
+        }
+        if self.migration_pending() {
+            return Err(MIGRATION_PENDING_MSG.into());
+        }
+        if self.migration_in_progress() {
+            return Err("数据迁移正在进行中，请稍候…".into());
+        }
+        // 预校验目标目录（executor 后台线程内会再校验一次，幂等）
+        validate_data_dir(&self.data_dir(), dest)?;
+        let exec = self
+            .migration_executor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(exec) = exec {
+            // 后台：先置进行中，交给 executor 闭包（内部 spawn 线程 + 事件回传）
+            self.migration_in_progress
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Err(e) = exec(dest) {
+                self.mark_migration_finished();
+                return Err(e);
+            }
+            Ok(MigrateOutcome::Background)
+        } else {
+            // 同步（测试）：保持既有行为
+            self.move_data_dir(dest)?;
+            Ok(MigrateOutcome::Done)
+        }
     }
 
     /// 等待在跑的收件轮收尾（迁移前调用）。收件线程每轮开头会检查冻结位并主动退出，
@@ -502,8 +641,25 @@ impl AppState {
     }
 
     /// 迁移落盘（快照 → 附件 → 指针）。调用前必须已置冻结位并确认无在跑收件轮
-    fn migrate_snapshot(&self, cur: &Path, dest_path: &Path) -> Result<(), String> {
+    fn migrate_snapshot(
+        &self,
+        cur: &Path,
+        dest_path: &Path,
+        cb: Option<&(dyn Fn(&MigrationProgress) + Sync)>,
+    ) -> Result<(), String> {
+        // 进度快照透传（cb 为 None 时即同步 no-op，保持既有行为）
+        let emit = |phase: &'static str, detail: String, done: usize, total: Option<usize>| {
+            if let Some(cb) = cb {
+                cb(&MigrationProgress {
+                    phase,
+                    detail,
+                    files_done: done,
+                    files_total: total,
+                });
+            }
+        };
         // 1) 数据库在线快照（VACUUM INTO：WAL 安全的一致性副本，业务不中断）
+        emit("snapshot", "正在快照数据库…".into(), 0, None);
         let new_db = dest_path.join("corpmail.db");
         self.with_conn(|conn| {
             conn.execute("VACUUM INTO ?1", [new_db.to_string_lossy().as_ref()])
@@ -516,11 +672,33 @@ impl AppState {
         let src_att = cur.join("attachments");
         // 本次实际写入的文件清单：回滚只删这些，不碰目标目录里任何既有内容
         let mut written: Vec<PathBuf> = Vec::new();
+        // 附件复制进度计数（copy_dir_recursive 递归内共享）
+        let copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let migrated: Result<(), String> = (|| {
             if src_att.is_dir() {
-                copy_dir_recursive(&src_att, &dest_path.join("attachments"), &mut written)
-                    .map_err(|e| format!("附件目录复制失败：{e}"))?;
+                let total = count_attachment_files(&src_att);
+                emit(
+                    "attachments",
+                    format!("正在复制附件（共 {total} 个）…"),
+                    0,
+                    Some(total),
+                );
+                copy_dir_recursive(
+                    &src_att,
+                    &dest_path.join("attachments"),
+                    &mut written,
+                    &copied,
+                    total,
+                    cb,
+                )
+                .map_err(|e| format!("附件目录复制失败：{e}"))?;
             }
+            emit(
+                "pointer",
+                "正在写入数据库指针…".into(),
+                copied.load(std::sync::atomic::Ordering::SeqCst),
+                None,
+            );
             let (prev, save_res) = {
                 let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
                 let prev = cfg.get(keys::DATA_DIR).cloned();
@@ -776,11 +954,7 @@ impl AppState {
             s.epoch
         };
         let deadline = std::time::Instant::now() + MIGRATION_FETCH_WAIT;
-        while self
-            .active_rounds
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
+        while self.active_rounds.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             if std::time::Instant::now() >= deadline {
                 eprintln!(
                     "[state] 切换数据目录前等待收件轮收尾超时（{}s，可能有挂死轮），继续切换",
@@ -942,6 +1116,40 @@ impl AppState {
         }
     }
 
+    /// 存储页统计（clean::estimate + 旧目录备份）：短 TTL 缓存，避免每次打开
+    /// 存储页/迁移返回时重复全库扫描（大库下全库扫描可达秒级）
+    pub fn storage_stats(&self) -> (crate::clean::Estimate, Option<(u64, u64)>) {
+        let now = std::time::Instant::now();
+        if let Some(c) = self
+            .stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && now.duration_since(c.at) < STORAGE_STATS_CACHE_TTL
+        {
+            return (c.estimate.clone(), c.backup);
+        }
+        let estimate = crate::clean::estimate(self);
+        let backup = self.old_backup_stats();
+        self.stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(StorageStatsCache {
+                at: now,
+                estimate: estimate.clone(),
+                backup,
+            });
+        (estimate, backup)
+    }
+
+    /// 存储统计变化（清理/迁移）后失效缓存，下次打开重新计算
+    pub fn invalidate_stats_cache(&self) {
+        self.stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
     /// 迁移备份统计：锚点（默认安装目录）中的 corpmail.db[-wal/-shm] + attachments/。
     /// 仅当已迁移（data_dir != anchor）且锚点存在备份文件时为 Some
     pub fn old_backup_stats(&self) -> Option<(u64, u64)> {
@@ -1020,9 +1228,7 @@ impl AppState {
     fn fetch_guard_hung(&self) {
         let mut s = self.fetch_state.lock().unwrap_or_else(|e| e.into_inner());
         if s.running && crate::mail::now_epoch() - s.started_at > FETCH_WATCHDOG_SECS {
-            eprintln!(
-                "[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，判定挂起并释放名额"
-            );
+            eprintln!("[fetch] 看门狗：收件轮超 {FETCH_WATCHDOG_SECS}s 无进展，判定挂起并释放名额");
             // imap 无读超时，这一轮可能永不返回：把名额转成 detached，否则
             // 两轮挂住就再也发不出新的收件请求，用户只能重启（审计 P1-13）
             if let Some(ticket) = self
@@ -1160,8 +1366,7 @@ impl AppState {
             return Err(ResetFetchError::Busy);
         }
         // 游标/参数落库：失败即整体未动（db 键单事务；配置键两通道互回滚）
-        self.set_batch(pairs)
-            .map_err(ResetFetchError::Other)?;
+        self.set_batch(pairs).map_err(ResetFetchError::Other)?;
         let epoch = begin_round(&mut s);
         drop(s);
         self.dispatch_fetch_round(epoch);
@@ -1187,7 +1392,9 @@ impl AppState {
             self.fetch_end(
                 epoch,
                 0,
-                &format!("已有 {detached} 轮收件在后台无响应（网络可能中断），请检查网络后重启应用"),
+                &format!(
+                    "已有 {detached} 轮收件在后台无响应（网络可能中断），请检查网络后重启应用"
+                ),
             );
             return;
         }
@@ -1226,10 +1433,8 @@ impl AppState {
             std::sync::Arc::clone(&self.active_rounds),
             std::sync::Arc::clone(&self.detached_rounds),
         ));
-        *self
-            .round_ticket
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::downgrade(&ticket);
+        *self.round_ticket.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::sync::Arc::downgrade(&ticket);
         // 通知钩子提前 clone（spawn 要 'static，锁守卫不得跨线程）
         let notify = self
             .notify_hook
@@ -1542,9 +1747,10 @@ impl AppState {
             let owner = crate::db::settings::get(c, keys::STORE_OWNER)
                 .ok()
                 .flatten();
-            if owner.as_deref().is_some_and(|o| {
-                !o.trim().eq_ignore_ascii_case(account.trim())
-            }) {
+            if owner
+                .as_deref()
+                .is_some_and(|o| !o.trim().eq_ignore_ascii_case(account.trim()))
+            {
                 return None;
             }
             crate::mail::infer_display_name_conn(c, &account)
@@ -1623,7 +1829,9 @@ impl AppState {
             }
             return Err(format!("配置文件写入失败：{e}"));
         }
-        if !db_pairs.is_empty() && let Err(e) = self.write_db_pairs(&db_pairs) {
+        if !db_pairs.is_empty()
+            && let Err(e) = self.write_db_pairs(&db_pairs)
+        {
             // 库键失败：文件已带新值——必须把 prev 写回镜像与文件，否则
             // 配置面（host/账号/目录指针这类关键字段）静默半生效
             if let Err(rb) = self.restore_config_to(&prev) {
@@ -1692,10 +1900,7 @@ impl AppState {
         let conn = &store.db;
         match Self::count_mailboxes(conn) {
             Ok(counts) => {
-                *self
-                    .counts_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(counts.clone());
+                *self.counts_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(counts.clone());
                 counts
             }
             Err(err) => {
@@ -1710,34 +1915,34 @@ impl AppState {
     }
 
     /// 四个角标计数：每个查询都带 folder 谓词，各自命中索引
-/// （`idx_folder_sort` 前缀 / `idx_inbox_unread` 部分索引），不再全表 SUM
-fn count_mailboxes(conn: &Connection) -> rusqlite::Result<HashMap<&'static str, i64>> {
-    let by_folder = |folder: &str| -> rusqlite::Result<i64> {
-        conn.prepare_cached("SELECT count(*) FROM emails WHERE folder = ?1")?
-            .query_row([folder], |r| r.get(0))
-    };
-    let inbox_unread = conn
-        .prepare_cached("SELECT count(*) FROM emails WHERE folder = 'inbox' AND unread = 1")?
-        .query_row([], |r| r.get(0))?;
-    Ok(HashMap::from([
-        ("inbox", by_folder("inbox")?),
-        ("inbox_unread", inbox_unread),
-        ("sent", by_folder("sent")?),
-        ("draft", by_folder("draft")?),
-    ]))
-}
+    /// （`idx_folder_sort` 前缀 / `idx_inbox_unread` 部分索引），不再全表 SUM
+    fn count_mailboxes(conn: &Connection) -> rusqlite::Result<HashMap<&'static str, i64>> {
+        let by_folder = |folder: &str| -> rusqlite::Result<i64> {
+            conn.prepare_cached("SELECT count(*) FROM emails WHERE folder = ?1")?
+                .query_row([folder], |r| r.get(0))
+        };
+        let inbox_unread = conn
+            .prepare_cached("SELECT count(*) FROM emails WHERE folder = 'inbox' AND unread = 1")?
+            .query_row([], |r| r.get(0))?;
+        Ok(HashMap::from([
+            ("inbox", by_folder("inbox")?),
+            ("inbox_unread", inbox_unread),
+            ("sent", by_folder("sent")?),
+            ("draft", by_folder("draft")?),
+        ]))
+    }
 
-/// 无历史值时的兜底（等价于旧行为的"全 0"，但只出现在首次读就失败的情况）
-fn zero_counts() -> HashMap<&'static str, i64> {
-    HashMap::from([
-        ("inbox", 0i64),
-        ("inbox_unread", 0),
-        ("sent", 0),
-        ("draft", 0),
-    ])
-}
+    /// 无历史值时的兜底（等价于旧行为的"全 0"，但只出现在首次读就失败的情况）
+    fn zero_counts() -> HashMap<&'static str, i64> {
+        HashMap::from([
+            ("inbox", 0i64),
+            ("inbox_unread", 0),
+            ("sent", 0),
+            ("draft", 0),
+        ])
+    }
 
-/// 回退密钥文件路径（锚点目录，与 corpmail.toml 同处）。
+    /// 回退密钥文件路径（锚点目录，与 corpmail.toml 同处）。
     /// 放锚点而非数据目录：数据目录可被迁到外置盘/U 盘，密钥跟着走就失去
     /// 「密钥与密文分离」的意义（审计：库内容易外流，备份/同步盘/误传）
     pub fn key_file(&self) -> PathBuf {
@@ -1993,7 +2198,14 @@ fn dir_stats(p: &Path) -> (u64, u64) {
 /// 递归复制目录（M5 迁移用：附件目录两级结构 {YYYY-MM}/{email_id}/ 文件）；
 /// 目标已存在的同名文件覆盖，缺失目录逐级创建。写入成功的目标路径追加进
 /// `written`，供失败回滚精确删除本次产出物（不误伤目标目录既有文件）
-fn copy_dir_recursive(src: &Path, dest: &Path, written: &mut Vec<PathBuf>) -> Result<(), String> {
+fn copy_dir_recursive(
+    src: &Path,
+    dest: &Path,
+    written: &mut Vec<PathBuf>,
+    copied: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+    cb: Option<&(dyn Fn(&MigrationProgress) + Sync)>,
+) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("创建目录失败：{e}"))?;
     for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))? {
         let entry = entry.map_err(|e| format!("遍历失败：{e}"))?;
@@ -2002,13 +2214,37 @@ fn copy_dir_recursive(src: &Path, dest: &Path, written: &mut Vec<PathBuf>) -> Re
             .map_err(|e| format!("读取类型失败：{e}"))?;
         let to = dest.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &to, written)?;
+            copy_dir_recursive(&entry.path(), &to, written, copied, total, cb)?;
         } else {
             std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
+            let n = copied.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if let Some(cb) = cb {
+                cb(&MigrationProgress {
+                    phase: "attachments",
+                    detail: format!("复制附件 {n}/{total}"),
+                    files_done: n,
+                    files_total: Some(total),
+                });
+            }
             written.push(to);
         }
     }
     Ok(())
+}
+
+/// 统计目录内文件总数（附件复制进度用；失败目录按 0 处理，不影响复制本体）
+fn count_attachment_files(dir: &Path) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                n += count_attachment_files(&e.path());
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// 首拉天数解析：0 = 全部（UID SEARCH ALL，合法值，不得作非法过滤）；
@@ -2019,10 +2255,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path, written: &mut Vec<PathBuf>) -> Re
 /// 上限 3650 天（10 年）：值来自配置文件/表单，负数或天文数字只会让
 /// `now - days*86400` 溢出或扫全库，钳到合理区间。
 fn first_fetch_days_from_raw(raw: &str) -> i64 {
-    raw.trim()
-        .parse::<i64>()
-        .unwrap_or(30)
-        .clamp(0, 3650)
+    raw.trim().parse::<i64>().unwrap_or(30).clamp(0, 3650)
 }
 
 /// 单封收件上限（字节）：解析失败/未配置取默认 50MB；超出区间钳制到 1..=200MB

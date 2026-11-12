@@ -59,10 +59,9 @@ fn pending_rows(state: &AppState) -> Result<Vec<Pending>, String> {
             )
             .map_err(|e| e.to_string())?;
         let out = stmt
-            .query_map(
-                rusqlite::params![account, MAX_UIDS_PER_ROUND as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_map(rusqlite::params![account, MAX_UIDS_PER_ROUND as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
             .collect();

@@ -295,10 +295,12 @@ async function mbxExportMd(emailId, filename) {
     }
 }
 
-// 数据目录迁移（M5）：系统对话框选目录 → POST 迁移（在线快照，重启生效）。
-// 响应为存储 pane 片段：成功显示"待生效目录"，失败显示错误区。
-// 请求护栏（M5 防抖审计）：弹窗+请求全程只允许一次在途
+// 数据目录迁移（M5 后台化）：系统对话框选目录 → POST 启动后台迁移（协议回调秒回，
+// 不再同步跑 VACUUM/附件复制阻塞前端）→ 弹阻塞进度模态，经 __TAURI__.event 收
+// 进度/结果。迁移完成由后端自动退出，用户重开即用新目录。
+// 请求护栏（防抖）：弹窗+请求全程只允许一次在途。
 let mbxMoveBusy = false;
+let mbxMigUnlisten = null;
 
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
@@ -306,16 +308,107 @@ async function mbxMoveDataDir() {
     try {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
-        await htmx.ajax('POST', '/settings/storage/move', {
-            target: '#settings-pane',
-            swap: 'outerHTML',
-            values: { dest: dir }
+        // 先弹模态并注册事件监听（避免后台完成事件在监听前发出被丢）
+        mbxMigOpen('准备迁移…');
+        await mbxMigListen();
+        await fetch('/settings/storage/move', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ dest: dir }).toString(),
         });
     } catch (e) {
-        console.error('[mbx] 打开目录对话框失败', e);
+        console.error('[mbx] 迁移启动失败', e);
+        mbxMigShowError('迁移启动失败：' + (e && e.message ? e.message : e));
     } finally {
         mbxMoveBusy = false;
     }
+}
+
+// ---------- 迁移阻塞进度模态 ----------
+// 迁移期间全屏遮罩 + 居中卡片 + 进度条；无关闭按钮（用户只能等待），
+// 完成由后端自动退出，失败才出现「返回」按钮。CSP 禁内联脚本，交互走 data-mbx-action 委托。
+function mbxMigOpen() {
+    let mask = document.getElementById('migrate-mask');
+    if (!mask) {
+        mask = document.createElement('div');
+        mask.id = 'migrate-mask';
+        mask.className = 'migrate-mask';
+        mask.innerHTML = '<div class="migrate-card" role="alertdialog" aria-modal="true" tabindex="-1">'
+            + '<div class="migrate-title">数据迁移</div>'
+            + '<div class="migrate-bar"><div class="migrate-bar-fill" id="migrate-bar"></div></div>'
+            + '<div class="migrate-detail" id="migrate-detail">准备迁移…</div>'
+            + '<button type="button" class="btn" data-mbx-action="migration-close" hidden>返回</button>'
+            + '</div>';
+        document.body.appendChild(mask);
+    }
+    mask.hidden = false;
+    mask.__mbxRelease = mbxModalOpen(mask, mask.querySelector('.migrate-card'));
+}
+
+// 更新进度条（0-100）+ 阶段文案
+function mbxMigSet(pct, detail) {
+    var bar = document.getElementById('migrate-bar');
+    if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    var d = document.getElementById('migrate-detail');
+    if (d) d.textContent = detail;
+}
+
+// 阶段 → 进度百分比（VACUUM 无精确进度：快照给固定段，附件按文件数）
+function mbxMigPhasePct(p) {
+    var t = p && p.files_total ? p.files_total : 0;
+    var d = p && p.files_done ? p.files_done : 0;
+    switch (p && p.phase) {
+        case 'attach': return 5;
+        case 'snapshot': return 40;
+        case 'attachments': return t ? 40 + Math.round(d / t * 50) : 60;
+        case 'pointer': return 90;
+        case 'done': return 100;
+        default: return 0;
+    }
+}
+
+// 失败态：显示错误 + 「返回」按钮（隐藏模式，用户可关回到存储页）
+function mbxMigShowError(msg) {
+    var mask = document.getElementById('migrate-mask');
+    var d = document.getElementById('migrate-detail');
+    if (d) d.textContent = msg || '迁移失败，请重试';
+    var btn = mask && mask.querySelector('[data-mbx-action="migration-close"]');
+    if (btn) btn.hidden = false;
+}
+
+// 关闭迁移模态（data-mbx-action=migration-close）：释放焦点陷阱 + 解除监听
+function mbxMigCloseModal() {
+    var mask = document.getElementById('migrate-mask');
+    if (!mask) return;
+    if (typeof mask.__mbxRelease === 'function') mask.__mbxRelease();
+    mask.hidden = true;
+    if (mbxMigUnlisten) {
+        try { mbxMigUnlisten(); } catch (e) { /* 已解绑 */ }
+        mbxMigUnlisten = null;
+    }
+}
+
+// 注册迁移事件监听（返回 Promise 就绪，避免 done 在监听前被丢）
+async function mbxMigListen() {
+    if (mbxMigUnlisten) return;
+    var unlist = [];
+    var add = function (name, fn) {
+        return window.__TAURI__.event.listen(name, function (e) {
+            try { fn(e); } catch (err) { console.error('[mbx] 迁移事件处理失败', err); }
+        }).then(function (f) { unlist.push(f); });
+    };
+    await add('migration-progress', function (e) {
+        var p = e.payload || {};
+        mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
+    });
+    await add('migration-done', function () {
+        // 后端将在短暂停留后自动退出（重开即用新目录）
+        mbxMigSet(100, '迁移完成，即将自动退出应用，请重新打开以使用新目录');
+    });
+    await add('migration-error', function (e) {
+        mbxMigShowError(typeof e.payload === 'string' ? e.payload : '迁移失败，请重试');
+    });
+    mbxMigUnlisten = function () { unlist.forEach(function (f) { if (f) f(); }); };
 }
 
 // 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——
@@ -438,6 +531,7 @@ document.addEventListener('click', function (ev) {
         case 'save-all-attachments': mbxSaveAllAttachments(Number(d.id)); break;
         case 'save-attachment': mbxSaveAttachment(Number(d.id), Number(d.aid), d.name); break;
         case 'move-data-dir': mbxMoveDataDir(); break;
+        case 'migration-close': mbxMigCloseModal(); break;
         case 'pick-setup-dir': mbxPickSetupDir(el); break;
         case 'toggle-hidden': {
             // 开关按钮：翻转自身 .on，并把对应 hidden input 写成 on/off 值

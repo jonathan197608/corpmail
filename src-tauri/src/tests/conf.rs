@@ -82,11 +82,13 @@ fn save_uses_pid_scoped_tmp_and_does_not_touch_legacy_stub() {
         "pid 命名的 tmp 不应覆盖旧固定名残留"
     );
     assert!(
-        !dir
-            .join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()))
+        !dir.join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()))
             .exists(),
         "rename 成功后临时文件必须消失"
     );
-    assert_eq!(load(&dir).get(keys::DISPLAY_NAME).map(String::as_str), Some("张三"));
+    assert_eq!(
+        load(&dir).get(keys::DISPLAY_NAME).map(String::as_str),
+        Some("张三")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

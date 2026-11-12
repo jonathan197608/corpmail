@@ -136,7 +136,7 @@ pub struct Resp {
 }
 
 impl Resp {
-    fn html(body: String) -> Self {
+    pub(super) fn html(body: String) -> Self {
         Self {
             status: 200,
             content_type: "text/html; charset=utf-8".into(),
@@ -547,7 +547,10 @@ fn foreign_origin(req: &Req) -> bool {
         .split([':', '/'])
         .next()
         .unwrap_or("");
-    !matches!(host, "ui.localhost" | "tauri.localhost" | "localhost" | "127.0.0.1")
+    !matches!(
+        host,
+        "ui.localhost" | "tauri.localhost" | "localhost" | "127.0.0.1"
+    )
 }
 
 /// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
@@ -810,7 +813,8 @@ fn list_rows(state: &AppState, req: &Req) -> Resp {
     let mut resp = render_html("mail_list_rows.html", &ctx);
     // 计数在行片段之外：用 OOB 一并换掉（htmx 会先摘出 OOB 元素再 swap 主片段）
     resp.body.extend_from_slice(
-        format!("<span id=\"mail-count\" hx-swap-oob=\"outerHTML\">共 {total} 封</span>").as_bytes(),
+        format!("<span id=\"mail-count\" hx-swap-oob=\"outerHTML\">共 {total} 封</span>")
+            .as_bytes(),
     );
     resp
 }
@@ -2707,11 +2711,13 @@ fn redirect_compose(draft_id: i64, error: &str) -> Resp {
 /// 刚敲的收件人/主题/正文整段消失（htmx 走 HX-Redirect 整页导航，DOM 里的
 /// 值不会自动保留）。正文按 8KB 截断（UTF-8 安全边界）：超长邮件仍会丢尾巴，
 /// 但一段都不给才是真丢。
-fn compose_retry_redirect(draft_id: i64, error: &str, ctx_qs: &str, form: &HashMap<String, String>) -> Resp {
-    let mut url = format!(
-        "/compose?draft_id={draft_id}&error={}",
-        urlencode(error)
-    );
+fn compose_retry_redirect(
+    draft_id: i64,
+    error: &str,
+    ctx_qs: &str,
+    form: &HashMap<String, String>,
+) -> Resp {
+    let mut url = format!("/compose?draft_id={draft_id}&error={}", urlencode(error));
     if !ctx_qs.is_empty() {
         url.push('&');
         url.push_str(ctx_qs);

@@ -234,7 +234,10 @@ fn preview_uses_html_source_when_plain_text_is_mojibake() {
     // 构造历史乱码：UTF-8 字节被按 GBK 解码（与 e5abf2f 用户截图同源）
     let (garbled, _, _) = encoding_rs::GBK.decode(good.as_bytes());
     let garbled = garbled.into_owned();
-    assert!(looks_mojibake(&garbled), "构造样本必须被判为乱码：{garbled}");
+    assert!(
+        looks_mojibake(&garbled),
+        "构造样本必须被判为乱码：{garbled}"
+    );
     let html = format!("<div><p>{good}</p></div>");
     assert_eq!(
         preview_text(&garbled, &html),
@@ -254,7 +257,10 @@ fn preview_uses_html_source_when_plain_text_is_mojibake() {
     assert_eq!(preview_text("正常 <b>加粗</b> 文本", ""), "正常 加粗 文本");
     // 乱码判定护栏：正常中文/西文/短文本不得误判
     assert!(!looks_mojibake(good), "正常中文不误判");
-    assert!(!looks_mojibake("Réunion déjà prévue à l'été"), "西文重音不误判");
+    assert!(
+        !looks_mojibake("Réunion déjà prévue à l'été"),
+        "西文重音不误判"
+    );
     assert!(!looks_mojibake("中文"), "短文本不判乱码");
     assert!(looks_mojibake("解码\u{FFFD}失败\u{FFFD}占位"));
     // UTF-8 字节被按 latin1 逐字节显示（含 C1 控制字符）
@@ -282,11 +288,8 @@ fn repair_mojibake_bodies_rewrites_from_html_and_runs_once() {
         rusqlite::params![garbled, format!("<p>{good}</p>"), "乱 码"],
     )
     .unwrap();
-    conn.execute(
-        insert,
-        rusqlite::params!["正常正文", "", "正 常"],
-    )
-    .unwrap();
+    conn.execute(insert, rusqlite::params!["正常正文", "", "正 常"])
+        .unwrap();
 
     repair_mojibake_bodies(&mut conn).unwrap();
     let (bt, tokens): (String, String) = conn
@@ -299,7 +302,9 @@ fn repair_mojibake_bodies_rewrites_from_html_and_runs_once() {
     assert_eq!(bt, good, "乱码正文应被同源 HTML 派生文本替换");
     assert_eq!(tokens, tokenize(good), "FTS 分词需同步重算");
     let normal: String = conn
-        .query_row("SELECT body_text FROM emails WHERE id = 2", [], |r| r.get(0))
+        .query_row("SELECT body_text FROM emails WHERE id = 2", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(normal, "正常正文", "正常正文不得误改");
 
@@ -311,7 +316,9 @@ fn repair_mojibake_bodies_rewrites_from_html_and_runs_once() {
     .unwrap();
     repair_mojibake_bodies(&mut conn).unwrap();
     let after: String = conn
-        .query_row("SELECT body_text FROM emails WHERE id = 1", [], |r| r.get(0))
+        .query_row("SELECT body_text FROM emails WHERE id = 1", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(after, garbled, "marker 生效后不应二次改写");
     drop(conn);
@@ -740,7 +747,10 @@ fn attachment_suffix_inference_rules() {
     );
     assert_eq!(ext_for_mime("application/octet-stream"), None);
 
-    assert_eq!(save_name_of("清单.xlsx", "application/octet-stream"), "清单.xlsx");
+    assert_eq!(
+        save_name_of("清单.xlsx", "application/octet-stream"),
+        "清单.xlsx"
+    );
     assert_eq!(save_name_of("清单", "application/pdf"), "清单.pdf");
     assert_eq!(save_name_of("清单", "application/octet-stream"), "清单.bin");
     assert_eq!(save_name_of("", "image/png"), "attachment.png");
@@ -1466,7 +1476,11 @@ fn template_html_is_sanitized_on_save() {
     assert!(!t.body_html.contains("onerror"), "{}", t.body_html);
     assert!(!t.body_html.contains("<script"), "{}", t.body_html);
     assert!(!t.body_html.contains("onclick"), "{}", t.body_html);
-    assert!(t.body_html.contains("hi"), "正文文本应保留：{}", t.body_html);
+    assert!(
+        t.body_html.contains("hi"),
+        "正文文本应保留：{}",
+        t.body_html
+    );
     cleanup(&dir);
 }
 
@@ -1690,10 +1704,9 @@ fn attachment_read_distinguishes_permission_from_missing() {
     std::fs::write(&locked, b"data").unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
     match read_attach_gz(&locked) {
-        Err(AttachIo::Unreadable(why)) => assert!(
-            why.contains("权限"),
-            "应说明权限问题而不是笼统失败：{why}"
-        ),
+        Err(AttachIo::Unreadable(why)) => {
+            assert!(why.contains("权限"), "应说明权限问题而不是笼统失败：{why}")
+        }
         other => panic!("权限不足应判 Unreadable，实际：{:?}", other.is_ok()),
     }
     // 不存在 → Missing
@@ -1735,7 +1748,10 @@ fn eml_attachment_base64_wraps_at_76_cols_and_round_trips() {
         }
     }
     assert!(lines.len() > 1, "300 字节必须折成多行：{lines:?}");
-    assert!(lines.iter().all(|l| l.len() <= 76), "单行超 76 列：{lines:?}");
+    assert!(
+        lines.iter().all(|l| l.len() <= 76),
+        "单行超 76 列：{lines:?}"
+    );
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(lines.concat())
         .unwrap();
@@ -1753,8 +1769,11 @@ fn eml_export_skips_cleaned_attachment() {
     add_attachment_bytes(&state, id, "big.bin", "application/octet-stream", b"abc").unwrap();
     state
         .with_conn(|conn| {
-            conn.execute("UPDATE attachments SET detached = 1 WHERE email_id = ?1", [id])
-                .map_err(|e| e.to_string())
+            conn.execute(
+                "UPDATE attachments SET detached = 1 WHERE email_id = ?1",
+                [id],
+            )
+            .map_err(|e| e.to_string())
         })
         .unwrap();
 

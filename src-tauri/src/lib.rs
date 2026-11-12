@@ -27,7 +27,7 @@ pub(crate) fn err<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 主窗口入口 URL：自定义协议 `ui` 的根路径。
 ///
@@ -133,6 +133,43 @@ pub fn run() {
                 }));
             }
             app.manage(state);
+
+            if cfg!(not(feature = "e2e")) {
+                // 后台迁移执行器（M5 存储迁移后台化）：注入后 start_migration 走后台线程，
+                // 协议回调立即返回（不再同步跑 VACUUM/附件复制阻塞前端），进度/结果经
+                // 事件回传，迁移完成自动退出（用户重开即用新目录）。
+                // 未注入（单元测试 / e2e 构建）时 start_migration 走同步，保持既有测试
+                // 语义——e2e 的 95 迁移/冻结用例与阶段二复用链路都依赖同步进程内状态，
+                // 后台自动退出会杀 e2e 进程，故 e2e 不注入、生产才后台化。
+                let handle: tauri::AppHandle = app.handle().clone();
+                app.state::<state::AppState>()
+                    .set_migration_executor(std::sync::Arc::new(move |dest| {
+                        let app = handle.clone();
+                        let dest = dest.to_string();
+                        std::thread::spawn(move || {
+                            let s = app.state::<state::AppState>();
+                            let result =
+                                s.move_data_dir_progress(&dest, &|p: &state::MigrationProgress| {
+                                    let _ = app.emit("migration-progress", p);
+                                });
+                            match result {
+                                Ok(msg) => {
+                                    // 迁移完成：先提示前端（模态显示"即将退出"），
+                                    // 短暂停留后自动退出，用户重开即用新目录
+                                    let _ = app.emit("migration-done", msg);
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    app.exit(0);
+                                }
+                                Err(e) => {
+                                    // 迁移失败：解冻已完成（move_data_dir 内部），回传错误
+                                    let _ = app.emit("migration-error", e);
+                                }
+                            }
+                            s.mark_migration_finished();
+                        });
+                        Ok(())
+                    }));
+            }
 
             // M4-1 托盘常驻：图标 + 菜单 + 左键唤起 + 未读角标（setup 需在
             // manage 之后：refresh_badge 读 AppState）
@@ -329,7 +366,10 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                         failures = 0;
                         continue;
                     }
-                    if !wait_or_stop(mail::seen::backoff(failures), std::time::Duration::from_secs(2)) {
+                    if !wait_or_stop(
+                        mail::seen::backoff(failures),
+                        std::time::Duration::from_secs(2),
+                    ) {
                         return;
                     }
                 }

@@ -10,7 +10,7 @@ use super::router::{
     human_bytes, parse_form, render_html, render_pane_with_sidebar_refresh, security_or,
     test_fragment, test_view, trimmed_field,
 };
-use crate::state::{self, AppState, ResetFetchError, defaults, full_address, keys};
+use crate::state::{self, AppState, MigrateOutcome, ResetFetchError, defaults, full_address, keys};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -136,38 +136,38 @@ pub(super) fn settings_ctx(
     clean: Option<CleanView>,
     backup: Option<BackupDeleteView>,
 ) -> SettingsCtx {
-    // M5 旧目录迁移备份：仅存储 tab 计算（递归扫描锚点附件）
-    let (has_backup, backup_size, backup_files) = if tab == "storage" {
-        match state.old_backup_stats() {
-            Some((b, n)) => (true, human_bytes(b), n),
-            None => (false, String::new(), 0),
-        }
-    } else {
-        (false, String::new(), 0)
+    // 存储页统计（estimate + 旧目录备份）一次取回（带缓存，避免打开存储页反复
+    // 全库扫描）；其他 tab 不触发。迁移后台分支也走同一缓存避免返回时扫描
+    let storage_stats = (tab == "storage").then(|| state.storage_stats());
+    // M5 旧目录迁移备份：仅存储 tab（锚点附件）
+    let (has_backup, backup_size, backup_files) = match storage_stats.as_ref() {
+        Some((_, Some((b, n)))) => (true, human_bytes(*b), *n),
+        Some((_, None)) => (false, String::new(), 0),
+        None => (false, String::new(), 0),
     };
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
     let counts = state.folder_counts();
-    // M5 清理预估：仅存储 tab 计算（含孤儿 fs 扫描，其他 tab 免开销）
-    let (est_bytes, est_detail, can_clean) = if tab == "storage" {
-        let est = crate::clean::estimate(state);
-        let mut parts: Vec<String> = Vec::new();
-        if est.detach_files > 0 {
-            parts.push(format!("大附件 {} 个", est.detach_files));
+    // M5 清理预估：仅存储 tab（含孤儿 fs 扫描，其他 tab 免开销）
+    let (est_bytes, est_detail, can_clean) = match storage_stats.as_ref() {
+        Some((est, _)) => {
+            let mut parts: Vec<String> = Vec::new();
+            if est.detach_files > 0 {
+                parts.push(format!("大附件 {} 个", est.detach_files));
+            }
+            if est.expire_emails > 0 {
+                parts.push(format!("过期邮件 {} 封", est.expire_emails));
+            }
+            if est.orphan_files > 0 {
+                parts.push(format!("孤儿文件 {} 个", est.orphan_files));
+            }
+            (
+                human_bytes(est.bytes),
+                parts.join(" · "),
+                est.detach_files > 0 || est.expire_emails > 0 || est.orphan_files > 0,
+            )
         }
-        if est.expire_emails > 0 {
-            parts.push(format!("过期邮件 {} 封", est.expire_emails));
-        }
-        if est.orphan_files > 0 {
-            parts.push(format!("孤儿文件 {} 个", est.orphan_files));
-        }
-        (
-            human_bytes(est.bytes),
-            parts.join(" · "),
-            est.detach_files > 0 || est.expire_emails > 0 || est.orphan_files > 0,
-        )
-    } else {
-        (human_bytes(0), String::new(), false)
+        None => (human_bytes(0), String::new(), false),
     };
     let (attach_bytes, attach_files) = state.attachments_stats();
     let db_bytes = state.db_size_bytes();
@@ -635,6 +635,8 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
     // 立即可见效果，无需等每日定时器或手动点「立即清理」（2026-11-03 需求：
     // 此前只改值不清理，“收件保留时长”看起来不生效）。清理失败不影响保存成功
     let view = clean_view_of(crate::clean::run(state));
+    // 清理改了库 → 存储统计缓存失效，下次打开重新计算
+    state.invalidate_stats_cache();
     // 清理可能删邮件 → 边栏计数需要同步刷新（HX-Trigger 事件驱动局部刷新）
     render_pane_with_sidebar_refresh(
         &pane_template("storage"),
@@ -648,18 +650,22 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
 pub(super) fn settings_storage_move(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
     let dest = form.get("dest").cloned().unwrap_or_default();
-    let error = if dest.trim().is_empty() {
-        "未选择目标目录".to_string()
-    } else {
-        match state.move_data_dir(&dest) {
-            Ok(_) => String::new(),
-            Err(e) => e,
-        }
-    };
-    render_html(
-        &pane_template("storage"),
-        &settings_ctx(state, "storage", false, &error, None, None),
-    )
+    match state.start_migration(&dest) {
+        // 后台迁移已启动（生产）：协议回调立即返回轻量片段，前端据此开阻塞模态，
+        // 进度/结果经事件回传（不再在协议回调内同步执行 VACUUM/附件复制）
+        Ok(MigrateOutcome::Background) => Resp::html(
+            "<div class=\"settings-pane\" id=\"settings-pane\"><p class=\"desc\">数据迁移正在进行中，请稍候…</p></div>".into(),
+        ),
+        // 同步完成（单元测试 / 未注入 executor）：保持既有 pane 返回语义
+        Ok(MigrateOutcome::Done) => render_html(
+            &pane_template("storage"),
+            &settings_ctx(state, "storage", false, "", None, None),
+        ),
+        Err(e) => render_html(
+            &pane_template("storage"),
+            &settings_ctx(state, "storage", false, &e, None, None),
+        ),
+    }
 }
 
 /// 清理结果 → 展示视图（手动/保存后自动共用）
@@ -689,6 +695,8 @@ fn clean_view_of(result: Result<crate::clean::CleanReport, String>) -> CleanView
 /// 设置·存储管理：立即清理（手动触发，同步执行；回 pane 带报告）
 pub(super) fn settings_storage_clean(state: &AppState) -> Resp {
     let view = clean_view_of(crate::clean::run(state));
+    // 清理改了库 → 存储统计缓存失效，下次打开重新计算
+    state.invalidate_stats_cache();
     // 清理删行后边栏计数需刷新（同保存路径）
     render_pane_with_sidebar_refresh(
         &pane_template("storage"),

@@ -233,7 +233,10 @@ fn store_incoming_dedupes_and_sets_unread() {
         incoming(9, false, "清单转发", "<m-1@x.cn>"),
     ];
     let added = store_incoming(&state, &mails).unwrap();
-    assert_eq!(added, 3, "只按远端键去重：同 UID 跳过，同 UV 异构 UID 视为两份");
+    assert_eq!(
+        added, 3,
+        "只按远端键去重：同 UID 跳过，同 UV 异构 UID 视为两份"
+    );
     let rows: Vec<(String, bool, String)> = state.with_conn(|c| {
         c.prepare("SELECT remote_uid, unread = 1, message_id FROM emails ORDER BY id")
             .unwrap()
@@ -903,7 +906,11 @@ fn store_incoming_remaps_remote_uid_on_uidvalidity_change() {
     // UIDVALIDITY 从 42 变 7：同一封的 UID 也跟着变（10）→ 迁移，不新增
     let mut again = incoming(10, false, "重编号", "<m-uv@x.cn>");
     again.uidvalidity = 7;
-    assert_eq!(store_incoming(&state, &[again]).unwrap(), 0, "重编号不得重复入库");
+    assert_eq!(
+        store_incoming(&state, &[again]).unwrap(),
+        0,
+        "重编号不得重复入库"
+    );
     let (n, remote): (i64, String) = state.with_conn(|c| {
         (
             c.query_row("SELECT count(*) FROM emails", [], |r| r.get(0))

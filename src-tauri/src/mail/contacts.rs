@@ -360,25 +360,25 @@ pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
     loop {
         type BackfillRow = (i64, String, String, String, String, String, String, i64);
         let rows: Vec<BackfillRow> = crate::db::collect_rows(
-                conn,
-                "SELECT id, direction, from_addr, COALESCE(from_name,''), to_addrs, \
+            conn,
+            "SELECT id, direction, from_addr, COALESCE(from_name,''), to_addrs, \
                  COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
                  COALESCE(received_at, sent_at, created_at, 0) FROM emails \
                  WHERE id > ?1 ORDER BY id LIMIT ?2",
-                &[&after, &crate::mail::REPAIR_CHUNK],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                    ))
-                },
-            )?;
+            &[&after, &crate::mail::REPAIR_CHUNK],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )?;
         let Some(last) = rows.last().map(|r| r.0) else {
             break;
         };

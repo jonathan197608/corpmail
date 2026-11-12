@@ -3888,3 +3888,50 @@ form.setup-card .setup-actions {
     justify-content: flex-end;
     gap: var(--gap-btn);
 }
+
+/* ---------- 数据迁移阻塞模态（M5 后台化，2026-11-10） ---------- */
+.migrate-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: rgba(20, 26, 34, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.migrate-card {
+    width: 380px;
+    background: #fff;
+    border-radius: 12px;
+    padding: 22px 24px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+    text-align: center;
+}
+.migrate-title {
+    font-weight: 600;
+    font-size: 15px;
+    margin-bottom: 14px;
+}
+.migrate-bar {
+    height: 8px;
+    border-radius: 4px;
+    background: #eceff3;
+    overflow: hidden;
+    margin-bottom: 12px;
+}
+.migrate-bar-fill {
+    height: 100%;
+    width: 0;
+    background: #2563eb;
+    border-radius: 4px;
+    transition: width 0.2s ease;
+}
+.migrate-detail {
+    font-size: 12px;
+    color: #6b7280;
+    line-height: 1.6;
+    min-height: 20px;
+}
+.migrate-card .btn {
+    margin-top: 12px;
+}

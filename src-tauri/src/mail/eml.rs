@@ -232,7 +232,11 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
     let boundary = format!("=_corpmail_{email_id}_{:x}", super::now_epoch());
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(
-        format!("From: {}\r\n", addr_header(&detail.from_name, &detail.from_addr)).as_bytes(),
+        format!(
+            "From: {}\r\n",
+            addr_header(&detail.from_name, &detail.from_addr)
+        )
+        .as_bytes(),
     );
     if !detail.to_addrs.trim().is_empty() {
         out.extend_from_slice(format!("To: {}\r\n", addr_list_header(&detail.to_addrs)).as_bytes());

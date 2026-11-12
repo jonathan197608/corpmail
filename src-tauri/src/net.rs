@@ -135,7 +135,10 @@ pub fn probe_tcp(host: &str, port: u16) -> Result<(), String> {
             Some(d) if !d.is_zero() => d,
             // 预算已耗尽：不再尝试后续地址（否则总耗时随地址数线性膨胀）
             _ => {
-                last = format!("连接 {host}:{port} 超时（已等待 {} 秒）", PROBE_BUDGET.as_secs());
+                last = format!(
+                    "连接 {host}:{port} 超时（已等待 {} 秒）",
+                    PROBE_BUDGET.as_secs()
+                );
                 break;
             }
         };

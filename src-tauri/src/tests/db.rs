@@ -639,7 +639,9 @@ fn sort_and_lookup_indexes_are_used() {
     .unwrap();
     for (id, want) in [(1, 100i64), (2, 200), (3, 30)] {
         let got: i64 = conn
-            .query_row("SELECT sort_time FROM emails WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT sort_time FROM emails WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(got, want, "id={id} 的 sort_time 口径变了");
     }
@@ -692,9 +694,7 @@ fn folder_count_queries_use_indexes() {
 
 /// EXPLAIN QUERY PLAN 的明细文本（每行 detail 拼接）
 fn plan_of(conn: &Connection, sql: &str) -> String {
-    let mut stmt = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-        .unwrap();
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(3))
         .unwrap()

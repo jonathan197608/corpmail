@@ -175,9 +175,7 @@ fn strip_thread_prefix(subject: &str) -> Option<&str> {
             .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
     });
     if is_en || is_cn {
-        Some(
-            rest.trim_start_matches(|c: char| c == ':' || c == '\u{FF1A}' || c.is_whitespace()),
-        )
+        Some(rest.trim_start_matches(|c: char| c == ':' || c == '\u{FF1A}' || c.is_whitespace()))
     } else {
         None
     }
@@ -927,11 +925,7 @@ pub(crate) fn repair_mark_get(conn: &rusqlite::Connection, key: &str) -> i64 {
 }
 
 /// 写分块游标（在数据事务内调用，与数据同进同退）
-fn repair_mark_set(
-    tx: &rusqlite::Connection,
-    key: &str,
-    v: i64,
-) -> Result<(), String> {
+fn repair_mark_set(tx: &rusqlite::Connection, key: &str, v: i64) -> Result<(), String> {
     tx.execute(
         "INSERT INTO repair_marks(k, v) VALUES(?1, ?2)
          ON CONFLICT(k) DO UPDATE SET v = excluded.v",
@@ -1356,7 +1350,9 @@ fn order_sql(sort: SortKey, alias: &str) -> String {
                 "{a}from_name COLLATE NOCASE ASC, {a}from_addr COLLATE NOCASE ASC, {a}sort_time DESC, {a}id DESC"
             )
         }
-        SortKey::SubjectAsc => format!("{a}subject COLLATE NOCASE ASC, {a}sort_time DESC, {a}id DESC"),
+        SortKey::SubjectAsc => {
+            format!("{a}subject COLLATE NOCASE ASC, {a}sort_time DESC, {a}id DESC")
+        }
     }
 }
 
@@ -2059,9 +2055,9 @@ fn preview_base(text: &str, html: &str) -> String {
 fn has_html_markup(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
-        "<div", "<p>", "<p ", "<span", "<table", "<br", "<html", "<body", "<style",
-        "<script", "<font", "<td", "<tr", "<!--", "<b>", "<b ", "<strong", "<em>",
-        "<i>", "<u>", "<a ", "<img", "<li", "<ul", "<h1", "<h2", "<h3",
+        "<div", "<p>", "<p ", "<span", "<table", "<br", "<html", "<body", "<style", "<script",
+        "<font", "<td", "<tr", "<!--", "<b>", "<b ", "<strong", "<em>", "<i>", "<u>", "<a ",
+        "<img", "<li", "<ul", "<h1", "<h2", "<h3",
     ]
     .iter()
     .any(|p| lower.contains(p))
@@ -3172,11 +3168,16 @@ fn save_dest_allowed(p: &Path) -> bool {
 #[cfg(windows)]
 fn save_dest_allowed(p: &Path) -> bool {
     let target = comparable_path(p);
-    let denied: Vec<String> = ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
-        .iter()
-        .filter_map(|k| std::env::var_os(k))
-        .map(|v| comparable_path(Path::new(&v)))
-        .collect();
+    let denied: Vec<String> = [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+    ]
+    .iter()
+    .filter_map(|k| std::env::var_os(k))
+    .map(|v| comparable_path(Path::new(&v)))
+    .collect();
     !denied.iter().any(|r| path_within(&target, r))
 }
 

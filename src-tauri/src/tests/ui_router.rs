@@ -919,7 +919,11 @@ fn storage_move_returns_pane_with_pending_dir() {
         &tester,
     );
     assert_eq!(resp.status, 409, "冻结期二次迁移必须被拒");
-    assert!(body(&resp).contains("已迁移"), "应提示重启：{}", body(&resp));
+    assert!(
+        body(&resp).contains("已迁移"),
+        "应提示重启：{}",
+        body(&resp)
+    );
     // 存储 pane：固定横幅 + 写操作按钮禁用
     let html2 = body(&route(
         &state,
@@ -2648,8 +2652,16 @@ fn detail_status_polling_targets_status_region_only() {
         "不得再整页 outerHTML 重建"
     );
     // 状态区片段：只含状态行，不含正文/侧栏/顶栏
-    let frag = body(&route(&state, &assets(), &req("GET", "/emails/1/statusbar", b""), &t));
-    assert!(frag.trim_start().starts_with("<div id=\"mail-status\""), "片段根节点是状态区：{frag}");
+    let frag = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/1/statusbar", b""),
+        &t,
+    ));
+    assert!(
+        frag.trim_start().starts_with("<div id=\"mail-status\""),
+        "片段根节点是状态区：{frag}"
+    );
     assert!(frag.contains("排队中"), "queued 应显示排队文案：{frag}");
     assert!(
         frag.contains("hx-get=\"/emails/1/statusbar\""),
@@ -2660,12 +2672,22 @@ fn detail_status_polling_targets_status_region_only() {
         "片段不应包含正文与顶栏：{frag}"
     );
     // 终态：不再带轮询属性（服务端渲染即停止逻辑）
-    let done = body(&route(&state, &assets(), &req("GET", "/emails/2/statusbar", b""), &t));
+    let done = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/2/statusbar", b""),
+        &t,
+    ));
     assert!(done.contains("已发送"), "sent 片段显示终态");
     assert!(!done.contains("hx-get="), "终态不应再轮询：{done}");
     // 未配置账号：拒绝（不渲染空状态区）
     let (fresh, fresh_dir) = temp_state("r42-statusbar-empty");
-    let resp = route(&fresh, &assets(), &req("GET", "/emails/1/statusbar", b""), &t);
+    let resp = route(
+        &fresh,
+        &assets(),
+        &req("GET", "/emails/1/statusbar", b""),
+        &t,
+    );
     assert_eq!(resp.status, 400, "未配置时应 400");
     cleanup(&fresh_dir);
     cleanup(&dir);
@@ -2786,7 +2808,11 @@ fn wizard_save_first_run_requires_data_dir_choice() {
     let shown = &page[at..at + page[at..].find('"').expect("value 引号")];
     // minijinja autoescape 会把 '/' 转成 &#x2f;（详情页 title 同样），还原后比对
     let shown = shown.replace("&#x2f;", "/").replace("&#x2F;", "/");
-    assert_eq!(shown, dir.display().to_string(), "已配置后应回显当前数据目录");
+    assert_eq!(
+        shown,
+        dir.display().to_string(),
+        "已配置后应回显当前数据目录"
+    );
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }
@@ -2908,7 +2934,11 @@ fn wizard_save_success_redirects_and_persists() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -2941,7 +2971,11 @@ fn wizard_save_aborts_when_any_channel_fails() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: false,
             imap_ok: true,
@@ -2973,7 +3007,11 @@ fn wizard_done_shows_summary_and_guards_unconfigured() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3127,9 +3165,7 @@ fn huge_page_number_does_not_panic() {
 #[test]
 fn protocol_rejects_foreign_origin() {
     let (state, dir) = temp_state("origin-guard");
-    state
-        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo")])
-        .unwrap();
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
     let t = FakeTester {
         smtp_ok: true,
         imap_ok: true,
@@ -3171,7 +3207,12 @@ fn protocol_rejects_foreign_origin() {
     );
     assert_eq!(resp.status, 403, "Sec-Fetch-Site: cross-site 应拒绝");
     // 应用自身来源与不可判定（自定义协议可能不带 Origin / 写 null）放行
-    for origin in ["http://ui.localhost", "http://tauri.localhost", "null", "ui://localhost"] {
+    for origin in [
+        "http://ui.localhost",
+        "http://tauri.localhost",
+        "null",
+        "ui://localhost",
+    ] {
         let resp = route(
             &state,
             &assets(),
@@ -3189,9 +3230,7 @@ fn protocol_rejects_foreign_origin() {
 #[test]
 fn remote_images_blocked_until_enabled() {
     let (state, dir) = temp_state("remote-img");
-    state
-        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo")])
-        .unwrap();
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
     let t = FakeTester {
         smtp_ok: true,
         imap_ok: true,
@@ -3717,7 +3756,11 @@ fn settings_account_save_keeps_credential_when_blank() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3918,7 +3961,11 @@ fn wizard_save_first_run_custom_dir_switches_immediately() {
     let resp2 = route(
         &state2,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir2.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir2.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -3989,7 +4036,11 @@ fn settings_account_ignores_readonly_submissions() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -4108,7 +4159,11 @@ fn settings_account_test_uses_saved_credential() {
     let _ = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -4964,13 +5019,7 @@ fn router_tolerates_malformed_requests() {
     }
     // 3) 未配置状态下的全部动态路由 → 欢迎页（强制入口），不 panic
     let (fresh, fdir) = temp_state("fuzz-req-fresh");
-    for p in [
-        "/",
-        "/compose",
-        "/emails/1",
-        "/settings",
-        "/welcome/done",
-    ] {
+    for p in ["/", "/compose", "/emails/1", "/settings", "/welcome/done"] {
         let resp = route(&fresh, &a, &req("GET", p, b""), &t);
         assert_eq!(resp.status, 200, "{p} 未配置应渲染欢迎页");
     }
@@ -5394,7 +5443,11 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -9090,7 +9143,11 @@ fn wizard_reuses_current_dir_store_when_owner_matches() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &FakeTester {
             smtp_ok: true,
             imap_ok: true,
@@ -9156,7 +9213,11 @@ fn wizard_rejects_current_dir_store_of_other_account() {
     let resp = route(
         &state,
         &assets(),
-        &req("POST", "/welcome/setup/save", &form(&wizard_pairs(dir.to_str().unwrap()))),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
         &t,
     );
     let b = body(&resp);
@@ -9220,7 +9281,10 @@ fn display_name_autofill_is_visible_in_ui() {
         &req("GET", "/welcome/done", b""),
         &t,
     ));
-    assert!(done.contains("张伟"), "完成页应展示自动补齐的显示名：{done}");
+    assert!(
+        done.contains("张伟"),
+        "完成页应展示自动补齐的显示名：{done}"
+    );
     let saved = state.get(keys::DISPLAY_NAME).flatten();
     assert_eq!(saved.as_deref(), Some("张伟"), "完成页应触发配置写回");
     let side = body(&route(
@@ -9391,7 +9455,12 @@ fn migration_freeze_blocks_writes_but_allows_reads() {
         body(&resp)
     );
     // 带副作用的 GET：手动收件同样被拒（否则会写旧库并卡住状态条）
-    let resp = route(&state, &assets(), &req("GET", "/emails/fetch", b""), &tester);
+    let resp = route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/fetch", b""),
+        &tester,
+    );
     assert_eq!(resp.status, 409, "冻结期手动收件必须 409");
     // 读：列表页照常渲染（冻结只挡写）
     let resp = route(&state, &assets(), &req("GET", "/", b""), &tester);
@@ -9408,7 +9477,10 @@ fn migration_freeze_blocks_writes_but_allows_reads() {
 fn compose_save_failure_carries_form_values_back() {
     let (state, dir) = temp_state("r44-retry");
     state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
-    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
     let resp = route(
         &state,
         &assets(),

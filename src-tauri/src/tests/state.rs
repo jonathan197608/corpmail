@@ -1279,7 +1279,11 @@ fn display_name_prefers_login_account_and_rejects_foreign_senders() {
         }
         insert_sent_mail(c, "demo@chinatelecom.cn", "本人", 100);
     });
-    assert_eq!(s.display_name(), "本人", "登录账号出现时应优先，不取别名众数");
+    assert_eq!(
+        s.display_name(),
+        "本人",
+        "登录账号出现时应优先，不取别名众数"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     let dir2 = temp_dir("display-alias-only");
@@ -1487,7 +1491,10 @@ fn set_batch_rolls_back_config_file_when_db_write_fails() {
     // 旧值先落文件
     state.set_batch(&[(keys::SMTP_PORT, "25")]).unwrap();
     assert_eq!(
-        crate::conf::load(&dir).unwrap().get(keys::SMTP_PORT).map(String::as_str),
+        crate::conf::load(&dir)
+            .unwrap()
+            .get(keys::SMTP_PORT)
+            .map(String::as_str),
         Some("25")
     );
     // 挡死库键写入（settings 一律 ABORT，模拟库损坏/只读）
@@ -1503,14 +1510,17 @@ fn set_batch_rolls_back_config_file_when_db_write_fails() {
 
     let err = state
         .set_batch(&[
-            (keys::SMTP_PORT, "587"),  // 配置键（文件）
-            (keys::PAGE_SIZE, "100"),  // 库键（settings，被触发器挡死）
+            (keys::SMTP_PORT, "587"), // 配置键（文件）
+            (keys::PAGE_SIZE, "100"), // 库键（settings，被触发器挡死）
         ])
         .expect_err("库键失败必须整体报错");
     assert!(err.contains("blocked") || err.contains("写入"), "{err}");
     // 文件与内存镜像都不得带上 587
     assert_eq!(
-        crate::conf::load(&dir).unwrap().get(keys::SMTP_PORT).map(String::as_str),
+        crate::conf::load(&dir)
+            .unwrap()
+            .get(keys::SMTP_PORT)
+            .map(String::as_str),
         Some("25"),
         "文件必须回滚到旧值"
     );
@@ -1597,7 +1607,10 @@ fn swap_quiesce_bumps_epoch_to_invalidate_running_round() {
     state.quiesce_fetch_rounds(); // active_rounds == 0：立即返回
     let after = state.fetch_snapshot();
     assert_eq!(after.epoch, before.epoch + 1, "在跑轮必须被作废");
-    assert!(!after.running, "名额归零后 running 必须复位（不留 300s 卡死）");
+    assert!(
+        !after.running,
+        "名额归零后 running 必须复位（不留 300s 卡死）"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1639,5 +1652,103 @@ fn adopt_owner_mark_failure_leaves_pointer_untouched() {
         state.get(keys::DATA_DIR).flatten().is_none(),
         "标记失败发生在指针提交之前，指针必须未动"
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn start_migration_sync_without_executor() {
+    // 未注入 executor（单元测试/e2e）→ start_migration 走同步，落盘 + 冻结待重启
+    let base = temp_dir("start-sync");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let dest = base.join("moved");
+    let out = state
+        .start_migration(dest.to_str().unwrap())
+        .expect("同步迁移应成功");
+    assert!(
+        matches!(out, MigrateOutcome::Done),
+        "无 executor 应同步完成"
+    );
+    assert!(dest.join("corpmail.db").exists(), "库应已迁走");
+    assert!(state.migration_pending(), "同步迁移完成应冻结待重启");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn start_migration_background_when_executor_injected() {
+    // 注入 executor（生产）→ start_migration 返回 Background，交给 executor，不在此同步落盘
+    let base = temp_dir("start-bg");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let called2 = std::sync::Arc::clone(&called);
+    state.set_migration_executor(std::sync::Arc::new(move |_| {
+        called2.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }));
+    let dest = base.join("moved");
+    let out = state.start_migration(dest.to_str().unwrap()).unwrap();
+    assert!(
+        matches!(out, MigrateOutcome::Background),
+        "注入 executor 应后台启动"
+    );
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "executor 应被调用"
+    );
+    assert!(
+        !dest.join("corpmail.db").exists(),
+        "后台启动不应同步落库（交给 executor 后台线程）"
+    );
+    // 幂等：后台进行中再次触发被拒
+    let err = state
+        .start_migration(base.join("moved2").to_str().unwrap())
+        .expect_err("进行中应拒绝重复迁移");
+    assert!(err.contains("进行中"), "{err}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn start_migration_rejects_empty_dest() {
+    // 空目标（表单留空）在最前置入口即被拒，文案为「未选择目标目录」，
+    // 不落到 validate_data_dir 的「请选择绝对路径目录」——无论是否注入 executor
+    let base = temp_dir("start-empty");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let err = state.start_migration("").expect_err("空目标应被拒");
+    assert!(err.contains("未选择目标目录"), "{err}");
+    assert!(
+        !state.migration_in_progress(),
+        "空目标被拒不应进入迁移进行中"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn move_data_dir_progress_reports_phases() {
+    // 带进度回传的迁移：阶段应含 attach/snapshot/pointer（附件阶段有附件才触发）
+    let base = temp_dir("move-prog");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let phases = Mutex::new(Vec::<String>::new());
+    let dest = base.join("moved");
+    state
+        .move_data_dir_progress(dest.to_str().unwrap(), &|p: &MigrationProgress| {
+            phases.lock().unwrap().push(p.phase.to_string());
+        })
+        .unwrap();
+    let phases = phases.into_inner().unwrap();
+    for need in ["attach", "snapshot", "pointer"] {
+        assert!(
+            phases.iter().any(|p| p == need),
+            "进度应含 {need} 阶段，实际 {phases:?}"
+        );
+    }
+    assert!(dest.join("corpmail.db").exists(), "库应已迁走");
     let _ = std::fs::remove_dir_all(&base);
 }

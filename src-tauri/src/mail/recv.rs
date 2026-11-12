@@ -1054,7 +1054,10 @@ fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
 fn extract_body(mail: &mailparse::ParsedMail) -> (String, Option<String>) {
     let plain = find_inline_part(mail, "text/plain").map(body_text_repaired);
     let html = find_inline_part(mail, "text/html").map(body_text_repaired);
-    let from_html = html.as_deref().map(strip_html).map(|s| s.trim().to_string());
+    let from_html = html
+        .as_deref()
+        .map(strip_html)
+        .map(|s| s.trim().to_string());
     let plain_text = match (&plain, &from_html) {
         (Some(t), _) if !looks_mojibake(t) => t.clone(),
         (_, Some(h)) if !h.is_empty() => h.clone(),
@@ -1195,9 +1198,7 @@ pub fn store_incoming_conn(
                     remap.get_or_insert(id); // ② 旧 UV 的同一封
                 }
             }
-            if !same_uv
-                && let (Some(id), Some(new_remote)) = (remap, remote.as_deref())
-            {
+            if !same_uv && let (Some(id), Some(new_remote)) = (remap, remote.as_deref()) {
                 conn.execute(
                     "UPDATE emails SET remote_uid = ?2 WHERE id = ?1",
                     rusqlite::params![id, new_remote],

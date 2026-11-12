@@ -38,7 +38,7 @@ pub struct CleanReport {
 }
 
 /// 清理预估（estimate 返回；存储页"预计可释放"明细）
-#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+#[derive(Serialize, Default, Debug, PartialEq, Eq, Clone)]
 pub struct Estimate {
     /// 预计释放字节数（合计）
     pub bytes: u64,
