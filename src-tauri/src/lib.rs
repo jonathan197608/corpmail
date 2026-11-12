@@ -517,9 +517,15 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
         }
         loop {
             let state = handle.state::<state::AppState>();
-            // 迁移冻结（R2）：清理器会删库行与附件文件，冻结期整轮跳过
+            // 迁移冻结（R2）：清理器会删库行与附件文件，冻结期整轮跳过。
+            // R9：进行中与待重启分开留痕——两种状态日志若都写「待重启」，
+            // 线上排查时分不清那一刻迁移到底跑完没有
             if state.migration_pending() {
-                eprintln!("[clean] 迁移待重启，跳过本轮清理");
+                let why = match state.migration_phase() {
+                    state::MigrationPhase::Running => "迁移进行中",
+                    _ => "迁移待重启",
+                };
+                eprintln!("[clean] {why}，跳过本轮清理");
             } else if let Err(err) = clean::run(&state) {
                 eprintln!("[clean] 清理器执行失败：{err}");
             }

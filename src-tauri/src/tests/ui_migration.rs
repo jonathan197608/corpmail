@@ -261,6 +261,10 @@ fn migration_modal_has_stall_watchdog() {
         "必须起看门狗定时器"
     );
     assert!(
+        APP_JS.contains("MBX_MIG_SNAPSHOT_STALL_MS"),
+        "快照阶段要单独放宽阈值：VACUUM 是一次性阻塞、期间零事件，60s 会自伤"
+    );
+    assert!(
         APP_JS.contains("长时间无进展"),
         "超时必须切到可关闭的失败态并说明后台仍在跑"
     );

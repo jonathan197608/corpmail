@@ -304,8 +304,13 @@ let mbxMigUnlisten = null;
 // R10：看门狗状态（后端 panic / 目标目录卡死时前端没有任何事件可等）
 let mbxMigWatchdog = null;
 let mbxMigLastEvent = 0;
+// 最近一次进度事件的阶段：看门狗按阶段取不同阈值（快照期阻塞、无事件可发）
+let mbxMigPhase = '';
 // 无进展阈值：附件复制期间进度事件最密，60s 一条都没到说明线程已卡死
 const MBX_MIG_STALL_MS = 60000;
+// 快照阶段（VACUUM INTO）是**一次性阻塞调用、期间零事件**：GB 级库几十秒到几分钟
+// 都属正常，用 60s 会把「正在快照」误判成卡死（看门狗自伤）。单给 5 分钟。
+const MBX_MIG_SNAPSHOT_STALL_MS = 300000;
 
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
@@ -453,6 +458,7 @@ async function mbxMigListen() {
     await add('migration-progress', function (e) {
         mbxMigLastEvent = Date.now();
         var p = e.payload || {};
+        mbxMigPhase = p.phase || '';
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
     await add('migration-done', function (e) {
@@ -475,9 +481,11 @@ async function mbxMigListen() {
     // 前端一条事件都收不到，模态永久停在最后一帧。超过阈值切失败态并允许关闭；
     // 关闭只关窗口，后台线程仍在跑（文案写清，别让用户以为已经中止）
     mbxMigLastEvent = Date.now();
+    mbxMigPhase = '';
     mbxMigStopWatchdog();
     mbxMigWatchdog = setInterval(function () {
-        if (Date.now() - mbxMigLastEvent < MBX_MIG_STALL_MS) return;
+        var limit = mbxMigPhase === 'snapshot' ? MBX_MIG_SNAPSHOT_STALL_MS : MBX_MIG_STALL_MS;
+        if (Date.now() - mbxMigLastEvent < limit) return;
         mbxMigStopWatchdog();
         mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
             + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
