@@ -24,7 +24,7 @@
 #
 # 环境变量：
 #   E2E_SKIP_PHASE2=1    单点调试时显式允许跳过阶段二
-#   E2E_ALLOW_UNSIGNED=1 没有固定签名身份时仍继续（CI 用；本地默认 fail-closed）
+#   E2E_ALLOW_UNSIGNED=1 没有固定签名身份时仍继续（本地默认 fail-closed）
 #   CORPMAIL_SIGN_IDENTITY 覆盖签名身份名（默认 CorpMail Local）
 set -eu
 
@@ -93,13 +93,13 @@ if security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; 
     codesign --force --sign "$IDENTITY" --identifier com.corpmail.desktop "$BIN"
     echo "   ✓ 已签名：$IDENTITY"
 elif [ "${E2E_ALLOW_UNSIGNED:-0}" = "1" ]; then
-    # CI 没有固定身份。未签名跑得通但不稳：ad-hoc 签名的 ACL 绑定 cdhash，每次
+    # 无固定身份时。未签名跑得通但不稳：ad-hoc 签名的 ACL 绑定 cdhash，每次
     # 链接都变，首次读钥匙串可能弹授权框把自动化卡死（审计 R85 要求默认 fail-closed）
     echo "   ! 未找到签名身份「${IDENTITY}」，按 E2E_ALLOW_UNSIGNED=1 继续（可能弹钥匙串授权）"
 else
     echo "   ✗ 未找到签名身份「${IDENTITY}」" >&2
     echo "     先跑 scripts/setup-macos-signing.sh 建本地证书；" >&2
-    echo "     确需未签名运行请显式设置 E2E_ALLOW_UNSIGNED=1（CI 用）" >&2
+    echo "     确需未签名运行请显式设置 E2E_ALLOW_UNSIGNED=1" >&2
     exit 1
 fi
 

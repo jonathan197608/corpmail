@@ -97,6 +97,7 @@ scripts/dev-macos.sh             # 构建 → 重签 → 启动
 cd src-tauri
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -- --test-threads=1    # 单测各自持临时目录 + 钥匙串走 keyfile 分支，须串行
+cargo audit                            # 依赖 CVE 扫描（npm 侧见 e2e/package.json）
 cd .. && ./e2e/run.sh                   # 完整 GUI E2E（两阶段）
 ```
 
@@ -105,22 +106,26 @@ E2E 相关开关：
 | 变量 | 作用 |
 |---|---|
 | `E2E_SKIP_PHASE2=1` | 单点调试单个 spec 时显式允许跳过阶段二（默认缺 marker 即失败） |
-| `E2E_ALLOW_UNSIGNED=1` | 没有固定签名身份时继续（CI 用；本地默认直接退出） |
+| `E2E_ALLOW_UNSIGNED=1` | 没有固定签名身份时继续（本地默认直接退出） |
 | `CORPMAIL_SIGN_IDENTITY` | 覆盖签名身份名，默认 `CorpMail Local` |
 
-### CI
+### 发版（本机手动）
 
-| 工作流 | 触发 | 内容 |
+仓库不跑任何云端流水线，安装包一律在本机产出、手工挂到 Release：
+
+| 目标 | 命令 | 产物 |
 |---|---|---|
-| `.github/workflows/ci.yml` | push / PR | `clippy -D warnings`、全量单测、`cargo audit`、`npm audit`（审计类任务先只报告，不阻断） |
-| `.github/workflows/e2e.yml` | 手动 | macOS runner 跑完整两阶段 E2E，产物（截图/日志）作为 artifact 上传 |
-| `.github/workflows/release.yml` | 推 `v*` 标签 | macOS（ad-hoc 签名 DMG）与 Windows（未签名 NSIS）打包并挂到 Release |
+| macOS（Apple Silicon） | `cd src-tauri && cargo tauri build --target aarch64-apple-darwin --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'` | `src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg` |
+| Windows 直发（NSIS） | `scripts/build-windows.sh` | `src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe` |
+| Microsoft Store（MSIX） | Windows 侧跑 `scripts/build-msix.ps1` | `*.msix` |
+
+发版前先跑完上面的本地门禁；打到 `v*` 标签后仍由人工在 Releases 页上传产物并填写 SHA-256。
 
 ### 应用内更新（暂未启用）
 
 直发渠道**没有**接入 `tauri-plugin-updater`，原因有两条：
 
-1. 打开 `bundle.createUpdaterArtifacts` 之后，**每一次**本地/CI 打包都要求提供更新签名私钥，否则构建直接失败——在密钥托管方式定下来之前，这会打断现有发版流程。
+1. 打开 `bundle.createUpdaterArtifacts` 之后，**每一次**打包都要求提供更新签名私钥，否则构建直接失败——在密钥托管方式定下来之前，这会打断现有发版流程。
 2. 更新检查要一个稳定托管的 `latest.json`（含每个平台的签名产物地址）。端点缺失或不可达时，界面上的「检查更新」只会永远报错，比没有这个按钮更糟。
 
 真要做时的最小步骤：`cargo tauri signer generate` 生成密钥对（私钥离线保管，公钥入库）→ 在 `tauri.conf.json` 配 `plugins.updater.pubkey` 与 `endpoints`（例如 GitHub Releases 的 `latest.json`）→ 打包时注入私钥并开启 `createUpdaterArtifacts` → 发布流程产出并上传 `latest.json`。商店渠道（MSIX）的更新始终由 Microsoft Store 负责，与本项无关。
