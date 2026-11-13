@@ -139,7 +139,8 @@ struct Store {
 }
 
 /// 迁移进度快照（后台迁移期间经事件回传前端展示）。
-/// phase 语义：`attach`=等待收件收尾 `snapshot`=数据库快照(VACUUM) `attachments`=附件复制
+/// phase 语义：`starting`=后台线程刚起、正在校验目标目录（C9 启动宽限期）
+/// `attach`=等待收件收尾 `snapshot`=数据库快照(VACUUM) `attachments`=附件复制
 /// `pointer`=写指针。**没有 `done` 阶段**：100% 由 `migration-done` 事件直接驱动
 /// （R17：前端曾留 `case 'done'` 死分支，已删）
 #[derive(Clone, Debug, serde::Serialize)]
@@ -797,7 +798,9 @@ impl AppState {
         self.migration_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let started = (|| {
-            validate_data_dir(&self.data_dir(), dest)?;
+            // C9：协议线程只做纯内存预检；create_dir_all / recover / 写探针全部
+            // 由后台线程的 validate_data_dir 承担，慢盘不会把协议回调挂住
+            precheck_data_dir(&self.data_dir(), dest)?;
             exec(dest)
         })();
         if let Err(e) = started {
@@ -2394,7 +2397,14 @@ impl AppState {
 /// 数据目录目标校验（迁移与首设直切共用）：绝对路径、不与当前目录互相嵌套、
 /// 目标须为空（无 corpmail.db / attachments——避免与既有文件混同导致回滚无法
 /// 区分"本次写入"与"用户原有文件"）、可创建可写。通过返回归一化后的目标路径。
-fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
+/// 纯内存预检（C9）：绝对路径 + 不与当前目录互相嵌套。
+///
+/// 协议回调线程只能跑这一段——`validate_data_dir` 里的 create_dir_all、
+/// recover_incomplete_migration（可能 remove_dir_all 一个 GB 级残副本）和写探针
+/// 在网络盘上可阻塞到分钟级甚至永久：A6 已提前置冻结位、后台线程尚未 spawn，
+/// 挂在这里就是「协议回调不返回 + 进程永久只读且无法自愈」。
+/// IO 部分一律留给后台线程，前端用 starting 宽限期覆盖这段窗口。
+fn precheck_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
     let dest_path = normalize_dest(dest)?;
     if dest_path == cur {
         return Err("目标目录与当前数据目录相同".into());
@@ -2402,6 +2412,11 @@ fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
     if cur.starts_with(&dest_path) || dest_path.starts_with(cur) {
         return Err("目标目录不能位于当前数据目录内（或反向包含）".into());
     }
+    Ok(dest_path)
+}
+
+fn validate_data_dir(cur: &Path, dest: &str) -> Result<PathBuf, String> {
+    let dest_path = precheck_data_dir(cur, dest)?;
     std::fs::create_dir_all(&dest_path).map_err(|e| format!("目标目录无法创建：{e}"))?;
     // A8：上次进程被强杀留下的半成品，凭本应用自己写的标记安全清理。
     // 必须放在「目标须为空」检查之前，否则用户会被「请选择空目录」卡死在原目录

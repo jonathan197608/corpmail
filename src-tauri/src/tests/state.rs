@@ -2028,6 +2028,36 @@ fn startup_ignores_foreign_directory_without_marker() {
 }
 
 #[test]
+fn protocol_thread_defers_io_validation_to_background() {
+    // C9：协议回调线程不得碰 FS。目标目录已有 corpmail.db 属 IO 校验，
+    // 旧实现会在协议线程直接返回 Err「目标目录已存在 corpmail.db」；
+    // 新实现只做纯内存预检，返回 Background，把拒绝交给后台事件链。
+    let base = temp_dir("mig-precheck");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let state = AppState::open(&anchor);
+    let dest = base.join("occupied");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("corpmail.db"), b"existing").unwrap();
+    state.set_migration_executor(std::sync::Arc::new(|_dest: &str| Ok(())));
+    let out = state.start_migration(dest.to_str().unwrap()).unwrap();
+    assert!(
+        matches!(out, MigrateOutcome::Background),
+        "目录占用检查必须留给后台线程，协议线程只做纯内存预检"
+    );
+    // 纯内存预检仍要挡住明显坏输入，且不得创建任何目录
+    assert!(precheck_data_dir(&state.data_dir(), "relative/path").is_err());
+    let nested = state.data_dir().join("nested");
+    assert!(precheck_data_dir(&state.data_dir(), nested.to_str().unwrap()).is_err());
+    assert!(!nested.exists(), "预检不得碰文件系统");
+    state.mark_migration_finished();
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn fetch_round_freeze_message_follows_migration_phase() {
     // C10：R9 改了 start_fetch / dispatch_fetch_round / 路由 409，但 fetch_round
     // 的 attempt 边界是另一条独立写 fetch_state.last_error 的路径。后台迁移

@@ -422,9 +422,11 @@ const MBX_MIG_STALL_MS = 60000;
 // 且到点不直接判死——先提醒用户，由用户决定是否继续等（见 mbxMigPromptStall）
 const MBX_MIG_SNAPSHOT_STALL_MS = 1800000;
 
-// 超时决策：null=继续等，'prompt'=快照阶段交用户决定，'fail'=其余阶段判死
+// 超时决策：null=继续等，'prompt'=启动/快照阶段交用户决定，'fail'=其余阶段判死。
+// starting（C9）：后台线程刚 spawn，validate_data_dir 的 create_dir_all / recover /
+// 写探针都在第一条 attach 之前，慢盘上这段零事件窗口与快照同样可能超过 30 分钟。
 function mbxMigStallDecision(phase, elapsedMs) {
-    if (phase === 'snapshot') {
+    if (phase === 'starting' || phase === 'snapshot') {
         return elapsedMs >= MBX_MIG_SNAPSHOT_STALL_MS ? 'prompt' : null;
     }
     return elapsedMs >= MBX_MIG_STALL_MS ? 'fail' : null;
@@ -537,7 +539,8 @@ async function mbxMigListen() {
     //   快照阶段 → 只提醒不判死（磁盘过慢属正常），由用户决定是否再等 30 分钟；
     //   其余阶段 → 切失败态并允许关闭（关闭只关窗口，后台线程仍在跑，文案写清）
     mbxMigLastEvent = Date.now();
-    mbxMigPhase = '';
+    // C9：尚未收到任何进度事件前处于启动宽限期，不按 60s 判死
+    mbxMigPhase = 'starting';
     mbxMigStartWatchdog();
 }
 
@@ -547,7 +550,10 @@ async function mbxMigListen() {
 // 两个出口：继续等待（再等一个完整窗口）/ 返回（关窗口，后台不中止）
 function mbxMigPromptStall() {
     var d = document.getElementById('migrate-detail');
-    if (d) d.textContent = '数据库快照已连续运行超过 30 分钟，目标磁盘写入可能较慢。\n\n'
+    var what = mbxMigPhase === 'starting'
+        ? '目标目录校验已连续运行超过 30 分钟（磁盘响应可能很慢），后台迁移仍在启动阶段。'
+        : '数据库快照已连续运行超过 30 分钟，目标磁盘写入可能较慢。';
+    if (d) d.textContent = what + '\n\n'
         + '后台迁移仍在进行，关闭窗口不会中止。\n'
         + '是否继续等待下一个 30 分钟？';
     var mask = document.getElementById('migrate-mask');

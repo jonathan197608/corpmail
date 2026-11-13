@@ -207,6 +207,49 @@ fn seen_worker_respects_migration_freeze() {
 }
 
 #[test]
+fn protocol_callback_never_runs_io_validation() {
+    // C9：A6 在协议线程提前置冻结位，若 validate_data_dir 的 create_dir_all /
+    // recover / 写探针在慢盘上挂住，协议回调不返回且进程永久只读无法自愈。
+    let at = STATE_RS
+        .find("pub fn start_migration(")
+        .expect("start_migration 存在");
+    let rest = &STATE_RS[at..];
+    let body = &rest[..rest
+        .find("/// 等待在跑的收件轮收尾")
+        .expect("下一方法注释存在")];
+    assert!(
+        body.contains("precheck_data_dir(&self.data_dir(), dest)"),
+        "协议线程必须只调纯内存预检"
+    );
+    assert!(
+        !body.contains("validate_data_dir(&"),
+        "协议线程不得再调 IO 版校验"
+    );
+    let p = STATE_RS
+        .find("fn precheck_data_dir(")
+        .expect("precheck_data_dir 存在");
+    let prest = &STATE_RS[p..];
+    let pbody = &prest[..prest.find("fn validate_data_dir(").expect("下一函数存在")];
+    assert!(!pbody.contains("std::fs::"), "预检必须纯内存");
+    // 生产后台线程必须先发一条 starting 事件，前端才有启动宽限期可依
+    assert!(
+        LIB_RS.contains("phase: \"starting\"")
+            && LIB_RS.contains("\"migration-progress\""),
+        "后台线程 spawn 后必须先 emit starting 进度"
+    );
+    assert!(
+        APP_JS.contains("mbxMigPhase = 'starting'"),
+        "前端首启阶段必须是 starting（不按 60s 判死）"
+    );
+    let core = &APP_JS[APP_JS.find("// --- C19 watchdog core START ---").unwrap()..];
+    let core = &core[..core.find("// --- C19 watchdog core END ---").unwrap()];
+    assert!(
+        core.contains("phase === 'starting'"),
+        "starting 与 snapshot 同享 30 分钟宽限且走确认态"
+    );
+}
+
+#[test]
 fn progress_phase_has_no_dead_done_branch() {
     // R17：后端从不 emit phase="done"（100% 由 migration-done 直写），
     // 前端留 `case 'done'` 只会误导后续改动

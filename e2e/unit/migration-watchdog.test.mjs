@@ -71,6 +71,24 @@ test('决策函数：snapshot 30 分钟才提醒，其余阶段 60s 判死', () 
     assert.equal(h.decision('attachments', 60000), 'fail');
     assert.equal(h.decision('pointer', 60000), 'fail');
     assert.equal(h.decision('', 60000), 'fail');
+    // C9：后台线程刚 spawn、validate_data_dir 尚未发出 attach 的窗口
+    assert.equal(h.decision('starting', 60000), null, '启动宽限期不得按 60s 判死');
+    assert.equal(h.decision('starting', 1799999), null);
+    assert.equal(h.decision('starting', 1800000), 'prompt');
+});
+
+test('starting 阶段超时同样只提醒、不判死', () => {
+    const h = harness();
+    h.setPhase('starting');
+    h.start();
+    h.setNow(60_000);
+    h.tick();
+    assert.equal(h.calls.fail, 0, 'C9：慢盘校验 60s 无事件属正常');
+    assert.equal(h.calls.prompt, 0);
+    h.setNow(1_800_000);
+    h.tick();
+    assert.equal(h.calls.prompt, 1);
+    assert.equal(h.calls.fail, 0);
 });
 
 test('snapshot 超时：到点走确认态，绝不能切失败态', () => {

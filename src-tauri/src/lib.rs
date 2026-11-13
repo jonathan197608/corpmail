@@ -164,6 +164,19 @@ pub fn run() {
                                 let s = app.state::<state::AppState>();
                                 // A5：RAII 复位「进行中」，panic 展开也不会把标志卡死
                                 let _guard = s.migration_guard();
+                                // C9：线程一启动就发事件，把「正在校验目标目录」
+                                // 告知前端。后端的 create_dir_all / recover / 写探针
+                                // 全在 migrate_impl 的第一条 attach 之前，慢盘上
+                                // 这段零事件窗口不能被 60s 看门狗误判成卡死。
+                                let _ = app.emit(
+                                    "migration-progress",
+                                    state::MigrationProgress {
+                                        phase: "starting",
+                                        detail: "正在校验目标目录…".into(),
+                                        files_done: 0,
+                                        files_total: None,
+                                    },
+                                );
                                 // R10：panic 不会自己走进 Err 分支——不兜这一下，前端
                                 // 模态既无进度也无出口，只能强杀。guard 仍负责复位标志
                                 let result = std::panic::catch_unwind(
