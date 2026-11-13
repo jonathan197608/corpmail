@@ -948,3 +948,48 @@ fn decode_mutf7_handles_rfc3501_mailbox_names() {
     assert_eq!(decode_mutf7("&XfJT0ZAB"), "&XfJT0ZAB");
     assert_eq!(decode_mutf7("尾随&"), "尾随&");
 }
+
+/// C2：收件循环把每个 UID 计入 `batch_uids` 并据此推进游标，所以解析失败 /
+/// 缺 BODY 的 UID 必须有对应库行，否则这封信永久进不了库且无任何提示。
+const RECV_RS: &str = include_str!("../mail/recv.rs");
+
+#[test]
+fn unreadable_fetch_keeps_a_placeholder_row() {
+    let raw = b"Subject: \xe6\xb5\x8b\xe8\xaf\x95\r\nFrom: a@b.com\r\nMessage-ID: <x@y>\r\n\r\nhello";
+    // 正常解析：原样入库，不落占位
+    let good = parse_incoming(7, 42, false, Some(100), raw).expect("正常邮件可解析");
+    let ok = mail_or_placeholder(7, 42, false, Some(100), Some(good), raw);
+    assert_eq!(ok.subject, "测试");
+    assert!(!ok.too_large);
+
+    // parse_incoming 返回 None（畸形 MIME）：占位保留信头，游标越过也不丢信
+    let ph = mail_or_placeholder(7, 43, false, None, None, raw);
+    assert_eq!(ph.uid, 43);
+    assert_eq!(ph.uidvalidity, 7);
+    assert_eq!(ph.message_id, "<x@y>");
+    assert_eq!(ph.subject, "测试", "信头仍可用时必须保留主题");
+    assert!(ph.body_text.contains("无法解析"));
+    assert!(!ph.too_large, "解析失败不是超限，别让用户去调单封上限");
+    assert!(ph.attachments.is_empty());
+
+    // FETCH 缺 BODY：同样落占位，主题有兜底
+    let no_body = mail_or_placeholder(7, 44, false, None, None, b"");
+    assert_eq!(no_body.uid, 44);
+    assert!(!no_body.subject.is_empty(), "占位必须有可读主题");
+    assert!(no_body.body_text.contains("无法解析"));
+}
+
+#[test]
+fn fetch_loop_routes_every_returned_uid_through_placeholder_guard() {
+    // 行为测试钉住了决策函数，这里钉住循环确实调用它（而不是重写回 eprintln 跳过）
+    let body = &RECV_RS[RECV_RS.find("for &uid in &run.uids").unwrap()..];
+    let body = &body[..body.find("// 双阈值 flush").unwrap()];
+    assert!(
+        body.contains("mail_or_placeholder("),
+        "普通 FETCH 分支必须经占位决策"
+    );
+    assert!(
+        !body.contains("无 BODY，跳过"),
+        "缺 BODY 不得再被静默跳过"
+    );
+}

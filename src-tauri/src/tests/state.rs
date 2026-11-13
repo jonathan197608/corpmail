@@ -1942,6 +1942,60 @@ fn startup_never_cleans_the_active_data_dir() {
         anchor.join("corpmail.db").exists(),
         "活动数据目录的库不得被当残副本删除"
     );
+    // C1：光断言「库还在」是无鉴别力的假通过——same 分支旧实现直接 return，
+    // marker 会永久残留，日后该目录再次被选为迁移目标时 recover 会删库 + 附件
+    assert!(
+        !anchor.join(MIGRATION_MARKER).exists(),
+        "活动目录残留的中断标记必须在启动时清掉"
+    );
+    assert!(
+        anchor.join(MIGRATION_DONE_MARKER).exists(),
+        "必须补写终态哨兵，标记删除失败时也能挡住误删"
+    );
+    assert!(
+        !anchor.join(MIGRATION_TARGET_FILE).exists(),
+        "目标记录只用一次"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn active_dir_with_stale_marker_survives_being_reused_as_migration_target() {
+    // C1 行为验收：pointer 已写 / done 未写的强杀窗口 → 重启 → 用户把该目录
+    // 再次选为迁移目标。旧实现在 validate_data_dir 里先 recover 再判空，会把
+    // 已承载全部邮件的库与整个 attachments/ 删掉后还报「迁移成功」。
+    let base = temp_dir("mig-orphan-active-reuse");
+    let anchor = base.join("active");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let other = base.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    {
+        let _state = AppState::open(&anchor);
+        std::fs::create_dir_all(anchor.join("attachments")).unwrap();
+        std::fs::write(anchor.join("attachments").join("mail.eml"), b"real mail").unwrap();
+        std::fs::write(anchor.join(MIGRATION_MARKER), b"incomplete").unwrap();
+        std::fs::write(
+            anchor.join(MIGRATION_TARGET_FILE),
+            anchor.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    }
+    let _state = AppState::open(&anchor);
+    // 「先迁到别处，再迁回该目录」：validate 会因目标非空而拒绝，但绝不能删数据
+    let res = validate_data_dir(&other, anchor.to_str().unwrap());
+    assert!(res.is_err(), "非空目录本就应被拒绝作为迁移目标");
+    assert!(
+        anchor.join("corpmail.db").exists(),
+        "有效库不得被当成上次中断的半成品删除"
+    );
+    assert!(
+        anchor.join("attachments").join("mail.eml").exists(),
+        "有效附件不得被当成上次中断的半成品删除"
+    );
+    assert!(
+        !anchor.join(MIGRATION_MARKER).exists(),
+        "复用后也不该留下中断标记"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 

@@ -1056,6 +1056,30 @@ impl AppState {
             _ => target == cur,
         };
         if same {
+            // C1：本进程已把该目录当当前数据目录打开，库与附件必然完整有效。
+            // 但「pointer 已写、done 哨兵未写」时被强杀会留下 incomplete marker，
+            // 旧实现直接 return，锚点记录又已删 → 该目录日后再次被选为迁移目标时
+            // recover 会把有效库 + 附件当半成品删掉（不可逆数据丢失）。
+            // 既然目录现在正被使用，先补 done 再清 marker：两步任一成功都能让
+            // recover 走「只清标记不删数据」或无标记的安全分支。
+            let marker = target.join(MIGRATION_MARKER);
+            if marker.exists() {
+                let done = target.join(MIGRATION_DONE_MARKER);
+                if !done.exists()
+                    && let Err(e) = std::fs::write(&done, target.to_string_lossy().as_bytes())
+                {
+                    eprintln!(
+                        "[state] 活动目录终态哨兵补写失败（{}）：{e}",
+                        done.display()
+                    );
+                }
+                if let Err(e) = std::fs::remove_file(&marker) {
+                    eprintln!(
+                        "[state] 活动目录中断标记清理失败（{}）：{e}",
+                        marker.display()
+                    );
+                }
+            }
             return;
         }
         if !target.join(MIGRATION_MARKER).exists() {

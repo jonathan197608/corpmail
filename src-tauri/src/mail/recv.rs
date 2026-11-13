@@ -564,17 +564,25 @@ impl RealFetcher {
                             .iter()
                             .any(|flag| flag.to_string().contains("\\Seen"));
                         let internal_date = f.internal_date().map(|dt| dt.timestamp());
-                        match f.body() {
-                            Some(body) => {
-                                batch_bytes += body.len() as u64;
-                                if let Some(mail) =
-                                    parse_incoming(uidvalidity, uid, seen, internal_date, body)
-                                {
-                                    batch.push(mail);
-                                }
-                            }
-                            None => eprintln!("[fetch] uid={uid} 无 BODY，跳过"),
+                        // C2：解析失败 / FETCH 缺 BODY 也必须落占位行。调用方无条件
+                        // 把 uid 计入 batch_uids 并据此推进游标，没有库行 = 这封信
+                        // 此后增量续拉永不回头（超限分支早有占位，此处补齐对称护栏）
+                        let body = f.body();
+                        let raw = body.unwrap_or(&[]);
+                        batch_bytes += raw.len() as u64;
+                        if body.is_none() {
+                            eprintln!("[fetch] uid={uid} 无 BODY，落占位避免游标越过");
                         }
+                        batch.push(mail_or_placeholder(
+                            uidvalidity,
+                            uid,
+                            seen,
+                            internal_date,
+                            body.and_then(|b| {
+                                parse_incoming(uidvalidity, uid, seen, internal_date, b)
+                            }),
+                            raw,
+                        ));
                     }
                     // 超限邮件必须有占位行：服务器未返回该 uid 也要落一条，
                     // 否则游标越过它、用户永远看不到这封邮件（静默漏信）
@@ -879,6 +887,65 @@ fn placeholder_mail(
         attachments: Vec::new(),
         too_large: true,
     }
+}
+
+/// 解析失败 / FETCH 缺 BODY 的占位邮件（审计 C2）。与 `placeholder_mail` 是
+/// 同一套护栏，但**不是超限**：`too_large=false`，别误导用户去调单封上限。
+/// 信头还能解析时保留主题/发件人/Message-ID，方便用户定位是哪一封。
+fn unreadable_mail(
+    uidvalidity: u32,
+    uid: u32,
+    seen: bool,
+    internal_date: Option<i64>,
+    raw: &[u8],
+) -> IncomingMail {
+    let mut fields = mailparse::parse_mail(raw)
+        .map(|m| header_fields(&m))
+        .unwrap_or(HeaderFields {
+            subject: "（邮件内容无法解析）".into(),
+            from_addr: String::new(),
+            from_name: String::new(),
+            to_addrs: String::new(),
+            cc_addrs: String::new(),
+            message_id: String::new(),
+        });
+    if fields.subject.is_empty() {
+        fields.subject = "（邮件内容无法解析）".into();
+    }
+    IncomingMail {
+        uidvalidity,
+        uid,
+        seen,
+        internal_date,
+        message_id: fields.message_id,
+        subject: fields.subject,
+        from_addr: fields.from_addr,
+        from_name: fields.from_name,
+        to_addrs: fields.to_addrs,
+        cc_addrs: fields.cc_addrs,
+        body_text: "（该邮件内容无法解析，或服务器未返回正文，正文与附件未保存。\
+                     可用网页邮箱查看完整内容，或清除收件游标后重新拉取。）"
+            .into(),
+        body_kind: "plain".into(),
+        body_html: None,
+        raw_headers: raw_header_block(raw),
+        attachments: Vec::new(),
+        too_large: false,
+    }
+}
+
+/// 单封 FETCH 的入库决策：`parsed=None`（MIME 解析失败 / 无 BODY）一律落占位。
+/// 抽成函数是为了让「游标不得越过失败 UID」这条能被行为单测直接钉住，
+/// 不用搭一台假 IMAP 服务器。
+fn mail_or_placeholder(
+    uidvalidity: u32,
+    uid: u32,
+    seen: bool,
+    internal_date: Option<i64>,
+    parsed: Option<IncomingMail>,
+    raw: &[u8],
+) -> IncomingMail {
+    parsed.unwrap_or_else(|| unreadable_mail(uidvalidity, uid, seen, internal_date, raw))
 }
 
 /// 原始信头提取（A5）：首个空行前的字节块，UTF-8 lossy + 64KB 截断。
