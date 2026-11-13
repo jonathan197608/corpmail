@@ -3221,7 +3221,7 @@ fn save_dest_allowed(p: &Path) -> bool {
         "ProgramData",
     ]
     .iter()
-    .filter_map(|k| std::env::var_os(k))
+    .filter_map(std::env::var_os)
     .map(|v| comparable_path(Path::new(&v)))
     .collect();
     !denied.iter().any(|r| path_within(&target, r))
