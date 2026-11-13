@@ -1803,6 +1803,7 @@ impl AppState {
         let fetch_state = std::sync::Arc::clone(&self.fetch_state);
         // 冻结位随 job 进线程：每轮 attempt 开头据此立刻收手（迁移正在等它收尾）
         let migration_flag = std::sync::Arc::clone(&self.migration_pending);
+        let migration_running_flag = std::sync::Arc::clone(&self.migration_in_progress);
         // 名额凭证：正常结束 release，看门狗判死 detach（二者只结算一次）
         let ticket = std::sync::Arc::new(RoundTicket::new(
             std::sync::Arc::clone(&self.active_rounds),
@@ -1838,6 +1839,7 @@ impl AppState {
                 epoch,
                 notify,
                 migration: migration_flag,
+                migration_in_progress: migration_running_flag,
             });
         });
     }
@@ -2840,6 +2842,19 @@ struct FetchJob {
     notify: Option<NotifyHook>,
     /// 迁移冻结位（R2）：每轮 attempt 开头检查，已冻结则立刻收手交还名额
     migration: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 迁移进行中位（C10）：冻结期收尾文案要按阶段选，不能一律「请重启」
+    migration_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 收件轮在冻结位命中时的收尾文案（C10）。R9 改了 start_fetch 入口、
+/// dispatch_fetch_round、路由 409，但 `fetch_round` 的 attempt 边界是另一条
+/// 独立写 `last_error` 的路径：后台迁移发起时若有首拉轮在跑，每次都会命中。
+fn fetch_round_freeze_msg(in_progress: &std::sync::atomic::AtomicBool) -> &'static str {
+    if in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+        MIGRATION_RUNNING_FETCH_MSG
+    } else {
+        MIGRATION_PENDING_MSG
+    }
 }
 
 /// 收件轮次主体（start_fetch 线程执行体）：拉取 → 入库 → 游标推进 → 状态复位。
@@ -3057,6 +3072,7 @@ fn fetch_round(job: FetchJob) {
         epoch,
         notify,
         migration,
+        migration_in_progress,
     } = job;
     // 本轮开始时刻：完成后作为新增邮件查询窗口下界（通知用）。
     // 取在拆 job 后、首个入库前：宁可窗口稍宽（前一轮尾部重叠由进程内
@@ -3107,7 +3123,11 @@ fn fetch_round(job: FetchJob) {
         // 迁移冻结（R2）：快照已定格，本轮立即收手交还 running 名额
         // （move_data_dir 正在等它；继续拉只会写进即将被抛弃的旧库）
         if migration.load(std::sync::atomic::Ordering::SeqCst) {
-            finish(added as i64, MIGRATION_PENDING_MSG.to_string());
+            // C10：R9 漏的第五处——进行中说「暂不收取」，只有待重启才说「请重启」
+            finish(
+                added as i64,
+                fetch_round_freeze_msg(&migration_in_progress).to_string(),
+            );
             return;
         }
         let (cur_sent, cur_inbox) = if attempt == 1 {

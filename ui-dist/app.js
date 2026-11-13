@@ -306,12 +306,7 @@ let mbxMigWatchdog = null;
 let mbxMigLastEvent = 0;
 // 最近一次进度事件的阶段：看门狗按阶段取不同阈值（快照期阻塞、无事件可发）
 let mbxMigPhase = '';
-// 无进展阈值：附件复制期间进度事件最密，60s 一条都没到说明线程已卡死
-const MBX_MIG_STALL_MS = 60000;
-// 快照阶段（VACUUM INTO）是**一次性阻塞调用、期间零事件**：GB 级库几十秒到几分钟
-// 都属正常；机械盘 / 网络盘写入过慢时甚至远超常速估计。放宽到 30 分钟，且到点
-// 不直接判死——先提醒用户，由用户决定是否继续等下一个 30 分钟（见 mbxMigPromptStall）
-const MBX_MIG_SNAPSHOT_STALL_MS = 1800000;
+// 阈值常量与看门狗实现见下方 C19 watchdog core（可被 Node vm 单独执行做行为测试）
 
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
@@ -389,10 +384,7 @@ function mbxMigOpen() {
     if (bar) bar.style.width = '0%';
     var detail = document.getElementById('migrate-detail');
     if (detail) detail.textContent = '准备迁移…';
-    var btn = mask.querySelector('[data-mbx-action="migration-close"]');
-    if (btn) btn.hidden = true;
-    var keep = mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
-    if (keep) keep.hidden = true;
+    mbxMigHideActions();
     mask.hidden = false;
     mask.__mbxRelease = mbxModalOpen(mask, mask.querySelector('.migrate-card'));
 }
@@ -420,6 +412,24 @@ function mbxMigPhasePct(p) {
     }
 }
 
+// --- C19 watchdog core START ---
+// 下面这一段不碰 DOM，e2e/unit/migration-watchdog.test.mjs 用 Node vm 直接执行，
+// 以假时钟 + 手动驱动 setInterval 做行为测试（静态字符串断言挡不住阈值改坏）。
+// 无进展阈值：附件复制期间进度事件最密，60s 一条都没到说明线程已卡死
+const MBX_MIG_STALL_MS = 60000;
+// 快照阶段（VACUUM INTO）是**一次性阻塞调用、期间零事件**：GB 级库几十秒到
+// 几分钟都属正常；机械盘 / 网络盘写入过慢时甚至远超常速估计。放宽到 30 分钟，
+// 且到点不直接判死——先提醒用户，由用户决定是否继续等（见 mbxMigPromptStall）
+const MBX_MIG_SNAPSHOT_STALL_MS = 1800000;
+
+// 超时决策：null=继续等，'prompt'=快照阶段交用户决定，'fail'=其余阶段判死
+function mbxMigStallDecision(phase, elapsedMs) {
+    if (phase === 'snapshot') {
+        return elapsedMs >= MBX_MIG_SNAPSHOT_STALL_MS ? 'prompt' : null;
+    }
+    return elapsedMs >= MBX_MIG_STALL_MS ? 'fail' : null;
+}
+
 // 停止无进展看门狗（关闭模态 / 收到终态事件时调用）
 function mbxMigStopWatchdog() {
     if (mbxMigWatchdog) {
@@ -428,8 +438,37 @@ function mbxMigStopWatchdog() {
     }
 }
 
+// 起看门狗（首次注册与「继续等待」复用同一段逻辑）
+function mbxMigStartWatchdog() {
+    mbxMigStopWatchdog();
+    mbxMigWatchdog = setInterval(function () {
+        var action = mbxMigStallDecision(mbxMigPhase, Date.now() - mbxMigLastEvent);
+        if (!action) return;
+        mbxMigStopWatchdog();
+        if (action === 'prompt') {
+            mbxMigPromptStall();
+        } else {
+            mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
+                + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
+        }
+    }, 1000);
+}
+// --- C19 watchdog core END ---
+
+// C4：终态统一收起两个动作按钮。旧实现只在 migration-progress 收起「继续等待」，
+// done / error 后确认态按钮仍在：错误态点它会把错误文案覆盖成「继续等待…」并
+// 重启 30 分钟看门狗，把已终止的线程伪装成仍在跑。
+function mbxMigHideActions() {
+    var mask = document.getElementById('migrate-mask');
+    var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
+    if (keep) keep.hidden = true;
+    var back = mask && mask.querySelector('[data-mbx-action="migration-close"]');
+    if (back) back.hidden = true;
+}
+
 // 失败态：显示错误 + 「返回」按钮（隐藏模式，用户可关回到存储页）
 function mbxMigShowError(msg) {
+    mbxMigHideActions();
     var mask = document.getElementById('migrate-mask');
     var d = document.getElementById('migrate-detail');
     if (d) d.textContent = msg || '迁移失败，请重试';
@@ -466,15 +505,20 @@ async function mbxMigListen() {
         mbxMigLastEvent = Date.now();
         var p = e.payload || {};
         mbxMigPhase = p.phase || '';
-        // 阶段推进说明快照已过：确认态的「继续等待」按钮收起，避免误点重启计时
+        // 阶段推进说明快照已过：两个动作按钮都收起，避免误点重启计时或关掉
+        // 正在跑的迁移遮罩（确认态的「继续等待」「返回」此时都已失效）
         var mask = document.getElementById('migrate-mask');
         var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
-        if (keep && !keep.hidden) keep.hidden = true;
+        if (keep) keep.hidden = true;
+        var back = mask && mask.querySelector('[data-mbx-action="migration-close"]');
+        if (back) back.hidden = true;
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
     await add('migration-done', function (e) {
         // R10：拿到终态就不再看门狗（应用随后自动退出）
         mbxMigStopWatchdog();
+        // C4：成功态不留任何出口，别把确认态的「继续等待 / 返回」挂在 100% 上
+        mbxMigHideActions();
         // A11：渲染后端完整成功文案（新目录路径、旧备份可删），别丢掉 payload
         var msg = (e && typeof e.payload === 'string' && e.payload.trim())
             ? e.payload.trim()
@@ -497,21 +541,7 @@ async function mbxMigListen() {
     mbxMigStartWatchdog();
 }
 
-// 起看门狗（首次注册与「继续等待」复用同一段逻辑）
-function mbxMigStartWatchdog() {
-    mbxMigStopWatchdog();
-    mbxMigWatchdog = setInterval(function () {
-        var limit = mbxMigPhase === 'snapshot' ? MBX_MIG_SNAPSHOT_STALL_MS : MBX_MIG_STALL_MS;
-        if (Date.now() - mbxMigLastEvent < limit) return;
-        mbxMigStopWatchdog();
-        if (mbxMigPhase === 'snapshot') {
-            mbxMigPromptStall();
-        } else {
-            mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
-                + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
-        }
-    }, 1000);
-}
+// 起看门狗（实现见上方 C19 watchdog core；首次注册与「继续等待」共用）
 
 // 快照超时的确认态（非失败）：VACUUM 写慢盘可能远超 30 分钟，到点先问用户。
 // 两个出口：继续等待（再等一个完整窗口）/ 返回（关窗口，后台不中止）

@@ -2028,6 +2028,38 @@ fn startup_ignores_foreign_directory_without_marker() {
 }
 
 #[test]
+fn fetch_round_freeze_message_follows_migration_phase() {
+    // C10：R9 改了 start_fetch / dispatch_fetch_round / 路由 409，但 fetch_round
+    // 的 attempt 边界是另一条独立写 fetch_state.last_error 的路径。后台迁移
+    // 发起时若有首拉轮在跑，每次都会命中——旧实现恒写「已迁移，请重启」。
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let running = AtomicBool::new(true);
+    assert_eq!(
+        fetch_round_freeze_msg(&running),
+        MIGRATION_RUNNING_FETCH_MSG,
+        "进行中不得催用户重启"
+    );
+    running.store(false, Ordering::SeqCst);
+    assert_eq!(
+        fetch_round_freeze_msg(&running),
+        MIGRATION_PENDING_MSG,
+        "冻结且不在进行中才是待重启"
+    );
+    // 钉住调用点：别让 fetch_round 又退回固定常量
+    let src = include_str!("../state.rs");
+    let body = &src[src.find("for attempt in 1..=FETCH_ATTEMPTS").unwrap()..];
+    let body = &body[..body.find("let (cur_sent, cur_inbox)").unwrap()];
+    assert!(
+        body.contains("fetch_round_freeze_msg("),
+        "attempt 边界必须按阶段取文案"
+    );
+    assert!(
+        !body.contains("MIGRATION_PENDING_MSG.to_string()"),
+        "不得再写死待重启文案"
+    );
+}
+
+#[test]
 fn migration_phase_separates_running_from_pending_restart() {
     // R9：A6 在协议线程提前置 migration_pending，于是「进行中」也表现为
     // pending=true。下游只读 pending 会把迁移跑着说成「已迁移，请重启」。

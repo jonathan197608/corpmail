@@ -85,6 +85,12 @@ wait_wal_quiet() {
     return 0
 }
 
+# C19：看门狗阈值/阶段切换的**行为**测试（假时钟 + 手动驱动 setInterval）。
+# Rust 侧只有 APP_JS.contains 静态护栏，改坏三元阈值也能全绿；这段用 Node vm
+# 直接执行 app.js 的 C19 watchdog core，不启动 app、不依赖 wdio 与签名。
+echo "== 0/6 迁移看门狗行为测试（node --test unit/） =="
+node --test unit/migration-watchdog.test.mjs
+
 echo "== 1/6 构建 E2E 二进制（cargo build --features e2e） =="
 (cd "$ROOT/src-tauri" && cargo build --features e2e)
 
