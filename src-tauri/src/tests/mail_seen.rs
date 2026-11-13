@@ -383,3 +383,71 @@ fn mark_read_records_account_on_pending_rows() {
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
 }
+
+/// C5：批量「标记已读」必须与单封 mark_read 同口径写 seen_pending + 归属账号，
+/// 否则本地已读、服务器仍 \Seen 未置，换设备/webmail 看到仍未读
+#[test]
+fn batch_mark_read_queues_seen_sync_for_current_account() {
+    let (state, dir, ids) = fixture("batch-read", &[(42, 1), (42, 2)]);
+    let n = crate::mail::batch_apply(
+        &state,
+        &crate::mail::BatchTarget::Ids(ids.clone()),
+        crate::mail::BatchAction::MarkRead,
+    )
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(pending_count(&state), 2, "批量也要写 seen_pending");
+    let accounts: Vec<String> = state.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT COALESCE(seen_account, '') FROM emails ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    });
+    assert!(
+        accounts
+            .iter()
+            .all(|a| a == "demo@chinatelecom.cn"),
+        "归属账号必须随批量写入，供 R13 过滤"
+    );
+    assert_eq!(
+        pending_rows(&state).unwrap().len(),
+        2,
+        "worker 必须能选出这些行"
+    );
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// C6：abandon 是「放弃」出口，必须与 pending_rows 一样按账号过滤。
+/// 当前账号 B 回写失败时清掉 A 的悬挂标志 = A 的服务器已读同步永久丢失。
+#[test]
+fn abandon_keeps_other_accounts_pending_rows() {
+    let (state, dir, ids) = fixture("abandon-acct", &[(42, 1), (42, 2)]);
+    mark_read(&state, ids[0]).unwrap();
+    mark_read(&state, ids[1]).unwrap();
+    // ids[0] 模拟账号 A 遗留的悬挂意向；当前账号仍是 fixture 的 demo（B）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET seen_account = 'other@x.cn' WHERE id = ?1",
+                [ids[0]],
+            )
+        })
+        .unwrap();
+    abandon(&state);
+    let flag = |id: i64| -> i64 {
+        state.with_conn(|c| {
+            c.query_row("SELECT seen_pending FROM emails WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        })
+    };
+    assert_eq!(flag(ids[0]), 1, "其它账号的悬挂标志不得被清掉");
+    assert_eq!(flag(ids[1]), 0, "当前账号的失败标志应被放弃");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}

@@ -1195,6 +1195,37 @@ pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize,
     state.with_conn(|conn| store_incoming_conn(conn, &data_dir, mails, MailDest::Inbox))
 }
 
+/// UV 变化后的 remote_uid 迁移（message_id 分支与 C3 的无 ID 指纹分支共用）。
+/// 候选行里只要出现**同一 UV**（服务器上确实有两封同内容邮件/群发副本），
+/// 就按合法重复处理，不迁移也不跳过；否则把最旧一行的 remote_uid 迁到新值，
+/// 保留已读/星标/本地附件，返回 true 让调用方跳过 INSERT。
+fn remap_old_uidvalidity(
+    conn: &mut rusqlite::Connection,
+    candidates: Vec<(i64, String)>,
+    uv: u32,
+    new_remote: Option<&str>,
+) -> Result<bool, String> {
+    let Some(new_remote) = new_remote else {
+        return Ok(false);
+    };
+    let mut remap: Option<i64> = None;
+    for (id, ru) in candidates {
+        if remote_uidvalidity(&ru) == Some(uv) {
+            return Ok(false);
+        }
+        remap.get_or_insert(id);
+    }
+    let Some(id) = remap else {
+        return Ok(false);
+    };
+    conn.execute(
+        "UPDATE emails SET remote_uid = ?2 WHERE id = ?1",
+        rusqlite::params![id, new_remote],
+    )
+    .map_err(e)?;
+    Ok(true)
+}
+
 /// 收件入库核心（独立连接版：收件线程使用，不依赖 AppState）。
 /// 每封邮件一个事务：正文行 + 附件行原子提交（避免"正文已入库、附件缺失"的半状态）；
 /// 单封失败回滚该封并中止整批（已提交的前序邮件保留，与 §6.1 取舍一致）。
@@ -1256,21 +1287,7 @@ pub fn store_incoming_conn(
                     .map_err(e)?;
                 rows.filter_map(Result::ok).collect()
             };
-            let mut remap: Option<i64> = None;
-            let mut same_uv = false;
-            for (id, ru) in existing {
-                if remote_uidvalidity(&ru) == Some(m.uidvalidity) {
-                    same_uv = true; // ③ 同 UV 的另一 UID：合法重复
-                } else {
-                    remap.get_or_insert(id); // ② 旧 UV 的同一封
-                }
-            }
-            if !same_uv && let (Some(id), Some(new_remote)) = (remap, remote.as_deref()) {
-                conn.execute(
-                    "UPDATE emails SET remote_uid = ?2 WHERE id = ?1",
-                    rusqlite::params![id, new_remote],
-                )
-                .map_err(e)?;
+            if remap_old_uidvalidity(conn, existing, m.uidvalidity, remote.as_deref())? {
                 continue;
             }
             // ④ 本地副本（无 remote_uid）已存在 → 不再插入
@@ -1284,6 +1301,34 @@ pub fn store_incoming_conn(
                 )
                 .map_err(e)?;
             if local {
+                continue;
+            }
+        } else if let (Some(ts), Some(new_remote)) = (m.internal_date, remote.as_deref()) {
+            // C3：R21 选了「message_id 优先」去重，但无 Message-ID 头的邮件
+            // （系统通知/告警/部分网关）整块跳过 → UV 变化时新旧 remote_uid
+            // 全不同，每封都 INSERT，旧行永久滞留。用 (发件人, 主题,
+            // INTERNALDATE) 作稳定指纹找旧 UV 行并 remap，口径与 message_id
+            // 分支一致。无 INTERNALDATE 时无法稳定比对（入库用 now），维持旧行为。
+            let existing: Vec<(i64, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, remote_uid FROM emails
+                          WHERE (message_id IS NULL OR message_id = '')
+                            AND direction = ?1 AND folder = ?2
+                            AND from_addr = ?3 AND subject = ?4
+                            AND COALESCE(received_at, sent_at) = ?5
+                            AND remote_uid IS NOT NULL",
+                    )
+                    .map_err(e)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![direction, folder, m.from_addr, m.subject, ts],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .map_err(e)?;
+                rows.filter_map(Result::ok).collect()
+            };
+            if remap_old_uidvalidity(conn, existing, m.uidvalidity, Some(new_remote))? {
                 continue;
             }
         }

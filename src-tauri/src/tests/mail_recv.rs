@@ -980,6 +980,52 @@ fn unreadable_fetch_keeps_a_placeholder_row() {
 }
 
 #[test]
+fn uidvalidity_change_does_not_duplicate_mail_without_message_id() {
+    // C3：R21 选「message_id 优先」去重，无 ID 邮件整块跳过。UV 变化时
+    // 新旧 remote_uid 全不同 → 每封都 INSERT，旧行永久滞留。
+    let (state, dir) = temp_state("uv-noid");
+    let mk = |uv: u32| IncomingMail {
+        uidvalidity: uv,
+        uid: 7,
+        seen: false,
+        internal_date: Some(1_700_000_000),
+        message_id: String::new(),
+        subject: "系统通知".into(),
+        from_addr: "noreply@x.cn".into(),
+        from_name: String::new(),
+        to_addrs: "demo@x.cn".into(),
+        cc_addrs: String::new(),
+        body_text: "内容".into(),
+        body_kind: "plain".into(),
+        body_html: None,
+        raw_headers: String::new(),
+        attachments: Vec::new(),
+        too_large: false,
+    };
+    assert_eq!(
+        store_incoming(&state, &[mk(1)]).unwrap(),
+        1,
+        "首封应入库"
+    );
+    assert_eq!(
+        store_incoming(&state, &[mk(2)]).unwrap(),
+        0,
+        "UV 变化后同一封不得重复入库"
+    );
+    let (count, remote): (i64, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT count(*), COALESCE(min(remote_uid), '') FROM emails",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(count, 1, "旧行必须被 remap 而不是留着");
+    assert_eq!(remote, "2:7", "remote_uid 应迁到新 UV");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn fetch_loop_routes_every_returned_uid_through_placeholder_guard() {
     // 行为测试钉住了决策函数，这里钉住循环确实调用它（而不是重写回 eprintln 跳过）
     let body = &RECV_RS[RECV_RS.find("for &uid in &run.uids").unwrap()..];

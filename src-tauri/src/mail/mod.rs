@@ -1621,6 +1621,9 @@ pub fn batch_apply(
     // SQL 既慢又容易撞 SQLite 的变量上限；按 BATCH_CHUNK 一批，单事务仍保证
     // 全有或全无（任一批失败整体回滚，附件文件也不会先删）。
     let root = attach_root(state);
+    // C5：批量「标记已读」必须与单封 mark_read 同口径——同事务写 seen_pending
+    // 与归属账号，提交后唤醒 worker；否则服务器 \Seen 永不回写
+    let account = state.current_account();
     let n = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         let mut changed = 0usize;
@@ -1631,14 +1634,44 @@ pub fn batch_apply(
                 BatchAction::MarkRead | BatchAction::MarkUnread => {
                     let v: i64 = if action == BatchAction::MarkRead { 0 } else { 1 };
                     // 仅收件箱有意义（unread 列语义限定；批量标已读时对草稿/发件 noop）
-                    changed += tx
-                        .execute(
-                            &format!(
-                                "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
-                            ),
-                            rusqlite::params_from_iter(chunk.iter()),
-                        )
-                        .map_err(e)?;
+                    if action == BatchAction::MarkRead {
+                        // SET 里的 unread 取 UPDATE 前的旧值（SQLite 语义），
+                        // 因此只有「本次真正 1→0」的行才入回写队列；已是已读、
+                        // 本地草稿/已发送（无 remote_uid）都不置标志。
+                        // 注意：SQLite 里一旦出现 ?NNN，匿名 ? 会从「已用最大编号+1」
+                        // 继续分配。所以账号固定 ?1，ids 显式编号 ?2..?N，
+                        // 参数顺序也照此排，混用匿名占位符会静默错位。
+                        let marks = (2..=chunk.len() + 1)
+                            .map(|i| format!("?{i}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let sql = format!(
+                            "UPDATE emails SET unread = 0,
+                                    seen_pending = CASE
+                                        WHEN unread = 1 AND direction = 'in'
+                                             AND remote_uid IS NOT NULL THEN 1
+                                        ELSE seen_pending END,
+                                    seen_account = CASE
+                                        WHEN unread = 1 AND direction = 'in'
+                                             AND remote_uid IS NOT NULL THEN ?1
+                                        ELSE seen_account END
+                              WHERE folder = 'inbox' AND id IN ({marks})"
+                        );
+                        let mut args: Vec<rusqlite::types::Value> = vec![account.clone().into()];
+                        args.extend(chunk.iter().map(|id| (*id).into()));
+                        changed += tx
+                            .execute(&sql, rusqlite::params_from_iter(args.iter()))
+                            .map_err(e)?;
+                    } else {
+                        changed += tx
+                            .execute(
+                                &format!(
+                                    "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
+                                ),
+                                rusqlite::params_from_iter(chunk.iter()),
+                            )
+                            .map_err(e)?;
+                    }
                 }
                 // 批量星标（M2-1 进批量栏）：全信箱行均合法（星标置顶对所有文件夹生效）。
                 // starred 不在 emails_au 触发器的 FTS 监听列内，翻转不引发检索重写
@@ -1686,6 +1719,11 @@ pub fn batch_apply(
         }
         Ok::<usize, String>(changed)
     })?;
+    // 提交后唤醒 seen worker（单封 mark_read 也是这个时机；n>0 才唤醒，
+    // 避免全选空集时无谓起线程）
+    if action == BatchAction::MarkRead && n > 0 {
+        state.notify_seen();
+    }
     Ok(n)
 }
 

@@ -116,12 +116,16 @@ fn clear_pending(state: &AppState, ids: &[i64]) {
     });
 }
 
-/// 放弃全部待回写（重试上限后用；下次点击已读会重新置标志，不影响本地语义）
+/// 放弃全部待回写（重试上限后用；下次点击已读会重新置标志，不影响本地语义）。
+/// C6：只放弃**当前账号**的行。pending_rows 已按账号过滤（R13），旧账号的
+/// 标志是「切回去再回写」的悬挂意向；全局清会把它们一并抹掉且无从重建。
 pub fn abandon(state: &AppState) {
+    let account = state.current_account();
     let n = state.with_conn(|conn| {
         conn.execute(
-            "UPDATE emails SET seen_pending = 0 WHERE seen_pending = 1",
-            [],
+            "UPDATE emails SET seen_pending = 0 WHERE seen_pending = 1
+               AND (seen_account IS NULL OR seen_account = ?1)",
+            rusqlite::params![account],
         )
         .unwrap_or(0)
     });
