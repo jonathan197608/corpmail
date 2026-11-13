@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% import "icons.html" as ic %}
+{% block body %}
+<div class="app on">
+    {% include "side.html" %}
+    <main class="main">
+        <div class="topbar">
+            <a class="back" href="/">‹ 返回列表</a>
+            <h1>撰写邮件</h1>
+        </div>
+
+        <div class="card compose-card">
+            {# A10：冻结期不放出撰写表单。此时 POST /compose/autosave 会被路由层
+               409 拒绝，内容只能留在内存里，迁移完成 1.5s 后自动退出即全丢。 #}
+            <div class="compose-note warn">{{ ic.icon('warning') }} {{ msg }}</div>
+            <p>迁移期间无法撰写邮件：此时保存的内容会写进即将被替换的旧库，重启后不会保留。</p>
+            <p>已保存的草稿会随数据一起迁移，重启应用后可在草稿箱继续编辑。</p>
+            <a class="btn" href="/">返回列表</a>
+        </div>
+    </main>
+</div>
+{% endblock %}

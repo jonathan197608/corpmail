@@ -9582,6 +9582,74 @@ fn migration_freeze_skips_get_page_size_persistence() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// ---------- A10：冻结期撰写页收敛 ----------
+
+/// A10：冻结位一旦置位，`POST /compose/autosave` 必被路由层 409，编辑只能留在
+/// 内存里，迁移完成 1.5s 后自动退出即全丢。所以冻结期根本不该放出撰写表单。
+/// 用「冻结前确实有表单 / 冻结后确实没有」的对照钉死，避免负向断言假通过。
+#[test]
+fn migration_freeze_blocks_compose_page_and_autosave() {
+    let base = std::env::temp_dir().join(format!("mbx-router-a10-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cur = base.join("cur");
+    std::fs::create_dir_all(&cur).unwrap();
+    let state = AppState::open(&cur);
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+
+    let before = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "", b""),
+        &tester,
+    );
+    assert_eq!(before.status, 200);
+    assert!(
+        body(&before).contains("hx-post=\"/compose/draft\""),
+        "前置：非冻结期必须给出撰写表单"
+    );
+
+    let dest = base.join("moved");
+    state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect("迁移应成功");
+    assert!(state.migration_pending(), "前置：迁移成功进入冻结期");
+
+    let page = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "", b""),
+        &tester,
+    );
+    assert_eq!(page.status, 200, "冻结期应回 200 提示页，不是 409 纯文本");
+    let html = body(&page);
+    assert!(html.contains("迁移期间无法撰写邮件"), "提示页须说明原因");
+    assert!(
+        !html.contains("hx-post=\"/compose/draft\""),
+        "冻结期不得放出无法保存的编辑表单"
+    );
+    assert!(
+        html.contains("compose-btn\" disabled"),
+        "侧栏「撰写邮件」入口须置灰"
+    );
+
+    let autosave = route(
+        &state,
+        &assets(),
+        &req_q("POST", "/compose/autosave", "", b"to_addrs=a%40b.test"),
+        &tester,
+    );
+    assert_eq!(autosave.status, 409, "冻结期自动保存必须明确失败");
+    assert!(body(&autosave).contains("已迁移"), "409 文案须点明原因");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // ---------- R9：迁移「进行中」与「待重启」文案必须分开 ----------
 
 /// R9：后台迁移期间 migration_pending 与 migration_in_progress 同时为 true。

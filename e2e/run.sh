@@ -85,12 +85,14 @@ wait_wal_quiet() {
     return 0
 }
 
-# C19/C14/C15：前端状态机的**行为**测试（假时钟 / 假 DOM / 假 htmx）。
-# Rust 侧只有 APP_JS.contains 静态护栏，改坏看门狗三元阈值、把确认标志的
-# delete 挪回放行分支、删掉刷新 URL 的搜索词拼接都能全绿；这里用 Node vm
-# 直接执行 app.js 里带锚点的 core 段，不启动 app、不依赖 wdio 与签名。
+# C19/C14/C15/A10：前端状态机与请求编排的**行为**测试（假时钟 / 假 DOM /
+# 假 htmx）。Rust 侧只有 APP_JS.contains 静态护栏，改坏看门狗三元阈值、把
+# 确认标志的 delete 挪回放行分支、删掉刷新 URL 的搜索词拼接、把草稿 flush
+# 挪到迁移 POST 之后都能全绿；这里用 Node vm 直接执行 app.js 里带锚点的
+# core 段，不启动 app、不依赖 wdio 与签名。
 echo "== 0/6 前端行为测试（node --test unit/） =="
-node --test unit/migration-watchdog.test.mjs unit/compose-confirm.test.mjs unit/list-refresh.test.mjs
+node --test unit/migration-watchdog.test.mjs unit/compose-confirm.test.mjs \
+    unit/list-refresh.test.mjs unit/migration-draft-flush.test.mjs
 
 echo "== 1/6 构建 E2E 二进制（cargo build --features e2e） =="
 (cd "$ROOT/src-tauri" && cargo build --features e2e)

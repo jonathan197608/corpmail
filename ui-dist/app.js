@@ -314,6 +314,18 @@ async function mbxMoveDataDir() {
     try {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
+        // A10：先强制把撰写页内容落进旧库。冻结位在下面这个 POST 的协议线程里
+        // 置位，此后 /compose/autosave 全被 409；迁移完成 1.5s 自动退出，
+        // 没落库的内容会随进程消失。flush 失败一律取消迁移，不静默放行。
+        const flushed = await mbxFlushComposeDraft();
+        const allowed = mbxMigAfterFlush(flushed, {
+            proceed: function () { return true; },
+            cancel: function () {
+                mbxToast('草稿保存失败，已取消迁移（避免未保存内容丢失）', 'err', 8000);
+                return false;
+            }
+        });
+        if (!allowed) return;
         // 先弹模态并注册事件监听（避免后台完成事件在监听前发出被丢）
         mbxMigOpen();
         await mbxMigListen();
@@ -1319,6 +1331,93 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     }
 });
 
+// --- A10 migration draft flush core START ---
+// 迁移发起前必须把撰写页内容写进旧库：冻结位在 POST /settings/storage/move
+// 的协议线程里置位（state.rs:798），此后 /compose/autosave 一律 409；快照
+// 定格后 1.5s 自动退出，留在内存里的编辑全丢。这里与 5s 防抖自动保存共用
+// 同一条请求（必须走 htmx.ajax，富文本 body_html / inline_images 由
+// htmx:configRequest 注入，原生 fetch 会漏参数）。Node vm 行为测试直接执行本段。
+var MBX_MIG_FLUSH_TIMEOUT_MS = 8000;
+
+function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
+    var values = {};
+    try {
+        new FormData(form).forEach(function (v, k) { values[k] = v; });
+    } catch (e) {
+        return Promise.resolve({ ok: false, status: 0 });
+    }
+    var limit = typeof timeoutMs === 'number' ? timeoutMs : MBX_MIG_FLUSH_TIMEOUT_MS;
+    return new Promise(function (resolve) {
+        var settled = false;
+        var timer = null;
+        function finish(r) {
+            if (settled) return;
+            settled = true;
+            if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
+            doc.body.removeEventListener('htmx:afterRequest', onDone);
+            resolve(r);
+        }
+        function onDone(ev) {
+            var d = ev.detail || {};
+            var p = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
+            if (p.indexOf('/compose/autosave') < 0) return;
+            var xhr = d.xhr;
+            finish({
+                ok: !!(xhr && xhr.status >= 200 && xhr.status < 300),
+                status: xhr ? xhr.status : 0
+            });
+        }
+        doc.body.addEventListener('htmx:afterRequest', onDone);
+        if (typeof setTimeout === 'function') {
+            timer = setTimeout(function () {
+                finish({ ok: false, status: 0, timeout: true });
+            }, limit);
+        }
+        try {
+            var pending = htx.ajax('POST', '/compose/autosave', {
+                source: form,
+                values: values,
+                handler: function (_elt, info) {
+                    var xhr = info && info.xhr;
+                    var ok = !!(xhr && xhr.status === 200);
+                    if (ok) {
+                        var res = null;
+                        try { res = JSON.parse(xhr.responseText); } catch (e) { res = null; }
+                        if (res && res.ok && res.draft_id > 0) {
+                            var idEl = form.querySelector('input[name="draft_id"]');
+                            if (idEl && (!idEl.value || idEl.value === '0')) {
+                                idEl.value = String(res.draft_id);
+                            }
+                        }
+                    }
+                    finish({ ok: ok, status: xhr ? xhr.status : 0 });
+                }
+            });
+            if (pending && typeof pending.catch === 'function') {
+                pending.catch(function () { finish({ ok: false, status: 0 }); });
+            }
+        } catch (e) {
+            finish({ ok: false, status: 0 });
+        }
+    });
+}
+
+function mbxFlushComposeDraft() {
+    var hint = document.getElementById('autosave-hint');
+    var form = hint && hint.closest ? hint.closest('form') : null;
+    // 非撰写页（设置页发起迁移的常见情形）：没有内容可丢，直接放行
+    if (!form || !form.isConnected) return Promise.resolve({ ok: true, skipped: true });
+    return mbxAutosaveRequest(form, document, htmx);
+}
+
+// 决策与执行分离：真实发起流程在 mbxMoveDataDir 里继续，避免回调里的 return
+// 语义丢失。proceed/cancel 的返回值决定是否继续。
+function mbxMigAfterFlush(flush, actions) {
+    if (flush && flush.ok === true) return actions.proceed();
+    return actions.cancel(flush);
+}
+// --- A10 migration draft flush core END ---
+
 // ---------- 撰写页：草稿自动保存（M3-1） ----------
 // 停止输入 5s（防抖）→ 静默 POST /compose/autosave（与存草稿同一条保存路径，
 // 返回轻量 JSON 无跳转）。首个 draft_id 回填隐藏域，此后自动保存变"覆盖"
@@ -1344,30 +1443,13 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
     function trigger() {
         var form = composeForm();
         if (!form || !form.isConnected) return; // 已导航离开撰写页
-        var values = {};
-        try {
-            new FormData(form).forEach(function (v, k) { values[k] = v; });
-        } catch (e) { return; }
-        htmx.ajax('POST', '/compose/autosave', {
-            source: form,
-            values: values,
-            handler: function (_elt, info) {
-                var xhr = info && info.xhr;
-                if (!xhr || xhr.status !== 200) return;
-                var res = null;
-                try { res = JSON.parse(xhr.responseText); } catch (e) { return; }
-                if (!res || !res.ok || res.draft_id <= 0) return;
-                // 只有"本次新创建"才回填（编辑已有草稿时表单本来就有值；
-                // 新建模板渲染 draft_id=0，与未创建等价）
-                var idEl = form.querySelector('input[name="draft_id"]');
-                if (idEl && (!idEl.value || idEl.value === '0')) {
-                    idEl.value = String(res.draft_id);
-                }
-                var hint = document.getElementById('autosave-hint');
-                if (hint) hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());
-            }
+        // 与迁移前强制 flush 共用同一条请求：富文本参数注入、draft_id 回填、
+        // 失败判定都只有一份实现
+        mbxAutosaveRequest(form, document, htmx).then(function (r) {
+            if (!r.ok) return;
+            var hint = document.getElementById('autosave-hint');
+            if (hint) hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());
         });
-        // 下轮防抖：保存后再有输入才会触发，不做周期性轮询
     }
 
     function schedule() {

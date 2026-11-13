@@ -250,6 +250,14 @@ pub(super) struct FrameCtx {
     pub(super) draft: i64,
     /// 当前列表 folder（inbox|sent|draft；side.html 高亮与列表页标题用）
     pub(super) folder: String,
+    /// A10：迁移冻结期禁用侧栏「撰写邮件」入口（GET /compose 也回只读提示页）
+    pub(super) compose_blocked: bool,
+}
+
+#[derive(Serialize)]
+struct MigrationComposeCtx {
+    frame: FrameCtx,
+    msg: String,
 }
 
 #[derive(Serialize)]
@@ -562,6 +570,8 @@ fn foreign_origin(req: &Req) -> bool {
 /// 跳过；`fetch_status` 的 `display_name()` 推断写回落在锚点目录 corpmail.toml
 /// （配置键不进库，不随数据目录迁移），冻结期写它不会丢——故不把这两个
 /// 高频 GET 判成副作用，否则冻结期轮询状态条会被 409 toast 反复轰炸。
+/// A10 复核：`GET /compose` 也不是写库点，不在这里拦；它在 `dynamic` 里单独
+/// 返回只读提示页（200），因为冻结期放出的表单根本无法保存。
 fn has_side_effect(req: &Req) -> bool {
     match req.method.as_str() {
         "GET" => req.path == "/emails/fetch",
@@ -597,7 +607,14 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/") => Some(list_root(state, req)),
         // 行片段（R41）：后台刷新只换邮件行 + 计数
         ("GET", "/list/rows") => Some(list_rows(state, req)),
-        ("GET", "/compose") => Some(compose_page(state, req)),
+        // A10：冻结期不放出撰写表单（POST autosave 会被 409，内容只能留内存，
+        // 迁移完成 1.5s 后自动退出即全丢）。返回 200 只读提示页，不打成 409，
+        // 免得整页导航只显示一段纯文本
+        ("GET", "/compose") => Some(if state.migration_pending() {
+            migration_compose_blocked(state)
+        } else {
+            compose_page(state, req)
+        }),
         ("POST", "/compose/draft") => Some(compose_draft_save(state, req)),
         // M3-1 草稿自动保存：与存草稿同一保存路径，返回轻量 JSON（无跳转）
         ("POST", "/compose/autosave") => Some(compose_autosave(state, req)),
@@ -2172,6 +2189,18 @@ fn fill_reply_body(ctx: &mut ComposeCtx, src: &mail::EmailDetail) {
     }
 }
 
+/// 冻结期撰写页：只回提示，不给可编辑表单。文案按阶段分（进行中 / 待重启），
+/// 与 409 toast 同源 `migration_block_msg()`，避免两处口径漂移。
+fn migration_compose_blocked(state: &AppState) -> Resp {
+    render_html(
+        "migration_compose.html",
+        &MigrationComposeCtx {
+            frame: frame_ctx(state, "draft"),
+            msg: state.migration_block_msg().to_string(),
+        },
+    )
+}
+
 /// 撰写页（GET /compose：空表单 / ?reply_to=N 回复预填 / ?draft_id=M 草稿编辑）
 fn compose_page(state: &AppState, req: &Req) -> Resp {
     if !state.configured() {
@@ -3375,6 +3404,7 @@ pub(super) fn frame_of(
     display: &str,
     folder: &str,
     counts: &HashMap<&'static str, i64>,
+    compose_blocked: bool,
 ) -> FrameCtx {
     FrameCtx {
         display_name: if display.is_empty() {
@@ -3392,6 +3422,7 @@ pub(super) fn frame_of(
         sent: counts["sent"],
         draft: counts["draft"],
         folder: folder.into(),
+        compose_blocked,
     }
 }
 
@@ -3674,7 +3705,14 @@ fn frame_ctx(state: &AppState, folder: &str) -> FrameCtx {
     let domain = state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default();
     let display = state.display_name();
     let counts = state.folder_counts();
-    frame_of(&prefix, &domain, &display, folder, &counts)
+    frame_of(
+        &prefix,
+        &domain,
+        &display,
+        folder,
+        &counts,
+        state.migration_pending(),
+    )
 }
 
 pub(super) fn test_fragment(tests: Vec<TestView>, note: &str, note_ok: bool) -> Resp {

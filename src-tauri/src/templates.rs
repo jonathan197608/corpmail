@@ -29,6 +29,11 @@ pub(crate) const TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/email_status.html"),
     ),
     ("compose.html", include_str!("templates/compose.html")),
+    // A10 冻结期撰写页：只回只读提示，不放出会被 409 的编辑表单
+    (
+        "migration_compose.html",
+        include_str!("templates/migration_compose.html"),
+    ),
     ("side.html", include_str!("templates/side.html")),
     ("settings.html", include_str!("templates/settings.html")),
     (

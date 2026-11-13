@@ -74,4 +74,24 @@ describe('95 数据目录迁移与冻结', () => {
     expect(probe.status).toBe(409)
     expect(probe.text).toContain('已迁移')
   })
+
+  // A10：冻结期 POST /compose/autosave 必被 409，放出的表单只能把内容留在
+  // 内存里，迁移完成自动退出即全丢。撰写页必须收敛成只读提示，入口置灰。
+  it('A10 冻结期撰写页只读、撰写入口置灰', async () => {
+    await goto('/compose')
+    const st = await browser.execute(() => {
+      const btn = document.querySelector('.compose-btn')
+      return {
+        hasForm: !!document.querySelector('form[hx-post="/compose/draft"]'),
+        note: (document.querySelector('.compose-note.warn')?.textContent || '').trim(),
+        blocked: !!btn && (btn.hasAttribute('disabled') || btn.tagName !== 'A'),
+        href: document.querySelector('a.compose-btn')?.getAttribute('href') || '',
+      }
+    })
+    expect(st.hasForm).toBe(false)
+    expect(st.note).toContain('迁移')
+    expect(st.blocked).toBe(true)
+    expect(st.href).toBe('')
+    await shot('冻结-撰写页只读提示')
+  })
 })

@@ -11,7 +11,13 @@
         </span>
         <div><b>CorpMail</b><small>企业邮箱客户端</small></div>
     </div>
+    {# A10：冻结期撰写入口置灰且不可点（span 无 href，天然不导航）。
+       GET /compose 后端同样回只读提示页，覆盖回复/转发/空态等所有链接形态 #}
+    {% if frame.compose_blocked %}
+    <span class="compose-btn" disabled aria-disabled="true" title="数据迁移期间无法撰写邮件"><span class="ico">{{ ic.icon('draft') }}</span>撰写邮件</span>
+    {% else %}
     <a class="compose-btn" href="/compose"><span class="ico">{{ ic.icon('draft') }}</span>撰写邮件</a>
+    {% endif %}
     <a class="folder {% if frame.folder == 'inbox' %}on{% endif %}" href="/?folder=inbox">{{ ic.icon('inbox') }} <span class="fw">收件箱</span> <span class="cnt">{{ frame.inbox }}{% if frame.inbox_unread > 0 %}
         <span class="unread-chip">{{ frame.inbox_unread }}</span>{% endif %}</span></a>
     <a class="folder {% if frame.folder == 'sent' %}on{% endif %}" href="/?folder=sent">{{ ic.icon('send') }} <span class="fw">发件箱</span> <span class="cnt">{{ frame.sent }}</span></a>
