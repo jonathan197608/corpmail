@@ -289,10 +289,19 @@ pub(super) fn sync_pane(state: &AppState, saved: bool) -> Resp {
     )
 }
 
-pub(super) fn storage_pane(state: &AppState, saved: bool) -> Resp {
+/// C8：保存失败必须回显原因。旧实现四个失败分支都返回「与点击前逐字节相同」
+/// 的正常 pane，用户误以为策略已生效；sync 模板此前连错误条都没有。
+pub(super) fn sync_pane_error(state: &AppState, error: &str) -> Resp {
+    render_html(
+        &pane_template("sync"),
+        &settings_ctx(state, "sync", false, error, None, None),
+    )
+}
+
+pub(super) fn storage_pane_error(state: &AppState, error: &str) -> Resp {
     render_html(
         &pane_template("storage"),
-        &settings_ctx(state, "storage", saved, "", None, None),
+        &settings_ctx(state, "storage", false, error, None, None),
     )
 }
 
@@ -539,7 +548,7 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
             }
             Err(ResetFetchError::Other(e)) => {
                 eprintln!("[settings] 范围变更保存失败：{e}");
-                sync_pane(state, false)
+                sync_pane_error(state, &format!("保存失败：{e}"))
             }
             Ok(()) => sync_pane(state, true),
         };
@@ -554,9 +563,9 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         (keys::FIRST_FETCH_DAYS, days.as_str()),
         (keys::MAX_MAIL_MB, max_mail.as_str()),
     ];
-    if state.set_batch(&pairs).is_err() {
-        // 保存失败回渲染当前值，用户重试（库错误在此无更优交互）
-        return sync_pane(state, false);
+    if let Err(e) = state.set_batch(&pairs) {
+        eprintln!("[settings] 收件同步保存失败：{e}");
+        return sync_pane_error(state, &format!("保存失败：{e}"));
     }
     sync_pane(state, true)
 }
@@ -596,7 +605,7 @@ pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
         }
         Err(ResetFetchError::Other(e)) => {
             eprintln!("[settings] 重新拉取启动失败：{e}");
-            sync_pane(state, false)
+            sync_pane_error(state, &format!("重新拉取失败：{e}"))
         }
         Ok(()) => {
             let mut ctx = settings_ctx(state, "sync", false, "", None, None);
@@ -638,9 +647,9 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
         (keys::KEEP_INBOX_DAYS, keep_inbox.as_str()),
         (keys::KEEP_SENT_DAYS, keep_sent.as_str()),
     ];
-    if state.set_batch(&pairs).is_err() {
-        // 保存失败也回渲染当前值，用户重试（库错误在此无更优交互）
-        return storage_pane(state, false);
+    if let Err(e) = state.set_batch(&pairs) {
+        eprintln!("[settings] 存储策略保存失败：{e}");
+        return storage_pane_error(state, &format!("保存失败：{e}"));
     }
     // 新策略落地即同步执行一轮清理（个人邮箱规模毫秒级）：改短保留时长
     // 立即可见效果，无需等每日定时器或手动点「立即清理」（2026-11-03 需求：

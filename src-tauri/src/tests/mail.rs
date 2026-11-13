@@ -815,6 +815,28 @@ fn save_dest_whitelist_blocks_system_paths() {
     cleanup(&dir);
 }
 
+/// C7：目录形态的 dest_dir 也必须过白名单。旧实现 guard_save_dest 在
+/// `md.is_dir()` 处提前 return Ok(())，而 save_all_attachments 先判 is_dir
+/// 再调它 —— R35 白名单对「全部另存」100% 失效（注释与实现相反）。
+#[cfg(not(windows))]
+#[test]
+fn save_dest_whitelist_covers_directory_targets() {
+    let (state, dir) = temp_state("dest-dir-guard");
+    for bad in ["/usr", "/usr/local/bin", "/etc"] {
+        assert!(
+            guard_save_dest(&state, bad).is_err(),
+            "目录目标也必须过白名单：{bad}"
+        );
+    }
+    let allowed = dir.join("exports");
+    std::fs::create_dir_all(&allowed).unwrap();
+    assert!(
+        guard_save_dest(&state, &allowed.to_string_lossy()).is_ok(),
+        "临时目录内新建导出目录应照常放行（正常另存体验不变）"
+    );
+    cleanup(&dir);
+}
+
 /// 另存无后缀路径时按附件名补后缀，并返回实际落盘路径（提示文案据此显示）
 #[test]
 fn save_attachment_infers_missing_extension() {

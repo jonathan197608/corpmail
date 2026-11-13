@@ -4,6 +4,9 @@
    此页提供查看、搜索与手动删除。 #}
 {% import "icons.html" as ic %}
 <div id="contacts-area">
+    {% if error %}
+    <div class="card compose-note err">{{ ic.icon('x') }} {{ error }}</div>
+    {% endif %}
     <div class="topbar">
         <h1>联系人 <span class="sub">{{ total }} 位</span></h1>
         {# 每页条数（默认 10，与邮件列表一致）：选择即提交回当前列表；per 持久化到设置 #}
@@ -87,7 +90,10 @@
         {% endfor %}
     {% else %}
         <div class="card empty-state">
-            {% if q %}
+            {% if error %}
+            <h2>联系人列表暂时不可用</h2>
+            <p>这是读取失败，不代表联系人丢失；请稍后重试或重启应用。</p>
+            {% elif q %}
             <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
             <h2>没有匹配的联系人</h2>
             <p>换个关键词试试，支持姓名与邮件地址模糊搜索。</p>

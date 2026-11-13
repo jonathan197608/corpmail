@@ -9673,3 +9673,66 @@ fn retry_body_truncates_on_char_boundary() {
     assert_eq!(decoded.len() % 3, 0, "截断点必须落在 UTF-8 字符边界");
     assert!(decoded.chars().all(|c| c == '汉'));
 }
+
+/// C8：收件同步 / 存储管理四个保存失败分支旧实现都返回「与点击前逐字节相同」
+/// 的正常 pane，用户误以为策略已生效。错误必须落到可见错误条。
+#[test]
+fn settings_save_errors_render_an_error_banner() {
+    let (state, dir) = temp_state("c8-settings");
+    let msg = "保存失败：磁盘只读";
+    let sync = settings_ctx(&state, "sync", false, msg, None, None);
+    let html = body(&render_html(&crate::ui::settings::pane_template("sync"), &sync));
+    assert!(html.contains(msg), "sync 模板必须渲染错误条：{html}");
+    let storage = settings_ctx(&state, "storage", false, msg, None, None);
+    let html = body(&render_html(
+        &crate::ui::settings::pane_template("storage"),
+        &storage,
+    ));
+    assert!(html.contains(msg), "storage 模板必须渲染错误条：{html}");
+    // 四个失败分支都必须走 *_pane_error（含定义各 1 处）
+    let src = include_str!("../ui/settings.rs");
+    assert!(
+        src.matches("sync_pane_error(").count() >= 4,
+        "范围变更 / 同步保存 / 重新拉取三个失败分支都要回显"
+    );
+    assert!(
+        src.matches("storage_pane_error(").count() >= 2,
+        "存储策略保存失败也要回显"
+    );
+    cleanup(&dir);
+}
+
+/// C12：联系人主列表查询失败不得被 unwrap_or_default 伪装成「没有联系人」——
+/// 库锁/损坏时用户会以为联系人全没了，甚至重新录入。
+#[test]
+fn contacts_query_failure_is_reported_not_mistaken_for_empty_list() {
+    let (state, dir) = temp_state("c12-contacts");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    state
+        .with_conn(|c| c.execute_batch("DROP TABLE contacts"))
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/contacts", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        html.contains("读取联系人失败"),
+        "必须把查询错误显示出来：{html}"
+    );
+    assert!(
+        html.contains("联系人列表暂时不可用"),
+        "空态文案必须区分「读失败」与「真的没有联系人」"
+    );
+    assert!(
+        !html.contains("还没有联系人"),
+        "不得把读取失败渲染成空通讯录"
+    );
+    cleanup(&dir);
+}

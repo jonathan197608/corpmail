@@ -3162,7 +3162,11 @@ pub fn guard_save_dest(state: &AppState, raw: &str) -> Result<(), String> {
         return Err(format!("保存路径必须是绝对路径：{raw}"));
     }
     match std::fs::symlink_metadata(p) {
-        Ok(md) if md.is_dir() => return Ok(()), // 「全部另存」的目录目标
+        // C7：目录目标（「全部另存」）同样必须过白名单。旧实现在这里提前
+        // return Ok(())，而 save_all_attachments 先判 is_dir 再调本函数，
+        // 因此 R35 白名单对目录形态 100% 失效：伪造 dest_dir 可落到任意
+        // 系统目录。跳过 return，让下面的 save_dest_allowed 继续判定。
+        Ok(md) if md.is_dir() => {}
         Ok(md) if md.file_type().is_symlink() => {
             return Err(format!("目标不能是符号链接：{raw}"));
         }

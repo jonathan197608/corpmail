@@ -1643,9 +1643,19 @@ fn contacts_ctx_full(
     error: &str,
 ) -> ContactsCtx {
     let sort = mail::contacts::ContactsSort::parse(Some(opts.sort));
-    let rows = state
-        .with_conn(|conn| mail::contacts::list_rows(conn, opts.q, 500, sort))
-        .unwrap_or_default();
+    // C12：查询失败不得被 unwrap_or_default 伪装成「没有联系人」（库锁/损坏时
+    // 用户会以为联系人全没了，甚至重新录入）。写到 error 区并保留空集。
+    let mut error_text = error.to_string();
+    let rows = match state.with_conn(|conn| mail::contacts::list_rows(conn, opts.q, 500, sort)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            if !error_text.is_empty() {
+                error_text.push('；');
+            }
+            error_text.push_str(&format!("读取联系人失败：{e}"));
+            Vec::new()
+        }
+    };
     let total = rows.len();
     let per = opts.per.max(1);
     let pages = ((total as i64) + per - 1) / per;
@@ -1689,7 +1699,7 @@ fn contacts_ctx_full(
         page_base: contact_page_base(opts.q, per, sort.key()),
         sort: sort.key().to_string(),
         notice: notice.to_string(),
-        error: error.to_string(),
+        error: error_text,
         edit_name: if edit_addr.is_empty() {
             String::new()
         } else {
