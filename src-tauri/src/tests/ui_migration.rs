@@ -555,6 +555,61 @@ fn migration_modal_resets_previous_failure_state() {
 }
 
 #[test]
+fn a3_e2e_switches_are_feature_gated() {
+    // A3：两个 E2E 开关必须只在 --features e2e 下读环境变量。生产构建里
+    // cfg!(feature="e2e") 恒 false，误设环境变量不得改变迁移注入/自动退出。
+    let at = LIB_RS.find("fn e2e_flag(").expect("e2e_flag 存在");
+    let rest = &LIB_RS[at..];
+    let body = &rest[..rest.find("/// 应用主入口").expect("下一注释存在")];
+    assert!(
+        body.contains("cfg!(feature = \"e2e\")"),
+        "开关必须带 feature 守卫，生产构建不能读环境变量"
+    );
+    assert!(
+        body.contains("std::env::var_os(name)"),
+        "开关必须按值 (=1) 读环境变量"
+    );
+    for name in ["CORPMAIL_E2E_BACKGROUND", "CORPMAIL_E2E_NO_EXIT"] {
+        assert!(
+            LIB_RS.contains(&format!("e2e_flag(\"{name}\")")),
+            "必须调用 {name} 开关"
+        );
+    }
+    assert!(
+        LIB_RS.contains("cfg!(not(feature = \"e2e\")) || e2e_background"),
+        "生产构建必须恒注入 executor，e2e 默认仍走同步分支"
+    );
+}
+
+#[test]
+fn a3_no_exit_switch_only_guards_the_exit_call() {
+    // A3：NO_EXIT 只跳过 app.exit(0)，done 事件、1.5s 渲染缓冲与 guard 复位
+    // 一个都不能少；成功分支里也不许有绕过开关的第二个 exit。
+    let success = LIB_RS.find("Ok(msg) =>").expect("成功分支存在");
+    let rest = &LIB_RS[success..];
+    let body = &rest[..rest.find("Err(e) =>").expect("失败分支存在")];
+    assert!(
+        body.contains("let e2e_no_exit = e2e_flag(\"CORPMAIL_E2E_NO_EXIT\");"),
+        "成功分支必须读 NO_EXIT 开关"
+    );
+    assert!(body.contains("wait_or_stop("), "1.5s 渲染缓冲不能跳过");
+    assert!(
+        body.contains("app.emit(\"migration-done\""),
+        "done 事件不能跳过"
+    );
+    let guard = body
+        .find("&& !e2e_no_exit")
+        .expect("退出必须受开关约束");
+    let exit = body.find("app.exit(0);").expect("仍要自动退出");
+    assert!(guard < exit, "app.exit(0) 必须在 NO_EXIT 条件之后");
+    assert_eq!(
+        body.matches("app.exit(0);").count(),
+        1,
+        "成功分支不得有绕过开关的第二个退出点"
+    );
+}
+
+#[test]
 fn wizard_path_does_not_call_migration_directly() {
     // R2（复查审计）：向导是协议回调线程，路由层不得再直呼同步迁移
     // （大库 VACUUM 会卡死「保存中…」）。唯一的迁移入口是 settings.rs 的

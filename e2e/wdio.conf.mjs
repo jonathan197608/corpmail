@@ -24,14 +24,20 @@ if (!fs.existsSync(APP)) {
 // ---- 沙箱数据目录 --------------------------------------------------------
 // 每个 run 一套独立 HOME：app_data_dir / corpmail.toml / keyfile / 隔离 keychain
 // 全部落在 run 目录内，互不干扰，也绝不触碰真实用户数据。
-const HOME = path.join(RUN_DIR, 'home')
+// A3 第三阶段例外：CORPMAIL_E2E_HOME 让第三阶段复用阶段二跑完向导后的
+// 「已配置 + 有库」HOME，产物目录仍是独立的 <RUN_ID>-bg。若换新 HOME，app
+// 只会回到欢迎页，根本进不了设置页，后台迁移无从发起。
+const HOME = process.env.CORPMAIL_E2E_HOME
+  ? path.resolve(process.env.CORPMAIL_E2E_HOME)
+  : path.join(RUN_DIR, 'home')
 fs.mkdirSync(path.join(HOME, 'Library', 'Application Support'), { recursive: true })
 process.env.HOME = HOME
 
 export const config = {
   runner: 'local',
-  // 单层 glob：specs/*.spec.mjs = 主链路（00-07 + 90）；
-  // specs/phase2/ 由 run.sh 第二阶段显式 --spec 调起（需重装前置状态）
+  // 单层 glob：specs/*.spec.mjs = 主链路（00-07 + 90 + 95）；
+  // specs/phase2/ 与 specs/phase3/ 分别由 run.sh 第二、三阶段显式 --spec
+  // 调起（各自需要独立前置状态 / 独立 app 进程与运行时开关）
   specs: ['./specs/*.spec.mjs'],
   maxInstances: 1,
   logLevel: 'info',

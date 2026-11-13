@@ -51,6 +51,13 @@ const APP_URL: &str = "http://ui.localhost/";
 #[cfg(not(windows))]
 const APP_URL: &str = "ui://localhost/";
 
+/// A3：E2E 专用运行时开关，只在 `cargo build --features e2e` 里生效。
+/// 生产构建中 `cfg!(feature = "e2e")` 恒 `false`，短路掉整个环境变量读取——
+/// 误设这些变量不可能改变生产二进制的迁移注入或自动退出行为。
+fn e2e_flag(name: &str) -> bool {
+    cfg!(feature = "e2e") && std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 /// 应用主入口
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -146,13 +153,16 @@ pub fn run() {
             }
             app.manage(state);
 
-            if cfg!(not(feature = "e2e")) {
+            // A3：e2e 构建默认仍不注入（95 迁移/冻结断言与阶段二复用链路依赖
+            // 同步进程内状态）；只有第三阶段显式给 CORPMAIL_E2E_BACKGROUND=1，
+            // 才在 E2E 二进制里跑与生产同构的后台链。生产构建恒注入。
+            let e2e_background = e2e_flag("CORPMAIL_E2E_BACKGROUND");
+            if cfg!(not(feature = "e2e")) || e2e_background {
                 // 后台迁移执行器（M5 存储迁移后台化）：注入后 start_migration 走后台线程，
                 // 协议回调立即返回（不再同步跑 VACUUM/附件复制阻塞前端），进度/结果经
                 // 事件回传，迁移完成自动退出（用户重开即用新目录）。
-                // 未注入（单元测试 / e2e 构建）时 start_migration 走同步，保持既有测试
-                // 语义——e2e 的 95 迁移/冻结用例与阶段二复用链路都依赖同步进程内状态，
-                // 后台自动退出会杀 e2e 进程，故 e2e 不注入、生产才后台化。
+                // 未注入（单元测试 / 主链路 e2e）时 start_migration 走同步，保持既有
+                // 测试语义；第三阶段由开关临时打开，见 run.sh 6/7 步。
                 let handle: tauri::AppHandle = app.handle().clone();
                 app.state::<state::AppState>()
                     .set_migration_executor(std::sync::Arc::new(move |dest| {
@@ -207,10 +217,15 @@ pub fn run() {
                                         // exit 触发退出事件时自然置位，常驻线程与退出
                                         // 之间仍隔着 1.5s 的 wait_or_stop 缓冲。
                                         let _ = app.emit("migration-done", msg);
-                                        if wait_or_stop(
+                                        // A3：第三阶段要留在进程里断言事件与落盘，由
+                                        // CORPMAIL_E2E_NO_EXIT=1 只跳过退出调用；
+                                        // 1.5s 渲染缓冲与生产自动退出保持不变。
+                                        let e2e_no_exit = e2e_flag("CORPMAIL_E2E_NO_EXIT");
+                                        let can_exit = wait_or_stop(
                                             std::time::Duration::from_millis(1500),
                                             std::time::Duration::from_millis(100),
-                                        ) {
+                                        );
+                                        if can_exit && !e2e_no_exit {
                                             app.exit(0);
                                         }
                                     }

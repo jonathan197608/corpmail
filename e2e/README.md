@@ -200,14 +200,14 @@ corpmail.toml 并进向导：
 ## 7. 运行方式
 
 ```sh
-# 全量（构建 → 重签 → 清理残留 → 阶段一主链路 → 重装准备 → 阶段二复用链路）
+# 全量（构建 → 重签 → 清理残留 → 阶段一主链路 → 重装准备 → 阶段二复用链路 → 阶段三后台迁移链）
 e2e/run.sh
 
-# 没有固定签名身份时（CI）：显式放行未签名，本地默认直接失败退出
+# 没有固定签名身份时：显式放行未签名，本地默认直接失败退出
 E2E_ALLOW_UNSIGNED=1 e2e/run.sh
 
-# 单点调试（只跑主链路某个 spec）：不会生成 reuse marker，必须显式允许跳过阶段二
-E2E_SKIP_PHASE2=1 e2e/run.sh --spec specs/01-wizard.spec.mjs
+# 单点调试（只跑主链路某个 spec）：不会生成 reuse marker，必须显式允许跳过阶段二/三
+E2E_SKIP_PHASE2=1 E2E_SKIP_PHASE3=1 e2e/run.sh --spec specs/01-wizard.spec.mjs
 
 # 换端口（与日常实例并存）
 E2E_WD_PORT=4455 e2e/run.sh
@@ -218,6 +218,24 @@ scripts/e2e-shell-macos.sh
 
 首轮会看到：`[E2E] mock 邮件服务器 imap=xxxxx smtp=xxxxx，初始邮件 3 封`，
 结束后输出截图目录。`e2e/artifacts/<run>/index.md` 是给人工复核的入口。
+
+### 第三阶段：生产后台迁移链（A3，2026-11-13 新增）
+
+`specs/phase3/09-migration-background.spec.mjs` 只在 `run.sh` 的 6/7 步跑，主链路
+95/90 的同步迁移断言一字不改。脚本临时注入 `CORPMAIL_E2E_BACKGROUND=1`（e2e 构建也
+注入后台 executor）与 `CORPMAIL_E2E_NO_EXIT=1`（成功后不调 `app.exit(0)`，留进程供
+wdio 断言），用例断言 `X-CorpMail-Migration: background` 响应头、`migration-progress`
+的 `starting` → 后续阶段、`migration-done` 终态、目标库落盘、源库保留、冻结 409。
+`CORPMAIL_E2E_HOME` 复用阶段二跑完向导的 HOME（全新 HOME 只会回到欢迎页），产物目录
+独立为 `<RUN_ID>-bg`；`CORPMAIL_E2E_SOURCE_DATA_DIR` 由脚本从 `reuse-ready.json` 读出。
+两个 `CORPMAIL_E2E_*` 开关在 `lib.rs` 带 `cfg!(feature = "e2e")` 守卫，生产二进制不受
+环境变量影响。第三个阶段不覆盖自动退出（会杀 wdio 会话），该分支由 Rust 单测静态护栏钉住。
+
+单点复跑命令见仓库根目录 `README.md` 的 E2E 段：先用
+`E2E_RUN_ID=<id> E2E_SKIP_PHASE3=1 e2e/run.sh` 生成阶段二终态，再带四个环境变量直接调
+`wdio`。**再次复跑前要复位**：迁移成功会把该 HOME 下 `corpmail.toml` 的
+`data_dir_override` 改到 `<id>-bg/bg-moved-data`，需改回 `<id>/reuse-data` 并删掉
+`<id>-bg/`，否则 spec 断言的源库与 app 实际使用的数据目录不一致。
 
 新增一个功能点用例（三步）：在 `specs/` 新建 `NN-<模块>.spec.mjs` → 用
 `goto()` 到位、`$()`/`$$()` 断言 → 关键画面调 `shot('<功能点>')`。截图清单自动汇总。
@@ -246,10 +264,10 @@ scripts/e2e-shell-macos.sh
 |---|---|---|
 | P0（已完成） | 构建 feature、隔离环境、mock 服务器、L2 全量用例（00–07 共 70 个 it，加 90 失败链路 5 个、阶段二 3 个，合计 78） | `e2e/run.sh` 全绿，截图 ≈97 张 |
 | P1 | 跑全量修选择器偏差（批量/模板/迁移的 DOM 细节以实测为准） | 全量 spec 通过 |
-| P2 | L3 外壳层接入 CI、L4 视觉基线（pixelmatch 阈值 0.1%） | 关键页截图 diff 稳定 |
-| P3 | GitHub Actions `macos-14` 跑全量（app 需 GUI 会话，先验证 runner 能力） | 每次 push 出截图 artifact |
+| P2 | L4 视觉基线（pixelmatch 阈值 0.1%）；外壳层云端 CI 已废弃，只做本机截图复核 | 关键页截图 diff 稳定 |
+| P3（已废弃） | GitHub Actions 跑全量：2026-11-12 已删除全部 workflow，发版与门禁均改本机手动 | 见根 README「发版（本机手动）」 |
 
-## 11. 当前实测状态（2026-11-11）
+## 11. 历史实测状态（2026-11-11，两阶段时期；三阶段现状见 §7）
 
 **全量通过（两阶段）**：`e2e/run.sh` → 阶段一 9 spec（00–07 + 90）+ 阶段二 08 复用
 1 spec / 3 用例全绿（00 smoke 4、01 向导 7〔2026-11-11 新增「首设数据目录必选」〕、

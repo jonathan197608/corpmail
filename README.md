@@ -98,16 +98,35 @@ cd src-tauri
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -- --test-threads=1    # 单测各自持临时目录 + 钥匙串走 keyfile 分支，须串行
 cargo audit                            # 依赖 CVE 扫描（npm 侧见 e2e/package.json）
-cd .. && ./e2e/run.sh                   # 完整 GUI E2E（两阶段）
+cd .. && ./e2e/run.sh                   # 完整 GUI E2E（三阶段）
 ```
+
+E2E 三个阶段：主链路 `specs/*.spec.mjs` → 重装复用 `specs/phase2/08-*` → 生产后台迁移链
+`specs/phase3/09-*`。前两阶段走同步迁移分支（95/90 断言同步响应），第三阶段由脚本临时注入
+`CORPMAIL_E2E_BACKGROUND=1` / `CORPMAIL_E2E_NO_EXIT=1`，在 `--features e2e` 二进制里跑与生产
+同构的后台线程并断言事件与落盘；这两个开关只在该阶段命令前缀上传，生产构建因
+`cfg!(feature = "e2e")` 恒 false 而不受影响。
 
 E2E 相关开关：
 
 | 变量 | 作用 |
 |---|---|
 | `E2E_SKIP_PHASE2=1` | 单点调试单个 spec 时显式允许跳过阶段二（默认缺 marker 即失败） |
+| `E2E_SKIP_PHASE3=1` | 单点调试时显式允许跳过阶段三（依赖阶段二的已配置终态） |
+| `E2E_RUN_ID=<id>` | 固定产物目录名，便于复跑第三阶段（产物在 `e2e/artifacts/<id>-bg/`） |
 | `E2E_ALLOW_UNSIGNED=1` | 没有固定签名身份时继续（本地默认直接退出） |
 | `CORPMAIL_SIGN_IDENTITY` | 覆盖签名身份名，默认 `CorpMail Local` |
+
+只重跑第三阶段（先用固定 ID 跑前两阶段并跳过第三阶段，再单点调起）：
+
+```bash
+E2E_RUN_ID=a3-debug E2E_SKIP_PHASE3=1 ./e2e/run.sh
+cd e2e && CORPMAIL_E2E_BACKGROUND=1 CORPMAIL_E2E_NO_EXIT=1 CORPMAIL_E2E_HOME="$PWD/artifacts/a3-debug/home" CORPMAIL_E2E_SOURCE_DATA_DIR="$PWD/artifacts/a3-debug/reuse-data" E2E_RUN_ID="a3-debug-bg" ./node_modules/.bin/wdio run ./wdio.conf.mjs --spec ./specs/phase3/09-migration-background.spec.mjs
+```
+
+第三次复跑前需复位：迁移成功会把 `artifacts/a3-debug/home/.../corpmail.toml` 的
+`data_dir_override` 改到 `a3-debug-bg/bg-moved-data`。把它改回 `a3-debug/reuse-data`
+并删掉 `a3-debug-bg/`，否则断言的源目录与 app 实际数据目录不一致。
 
 ### 发版（本机手动）
 
