@@ -234,3 +234,59 @@ fn skip_keychain_only_honours_exact_real_value() {
     // 生产构建（非 test）默认不短路：由 cfg!(test) 决定，这里只断言二者一致
     assert_eq!(skip_keychain_for(None), cfg!(test));
 }
+
+/// C17：从 keyfile 降级态恢复到 keychain 成功后，库内旧密文必须删除。
+///
+/// 不清的后果：keychain 因 ad-hoc 签名 ACL 失配再次失效时，回退路径会读回
+/// **改密前**的旧密码，发信/收件持续认证失败且 degraded() 不提示。
+/// 走 finish_keychain_store 而非 store()，避免测试碰真实 keychain。
+#[test]
+fn keychain_recovery_purges_stale_keyfile_ciphertext() {
+    let c = conn();
+    let kf = temp_key_path("c17-recover");
+    let account = "c17-recover@chinatelecom.cn";
+    let other = "c17-other@chinatelecom.cn";
+    keyfile_store(&c, &kf, account, "旧密码").unwrap();
+    keyfile_store(&c, &kf, other, "别人的密码").unwrap();
+    // 前置：回退路径本来确实能读回旧密码（否则「删掉」无鉴别力）
+    assert_eq!(
+        keyfile_retrieve(&c, &kf, account),
+        GetResult::Keyfile("旧密码".into())
+    );
+
+    let degraded = finish_keychain_store(&c, account, "新密码").unwrap();
+    assert!(!degraded, "keychain 成功不应报降级");
+    assert!(
+        matches!(keyfile_retrieve(&c, &kf, account), GetResult::Missing),
+        "本账号旧密文行必须删除"
+    );
+    assert_eq!(
+        keyfile_retrieve(&c, &kf, other),
+        GetResult::Keyfile("别人的密码".into()),
+        "其它账号密文不得被牵连"
+    );
+    assert!(
+        matches!(retrieve_fallback(&c, &kf, account), GetResult::Missing),
+        "keychain 再次失效时不得读回旧密码"
+    );
+    assert_eq!(
+        cached(account),
+        Some(GetResult::Keychain("新密码".into())),
+        "缓存应刷新为新密码"
+    );
+    // 全局进程内缓存：用独立账号 + 显式清理，避免串扰其它测试
+    cache_drop(account);
+    cache_drop(other);
+    cleanup(&kf);
+}
+
+/// 删除失败必须上报：keychain 已写成功但旧密文还在，静默 Ok 会留下坏态
+#[test]
+fn keychain_recovery_reports_purge_failure() {
+    let c = Connection::open_in_memory().unwrap(); // 故意不建 settings 表
+    let account = "c17-nosettings@chinatelecom.cn";
+    let err = finish_keychain_store(&c, account, "新密码").unwrap_err();
+    assert!(err.contains("清理本地旧密码失败"), "错误应说明真实原因：{err}");
+    assert_eq!(cached(account), None, "失败时不得把新密码写进缓存");
+    cache_drop(account);
+}

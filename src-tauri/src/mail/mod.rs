@@ -2167,8 +2167,12 @@ pub(crate) fn looks_mojibake(text: &str) -> bool {
         return true;
     }
     // 高位字符占绝对多数且不含任何 CJK：GBK/UTF-8 被 cp1252 类单字节编码解出的形态
-    // （正常西文重音稀疏，不会占 60% 以上）
-    if latin1 * 10 > total * 6 && !text.chars().any(is_cjk) {
+    // （正常西文重音稀疏，不会占 60% 以上）。
+    // C18：必须至少出现一次 latin1 特征序列。纯重音短西文（如 "ÉÉÉÉÉ"）高位
+    // 占比 100% 却无任何 `Ã©`/`â€` 特征，旧实现会把它判成乱码，短显示名被
+    // 拒绝、正文被 HTML 派生覆盖。用 `seqs >= 1`（而非 >= 2）保留「只有一种
+    // 特征却重复多次」的真实误码检出——`seqs` 数的是特征串种类而非出现次数。
+    if seqs >= 1 && latin1 * 10 > total * 6 && !text.chars().any(is_cjk) {
         return true;
     }
     recover_gbk_mojibake(text).is_some()

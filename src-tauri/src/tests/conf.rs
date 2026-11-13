@@ -66,6 +66,45 @@ fn corrupt_config_is_backed_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// C16：解析失败且**原文备份也失败**时不得按「未配置」继续。
+///
+/// 旧实现无条件 `Ok(BTreeMap::new())`，但原文仍留在原位且可能含
+/// data_dir_override；向导保存会原子覆盖它，用户唯一的目录指针就没了。
+/// 用「预占备份名」制造 rename 失败：无需改权限，跨平台稳定。
+/// 断言必须落在终态文件上（原文仍在、内容未变），不能只断言返回 Err。
+#[test]
+fn corrupt_config_without_backup_fails_loudly_and_keeps_original() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-nobackup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 损坏但含有效目录指针的原文：正是「静默按未配置启动」会毁掉的那一份
+    let original = format!(
+        "{} = \"/Volumes/data/mail\"\nthis is not [ valid toml ===",
+        keys::DATA_DIR
+    );
+    let path = dir.join(CONFIG_FILE);
+    std::fs::write(&path, &original).unwrap();
+
+    // 预建未来几秒的 broken-* 目录：rename(文件 → 已存在目录) 必失败，
+    // 覆盖测试跨秒边界，不依赖文件系统权限
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for d in 0..5 {
+        std::fs::create_dir_all(dir.join(format!("{CONFIG_FILE}.broken-{}", now + d))).unwrap();
+    }
+
+    let err = super::load(&dir).expect_err("备份失败时必须明确报错，不能静默按未配置启动");
+    assert!(err.contains("备份失败"), "错误应说明真实原因：{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original,
+        "原文必须原样保留，等待用户处理"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn save_uses_pid_scoped_tmp_and_does_not_touch_legacy_stub() {
     let dir = std::env::temp_dir().join(format!("mbx-conf-tmp-{}", std::process::id()));

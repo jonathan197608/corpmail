@@ -268,6 +268,26 @@ fn preview_uses_html_source_when_plain_text_is_mojibake() {
     assert!(looks_mojibake(&latin1_sample), "latin1 误标乱码应命中");
 }
 
+/// C18：「高位占绝对多数」分支必须带 latin1 特征序列护栏。
+/// 纯重音短西文（短显示名很常见）高位占比可达 100% 却无任何误码特征，
+/// 旧实现判成乱码后短显示名会被 clean_display_name 拒绝、正文被 HTML 派生覆盖。
+#[test]
+fn mojibake_high_ratio_branch_needs_a_latin1_marker() {
+    assert!(!looks_mojibake("ÉÉÉÉÉ"), "密集重音短西文不得误判");
+    assert!(!looks_mojibake("ÁÁÁÁÉÉÉÉ"), "两种重音拼的短姓名不得误判");
+    // seqs 数的是「特征串种类」而非出现次数：只有一种特征却重复多次的
+    // 真实误码仍需被这条分支兜住，不能简单把分支删光
+    assert!(
+        looks_mojibake("Ã©Ã©Ã©"),
+        "单一特征重复的 latin1 误码仍应识别"
+    );
+    // 主判据与 C1 控制字符判据不受影响
+    let good = "会议纪要：请于本周五前提交季度报表与预算说明";
+    let latin1_sample: String = good.bytes().map(|b| b as char).collect();
+    assert!(looks_mojibake(&latin1_sample));
+    assert!(!looks_mojibake(good), "正常中文不误判");
+}
+
 /// 存量回填：乱码正文用同源 body_html 派生文本写回，FTS 分词同步重算；
 /// 正常正文不误改；marker 生效后二次调用不再扫表。
 #[test]

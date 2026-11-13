@@ -46,6 +46,9 @@ pub fn is_config_key(key: &str) -> bool {
 ///   （`AppState::open`）走启动失败提示。
 /// - **解析失败**（手改坏、编码损坏、写一半）→ 原文改名备份后按未配置继续：
 ///   文件已留证可人工恢复，没必要因手误挡住整个应用。
+/// - **解析失败且原文备份失败**（C16）→ `Err`：此时原文还留在原位且可能含
+///   `data_dir_override`，若按未配置启动，向导保存会直接覆盖它，自定义数据
+///   目录指针将永久丢失。这种情况下「静默自愈」比启动失败更危险。
 ///
 /// `broken-*` 备份只保留最近 3 份，避免反复启动把锚点目录塞满。
 pub fn load(anchor: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -70,16 +73,23 @@ pub fn load(anchor: &Path) -> Result<BTreeMap<String, String>, String> {
             let backup = anchor.join(format!("{CONFIG_FILE}.broken-{stamp}"));
             let kept = std::fs::rename(&path, &backup).is_ok();
             eprintln!(
-                "[conf] 配置文件解析失败（{err}）；{}，本次按未配置启动",
+                "[conf] 配置文件解析失败（{err}）；{}",
                 if kept {
-                    format!("原文已备份为 {}", backup.display())
+                    format!("原文已备份为 {}，本次按未配置启动", backup.display())
                 } else {
-                    "原文备份失败（保留原文件）".to_string()
+                    "原文备份失败（保留原文件），已拒绝继续启动".to_string()
                 }
             );
-            if kept {
-                prune_broken_backups(anchor, 3);
+            // C16：备份失败时绝不能返回空 map。原文仍含可能有效的 data_dir_override，
+            // 按「未配置」走完向导后 save() 会原子覆盖它，用户唯一的目录指针就没了。
+            // 与「IO 失败」同口径返回 Err，由启动链给出明确提示，交用户处理权限。
+            if !kept {
+                return Err(format!(
+                    "配置文件格式异常且原文备份失败（{}）：为避免向导覆盖仍含数据目录指针的原文，已停止启动。请检查文件权限或磁盘状态后重试",
+                    path.display()
+                ));
             }
+            prune_broken_backups(anchor, 3);
             Ok(BTreeMap::new())
         }
     }

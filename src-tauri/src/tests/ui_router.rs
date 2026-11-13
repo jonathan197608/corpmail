@@ -9533,6 +9533,55 @@ fn migration_freeze_blocks_writes_but_allows_reads() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// C13：迁移冻结期的 GET 隐式写点不得落进旧库。
+///
+/// `migrate_impl` 只做快照 + 写指针，本进程仍连着旧库，重启后按指针打开新库。
+/// 列表页/联系人页在 GET 时顺手持久化 `per`，这个库键写进旧库就赶不上快照，
+/// 重启后 PAGE_SIZE 偏好凭空回退。用「冻结前能写 / 冻结后不写 + GET 也不写」
+/// 的对照钉死，避免负向断言假通过。
+#[test]
+fn migration_freeze_skips_get_page_size_persistence() {
+    let base = std::env::temp_dir().join(format!("mbx-router-c13-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cur = base.join("cur");
+    std::fs::create_dir_all(&cur).unwrap();
+    let state = AppState::open(&cur);
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+
+    // 对照组：未冻结时这个写点确实生效（否则下面的「没变」毫无鉴别力）
+    persist_page_size(&state, 20);
+    assert_eq!(per_from_settings(&state), 20, "前置：非冻结期应正常持久化");
+
+    let dest = base.join("moved");
+    state
+        .move_data_dir(dest.to_str().unwrap())
+        .expect("迁移应成功");
+    assert!(state.migration_pending(), "前置：迁移成功进入冻结期");
+
+    persist_page_size(&state, 50);
+    assert_eq!(per_from_settings(&state), 20, "冻结期不得写进旧库");
+
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("GET", "/", "per=50", b""),
+        &tester,
+    );
+    assert_eq!(resp.status, 200, "跳过持久化不得影响本次渲染");
+    assert_eq!(
+        per_from_settings(&state),
+        20,
+        "列表 GET 也不得把 per 写进旧库"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // ---------- R9：迁移「进行中」与「待重启」文案必须分开 ----------
 
 /// R9：后台迁移期间 migration_pending 与 migration_in_progress 同时为 true。

@@ -787,17 +787,54 @@ document.addEventListener('DOMContentLoaded', mbxRefetchToggle);
 // 列表行定向刷新（R41）：只换 #mail-list 与顶栏计数，顶栏搜索框/高级筛选
 // 面板/每页选择器一律不动。整段换 #list-area 会把「输入了但没提交」的搜索词、
 // 光标位置、已展开的高级面板全部抹掉——后台收取完成时用户正在打字就会被清空。
+// --- C15 list refresh core START ---
+// C15 core（纯函数 + 刷新入口，供 e2e/unit/list-refresh.test.mjs 用 Node vm 驱动）：
+// ① 刷新 URL 必须带上「输入了但没提交」的搜索词，否则框里有词、列表却是全部邮件；
+//    同时清掉 URL 里已过期的 q，避免框已清空仍按旧词过滤。
+function mbxRefreshQuery(locationSearch, typed) {
+    var params = new URLSearchParams(locationSearch || '');
+    var q = (typed || '').trim();
+    if (q) params.set('q', q); else params.delete('q');
+    var s = params.toString();
+    return s ? '?' + s : '';
+}
+
+// ② 行片段整体换入后，按当前状态机算出每一行该不该勾选。
+//    ids 模式：只保留仍在本页的 id（新到的邮件不得被自动选中）；
+//    all 模式：全选但排除 exclude 里的 id。
+function mbxSelectionPlan(stateBox, rowIds) {
+    if (stateBox.mode === 'all') {
+        return rowIds.map(function (id) { return stateBox.exclude.indexOf(id) < 0; });
+    }
+    var keep = {};
+    stateBox.ids.forEach(function (id) { keep[id] = true; });
+    return rowIds.map(function (id) { return !!keep[id]; });
+}
+
 function mbxRefreshList() {
     if (!document.getElementById('list-area')) return;
-    htmx.ajax('GET', '/list/rows' + location.search, {
+    var box = document.querySelector('form.search input[name="q"]');
+    var q = box ? (box.value || '').trim() : '';
+    // 行片段不回隐藏域：批量栏的 q 必须与本次实际筛选一致，否则提交时按旧
+    // 关键词作用到用户看不见的行（「已选 N 封」却无行勾选的同类问题）
+    var baQ = document.getElementById('ba-q');
+    if (baQ) baQ.value = q;
+    return htmx.ajax('GET', '/list/rows' + mbxRefreshQuery(location.search, q), {
         target: '#mail-list', swap: 'outerHTML'
     }).then(function () {
         // 计数由响应里的 OOB 片段更新；批量栏跨页全选的 total 同步跟上
         var list = document.getElementById('mail-list');
         var total = document.getElementById('ba-total');
         if (list && total && list.dataset.total) total.value = list.dataset.total;
+        // C15：换入后按状态机重建勾选（不重置 stateBox）
+        document.body.dispatchEvent(new CustomEvent('mbx:listRowsRefreshed'));
+    }).catch(function () {
+        if (typeof mbxToast === 'function') {
+            mbxToast('邮件列表刷新失败，请稍后重试', 'err', 6000);
+        }
     });
 }
+// --- C15 list refresh core END ---
 
 // 侧栏（计数/高亮/状态条）定向刷新：folder 取侧栏当前高亮项，
 // 非列表页（详情/撰写/设置）也不会丢上下文
@@ -1411,7 +1448,12 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
 // preventDefault 即取消本次请求（htmx 在全部监听器执行完后统一检查），
 // 此时 beforeRequest 未触达，hx-disabled-elt 不会留死锁禁用态。
 // 校验顺序：无收件人（硬拦）→ 空正文（无附件硬拦 / 有附件确认）→ 无主题（确认）。
-document.body.addEventListener('htmx:configRequest', function (ev) {
+// C14：两个「已确认」标志只在 htmx:afterRequest（一次真实请求结束）清理，
+// 放行分支不得 delete——否则「空正文 + 空主题」第二次点击时 bodyOk 已没了，
+// 会再弹一次正文确认，变成 3 次弹窗 / 4 次请求。
+// --- C14 compose confirm core START ---
+// 具名函数便于 e2e/unit/compose-confirm.test.mjs 用 Node vm 直接驱动这段状态机。
+function mbxComposePrecheck(ev) {
     var detail = ev.detail || {};
     var elt = detail.elt;
     if (!elt || !elt.matches || !elt.matches('button[hx-post="/compose/send"]')) return;
@@ -1479,7 +1521,7 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             }, '仍要发送', '返回修改');
             return;
         }
-        delete elt.dataset.mbxBodyOk;
+        // C14：不放行态的 delete 已移除，标志留给 afterRequest 统一清理
     }
     // 3) 主题为空：确认放行（企业邮件无主题易被过滤/忽视，确认防手滑）。
     //    同样走页面内模态（window.confirm 在 macOS 不可用），独立标志防与
@@ -1493,21 +1535,25 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
             }, '仍要发送', '返回修改');
             return;
         }
-        delete elt.dataset.mbxSubjOk;
+        // C14：同上，不在放行分支清标志
     }
-});
+}
+document.body.addEventListener('htmx:configRequest', mbxComposePrecheck);
 
-// R40：一次真实请求结束后（成功或失败）两个"已确认"标志都清掉。
-// 旧实现只在放行分支里 delete，请求失败/被后续校验拦下时标志会留在按钮上，
-// 下次点发送就静默跳过确认。取消（preventDefault，未发请求）不会进这里，
-// 但那条路径本就没置位。
-document.body.addEventListener('htmx:afterRequest', function (ev) {
+// R40 / C14：一次真实请求结束后（成功或失败）两个"已确认"标志都清掉。
+// 这是**唯一**清理点：放行分支只置位不 delete（C14），否则「空正文 + 空主题」
+// 第二次点击会因 bodyOk 已丢而回到正文确认，多一轮弹窗与请求。请求失败/
+// 被后续校验拦下时也在这里清，避免下次点发送静默跳过确认。取消
+// （preventDefault，未发请求）不会进这里，但那条路径本就没置位。
+function mbxComposeConfirmReset(ev) {
     var elt = ev.detail && ev.detail.elt;
     if (!elt || !elt.dataset || !elt.matches) return;
     if (!elt.matches('button[hx-post="/compose/send"]')) return;
     delete elt.dataset.mbxBodyOk;
     delete elt.dataset.mbxSubjOk;
-});
+}
+document.body.addEventListener('htmx:afterRequest', mbxComposeConfirmReset);
+// --- C14 compose confirm core END ---
 
 function mbxRtInit() {
     if (!document.getElementById('editor-container')) return;
@@ -1788,12 +1834,26 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         }
     });
 
-    // 片段换入（首次加载/批量操作返回/收取刷新）重建基线
+    // 片段换入（首次加载/批量操作返回）重建基线
     function init() {
         if (!bar()) return;
         stateBox = { mode: 'ids', ids: [], exclude: [], total: num('ba-total') };
         render();
     }
+    // C15：行片段（#mail-list）单独换入时**不重置**状态机，只按 stateBox
+    // 重建勾选。旧实现换完行什么也不做，于是「已选 N 封」还在、行却全空，
+    // 批量删除会作用到用户看不见的行。
+    function reapplySelection() {
+        var rows = items();
+        var plan = mbxSelectionPlan(stateBox, rows.map(function (c) {
+            return parseInt(c.value, 10);
+        }));
+        rows.forEach(function (c, i) { c.checked = plan[i]; });
+        if (stateBox.mode === 'ids') stateBox.ids = collectIds();
+        stateBox.total = num('ba-total') || stateBox.total;
+        render();
+    }
+    document.body.addEventListener('mbx:listRowsRefreshed', reapplySelection);
     document.body.addEventListener('htmx:afterSwap', function (ev) {
         if (ev.detail && ev.detail.target && ev.detail.target.id === 'list-area') init();
     });

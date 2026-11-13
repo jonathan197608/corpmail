@@ -556,7 +556,12 @@ fn foreign_origin(req: &Req) -> bool {
 }
 
 /// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
-/// GET 只读放行（页面/片段仍可查看），唯一例外是手动触发收件的 GET
+/// GET 只读放行（页面/片段仍可查看），唯一例外是手动触发收件的 GET。
+///
+/// C13 复核：`PAGE_SIZE` 这个 GET 隐式写点已在 `persist_page_size` 内按冻结位
+/// 跳过；`fetch_status` 的 `display_name()` 推断写回落在锚点目录 corpmail.toml
+/// （配置键不进库，不随数据目录迁移），冻结期写它不会丢——故不把这两个
+/// 高频 GET 判成副作用，否则冻结期轮询状态条会被 409 toast 反复轰炸。
 fn has_side_effect(req: &Req) -> bool {
     match req.method.as_str() {
         "GET" => req.path == "/emails/fetch",
@@ -3535,7 +3540,14 @@ fn per_from_settings(state: &AppState) -> i64 {
 /// 每页条数持久化（用户从顶栏选择即写 settings，下次无参访问沿用）。
 /// 失败只留痕不报错：本次渲染已按 URL 参数生效，持久化失败仅影响下次默认值
 /// （审计 P1-50 的「关键写」指状态判定前提，本项属纯偏好，不阻断渲染）
+///
+/// C13：`PAGE_SIZE` 是库键，而迁移冻结期本进程仍连着即将被抛弃的旧库——
+/// 写进去会在重启后凭空消失。列表页与联系人页这两个 GET 都经此函数，
+/// 统一在这里跳过，本次渲染仍按 URL/表单的 per 正常生效。
 fn persist_page_size(state: &AppState, per: i64) {
+    if state.migration_pending() {
+        return;
+    }
     let text = per.to_string();
     if let Err(err) = state.set_batch(&[(keys::PAGE_SIZE, text.as_str())]) {
         eprintln!("[ui] 每页条数 {per} 持久化失败（本次仍按该值显示）：{err}");

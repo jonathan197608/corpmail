@@ -141,10 +141,7 @@ pub fn store(
     }
     let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
     match entry.set_password(password) {
-        Ok(()) => {
-            cache_put(account, GetResult::Keychain(password.to_string()));
-            Ok(false)
-        }
+        Ok(()) => finish_keychain_store(conn, account, password),
         Err(_) => {
             // 回退：AES-256-GCM 落库，密钥在库外文件（设计 §5.4）
             keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
@@ -152,6 +149,29 @@ pub fn store(
             Ok(true)
         }
     }
+}
+
+/// keychain 写入成功后的收尾（C17）：清掉 keyfile 回退期留在库内的旧密文。
+///
+/// 不清会怎样：用户改密后 keychain 一度恢复成功，但 `enc:{account}` 仍是**改密前**
+/// 的旧密码；ad-hoc 签名使 keychain ACL 失配是常态，下一次 `retrieve` 回退到
+/// keyfile 就会读回旧密码，发信/收件持续认证失败，`degraded()` 也不会提示。
+/// `corpmail.key` 保留（其它账号可能还在用），只删对应账号的密文行。
+///
+/// 独立成函数是为了在「不碰真实 keychain」的前提下钉住这条恢复路径：
+/// 测试构建默认短路 keychain，走不到 `store` 的成功分支。
+/// 删除失败必须上报：keychain 已写成功但旧密文还在，静默返回 Ok 会留下坏态。
+fn finish_keychain_store(
+    conn: &Connection,
+    account: &str,
+    password: &str,
+) -> Result<bool, String> {
+    let key = format!("enc:{account}");
+    conn.execute("DELETE FROM settings WHERE k = ?1", [key])
+        .map(|_| ())
+        .map_err(|e| format!("写入 keychain 成功，但清理本地旧密码失败：{e}"))?;
+    cache_put(account, GetResult::Keychain(password.to_string()));
+    Ok(false)
 }
 
 /// 只探 keychain（不碰库、不碰缓存读取；`AppState::retrieve_password` 在取
