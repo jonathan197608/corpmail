@@ -13,6 +13,7 @@
 //! - 纯文本邮件原样导出；超大占位邮件按占位说明导出（提示未下载）
 
 use crate::state::AppState;
+use std::path::Path;
 
 /// 导出 .md 时可直接内嵌的附件大小上限（字节）：短文本附件直接进正文代码块，
 /// AI 单次可读、MD 不致膨胀；超过则改为输出本地文件路径
@@ -121,8 +122,11 @@ fn write_attachment_section(
         md.push_str(&format!("{fence}{lang}\n{content}\n{fence}\n\n"));
         return;
     }
-    // 大附件/二进制：本地完整路径（storage=file 为磁盘真实文件，gzip 压缩存储；
-    // inline BLOB 存于数据库无独立文件，如实说明）
+    // 大附件/二进制：storage=file 为磁盘真实文件（gzip 压缩存储）；inline BLOB
+    // 存于数据库无独立文件，如实说明。
+    // A13（audit 2026-11-16）：路径一律相对（attachments/<p>），不写本机绝对
+    // 路径——本模块定位「供 AI 分析」，导出文件常被外发/上传在线模型，
+    // /Users/<名>/Library/... 形态属本机信息泄露；文件名与体积照常保留
     let location = state
         .with_conn(|conn| {
             conn.query_row(
@@ -134,8 +138,8 @@ fn write_attachment_section(
         .ok();
     match location.as_ref().map(|(s, p)| (s.as_str(), p.as_str())) {
         Some(("file", p)) if !p.is_empty() => md.push_str(&format!(
-            "本地文件：{}（gzip 压缩存储）\n\n",
-            state.data_dir().join("attachments").join(p).display()
+            "本地文件（相对数据目录）：{}（gzip 压缩存储）\n\n",
+            Path::new("attachments").join(p).display()
         )),
         _ => md.push_str(&format!(
             "附件内容存于本地数据库（无独立文件，{}）\n\n",

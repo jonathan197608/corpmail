@@ -1416,15 +1416,26 @@ a.btn.link.disabled {
     padding: 0 18px;
 }
 
+/* A15：stab 由 span 改 button——原生样式重置（background/border/font/cursor），
+   原有 padding/下划线占位延续；type=button 不提交任何表单 */
 .settings-tabs .stab {
     padding: 12px 14px;
     font-size: 13.5px;
+    font-family: inherit;
+    line-height: inherit;
+    background: none;
+    border: 0;
+    border-bottom: 2px solid transparent;
     color: var(--muted);
     cursor: pointer;
-    border-bottom: 2px solid transparent;
     margin-bottom: -1px;
     user-select: none;
     transition: color 0.15s, border-bottom-color 0.15s;
+}
+
+.settings-tabs .stab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
 }
 
 .settings-tabs .stab:hover {
@@ -2641,6 +2652,15 @@ form.setup-card .setup-actions {
     width: 100%;
     font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     font-size: 12.5px;
+}
+
+/* 模板页提交按钮（新增模板/保存修改）是 form 直接子元素、无 .settings-actions
+   容器；.btn 默认 inline 会靠左，与其它设置页动作行的 flex-end 不同线——
+   按主按钮居组端规范收在表单行右缘（T2，2026-11-16） */
+.tpl-form > button[type="submit"],
+.tpl-edit form > button[type="submit"] {
+    display: flex;
+    margin-left: auto;
 }
 
 .compose-note {

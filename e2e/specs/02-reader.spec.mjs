@@ -1,11 +1,12 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, waitText, modalOpen } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, waitText, modalOpen, waitMailRows } from '../support/helpers.mjs'
 
 // 02：读信、附件、中文检索、已读切换。
 // 数据来自 mock 的 3 封 fixture（含一封 HTML + CSV 附件）。
 describe('02 读信与检索', () => {
   it('打开含附件的邮件：正文与附件清单渲染', async () => {
     await waitBoot()
+    await waitMailRows() // T4：读行前等首拉完成
     const rows = await $$('.mail-row')
     let opened = false
     for (const row of rows) {
@@ -78,6 +79,7 @@ describe('02 读信与检索', () => {
   // 2026-11 UI 改版：动作区整行移入顶栏、标题并入正文卡片、预览弹窗去掉
   // 工具栏行（Office/PDF 另存入口收敛到详情页附件列表）
   it('详情页结构：动作在顶栏、标题在卡片内、预览无工具栏', async () => {
+    await waitMailRows() // T4
     const rows = await $$('.mail-row')
     for (const row of rows) {
       if ((await row.getText()).includes('季度报表')) {
@@ -110,5 +112,30 @@ describe('02 读信与检索', () => {
     expect(s.titleInCard).toBe(true)
     expect(s.toolbarGone).toBe(true)
     await shot('读信-顶栏动作区')
+  })
+
+  it('T5 会话视图直达 URL：/threads/{id} 渲染该主题归组的往来卡片', async () => {
+    // 会话视图入口在详情页（mode=thread）；深链 /threads/{id} 是独立路由
+    // （router.rs thread_detail_page）——结构从未被 spec 直达覆盖。
+    // 前一用例停在详情页（无 .mail-row）：先回列表再取 id
+    await goto('/')
+    await waitMailRows() // T4
+    const rows = await $$('.mail-row')
+    const id = await rows[0].getAttribute('data-mail-id')
+    expect(id).toBeTruthy()
+    await goto(`/threads/${id}`)
+    await browser.waitUntil(
+      async () => (await $('body').getText()).includes('会话'),
+      { timeout: 10000, timeoutMsg: '未进入会话视图' },
+    )
+    const s = await browser.execute(() => ({
+      hasList: !!document.querySelector('.thread-list'),
+      cards: document.querySelectorAll('.thread-mail').length,
+      hasBack: !!document.querySelector('a.back[href*="/emails/"]'),
+    }))
+    expect(s.hasList).toBe(true)
+    expect(s.cards).toBeGreaterThanOrEqual(1)
+    expect(s.hasBack).toBe(true)
+    await shot('读信-会话视图直达')
   })
 })

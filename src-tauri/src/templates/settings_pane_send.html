@@ -10,20 +10,20 @@
             <p class="desc">服务器与账号由首次配置确定，此处仅可修改密码与发件显示名，并可编辑签名档。修改密码后请重新测试连接，凭据保存在操作系统凭据保管中。</p>
 
             <div class="sfield">
-                <label>登录账号</label>
-                <input class="mono" type="text" value="{{ account_prefix }}{{ account_domain }}" disabled
+                <label for="sf-login-account">登录账号</label>
+                <input class="mono" type="text" id="sf-login-account" value="{{ account_prefix }}{{ account_domain }}" disabled
                     spellcheck="false" title="首次配置时确定，如需变更请重新配置应用">
             </div>
             <div class="sfield">
-                <label>SMTP 服务器</label>
+                <label for="sf-smtp-host">SMTP 服务器</label>
                 <div class="port-row">
-                    <input class="mono" type="text" name="smtp_host" value="{{ smtp_host }}" spellcheck="false" disabled>
-                    <input class="num" type="text" name="smtp_port" value="{{ smtp_port }}" inputmode="numeric" disabled>
+                    <input class="mono" type="text" name="smtp_host" id="sf-smtp-host" value="{{ smtp_host }}" spellcheck="false" disabled>
+                    <input class="num" type="text" name="smtp_port" id="sf-smtp-port" value="{{ smtp_port }}" inputmode="numeric" disabled>
                 </div>
             </div>
             <div class="sfield">
-                <label>加密方式{{ ic.tip('自动 = 465 隐式 TLS、其余 STARTTLS') }}</label>
-                <select name="smtp_security" disabled>
+                <label for="sf-smtp-security">加密方式{{ ic.tip('自动 = 465 隐式 TLS、其余 STARTTLS') }}</label>
+                <select name="smtp_security" id="sf-smtp-security" disabled>
                     <option value="auto" {% if smtp_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                     <option value="implicit" {% if smtp_security == "implicit" %}selected{% endif %}>隐式 TLS（465/SMTPS）</option>
                     <option value="starttls" {% if smtp_security == "starttls" %}selected{% endif %}>STARTTLS（587/25）</option>
@@ -31,15 +31,15 @@
                 </select>
             </div>
             <div class="sfield">
-                <label>密码 / 授权码{{ ic.tip('留空 = 保持不变；修改后请重新测试连接') }}</label>
-                <input type="password" name="password" autocomplete="new-password">
+                <label for="sf-password">密码 / 授权码{{ ic.tip('留空 = 保持不变；修改后请重新测试连接') }}</label>
+                <input type="password" name="password" id="sf-password" autocomplete="new-password">
             </div>
             <div class="sfield">
-                <label>发件显示名</label>
-                <input type="text" name="display_name" value="{{ display_name }}">
+                <label for="sf-display-name">发件显示名</label>
+                <input type="text" name="display_name" id="sf-display-name" value="{{ display_name }}">
             </div>
             <div class="sfield sig-field">
-                <label>签名档{{ ic.tip('新邮件自动附加到正文底部；回复/转发不附加') }}</label>
+                <label for="signature-box">签名档{{ ic.tip('新邮件自动附加到正文底部；回复/转发不附加') }}</label>
                 <textarea name="signature" rows="3" id="signature-box"
                     placeholder="张伟&#10;中国电信广州分公司 政企客户部&#10;电话：020-12345678">{{ signature }}</textarea>
             </div>

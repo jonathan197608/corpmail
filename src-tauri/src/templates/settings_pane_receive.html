@@ -9,20 +9,20 @@
         <p class="desc">IMAP 增量同步，本地阅读后回写已读状态。与发信共用同一账号与密码；修改密码与自动收取策略分别到「发信」「收件同步」页。</p>
 
         <div class="sfield">
-            <label>登录账号</label>
-            <input class="mono" type="text" value="{{ account_prefix }}{{ account_domain }}" disabled
+            <label for="sf-recv-login-account">登录账号</label>
+            <input class="mono" type="text" id="sf-recv-login-account" value="{{ account_prefix }}{{ account_domain }}" disabled
                 spellcheck="false" title="首次配置时确定，如需变更请重新配置应用">
         </div>
         <div class="sfield">
-            <label>收信服务器</label>
+            <label for="sf-recv-host">收信服务器</label>
             <div class="port-row">
-                <input class="mono" type="text" name="recv_host" value="{{ recv_host }}" spellcheck="false" disabled>
-                <input class="num" type="text" name="recv_port" value="{{ recv_port }}" inputmode="numeric" disabled>
+                <input class="mono" type="text" name="recv_host" id="sf-recv-host" value="{{ recv_host }}" spellcheck="false" disabled>
+                <input class="num" type="text" name="recv_port" id="sf-recv-port" value="{{ recv_port }}" inputmode="numeric" disabled>
             </div>
         </div>
         <div class="sfield">
-            <label>加密方式{{ ic.tip('自动 = 993 隐式 TLS、其余 STARTTLS') }}</label>
-            <select name="recv_security" disabled>
+            <label for="sf-recv-security">加密方式{{ ic.tip('自动 = 993 隐式 TLS、其余 STARTTLS') }}</label>
+            <select name="recv_security" id="sf-recv-security" disabled>
                 <option value="auto" {% if recv_security == "auto" %}selected{% endif %}>自动（按端口判断）</option>
                 <option value="implicit" {% if recv_security == "implicit" %}selected{% endif %}>隐式 TLS（993/IMAPS）</option>
                 <option value="starttls" {% if recv_security == "starttls" %}selected{% endif %}>STARTTLS（143）</option>

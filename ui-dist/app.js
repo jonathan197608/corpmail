@@ -1155,12 +1155,35 @@ function mbxContactMark(state) {
 document.addEventListener('DOMContentLoaded', mbxInitContacts);
 
 // ---------- 设置页 tab 高亮（stab 自身不重渲染，点击时同步 .on） ----------
+// A15 补全：tab 栏不在 htmx target（#settings-pane）内，服务端只在整页
+// 渲染时写 aria-selected——切 pane 后选中态必须在此同步（.on 与
+// aria-selected 一起），否则读屏用户以为还在旧页（e2e 第 15 轮根因）。
+// 键盘激活（下方 keydown 委托）最终派发 click，走同一段单一事实源。
 document.addEventListener("click", function (e) {
     var stab = e.target.closest(".stab");
     if (!stab) { return; }
-    document.querySelectorAll(".settings-tabs .stab").forEach(function (s) { s.classList.remove("on"); });
+    document.querySelectorAll(".settings-tabs .stab").forEach(function (s) {
+        s.classList.remove("on");
+        s.setAttribute("aria-selected", "false");
+    });
     stab.classList.add("on");
+    stab.setAttribute("aria-selected", "true");
 });
+
+// ---------- A15：设置页 tab 键盘激活（Enter/Space，APG tab 模式） ----------
+// button 的原生键盘激活依赖浏览器行为层的 implicit activation；WKWebView
+// 的 WebDriver 注入按键只派发 DOM key 事件、不走该行为层，键盘链路会静默
+// 失效（e2e 第 14 轮：Enter 后 pane 不换）。显式实现激活——preventDefault
+// 兜住原生路径避免双触发（Space 原生激活在 keyup，拦下 keydown 即全覆盖），
+// 拦 e.repeat 避免长按连发请求；tab.click() 与真实点击同路（含脏拦截确认）。
+document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") { return; }
+    if (e.repeat) { return; }
+    var tab = e.target && e.target.closest ? e.target.closest(".settings-tabs .stab") : null;
+    if (!tab) { return; }
+    e.preventDefault();
+    tab.click();
+}, true);
 
 // ---------- 向导"测试并保存"：进行中锁定表单，结束后恢复 ----------
 // 双通道真实连接测试最长 ~15s（并行后）。htmx:configRequest触发时参数已收集完毕，

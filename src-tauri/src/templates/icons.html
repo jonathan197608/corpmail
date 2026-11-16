@@ -81,7 +81,10 @@
 {%- endmacro %}
 
 {# 字段说明气泡触发点（2026-11-10）：替代 label 后的行内 hint 小字。
-   tabindex 让键盘可聚焦（聚焦即显示气泡），点击由 app.js 委托处理。 #}
+   2026-11-16（A16）：去掉 tabindex 与 role=button——tip 被 label 包裹时，
+   交互元素嵌在 label 内违反内容模型（补 for 后激活控件与展开气泡互相打架），
+   且它不必参与 Tab 序序（说明不在键序主线）。气泡仍经 hover/click 委托
+   （app.js 按 [data-tip] 匹配，不依赖 role）触发，读屏经 label 整体朗读。 #}
 {% macro tip(text) -%}
-<span class="tip-i" tabindex="0" role="button" data-tip="{{ text }}" aria-label="说明：{{ text }}">{{ icon('info') }}</span>
+<span class="tip-i" data-tip="{{ text }}" aria-label="说明：{{ text }}">{{ icon('info') }}</span>
 {%- endmacro %}

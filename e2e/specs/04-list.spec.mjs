@@ -8,6 +8,7 @@ import {
   clickByText,
   confirmModalText,
   acceptConfirm,
+  waitMailRows,
 } from '../support/helpers.mjs'
 
 // 04：列表筛选、排序、翻页、批量操作、高级检索（B5–B16）。
@@ -96,11 +97,13 @@ describe('04 列表筛选与批量操作', () => {
   it('B7 排序：date_asc 首行为最早邮件，subject_asc 首行为「会议纪要」', async () => {
     await goto('/?sort=date_asc')
     await waitBoot()
+    await waitMailRows() // T4：断首行前等行挂载
     expect(await subjectOf(await $$('.mail-row')[0])).toContain('欢迎使用')
     await shot('列表-最早优先')
 
     await goto('/?sort=subject_asc')
     await waitBoot()
+    await waitMailRows() // T4
     expect(await subjectOf(await $$('.mail-row')[0])).toContain('会议纪要')
     await shot('列表-按主题排序')
   })
@@ -108,6 +111,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B8 每页条数 per=1：单行 + 首页/末页翻页', async () => {
     await goto('/?per=1')
     await waitBoot()
+    await waitMailRows() // T4
     expect((await $$('.mail-row')).length).toBe(1)
     const first = await subjectOf(await $$('.mail-row')[0])
     // 第 1 页不渲染「首页/上一页」，但渲染「下一页」与「末页」
@@ -291,6 +295,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B12 高级检索·发件人：from=张伟 命中欢迎邮件', async () => {
     await goto('/?from=%E5%BC%A0%E4%BC%9F') // 张伟
     await waitBoot()
+    await waitMailRows() // T4
     const rows = await $$('.mail-row')
     expect(rows.length).toBe(1)
     expect(await subjectOf(rows[0])).toContain('欢迎使用')
@@ -300,6 +305,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B13 高级检索·仅看附件：att=1 命中季度报表', async () => {
     await goto('/?att=1')
     await waitBoot()
+    await waitMailRows() // T4
     const rows = await $$('.mail-row')
     expect(rows.length).toBe(1)
     expect(await subjectOf(rows[0])).toContain('季度报表')
@@ -309,6 +315,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B14 高级检索·日期区间：11-02 当天只命中季度报表', async () => {
     await goto('/?df=2026-11-02&dt=2026-11-02')
     await waitBoot()
+    await waitMailRows() // T4
     const rows = await $$('.mail-row')
     expect(rows.length).toBe(1)
     expect(await subjectOf(rows[0])).toContain('季度报表')

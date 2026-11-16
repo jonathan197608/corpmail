@@ -6,6 +6,7 @@ import {
   waitText,
   confirmModalText,
   acceptConfirm,
+  waitRows,
 } from '../support/helpers.mjs'
 
 // 06：联系人（自动采集/搜索/新增/删除/补全接口）与邮件模板（F2–F5）。
@@ -164,11 +165,13 @@ describe('06 联系人与模板', () => {
       ),
     ).toBe('recent')
 
+    await waitRows('.contact-row') // T4
     const all = (await $$('.contact-row')).length
     expect(all).toBeGreaterThanOrEqual(3)
 
     await goto('/contacts?per=1')
     await waitBoot()
+    await waitRows('.contact-row') // T4：切分页后行真正挂载再断
     expect((await $$('.contact-row')).length).toBe(1)
     // 用地址标识行，不用姓名：采集不到 display name 的联系人统一显示「（未命名）」
     const firstAddr = (await (await $$('.contact-row'))[0].$('.ct-addr').getText()).trim()

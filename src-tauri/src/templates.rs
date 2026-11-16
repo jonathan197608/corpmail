@@ -78,8 +78,12 @@ pub(crate) const TEMPLATES: &[(&str, &str)] = &[
     ("source.html", include_str!("templates/source.html")),
 ];
 
-/// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义，
-/// 任何字符（含单引号/换行/反斜杠/代理对）都不会破坏外层单引号属性
+/// JSON 字符串字面量编码（内联 JS 属性用）：双引号包裹 + 全量转义。
+/// 输出经过 build_env() 的 autoescape：单引号变 `&#x27;`、双引号变 `&quot;`
+/// （2026-11-16 minijinja 3.0.3 探针实测 `o'brien@corp.com` →
+/// `&quot;o&#x27;brien@corp.com&quot;`）——属性不会被单/双引号闭合。
+/// **勿改为 safe string**：autoescape 是这里的 XSS 兜底，绕开它需要另行
+/// 证明每个调用点的引号形态
 fn js_str(s: String) -> String {
     serde_json::to_string(&s).unwrap_or_else(|_| "\"\"".to_string())
 }

@@ -9492,15 +9492,68 @@ fn settings_account_tab_is_split_into_send_and_receive() {
     cleanup(&dir);
 }
 
-/// 固定宽度与撰写页间距：CSS 令牌/作用域规则钉死；
-/// 真实对齐与行距由 E2E 03/05 的 getBoundingClientRect 断言覆盖
+/// CSS 剥块注释（静态护栏用：规则里的 /* … */ 不影响选择器块匹配）
+fn css_strip_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find("*/").map(|e| e + start + 2);
+        match end {
+            Some(e) => rest = &rest[e..],
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 取选择器块内容（首个 `sel { ... }` 的声明体；找不到返回 None）
+fn css_block<'a>(css: &'a str, selector: &str) -> Option<&'a str> {
+    let pat = format!("{selector} {{");
+    let start = css.find(&pat)? + pat.len();
+    let end = start + css[start..].find('}')?;
+    Some(&css[start..end])
+}
+
+/// 固定宽度与撰写页间距：CSS 令牌 + 选择器块级钉死（T2 升级：改坏 148px、
+/// .sfield display:block、动作行 justify-content 都在本护栏与 E2E 03/05 同时
+/// 变红）；真实对齐与行距由 E2E 03/05 的 getBoundingClientRect 断言覆盖
 #[test]
 fn settings_form_width_and_compose_spacing_are_pinned_in_css() {
     let css = include_str!("../../../ui-dist/app.css");
+    let css = css_strip_comments(css);
     assert!(css.contains("--settings-form-width: 760px;"));
     assert!(css.contains("--settings-label-width: 148px;"));
     assert!(css.contains("width: min(var(--settings-form-width), 100%);"));
-    assert!(css.contains("grid-template-columns: var(--settings-label-width) minmax(0, 1fr);"));
+
+    // .sfield 基础块：grid 双列（改 display:block 于此处 fail）
+    let sfield = css_block(&css, ".sfield").expect(".sfield 基础块应存在");
+    assert!(
+        sfield.contains("display: grid;"),
+        ".sfield 必须是 grid 双列布局"
+    );
+    assert!(
+        sfield.contains("grid-template-columns: 108px 1fr;"),
+        ".sfield 基础列宽受护栏：{sfield}"
+    );
+
+    // 设置页覆写块：标签列 148px（V8 变异点——改 300px 于此处与 E2E 同时红）
+    let pane_sfield =
+        css_block(&css, ".settings-pane .sfield").expect("设置页 .sfield 覆写块应存在");
+    assert!(
+        pane_sfield.contains("grid-template-columns: var(--settings-label-width) minmax(0, 1fr);"),
+        "设置页标签列宽令牌化：{pane_sfield}"
+    );
+
+    // 动作行右对齐（改 flex-start 于此处与 E2E 同时红）
+    let actions =
+        css_block(&css, ".settings-pane .settings-actions").expect(".settings-actions 块应存在");
+    assert!(
+        actions.contains("justify-content: flex-end;"),
+        "设置页动作行必须右对齐：{actions}"
+    );
+
     assert!(css.contains(".compose-card .sfield { margin-bottom: 0; }"));
     assert!(css.contains(".att-list:empty { display: none; }"));
     assert!(!css.contains(".account-grid {"), "旧两栏 CSS 不应残留");
@@ -10060,4 +10113,238 @@ fn settings_receive_test_imap_takes_typed_password() {
     assert!(body(&resp).contains("收信通道"), "应返回收信通道结果");
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
+}
+
+// ---------- A15/A16（audit 2026-11-16）：tablist 键盘可达 + label/for 关联 ----------
+
+/// A15：六个设置 tab 必须是 button[role=tab]（键盘 Tab/Enter/Space 可切换、
+/// 读屏可识别），tablist 容器带 role，选中态由 aria-selected 表达
+#[test]
+fn settings_tabs_are_keyboard_accessible() {
+    let (state, dir) = temp_state("a15-tabs");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let page = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/send", b""),
+        &tester,
+    ));
+    assert!(
+        page.contains("role=\"tablist\""),
+        "tab 容器应带 role=tablist（A15）"
+    );
+    let tab_count = page.matches("role=\"tab\"").count();
+    assert_eq!(tab_count, 6, "恰好六个 role=tab（实际 {tab_count}）");
+    // 仅当前 tab 的 aria-selected=true（send 请求）
+    let selected = page.matches("aria-selected=\"true\"").count();
+    assert_eq!(selected, 1, "只有当前 tab 为选中态（实际 {selected}）");
+    // button 化补断言（span 改造回归探针）
+    assert!(page.contains("<button type=\"button\" class=\"stab on\" role=\"tab\""));
+    assert!(
+        !page.contains("<span class=\"stab"),
+        "tab 不得再用 span 形态"
+    );
+
+    // 每个显名路径的 tab 全部恰好一个选中
+    for (path, name) in [
+        ("/settings/receive", "收信"),
+        ("/settings/sync", "收件同步"),
+        ("/settings/storage", "存储管理"),
+        ("/settings/templates", "模板"),
+        ("/settings/about", "关于"),
+        ("/settings", "默认"),
+    ] {
+        let page = body(&route(&state, &assets(), &req("GET", path, b""), &tester));
+        assert_eq!(
+            page.matches("aria-selected=\"true\"").count(),
+            1,
+            "{name}（{path}）应恰一个选中 tab"
+        );
+    }
+
+    // 键盘激活静态护栏（e2e 第 14 轮根因）：Enter/Space 不依赖 UA 的
+    // implicit activation（WKWebView 注入按键不走该行为层），app.js 必须
+    // 有显式 keydown 委托并最终走 tab.click()（与真实点击同路、含脏拦截）。
+    // 删掉该段时 e2e T3 变红（Enter 后 pane 不换），此处同步钉住
+    let js = include_str!("../../../ui-dist/app.js");
+    assert!(
+        js.contains("e.target.closest(\".settings-tabs .stab\")"),
+        "键盘激活委托应匹配 .settings-tabs .stab（A15）"
+    );
+    assert!(
+        js.contains("e.key !== \"Enter\" && e.key !== \" \" && e.key !== \"Spacebar\""),
+        "激活键面应覆盖 Enter/Space/Spacebar（A15）"
+    );
+    assert!(
+        js.contains("tab.click();"),
+        "键盘激活应最终派发原生 click（A15）"
+    );
+    // aria-selected 同步（e2e 第 15 轮根因）：tab 栏不在 htmx target 内，
+    // 切 pane 后 click 高亮必须一并复位其余 tab 的 aria-selected
+    assert!(
+        js.contains("s.setAttribute(\"aria-selected\", \"false\");"),
+        "切 tab 时其余 tab 的 aria-selected 应复位（A15）"
+    );
+    assert!(
+        js.contains("stab.setAttribute(\"aria-selected\", \"true\");"),
+        "激活 tab 的 aria-selected 应置 true（A15）"
+    );
+    cleanup(&dir);
+}
+
+/// A16：每个 .sfield 的 label 必须以 for 关联同块控件 id；全页 id 无重复；
+/// label 内不得有交互语义角色（tip 的 role=button 违反 label 内容模型）
+#[test]
+fn settings_sfields_have_label_for_associations() {
+    let (state, dir) = temp_state("a16-sfields");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张三")])
+        .unwrap();
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let html = |path: &str| body(&route(&state, &assets(), &req("GET", path, b""), &tester));
+
+    for path in [
+        "/settings/send",
+        "/settings/receive",
+        "/settings/sync",
+        "/settings/storage",
+        "/settings/templates",
+    ] {
+        let page = html(path);
+        // 1) label 内无 role=button（tip 交互化会打架 label 关联）
+        extract_labels(&page).iter().for_each(|lab| {
+            assert!(
+                !lab.contains("role=\"button\""),
+                "{path}：label 内不得含交互角色（tip 应去交互）：{lab}"
+            );
+        });
+        // 2) 全页 id 无重复
+        let ids = extract_attrs(&page, "id");
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(
+                seen.insert(id.clone()),
+                "{path}：id=\"{id}\" 在同页重复（label/for 要求控件 id 唯一）"
+            );
+        }
+        // 3) 每个 .sfield 的 label[for] 必须命中同块内某个控件 id
+        let fields = extract_sfields(&page);
+        for (i, field) in fields.iter().enumerate() {
+            let Some(for_id) = extract_labels(field)
+                .first()
+                .and_then(|l| extract_attr_inline(l, "for"))
+            else {
+                panic!("{path}：第 {i} 个 .sfield 的 label 缺 for 属性：{field}");
+            };
+            let control_ids = extract_attrs_of_controls(field);
+            assert!(
+                control_ids.contains(&for_id),
+                "{path}：第 {i} 个 .sfield 的 label for=\"{for_id}\" 未命中同块控件 id（实际 {control_ids:?}）\n块：{field}"
+            );
+        }
+    }
+    cleanup(&dir);
+}
+
+/// 提取所有 <label …>…</label> 片段（含开闭标签）
+fn extract_labels(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<label") {
+        let after = &rest[start..];
+        if let Some(end_rel) = after.find("</label>") {
+            out.push(after[..end_rel + 8].to_string());
+            rest = &after[end_rel + 8..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// 提取 .sfield 块（按 <div class="sfield"..."> 到匹配的粗略层级 </div>——
+/// 嵌套 port-row 一层，用深度计数解析到闭合）
+fn extract_sfields(html: &str) -> Vec<String> {
+    // 纯字节扫描（块内含中文，逐 char 步进会在切片时撞 UTF-8 边界；
+    // <div / </div> 全 ASCII，字节前缀比较安全，边界恒落在 char 边界上）
+    let hay = html.as_bytes();
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = html[search..].find("<div class=\"sfield") {
+        let start = search + rel;
+        let mut depth = 0i32;
+        let mut i = start;
+        let mut end = None;
+        while i < hay.len() {
+            if hay[i..].starts_with(b"<div") {
+                depth += 1;
+                i += 4;
+            } else if hay[i..].starts_with(b"</div>") {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 6);
+                    break;
+                }
+                i += 6;
+            } else {
+                i += 1;
+            }
+        }
+        let Some(end) = end else { break };
+        out.push(html[start..end].to_string());
+        search = end;
+    }
+    out
+}
+
+/// 提取整个标签内内联属性（如 label 里的 for="…"）
+fn extract_attr_inline(tag_html: &str, attr: &str) -> Option<String> {
+    let pat = format!("{attr}=\"");
+    let start = tag_html.find(&pat)? + pat.len();
+    let end = tag_html[start..].find('"')? + start;
+    Some(tag_html[start..end].to_string())
+}
+
+/// 提取指定属性的全部值（全文档）
+fn extract_attrs(html: &str, attr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let pat = format!("{attr}=\"");
+    let mut rest = html;
+    while let Some(pos) = rest.find(&pat) {
+        let start = pos + pat.len();
+        let end = match rest[start..].find('"') {
+            Some(e) => e + start,
+            None => break,
+        };
+        out.push(rest[start..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
+/// 提取块内控件（input/select/textarea）开标签上的 id 值
+fn extract_attrs_of_controls(field_html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in ["<input", "<select", "<textarea"] {
+        let mut from = 0usize;
+        while let Some(rel) = field_html[from..].find(tag) {
+            let pos = from + rel;
+            let end = field_html[pos..]
+                .find('>')
+                .map(|e| e + pos)
+                .unwrap_or(field_html.len());
+            if let Some(id) = extract_attr_inline(&field_html[pos..end], "id") {
+                out.push(id);
+            }
+            from = end.max(pos + tag.len());
+        }
+    }
+    out
 }

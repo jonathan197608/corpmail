@@ -52,6 +52,39 @@ export function modalOpen() {
   })
 }
 
+/** 等设置 pane 挂载且完成排版（display/尺寸就绪）。几何与文本断言不受
+ *  opacity 影响；旧实现按 opacity === '1' 判定动画落定，但 WKWebView 在
+ *  无交互驻留时可能挂起动画时钟（实测 about 页 opacity 恒 0.84、
+ *  animationPlayState=running 却永不推进）——动画判定在该环境不可靠，
+ *  改为「可见且有尺寸」；半透明截图属宿主动画 quirk，不算回归 */
+export async function waitPaneVisible() {
+  await browser.waitUntil(
+    async () => browser.execute(() => {
+      const pane = document.getElementById('settings-pane')
+      if (!pane) return false
+      const rect = pane.getBoundingClientRect()
+      return rect.width > 0 && rect.height > 0
+        && getComputedStyle(pane).display !== 'none'
+    }),
+    { timeout: 20000, timeoutMsg: '设置 pane 未挂载或未完成排版' },
+  )
+}
+
+/** 等列表行就绪（T4：ui:// 首帧仍是上一页残留 DOM 时直接断行会偶发红——
+ *  等行真正挂进来再度量/断言；20s 覆盖慢机首拉）。行选择器可换
+ *  （.mail-row / .contact-row 共用） */
+export async function waitRows(selector = '.mail-row', timeout = 20000) {
+  await browser.waitUntil(
+    async () => (await $$(selector)).length > 0,
+    { timeout, timeoutMsg: `行未出现（${selector} 空）` },
+  )
+}
+
+/** 邮件行就绪（waitRows 的 .mail-row 语义壳，见 T4） */
+export function waitMailRows(timeout = 20000) {
+  return waitRows('.mail-row', timeout)
+}
+
 /** 等到某段文本出现在页面上（htmx 局部刷新后的断言基础） */
 export async function waitText(selector, text, timeout = 20000) {
   await browser.waitUntil(

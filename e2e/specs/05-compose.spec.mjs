@@ -67,31 +67,45 @@ describe('05 撰写与发送', () => {
     await shot('撰写-初始态含模板下拉')
   })
 
-  it('D1b 撰写页垂直间距：行距 9px、字段行 margin 归零（不再叠加成 26px）', async () => {
+  it('D1b 撰写页垂直间距：行距 9px、相邻块距 ≤12px、空附件位不占高', async () => {
+    // T5（2026-11-16）：从「.sfield 之间」升级为「form 子块之间」——换行提示、
+    // 附件区头等非 .sfield 块的间距失控测不到；并补 .att-list:empty 的实际
+    // 盒高归零断言（display:none 的 CSS 断言已由静态护栏覆盖）
     await goto('/compose')
     await $('input[name="to_addrs"]').waitForExist({ timeout: 20000 })
     const m = await browser.execute(() => {
       const form = document.querySelector('.compose-card form')
       const fields = [...document.querySelectorAll('.compose-card .sfield')]
-      const gaps = []
+      const fieldGaps = []
       for (let i = 1; i < fields.length; i++) {
-        gaps.push(Math.round(
+        fieldGaps.push(Math.round(
           fields[i].getBoundingClientRect().top - fields[i - 1].getBoundingClientRect().bottom))
+      }
+      // T5：form 的全部可见子块相邻间距（含非 .sfield 块）
+      const kids = [...form.children].filter((el) => el.getBoundingClientRect().height > 0)
+      const blockGaps = []
+      for (let i = 1; i < kids.length; i++) {
+        blockGaps.push(Math.round(
+          kids[i].getBoundingClientRect().top - kids[i - 1].getBoundingClientRect().bottom))
       }
       const emptyLists = [...document.querySelectorAll('.compose-card .att-list:empty')]
       return {
         gap: getComputedStyle(form).rowGap,
         margins: fields.map((f) => getComputedStyle(f).marginBottom),
-        gaps,
-        emptyListDisplay: emptyLists.map((el) => getComputedStyle(el).display),
+        fieldGaps,
+        blockGaps,
+        emptyListHeights: emptyLists.map((el) =>
+          Math.round(el.getBoundingClientRect().height)),
       }
     })
     expect(m.gap).toBe('9px')
     expect(m.margins.every((v) => v === '0px')).toBe(true)
-    expect(m.gaps.length).toBeGreaterThan(0)
-    expect(m.gaps.every((g) => g >= 0 && g <= 12)).toBe(true)
-    expect(m.emptyListDisplay.length).toBeGreaterThan(0)
-    expect(m.emptyListDisplay.every((v) => v === 'none')).toBe(true)
+    expect(m.fieldGaps.length).toBeGreaterThan(0)
+    expect(m.fieldGaps.every((g) => g >= 0 && g <= 12)).toBe(true)
+    // T5：form 级相邻块距也受控（26px 时代在任意块间都可能复发）
+    expect(m.blockGaps.every((g) => g >= 0 && g <= 12)).toBe(true)
+    expect(m.emptyListHeights.length).toBeGreaterThan(0)
+    expect(m.emptyListHeights.every((h) => h === 0)).toBe(true)
     await shot('撰写-收紧后的垂直间距')
   })
 
@@ -162,6 +176,20 @@ describe('05 撰写与发送', () => {
     await waitBoot()
     await waitText('.mail-list', 'E2E 发送链路验证')
     await shot('发送-发件箱落位')
+
+    // T5（2026-11-16）：90-failure 覆盖 failed 终态；正常链路的 sent 徽标在
+    // 此前从未直接断言（仅靠 outbox 落位间接证明）。进详情页断 .md-status.sent
+    const sentRow = await $('.mail-row')
+    const sentId = await sentRow.getAttribute('data-mail-id')
+    await goto(`/emails/${sentId}`)
+    await browser.waitUntil(
+      async () => browser.execute(() => !!document.querySelector('.md-status.sent')),
+      { timeout: 20000, timeoutMsg: '已发送状态条未出现（sent 为终态应无轮询）' },
+    )
+    const sentText = await browser.execute(() =>
+      document.querySelector('.md-status.sent')?.textContent ?? '')
+    expect(sentText).toContain('已发送')
+    await shot('发送-详情页已发送徽标')
   })
 
   it('D5 撤销发送：toast 撤销按钮 8s 窗口内点击 → 回撰写页', async () => {

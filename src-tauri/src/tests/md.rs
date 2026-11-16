@@ -249,10 +249,71 @@ fn build_md_attachment_sections_embed_and_path() {
     );
     assert!(!md.contains("```text\nxxxx"), "{md}");
     assert!(md.contains("### 截图.png"), "{md}");
+    // A13（2026-11-16）：file 存储给**相对**路径（模块供 AI 分析，导出常外发，
+    // 本机绝对路径属信息泄露）——不再断言 data_dir 前缀
     assert!(
-        md.contains("本地文件：") && md.contains("2026-11/99/1_截图.png.gz（gzip 压缩存储）"),
-        "file 存储应输出完整路径：{md}"
+        md.contains(
+            "本地文件（相对数据目录）：attachments/2026-11/99/1_截图.png.gz（gzip 压缩存储）"
+        ),
+        "file 存储应输出相对路径：{md}"
+    );
+    assert!(
+        !md.contains(&dir.display().to_string()),
+        "导出不得回退到绝对路径：{md}"
     );
     assert!(md.contains("文件已按清理策略移除，无法导出。"), "{md}");
+    cleanup(&dir);
+}
+
+// ---------- A13（audit 2026-11-16）：导出 Markdown 不含本机绝对路径 ----------
+
+/// A13：独立文件附件在导出里只给相对路径（attachments/<p>），绝不出现
+/// `data_dir()` 绝对路径（模块定位「供 AI 分析」，导出常外发；/Users/<名>/
+/// Library/... 属本机信息泄露）。附件名与 gzip 说明保留
+#[test]
+fn build_md_uses_relative_attachment_path_only() {
+    let (state, dir) = temp_state("a13-path");
+    let email_id = state
+        .with_conn(|c| {
+            c.query_row(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                      subject_tokens, body_tokens, created_at, body_text, body_kind)
+                 VALUES ('in','inbox','received','A13','a@x.cn','demo@chinatelecom.cn','','',0,'正文','plain')
+                 RETURNING id",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap();
+    // 手动插一条独立文件附件（与既有测试同口径：绕过业务层直接 SQL）
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO attachments (email_id, filename, size_orig, size_gz, storage, file_path, sha256)
+                 VALUES (?1, '结算单.xlsx', 2048, 512, 'file', '2026-11/9/1_x.xlsx.gz', 'deadbeef')",
+                [email_id],
+            )
+        })
+        .unwrap();
+
+    let md = build_md(&state, email_id).unwrap();
+    // 相对路径与文件名保留
+    assert!(
+        md.contains("attachments/2026-11/9/1_x.xlsx.gz"),
+        "附件小节应含相对路径：{md}"
+    );
+    assert!(md.contains("结算单.xlsx"), "附件名保留");
+    assert!(md.contains("gzip 压缩存储"), "存储形态说明保留");
+    // 绝对路径绝不出现：含 data_dir 全串与本机用户名形态
+    let abs = dir.display().to_string();
+    assert!(
+        !md.contains(&abs),
+        "导出不得含数据目录绝对路径（{abs}）：{md}"
+    );
+    assert!(
+        !md.contains("/Users/"),
+        "不得出现任何本机绝对路径形态：{md}"
+    );
+    assert!(!md.contains("/Library/"), "同上：{md}");
     cleanup(&dir);
 }

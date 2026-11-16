@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, htmxAjax, runDir } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, htmxAjax, runDir, waitMailRows } from '../support/helpers.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -201,6 +201,7 @@ describe('90 失败链路', () => {
   it('F5 导出空目标：toast 提示未选择保存位置，不落盘', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4
     const rows = await $$('.mail-row')
     expect(rows.length).toBeGreaterThan(0)
     const id = await rows[0].getAttribute('data-mail-id')
