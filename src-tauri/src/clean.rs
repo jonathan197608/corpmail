@@ -167,7 +167,14 @@ fn referenced_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stri
     .collect())
 }
 
-/// 孤儿文件（未引用 + mtime 超宽限期）绝对路径列表（只收集不删除，estimate/run 共用）
+/// 孤儿文件（未引用 + mtime 超宽限期）绝对路径列表（只收集不删除，estimate/run 共用）。
+///
+/// 符号链接防护（A2，audit 2026-11-16）：month/edir/file 三级全部用
+/// `symlink_metadata` 判类型——不跟随链接。任一层是软链即跳过该子树
+/// （不递归、不统计、不删）。旧实现 `path.is_dir()`/`metadata()` 跟随链接：
+/// `2026-01 → 外部目录` 时 read_dir 枚举外部文件、相对名必不在引用集、
+/// `remove_file` 沿链接前缀 unlink 外部真实文件（静默数据丢失）。与迁移链
+/// `state.rs`（拒绝软链附件根目录）同口径
 fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(PathBuf, u64)> {
     let mut out = Vec::new();
     let Ok(months) = std::fs::read_dir(root) else {
@@ -179,14 +186,14 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
         .checked_sub(grace)
         .map(|d| std::time::UNIX_EPOCH + d);
     for month in months.flatten() {
-        if !month.path().is_dir() {
+        if !is_real_dir(&month.path()) {
             continue;
         }
         let Ok(email_dirs) = std::fs::read_dir(month.path()) else {
             continue;
         };
         for edir in email_dirs.flatten() {
-            if !edir.path().is_dir() {
+            if !is_real_dir(&edir.path()) {
                 continue;
             }
             let Ok(files) = std::fs::read_dir(edir.path()) else {
@@ -194,7 +201,11 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
             };
             for entry in files.flatten() {
                 let path = entry.path();
-                if !path.is_file() {
+                // 不跟随链接的一次性 stat：类型/mtime/size 全部来自这同一份
+                let Ok(md) = path.symlink_metadata() else {
+                    continue;
+                };
+                if md.file_type().is_symlink() || !md.is_file() {
                     continue;
                 }
                 let Ok(rel) = path.strip_prefix(root) else {
@@ -203,24 +214,26 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
                 if referenced.contains(rel.to_string_lossy().as_ref()) {
                     continue;
                 }
-                // mtime 宽限：刚落盘的文件（可能是收件竞态窗口）本轮跳过
                 // mtime 宽限：刚落盘的文件（可能是收件竞态窗口）本轮跳过；
                 // stale_before 为 None（系统时钟异常）时按不超期处理
-                let stale = stale_before.is_some_and(|cut| {
-                    std::fs::metadata(&path)
-                        .and_then(|md| md.modified())
-                        .map(|t| t < cut)
-                        .unwrap_or(false)
-                });
+                let stale =
+                    stale_before.is_some_and(|cut| md.modified().map(|t| t < cut).unwrap_or(false));
                 if !stale {
                     continue;
                 }
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                out.push((path, size));
+                out.push((path, md.len()));
             }
         }
     }
     out
+}
+
+/// 真实目录判定（`symlink_metadata`，不跟随链接）：目录且非软链（A2）。
+/// 软链目录 `is_dir()`（跟随）会误放行——这里要求入口本身不是链接
+fn is_real_dir(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|md| !md.file_type().is_symlink() && md.is_dir())
+        .unwrap_or(false)
 }
 
 /// 预估将释放空间（只读；存储页"预计可释放"）
@@ -259,11 +272,15 @@ pub fn estimate(state: &AppState) -> Estimate {
     est.detach_files = targets.len() as u64;
     est.bytes += targets.iter().map(|t| t.2).filter(|s| *s > 0).sum::<i64>() as u64;
     est.expire_emails = expire_count as u64;
-    // 锁外：逐个 stat + 孤儿目录遍历（慢 I/O 不再挡住 DB 连接）
+    // 锁外：逐个 stat + 孤儿目录遍历（慢 I/O 不再挡住 DB 连接）。
+    // symlink_metadata（A2）：引用文件若被替换成软链，统计链接条目本身即可，
+    // 不跟随统计外部目标——run 段的删除同样拒绝软链，两边口径一致
     for rel in files {
-        est.bytes += std::fs::metadata(root.join(&rel))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        if let Ok(md) = std::fs::symlink_metadata(root.join(&rel))
+            && !md.file_type().is_symlink()
+        {
+            est.bytes += md.len();
+        }
     }
     if let Some(refs) = refs {
         for (_, size) in orphan_files(&root, &refs, now) {
@@ -322,10 +339,14 @@ pub fn run(state: &AppState) -> Result<CleanReport, String> {
         Ok::<(), String>(())
     })?;
 
-    // 提交后删文件（失败残留由孤儿回收兜底）
+    // 提交后删文件（失败残留由孤儿回收兜底）。symlink_metadata 防软链（A2）：
+    // 引用文件被替换成软链时 remove_file 虽只删链接条目不触目标，但统计与
+    // 删除路径统一拒绝软链，避免任何沿链接操作的口径分叉
     for rel in &pending_files {
-        if let Ok(md) = std::fs::metadata(root.join(rel))
-            && std::fs::remove_file(root.join(rel)).is_ok()
+        let target = root.join(rel);
+        if let Ok(md) = std::fs::symlink_metadata(&target)
+            && !md.file_type().is_symlink()
+            && std::fs::remove_file(&target).is_ok()
         {
             report.freed_bytes += md.len();
         }
@@ -337,7 +358,13 @@ pub fn run(state: &AppState) -> Result<CleanReport, String> {
     match state.with_conn(|conn| referenced_paths(conn)) {
         Ok(refs) => {
             for (path, size) in orphan_files(&root, &refs, now) {
-                if std::fs::remove_file(&path).is_ok() {
+                // remove_file 前二次校验（A2）：orphan_files 收集后路径可能被
+                // 替换成软链，先确认仍是普通文件再删；软链跳过不删、不计数
+                if std::fs::symlink_metadata(&path)
+                    .map(|md| !md.file_type().is_symlink())
+                    .unwrap_or(false)
+                    && std::fs::remove_file(&path).is_ok()
+                {
                     report.orphan_files += 1;
                     report.freed_bytes += size;
                 }

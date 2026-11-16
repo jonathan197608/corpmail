@@ -2290,7 +2290,11 @@ fn migration_done_marker_prevents_recovery_from_deleting_migrated_data() {
     std::fs::write(dest.join("corpmail.db"), b"valid migrated db").unwrap();
     std::fs::write(dest.join("attachments/2026-01/1/a.bin"), b"valid data").unwrap();
     // 成功路径的产物：done 哨兵在场，incomplete marker 因删除失败残留
-    std::fs::write(dest.join(MIGRATION_DONE_MARKER), dest.to_string_lossy().as_bytes()).unwrap();
+    std::fs::write(
+        dest.join(MIGRATION_DONE_MARKER),
+        dest.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
     std::fs::write(dest.join(MIGRATION_MARKER), b"incomplete").unwrap();
 
     let err = state
@@ -2423,7 +2427,11 @@ fn migration_skips_symlinked_attachment_files() {
     #[cfg(unix)]
     {
         let ev = events.lock().unwrap();
-        assert_eq!(ev.last().copied(), Some((1, Some(1))), "终值必须补齐：{ev:?}");
+        assert_eq!(
+            ev.last().copied(),
+            Some((1, Some(1))),
+            "终值必须补齐：{ev:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(&base);
 }

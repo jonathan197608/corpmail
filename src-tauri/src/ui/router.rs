@@ -712,7 +712,10 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("GET", "/settings") => {
             let raw = req.query_param("tab");
             let tab = normalize_tab(raw.as_deref().unwrap_or("send"));
-            Some(settings_page(state, if valid_tab(tab) { tab } else { "send" }))
+            Some(settings_page(
+                state,
+                if valid_tab(tab) { tab } else { "send" },
+            ))
         }
         // 「账号」是拆分前旧名，保留为 /settings/send 的别名（旧书签/深链）
         ("GET", "/settings/send")

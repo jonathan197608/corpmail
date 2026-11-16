@@ -131,3 +131,79 @@ fn save_uses_pid_scoped_tmp_and_does_not_touch_legacy_stub() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- A8（audit 2026-11-16）：非 UTF-8 配置与语法错同走备份自愈 ----------
+
+/// A8：含非法 UTF-8 字节的 corpmail.toml 不得致命 Err 启动失败
+/// （read_to_string 的 InvalidData 旧路径），必须与 TOML 语法错同走
+/// 备份 → 按未配置继续
+#[test]
+fn non_utf8_config_backs_up_and_starts_unconfigured() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-a8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 不带 BOM 的纯 Latin-1 字节（0xFF 非法）
+    let original: &[u8] = b"account_prefix = \"caf\xFF\"\n";
+    let path = dir.join(CONFIG_FILE);
+    std::fs::write(&path, original).unwrap();
+
+    let map = super::load(&dir).expect("编码损坏应自愈为未配置，不得挡启动");
+    assert!(map.is_empty(), "按未配置继续：{map:?}");
+
+    // 备份存在且与原文逐字节一致（含非法字节本身）
+    let mut backups: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(&format!("{CONFIG_FILE}.broken-")))
+        .collect();
+    assert_eq!(backups.len(), 1, "恰一份备份：{backups:?}");
+    let backup = dir.join(backups.remove(0));
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        original,
+        "备份必须与原文逐字节一致"
+    );
+    assert!(!path.exists(), "原位文件应已被 rename 挪走");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A8 备份失败（目标名被只读目录抢占的重命名失败也包含在内）仍走 C16 的 Err：
+/// 唯一可恢复的原文绝不能被向导覆盖
+#[test]
+fn non_utf8_config_backup_failure_is_fatal() {
+    // 构造：锚点目录里先建一个同名 broken 备份文件并 chmod 444，
+    // rename 需要写锚点目录本身——把锚点目录置为只读即可让 rename 失败
+    let dir = std::env::temp_dir().join(format!("mbx-conf-a8f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(CONFIG_FILE);
+    std::fs::write(&path, b"display_name = \"caf\xFF\"\n").unwrap();
+    set_readonly(&dir, true);
+
+    let res = super::load(&dir);
+    set_readonly(&dir, false); // 无论结果先恢复权限，保证清理可执行
+    let err = res.expect_err("备份失败必须 Err（C16），不得静默按未配置启动");
+    assert!(err.contains("备份失败"), "错误应说明真实原因：{err}");
+    assert!(
+        std::fs::read(&path).is_ok_and(|t| t.windows(3).any(|w| w == b"caf")),
+        "原文必须原样保留在原位"
+    );
+    set_readonly(&dir, false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 目录只读开关（unix chmod / windows 目录只读属性不可靠则跳过本测）
+fn set_readonly(path: &Path, on: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(if on { 0o555 } else { 0o755 });
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, on);
+    }
+}

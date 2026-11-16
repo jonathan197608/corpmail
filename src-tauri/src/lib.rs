@@ -437,8 +437,18 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                     failures += 1;
                     eprintln!("[seen] 回写失败（第 {failures} 次）：{err}");
                     if failures >= mail::seen::MAX_ATTEMPTS {
-                        // 连续失败达上限：清标志放弃，避免永久重试（本地已读不受影响）
-                        mail::seen::abandon(&state);
+                        // 连续失败达上限：清标志放弃，避免永久重试（本地已读
+                        // 不受影响）。放弃失败（A6）只记日志不参与退避——
+                        // 标志仍在，下轮 flush 自然重试
+                        match mail::seen::abandon(&state) {
+                            Ok(n) if n > 0 => eprintln!(
+                                "[seen] 回写连续失败达上限，放弃 {n} 封的服务器已读同步（本地已读不受影响）"
+                            ),
+                            Ok(_) => {}
+                            Err(giveup_err) => eprintln!(
+                                "[seen] 放弃回写时清标志失败（标志仍待回写，下轮自动重试）：{giveup_err}"
+                            ),
+                        }
                         failures = 0;
                         continue;
                     }

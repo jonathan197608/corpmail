@@ -286,7 +286,151 @@ fn keychain_recovery_reports_purge_failure() {
     let c = Connection::open_in_memory().unwrap(); // 故意不建 settings 表
     let account = "c17-nosettings@chinatelecom.cn";
     let err = finish_keychain_store(&c, account, "新密码").unwrap_err();
-    assert!(err.contains("清理本地旧密码失败"), "错误应说明真实原因：{err}");
+    assert!(
+        err.contains("清理本地旧密码失败"),
+        "错误应说明真实原因：{err}"
+    );
     assert_eq!(cached(account), None, "失败时不得把新密码写进缓存");
     cache_drop(account);
+}
+
+// ---------- A1：改密回退 keyfile 前清 keychain 旧条目 ----------
+
+/// A1 正向：keychain 写失败 → 删旧条目成功 → 回退 keyfile。
+/// 旧实现不删旧条目：keychain 里仍是 P1，重启后两段式读取（keychain 优先）
+/// 读回 P1，改密静默失效
+#[test]
+fn store_fallback_deletes_stale_keychain_entry() {
+    let c = conn();
+    let kf = temp_key_path("a1-fallback");
+    let account = "a1-fallback@chinatelecom.cn";
+    let g = fake_keyring::Guard::install();
+    g.preset(account, "P1");
+    g.make_set_fail();
+    cache_drop(account); // 隔离全局缓存
+
+    let degraded = store(&c, &kf, account, "P2").unwrap();
+    assert!(degraded, "回退 keyfile 应报降级");
+    // keychain 旧条目必须已清：否则重启后 Keychain(P1) 永远压过 enc: 的 P2
+    assert_eq!(g.entry(account), None, "keychain 旧密码 P1 必须已清除");
+    // 重启语义（cache 模拟进程内存）：丢弃缓存后读回 Keyfile(P2)
+    cache_drop(account);
+    assert_eq!(
+        retrieve(&c, &kf, account),
+        GetResult::Keyfile("P2".into()),
+        "旧条目已删，重启后应读回 enc: 里的新密码"
+    );
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// A1 防半保存态：keychain 不可写且旧条目删不掉时，改密必须明确报 Err，
+/// 且 **不写 enc:**（不制造「看似保存成功、重启后失效」的坏态）。
+/// 这是设计取舍：明确失败让用户解锁钥匙串后重试，好过静默双存新旧密码
+#[test]
+fn store_fails_loudly_when_stale_keychain_undeletable() {
+    let c = conn();
+    let kf = temp_key_path("a1-undeletable");
+    let account = "a1-undeletable@chinatelecom.cn";
+    let g = fake_keyring::Guard::install();
+    g.preset(account, "P1");
+    g.make_set_fail();
+    g.make_delete_fail();
+    cache_drop(account);
+
+    let err = store(&c, &kf, account, "P2").unwrap_err();
+    assert!(err.contains("无法清除"), "错误应说明根因：{err}");
+    // enc: 不得写入 P2
+    assert!(
+        matches!(keyfile_retrieve(&c, &kf, account), GetResult::Missing),
+        "失败路径不得写入 enc: 密文（半保存态）"
+    );
+    assert_eq!(g.entry(account), Some("P1".into()), "keychain 保持 P1 原样");
+    // 重启语义：读回 Keychain(P1)——明确失败优于静默复活 P2 假象
+    cache_drop(account);
+    assert_eq!(retrieve(&c, &kf, account), GetResult::Keychain("P1".into()));
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// store 的 keychain 成功分支首次在单测中被真实执行（此前只有
+/// finish_keychain_store 的直调测试 C17）：写 keychain 成功 + 清 enc: 旧密文
+#[test]
+fn store_keychain_success_purges_keyfile_ciphertext() {
+    let c = conn();
+    let kf = temp_key_path("a1-success");
+    let account = "a1-success@chinatelecom.cn";
+    // 前置：keyfile 降级态（旧密码在 enc:）
+    keyfile_store(&c, &kf, account, "旧密码").unwrap();
+    let g = fake_keyring::Guard::install();
+    cache_drop(account);
+
+    let degraded = store(&c, &kf, account, "P2").unwrap();
+    assert!(!degraded, "keychain 写成功不应报降级");
+    assert_eq!(g.entry(account), Some("P2".into()), "keychain 应存新密码");
+    assert!(
+        matches!(keyfile_retrieve(&c, &kf, account), GetResult::Missing),
+        "enc: 旧密文必须清除（C17 语义经 store 主链复验）"
+    );
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// A1 环境级失败：keychain 后端完全不可用（set 失败 + 无条目可读，
+/// 如 e2e 隔离 HOME 无默认钥匙串）。旧密码此刻读不到 → 重启后 keychain_get
+/// 同样 miss → 无复活路径，必须放行 keyfile 回退（回归 e2e 向导保存）
+#[test]
+fn store_falls_back_when_keychain_backend_unavailable() {
+    let c = conn();
+    let kf = temp_key_path("a1-nobackend");
+    let account = "a1-nobackend@chinatelecom.cn";
+    let g = fake_keyring::Guard::install();
+    g.make_set_fail(); // 未 preset：get_password → None（相当于无默认钥匙串）
+    cache_drop(account);
+
+    let degraded = store(&c, &kf, account, "P2").unwrap();
+    assert!(
+        degraded,
+        "后端不可用应顺利回退 keyfile（不制造「降级失败」假象）"
+    );
+    assert_eq!(
+        retrieve(&c, &kf, account),
+        GetResult::Keyfile("P2".into()),
+        "回退后本进程读 Keyfile(P2)"
+    );
+    cache_drop(account);
+    assert_eq!(
+        retrieve(&c, &kf, account),
+        GetResult::Keyfile("P2".into()),
+        "重启语义：keychain 读不到（无条目）→ enc: 的 P2"
+    );
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// A1 决策口径：旧条目「当下可读」才存在复活路径。ACL 拒读（get 失败）
+/// 的旧条目重启后同样读不到，回退安全——无需删除成功
+#[test]
+fn store_falls_back_when_old_entry_unreadable() {
+    // fake 的 get 不可注入失败，本用例用「无条目」近似（读不到的两种形态
+    // 在决策上等价：is_none 即放行）；真正的 ACL 拒读只能靠上一用例的
+    // 后端不可用覆盖。此测钉住「读不到 → 不调 delete 也放行」的短路
+    let c = conn();
+    let kf = temp_key_path("a1-unreadable");
+    let account = "a1-unreadable@chinatelecom.cn";
+    let g = fake_keyring::Guard::install();
+    g.make_set_fail();
+    g.make_delete_fail(); // delete 必失败：若错误地先调 delete 会挡保存
+    cache_drop(account);
+
+    let degraded = store(&c, &kf, account, "P2").unwrap();
+    assert!(degraded, "读不到旧条目时 delete 失败也不得挡 keyfile 回退");
+    assert_eq!(retrieve(&c, &kf, account), GetResult::Keyfile("P2".into()));
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
 }

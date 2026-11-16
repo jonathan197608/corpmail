@@ -243,7 +243,7 @@ fn abandon_clears_all_pending() {
         mark_read(&state, *id).unwrap();
     }
     assert_eq!(pending_count(&state), 2);
-    abandon(&state);
+    abandon(&state).unwrap();
     assert_eq!(pending_count(&state), 0);
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
@@ -407,9 +407,7 @@ fn batch_mark_read_queues_seen_sync_for_current_account() {
             .collect()
     });
     assert!(
-        accounts
-            .iter()
-            .all(|a| a == "demo@chinatelecom.cn"),
+        accounts.iter().all(|a| a == "demo@chinatelecom.cn"),
         "归属账号必须随批量写入，供 R13 过滤"
     );
     assert_eq!(
@@ -437,7 +435,7 @@ fn abandon_keeps_other_accounts_pending_rows() {
             )
         })
         .unwrap();
-    abandon(&state);
+    abandon(&state).unwrap();
     let flag = |id: i64| -> i64 {
         state.with_conn(|c| {
             c.query_row("SELECT seen_pending FROM emails WHERE id = ?1", [id], |r| {
@@ -448,6 +446,108 @@ fn abandon_keeps_other_accounts_pending_rows() {
     };
     assert_eq!(flag(ids[0]), 1, "其它账号的悬挂标志不得被清掉");
     assert_eq!(flag(ids[1]), 0, "当前账号的失败标志应被放弃");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+// ---------- A6/A9（audit 2026-11-16）：清标志失败上报 / 积压自唤醒 ----------
+
+/// A6：清标志失败必须让 flush 返回 Err（调用方 worker 据此退避）。
+/// 注入手段：BEFORE UPDATE 触发器 RAISE(ABORT)，专拦 seen_pending 1→0
+#[test]
+fn flush_reports_clear_pending_failure() {
+    let (state, dir, ids) = fixture("a6-clearfail", &[(42, 1), (42, 2)]);
+    for id in &ids {
+        mark_read(&state, *id).unwrap();
+    }
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER a6_no_clear BEFORE UPDATE OF seen_pending ON emails
+                 WHEN NEW.seen_pending = 0 AND OLD.seen_pending = 1
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+        })
+        .unwrap();
+
+    let fetcher = FakeFetcher::ok();
+    // 旧实现：mark_seen_batch Ok → clear_pending 静默吞错 → flush Ok(0)，
+    // worker failures 恒 0 → 1.5s 无退避自唤醒死循环
+    let err = flush(&state, &fetcher).unwrap_err();
+    assert!(err.contains("清标志失败"), "错误应带上根因：{err}");
+    assert_eq!(
+        pending_count(&state),
+        2,
+        "标志未清（服务器已标已读但本地仍挂起，须退避重试清标志）"
+    );
+    assert_eq!(fetcher.calls().len(), 1, "STORE 本身已成功发出");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// A6：放弃路径（abandon）清标志失败上报而非吞错
+#[test]
+fn abandon_reports_clear_failure() {
+    let (state, dir, ids) = fixture("a6-abandonfail", &[(42, 1)]);
+    mark_read(&state, ids[0]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER a6_no_clear2 BEFORE UPDATE OF seen_pending ON emails
+                 WHEN NEW.seen_pending = 0 AND OLD.seen_pending = 1
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+        })
+        .unwrap();
+    let err = abandon(&state).unwrap_err();
+    assert!(err.contains("放弃回写时清标志失败"), "{err}");
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// A9：单轮 500 上限之外还有积压时必须自唤醒续轮——不看 done。
+/// 旧前置 `done > 0`：首批 500 全命中 ERR_UIDVALIDITY_CHANGED（清标志但
+/// done 不增）时，第 501+ 条悬挂到下次点击或重启
+#[test]
+fn flush_self_wakes_for_backlog_beyond_round_limit() {
+    let (state, dir, _) = fixture("a9-backlog", &[(42, 1)]);
+    // 直接 SQL 造 600 条待回写行（同一 uidvalidity=42，避免 store_incoming 600 封）
+    state.with_conn(|c| {
+        for uid in 1000..1600 {
+            c.execute(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                      subject_tokens, body_tokens, created_at, remote_uid,
+                                      seen_pending, seen_account)
+                 VALUES ('in','inbox','received','b','a@x.cn','demo@chinatelecom.cn','','',0,
+                         ?1, 1, 'demo@chinatelecom.cn')",
+                [format!("42:{uid}")],
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(pending_count(&state), 600, "600 条直造待回写行");
+
+    // 自唤醒观测：把 worker 的唤醒口换成测试 channel
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.set_seen_channel(tx);
+
+    // 全部回写命中 UIDVALIDITY 变化（清标志 + done 不增）
+    let fetcher = FakeFetcher::failing(ERR_UIDVALIDITY_CHANGED);
+    assert_eq!(
+        flush(&state, &fetcher).unwrap(),
+        0,
+        "UIDVALIDITY 分支不计 done"
+    );
+    // A9 断言：仍有积压 → 自唤醒被触发一次（旧代码 done==0 短路，这里会失败）
+    assert!(
+        rx.try_recv().is_ok(),
+        "首批 500 清标志后剩余 100 条应触发自唤醒续轮"
+    );
+    // 第二轮应处理剩余行（500 上限）
+    assert_eq!(flush(&state, &fetcher).unwrap(), 0);
+    let calls = fetcher.calls();
+    assert_eq!(calls[0].4.len(), 500, "第一轮 500 条");
+    assert_eq!(calls[1].4.len(), 100, "第二轮恰为剩余 100 条");
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
 }

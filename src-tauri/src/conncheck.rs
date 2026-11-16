@@ -73,36 +73,62 @@ fn with_timeout_limited(
     timeout: Duration,
 ) -> TestOutcome {
     if !try_acquire(&active, max) {
-        return TestOutcome::fail(
-            0,
-            format!("测试连接过于频繁（并发上限 {max}），请稍候再试"),
-        );
+        return TestOutcome::fail(0, format!("测试连接过于频繁（并发上限 {max}），请稍候再试"));
     }
     let slot = TestSlot(active);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let outcome = f();
+        // A7：后台闭包 panic 不能伪装成网络超时。旧实现 recv_timeout 的
+        // unwrap_or_else 把 Disconnected（线程已死）与 Timeout 混为一谈，
+        // 一律报「连接超时（15 秒无响应）」误导排查；catch_unwind 把 panic
+        // 转为明确的失败结果送回，elapsed_ms 用真实耗时而非恒 15000
+        let t = Instant::now();
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(o) => o,
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知".to_string());
+                eprintln!("[conncheck] 连接测试线程 panic：{reason}");
+                TestOutcome::fail(
+                    t.elapsed().as_millis() as u64,
+                    "连接测试线程异常终止，请重试；若持续出现请重启应用",
+                )
+            }
+        };
         let _ = tx.send(outcome);
         // 显式释放：槽位生命周期与后台线程一致，而非与调用方一致
         drop(slot);
     });
-    rx.recv_timeout(timeout).unwrap_or_else(|_| {
-        TestOutcome::fail(
-            timeout.as_millis() as u64,
+    let started = Instant::now();
+    match rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => TestOutcome::fail(
+            started.elapsed().as_millis() as u64,
             format!(
                 "连接超时（{} 秒无响应，请检查网络或服务器地址）",
                 timeout.as_secs()
             ),
-        )
-    })
+        ),
+        // 后台线程未及 send 即终止（超出 catch_unwind 覆盖面的意外退出）：
+        // 仍不得伪装成超时，报异常终止 + stderr 留痕（A7）
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let elapsed = started.elapsed().as_millis() as u64;
+            eprintln!("[conncheck] 连接测试通道提前关闭（后台线程意外终止）");
+            TestOutcome::fail(
+                elapsed,
+                "连接测试线程异常终止，请重试；若持续出现请重启应用",
+            )
+        }
+    }
 }
 
 fn with_timeout(f: impl FnOnce() -> TestOutcome + Send + 'static) -> TestOutcome {
     // 全局 static 无法直接装进 Arc，用 OnceLock 只初始化一次
     static GLOBAL: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
-    let active = GLOBAL
-        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
-        .clone();
+    let active = GLOBAL.get_or_init(|| Arc::new(AtomicUsize::new(0))).clone();
     with_timeout_limited(f, active, MAX_CONCURRENT_TESTS, TEST_TIMEOUT)
 }
 

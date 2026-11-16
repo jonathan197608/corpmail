@@ -86,52 +86,50 @@ fn pending_rows(state: &AppState) -> Result<Vec<Pending>, String> {
             "[seen] {} 行 remote_uid 无法解析，清标志跳过（该形态不可能成功回写）",
             bad.len()
         );
-        clear_pending(state, &bad);
+        // 尽力清理（畸形行不阻塞 good 行回写；失败留到下轮重试）
+        let _ = clear_pending(state, &bad);
     }
     Ok(good)
 }
 
-/// 清待回写标志（成功/放弃时调用；本地 unread 保持已读不受影响）
-fn clear_pending(state: &AppState, ids: &[i64]) {
+/// 清待回写标志（成功/放弃时调用；本地 unread 保持已读不受影响）。
+/// 失败必须上报（A6）：旧实现返回 () 吞掉事务/UPDATE/commit 错误，调用方
+/// 把清标志失败当成功——标志仍在，worker 尾部自唤醒重写同一批 UID，
+/// `failures` 恒 0 → 退避永不生效，1.5s 无限自唤醒可能触发服务器限流
+/// （与模块设计目标正好相反）
+fn clear_pending(state: &AppState, ids: &[i64]) -> Result<(), String> {
     if ids.is_empty() {
-        return;
+        return Ok(());
     }
     state.with_conn(|conn| {
-        let tx = match conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[seen] 清标志事务开启失败：{e}");
-                return;
-            }
-        };
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("清标志事务开启失败：{e}"))?;
         for id in ids {
-            if let Err(e) = tx.execute("UPDATE emails SET seen_pending = 0 WHERE id = ?1", [id]) {
-                eprintln!("[seen] 邮件 {id} 清标志失败：{e}");
-                return;
-            }
+            tx.execute("UPDATE emails SET seen_pending = 0 WHERE id = ?1", [id])
+                .map_err(|e| format!("邮件 {id} 清标志失败：{e}"))?;
         }
-        if let Err(e) = tx.commit() {
-            eprintln!("[seen] 清标志提交失败：{e}");
-        }
-    });
+        tx.commit()
+            .map_err(|e| format!("清标志提交失败（{} 封，含 id {}）：{e}", ids.len(), ids[0]))?;
+        Ok(())
+    })
 }
 
 /// 放弃全部待回写（重试上限后用；下次点击已读会重新置标志，不影响本地语义）。
 /// C6：只放弃**当前账号**的行。pending_rows 已按账号过滤（R13），旧账号的
 /// 标志是「切回去再回写」的悬挂意向；全局清会把它们一并抹掉且无从重建。
-pub fn abandon(state: &AppState) {
+/// 失败上报（A6）：放弃路径不参与退避，调用方（lib.rs worker）只打日志；
+/// 标志残留的下轮 flush 会自然重试，这里不许 panic
+pub fn abandon(state: &AppState) -> Result<usize, String> {
     let account = state.current_account();
-    let n = state.with_conn(|conn| {
+    state.with_conn(|conn| {
         conn.execute(
             "UPDATE emails SET seen_pending = 0 WHERE seen_pending = 1
                AND (seen_account IS NULL OR seen_account = ?1)",
             rusqlite::params![account],
         )
-        .unwrap_or(0)
-    });
-    if n > 0 {
-        eprintln!("[seen] 回写连续失败达上限，放弃 {n} 封的服务器已读同步（本地已读不受影响）");
-    }
+        .map_err(|e| format!("放弃回写时清标志失败：{e}"))
+    })
 }
 
 /// 执行一轮回写：返回本轮成功同步的封数。
@@ -148,7 +146,7 @@ pub fn flush(state: &AppState, fetcher: &dyn MailFetcher) -> Result<usize, Strin
     let Some(p) = seen_params_of(state, rows[0].id) else {
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         eprintln!("[seen] 凭据缺失，跳过 {} 封的服务器已读回写", ids.len());
-        clear_pending(state, &ids);
+        clear_pending(state, &ids)?;
         return Ok(0);
     };
     // 分组保序：BTreeMap 让日志与请求顺序稳定（便于排查）
@@ -171,19 +169,24 @@ pub fn flush(state: &AppState, fetcher: &dyn MailFetcher) -> Result<usize, Strin
             &uids,
         ) {
             Ok(()) => {
-                clear_pending(state, &ids);
+                // 清标志失败上抛（A6）：交 worker 计 failures 走退避重试，
+                // 决不做「服务器已标已读但标志仍在」的无退避自唤醒死循环
+                clear_pending(state, &ids)?;
                 done += ids.len();
             }
             Err(err) if err.starts_with(ERR_UIDVALIDITY_CHANGED) => {
                 // UID 已重排：旧 UID 可能指向别的邮件，写入会误标他人邮件为已读
                 eprintln!("[seen] {err}（uidvalidity={uidvalidity}）");
-                clear_pending(state, &ids);
+                clear_pending(state, &ids)?;
             }
             Err(err) => return Err(err), // 保留标志，调用方退避重试
         }
     }
-    // 单轮上限之外的积压：再自唤醒一次，避免剩余标志一直等到用户下次点击
-    if done > 0 && pending_rows(state).map(|r| !r.is_empty()).unwrap_or(false) {
+    // 单轮上限之外的积压：再自唤醒一次，避免剩余标志一直等到用户下次点击。
+    // 不看 done（A9）：首批 500 行全命中 ERR_UIDVALIDITY_CHANGED 时 done == 0
+    // 但清标志成功、库里还剩第 501+ 条——旧前置 `done > 0` 会让它们悬挂到
+    // 下次点击或重启。清标志失败已通过 `?` 上抛（A6），不会走进这里成紧循环
+    if pending_rows(state).map(|r| !r.is_empty()).unwrap_or(false) {
         state.notify_seen();
     }
     Ok(done)

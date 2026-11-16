@@ -889,9 +889,9 @@ fn storage_move_background_branch_carries_header_and_placeholder() {
     );
     assert_eq!(resp.status, 200, "后台分支是 200 + 自定义头，不是错误状态");
     assert!(
-        resp.extra_headers.iter().any(|(k, v)| {
-            k == crate::ui::MIGRATION_BACKGROUND_HEADER && v == "background"
-        }),
+        resp.extra_headers
+            .iter()
+            .any(|(k, v)| { k == crate::ui::MIGRATION_BACKGROUND_HEADER && v == "background" }),
         "缺头会让前端把占位 pane 渲染进页面并关模态，永久停在「准备迁移…」（A1 复现）：{:?}",
         resp.extra_headers
     );
@@ -5118,7 +5118,10 @@ fn settings_send_and_receive_panes_disable_readonly_fields() {
             .find(field)
             .unwrap_or_else(|| panic!("发信页应有字段 {field}"));
         let tag_end = send[idx..].find('>').unwrap() + idx;
-        assert!(send[idx..tag_end].contains("disabled"), "{field} 应为禁用态");
+        assert!(
+            send[idx..tag_end].contains("disabled"),
+            "{field} 应为禁用态"
+        );
         assert!(!recv.contains(field), "{field} 不应出现在收信页");
     }
     for field in [
@@ -5130,7 +5133,10 @@ fn settings_send_and_receive_panes_disable_readonly_fields() {
             .find(field)
             .unwrap_or_else(|| panic!("收信页应有字段 {field}"));
         let tag_end = recv[idx..].find('>').unwrap() + idx;
-        assert!(recv[idx..tag_end].contains("disabled"), "{field} 应为禁用态");
+        assert!(
+            recv[idx..tag_end].contains("disabled"),
+            "{field} 应为禁用态"
+        );
         assert!(!send.contains(field), "{field} 不应出现在发信页");
     }
     // 可编辑字段不得带禁用态，且只在发信页
@@ -5562,9 +5568,7 @@ fn wizard_save_triggers_first_fetch_unless_migration_pending() {
     );
     let text = body(&resp);
     assert!(
-        resp.extra_headers
-            .iter()
-            .all(|(k, _)| k != "HX-Redirect"),
+        resp.extra_headers.iter().all(|(k, _)| k != "HX-Redirect"),
         "引导分支不得跳转完成页"
     );
     assert!(text.contains("存储管理"), "应引导去设置页发起迁移：{text}");
@@ -9871,7 +9875,10 @@ fn settings_save_errors_render_an_error_banner() {
     let (state, dir) = temp_state("c8-settings");
     let msg = "保存失败：磁盘只读";
     let sync = settings_ctx(&state, "sync", false, msg, None, None);
-    let html = body(&render_html(&crate::ui::settings::pane_template("sync"), &sync));
+    let html = body(&render_html(
+        &crate::ui::settings::pane_template("sync"),
+        &sync,
+    ));
     assert!(html.contains(msg), "sync 模板必须渲染错误条：{html}");
     let storage = settings_ctx(&state, "storage", false, msg, None, None);
     let html = body(&render_html(

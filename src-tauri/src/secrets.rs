@@ -47,6 +47,163 @@ fn skip_keychain() -> bool {
     *SKIP.get_or_init(|| skip_keychain_for(std::env::var("CORPMAIL_KEYCHAIN").ok().as_deref()))
 }
 
+// ---------- keychain 三操作收口（A1，audit 2026-11-16）----------
+//
+// store/retrieve/keychain_get 里的 keyring 调用统一抽到这里。目的：
+// 1. A1 的「set 失败 → 删旧 keychain 条目 → keyfile 回退」链路必须在单测中被
+//    **真实执行生产代码**——但 keyring::Entry 无公开构造器、无法造实例，
+//    不抽收口就只能测镜像副本，变异验证（V1）无鉴别力；
+// 2. 测试经 FakeKeyring（下方 cfg(test) 模块）替换三个操作，不碰真实钥匙串、
+//    不改 skip_keychain()（R74 开关语义与 tests 既有断言全部保留）。
+
+/// keychain 是否参与本轮 store/retrieve。生产恒 true（skip_keychain 的非测试
+/// 分支恒 false）；测试默认短路，但 FakeKeyring 激活时强制走 keychain 链路
+fn keychain_active() -> bool {
+    #[cfg(test)]
+    {
+        if fake_keyring::active() {
+            return true;
+        }
+    }
+    !skip_keychain()
+}
+
+fn keychain_set_password(account: &str, password: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if fake_keyring::active() {
+        return fake_keyring::set_password(account, password);
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+    entry.set_password(password).map_err(|e| e.to_string())
+}
+
+/// 删 keychain 条目：Ok(已删条目)；NoEntry 视为已清空（幂等语义）
+fn keychain_delete_credential(account: &str) -> Result<bool, String> {
+    #[cfg(test)]
+    if fake_keyring::active() {
+        return fake_keyring::delete_credential(account);
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn keychain_get_password(account: &str) -> Option<String> {
+    #[cfg(test)]
+    if fake_keyring::active() {
+        return fake_keyring::get_password(account);
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).ok()?;
+    entry.get_password().ok()
+}
+
+/// FakeKeyring：线程本地的假钥匙串（条目表 + 可注入 set/delete 失败）。
+/// 测试串行同线程，thread_local 即隔离；RAII Guard 装卸，panic 也能复位
+#[cfg(test)]
+mod fake_keyring {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Fake {
+        entries: HashMap<String, String>,
+        fail_set: bool,
+        fail_delete: bool,
+    }
+
+    thread_local! {
+        static FAKE: RefCell<Option<Fake>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn active() -> bool {
+        FAKE.with(|c| c.borrow().is_some())
+    }
+
+    pub(super) fn set_password(account: &str, password: &str) -> Result<(), String> {
+        FAKE.with(|c| {
+            let mut guard = c.borrow_mut();
+            let Some(f) = guard.as_mut() else {
+                return Ok(());
+            };
+            if f.fail_set {
+                return Err("注入的 keychain 写失败".into());
+            }
+            f.entries.insert(account.to_string(), password.to_string());
+            Ok(())
+        })
+    }
+
+    pub(super) fn delete_credential(account: &str) -> Result<bool, String> {
+        FAKE.with(|c| {
+            let mut guard = c.borrow_mut();
+            let Some(f) = guard.as_mut() else {
+                return Ok(false);
+            };
+            if f.fail_delete {
+                return Err("注入的 keychain 删除失败".into());
+            }
+            Ok(f.entries.remove(account).is_some())
+        })
+    }
+
+    pub(super) fn get_password(account: &str) -> Option<String> {
+        FAKE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|f| f.entries.get(account).cloned())
+        })
+    }
+
+    /// RAII 安装/卸载（drop 时复位）。配置方法均为短暂借用，与生产代码
+    /// 中收口函数的重入（store → keychain_set_password）不冲突
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn install() -> Self {
+            FAKE.with(|c| *c.borrow_mut() = Some(Fake::default()));
+            Guard
+        }
+        pub(super) fn preset(&self, account: &str, password: &str) {
+            FAKE.with(|c| {
+                if let Some(f) = c.borrow_mut().as_mut() {
+                    f.entries.insert(account.to_string(), password.to_string());
+                }
+            });
+        }
+        pub(super) fn make_set_fail(&self) {
+            FAKE.with(|c| {
+                if let Some(f) = c.borrow_mut().as_mut() {
+                    f.fail_set = true;
+                }
+            });
+        }
+        pub(super) fn make_delete_fail(&self) {
+            FAKE.with(|c| {
+                if let Some(f) = c.borrow_mut().as_mut() {
+                    f.fail_delete = true;
+                }
+            });
+        }
+        /// 当前条目（None = 不存在）
+        pub(super) fn entry(&self, account: &str) -> Option<String> {
+            FAKE.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .and_then(|f| f.entries.get(account).cloned())
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAKE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
+
 /// 凭据读取结果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GetResult {
@@ -127,22 +284,49 @@ fn cache_drop(account: &str) {
 ///
 /// `key_file`：回退密钥文件路径（锚点目录）。只有走回退分支才会被创建。
 ///
-/// 测试二进制短路 keychain（见 `skip_keychain`）
+/// 测试二进制短路 keychain（见 `skip_keychain`）；FakeKeyring 激活时例外
 pub fn store(
     conn: &Connection,
     key_file: &Path,
     account: &str,
     password: &str,
 ) -> Result<bool, String> {
-    if skip_keychain() {
-        keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
-        cache_put(account, GetResult::Keyfile(password.to_string()));
-        return Ok(true);
+    if keychain_active() {
+        return store_keychain(conn, key_file, account, password);
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
-    match entry.set_password(password) {
+    keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
+    cache_put(account, GetResult::Keyfile(password.to_string()));
+    Ok(true)
+}
+
+/// keychain 可用时的 store 主链：写 keychain；写失败走「按可读性决策」的回退（A1）。
+///
+/// 风险的本质：重启后两段式读取（keychain 优先）读回旧密码 P1、`enc:` 的新密码
+/// P2 永不生效，且 `degraded()` 因返回 Keychain 不提示——改密静默失效死循环。
+/// 而复活路径**当且仅当旧条目当下可读**：此刻 `keychain_get_password` 读不到
+/// （无默认钥匙串的环境级失败 / NoEntry / ACL 拒读），重启后同样读不到，
+/// 回退 keyfile 绝对安全——e2e 的隔离 HOME（无默认钥匙串）正是这种形态，
+/// 不能把「环境里根本没有可用 keychain」当成「降级失败」挡住保存。
+///
+/// 旧密码可读但删不掉（ACL 拒删等）才是必须报错的状态：返回 `Err` 且
+/// **不写 enc:**——绝不制造「看似保存成功、重启后失效」的坏态；这比静默
+/// 双写（两处不一致地各存新旧密码）安全得多
+fn store_keychain(
+    conn: &Connection,
+    key_file: &Path,
+    account: &str,
+    password: &str,
+) -> Result<bool, String> {
+    match keychain_set_password(account, password) {
         Ok(()) => finish_keychain_store(conn, account, password),
         Err(_) => {
+            if keychain_get_password(account).is_some()
+                && let Err(e) = keychain_delete_credential(account)
+            {
+                return Err(format!(
+                    "钥匙串中仍存有旧密码且无法清除，本次修改未保存（{e}）。请解锁钥匙串或授权后重试"
+                ));
+            }
             // 回退：AES-256-GCM 落库，密钥在库外文件（设计 §5.4）
             keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
             cache_put(account, GetResult::Keyfile(password.to_string()));
@@ -161,11 +345,7 @@ pub fn store(
 /// 独立成函数是为了在「不碰真实 keychain」的前提下钉住这条恢复路径：
 /// 测试构建默认短路 keychain，走不到 `store` 的成功分支。
 /// 删除失败必须上报：keychain 已写成功但旧密文还在，静默返回 Ok 会留下坏态。
-fn finish_keychain_store(
-    conn: &Connection,
-    account: &str,
-    password: &str,
-) -> Result<bool, String> {
+fn finish_keychain_store(conn: &Connection, account: &str, password: &str) -> Result<bool, String> {
     let key = format!("enc:{account}");
     conn.execute("DELETE FROM settings WHERE k = ?1", [key])
         .map(|_| ())
@@ -179,11 +359,10 @@ fn finish_keychain_store(
 /// 命中返回 Keychain 结果并写入缓存；无条目/后端异常/测试短路返回 None
 /// （统一由调用方走 keyfile 回退段）。Missing 语义不属于 keychain 段
 pub fn keychain_get(account: &str) -> Option<GetResult> {
-    if skip_keychain() {
+    if !keychain_active() {
         return None;
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).ok()?;
-    let password = entry.get_password().ok()?;
+    let password = keychain_get_password(account)?;
     let out = GetResult::Keychain(password);
     cache_put(account, out.clone());
     Some(out)
@@ -208,19 +387,14 @@ pub fn retrieve(conn: &Connection, key_file: &Path, account: &str) -> GetResult 
     if let Some(hit) = cache_get(account) {
         return hit;
     }
-    if skip_keychain() {
-        let out = keyfile_retrieve(conn, key_file, account);
-        if !matches!(out, GetResult::Missing) {
-            cache_put(account, out.clone());
+    // keychain 段（Entry::new 失败与 get_password 失败同口径：都只剩 keyfile 一条路）
+    let out = if keychain_active() {
+        match keychain_get_password(account) {
+            Some(p) => GetResult::Keychain(p),
+            None => keyfile_retrieve(conn, key_file, account),
         }
-        return out;
-    }
-    let out = match keyring::Entry::new(KEYRING_SERVICE, account) {
-        Ok(entry) => match entry.get_password() {
-            Ok(p) => GetResult::Keychain(p),
-            Err(_) => keyfile_retrieve(conn, key_file, account),
-        },
-        Err(_) => keyfile_retrieve(conn, key_file, account),
+    } else {
+        keyfile_retrieve(conn, key_file, account)
     };
     if !matches!(out, GetResult::Missing) {
         cache_put(account, out.clone());

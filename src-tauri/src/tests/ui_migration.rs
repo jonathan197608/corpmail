@@ -20,7 +20,10 @@ const STORAGE_TPL: &str = include_str!("../templates/settings_pane_storage.html"
 fn migration_start_response_is_fully_consumed() {
     // fetch 的响应必须被读取：只读 status 或不读都会让校验失败/同步完成卡在模态里
     assert!(APP_JS.contains("await res.text()"), "必须读取响应体");
-    assert!(APP_JS.contains("mbxMigApplyPane(text)"), "HTML pane 必须落到页面");
+    assert!(
+        APP_JS.contains("mbxMigApplyPane(text)"),
+        "HTML pane 必须落到页面"
+    );
     assert!(
         APP_JS.contains("res.headers.get('X-CorpMail-Migration')"),
         "必须按后台标记分支，不能一律等事件"
@@ -40,7 +43,10 @@ fn migration_start_response_is_fully_consumed() {
 fn migration_modal_hidden_rules_are_explicit() {
     // 作者样式 display:flex / inline-flex 压过 UA 的 [hidden]，缺这两条规则
     // 会让「返回」关不掉遮罩（app.css:2646 的同坑注释）
-    assert!(APP_CSS.contains(".migrate-mask[hidden]"), "遮罩需显式 [hidden]");
+    assert!(
+        APP_CSS.contains(".migrate-mask[hidden]"),
+        "遮罩需显式 [hidden]"
+    );
     assert!(
         APP_CSS.contains(".migrate-card .btn[hidden]"),
         "返回按钮需显式 [hidden]"
@@ -68,7 +74,9 @@ fn migration_event_names_match_between_rust_and_frontend() {
 #[test]
 fn migration_unlisten_is_registered_before_first_await() {
     // 注册中途抛错时，已注册的监听也必须可解绑（A14）
-    let listen = APP_JS.find("async function mbxMigListen()").expect("监听函数存在");
+    let listen = APP_JS
+        .find("async function mbxMigListen()")
+        .expect("监听函数存在");
     let assign = APP_JS[listen..]
         .find("mbxMigUnlisten = function ()")
         .expect("解绑收集器存在");
@@ -107,7 +115,9 @@ fn migration_done_renders_backend_message_and_manual_restart_hint() {
         .find("add('migration-done'")
         .expect("done 监听器存在");
     let rest = &APP_JS[handler..];
-    let body = &rest[..rest.find("add('migration-error'").expect("error 监听器存在")];
+    let body = &rest[..rest
+        .find("add('migration-error'")
+        .expect("error 监听器存在")];
     assert!(body.contains("e.payload"), "必须渲染后端成功文案");
     assert!(body.contains("手动重启"), "必须给出手动重启兜底");
     assert!(
@@ -176,10 +186,7 @@ fn production_migration_runs_through_injected_executor() {
         LIB_RS.contains("app.emit(\"migration-done\""),
         "成功分支必须回传 done 事件"
     );
-    assert!(
-        LIB_RS.contains("app.exit(0);"),
-        "成功分支必须自动退出"
-    );
+    assert!(LIB_RS.contains("app.exit(0);"), "成功分支必须自动退出");
     assert!(
         STATE_RS.contains("fn migration_guard("),
         "生产后台链必须有 RAII guard"
@@ -190,11 +197,11 @@ fn production_migration_runs_through_injected_executor() {
 fn seen_worker_respects_migration_freeze() {
     // R14：seen worker 是唯一不查冻结位的常驻线程——冻结期连 IMAP 并写旧库，
     // 重启后这次回写丢失（幂等，但白连一次）。必须跳过且不清标志
-    let at = LIB_RS.find("fn spawn_seen_worker").expect("seen worker 存在");
+    let at = LIB_RS
+        .find("fn spawn_seen_worker")
+        .expect("seen worker 存在");
     let rest = &LIB_RS[at..];
-    let body = &rest[..rest
-        .find("fn spawn_fetch_scheduler")
-        .expect("下一函数存在")];
+    let body = &rest[..rest.find("fn spawn_fetch_scheduler").expect("下一函数存在")];
     let guard = body
         .find("if state.migration_pending()")
         .expect("必须查冻结位");
@@ -233,8 +240,7 @@ fn protocol_callback_never_runs_io_validation() {
     assert!(!pbody.contains("std::fs::"), "预检必须纯内存");
     // 生产后台线程必须先发一条 starting 事件，前端才有启动宽限期可依
     assert!(
-        LIB_RS.contains("phase: \"starting\"")
-            && LIB_RS.contains("\"migration-progress\""),
+        LIB_RS.contains("phase: \"starting\"") && LIB_RS.contains("\"migration-progress\""),
         "后台线程 spawn 后必须先 emit starting 进度"
     );
     assert!(
@@ -340,9 +346,7 @@ fn migration_terminal_events_hide_stall_actions() {
     // C4：2b94399 的 30 分钟确认态只在 migration-progress 收起按钮。
     // done / error 到达后「继续等待」仍可点：错误态点它会覆盖错误文案并重启
     // 30 分钟看门狗，把已终止的线程伪装成仍在跑。
-    let done = APP_JS
-        .find("add('migration-done'")
-        .expect("done 监听存在");
+    let done = APP_JS.find("add('migration-done'").expect("done 监听存在");
     let dbody = &APP_JS[done..];
     let dbody = &dbody[..dbody.find("add('migration-error'").expect("error 监听存在")];
     assert!(
@@ -384,7 +388,9 @@ fn migration_snapshot_stall_asks_user_before_failing() {
         .find("function mbxMigPromptStall()")
         .expect("mbxMigPromptStall 存在");
     let pbody = &APP_JS[prompt..];
-    let pbody = &pbody[..pbody.find("function mbxMigKeepWaiting()").expect("下一函数存在")];
+    let pbody = &pbody[..pbody
+        .find("function mbxMigKeepWaiting()")
+        .expect("下一函数存在")];
     assert!(
         pbody.contains("超过 30 分钟") && pbody.contains("继续等待"),
         "确认文案要写清超时时长与两个出口"
@@ -459,7 +465,10 @@ fn extra_headers_reach_the_http_response() {
         content_type: "text/html; charset=utf-8".into(),
         cache_control: "no-store",
         body: b"<div id=\"settings-pane\"></div>".to_vec(),
-        extra_headers: vec![(MIGRATION_BACKGROUND_HEADER.to_string(), "background".to_string())],
+        extra_headers: vec![(
+            MIGRATION_BACKGROUND_HEADER.to_string(),
+            "background".to_string(),
+        )],
     };
     let http = to_http_response(resp);
     assert_eq!(
@@ -479,7 +488,10 @@ fn extra_headers_reach_the_http_response() {
         content_type: "text/plain; charset=utf-8".into(),
         cache_control: "no-store",
         body: b"x".to_vec(),
-        extra_headers: vec![(MIGRATION_BACKGROUND_HEADER.to_string(), "background".to_string())],
+        extra_headers: vec![(
+            MIGRATION_BACKGROUND_HEADER.to_string(),
+            "background".to_string(),
+        )],
     });
     assert_eq!(
         plain
@@ -529,7 +541,10 @@ fn migration_modal_resets_previous_failure_state() {
         body.contains("detail.textContent = '准备迁移…'"),
         "详情必须复位为初始文案"
     );
-    assert!(body.contains("mbxMigHideActions()"), "打开时必须统一复位按钮");
+    assert!(
+        body.contains("mbxMigHideActions()"),
+        "打开时必须统一复位按钮"
+    );
     // C4：复位函数本体必须真的隐藏两个按钮（「调用了一个空函数」不算修好）
     let hide = APP_JS
         .find("function mbxMigHideActions()")
@@ -546,10 +561,10 @@ fn migration_modal_resets_previous_failure_state() {
         .find("function mbxMigCloseModal()")
         .expect("mbxMigCloseModal 存在");
     let cbody = &APP_JS[close..];
-    let cbody = &cbody[..cbody.find("async function mbxMigListen()").expect("下一函数存在")];
-    let unlisten = cbody
-        .find("if (mbxMigUnlisten)")
-        .expect("解绑段存在");
+    let cbody = &cbody[..cbody
+        .find("async function mbxMigListen()")
+        .expect("下一函数存在")];
+    let unlisten = cbody.find("if (mbxMigUnlisten)").expect("解绑段存在");
     let guard = cbody.find("if (!mask) return;").expect("遮罩判空存在");
     assert!(unlisten < guard, "必须先解绑监听再判遮罩");
 }
@@ -597,9 +612,7 @@ fn a3_no_exit_switch_only_guards_the_exit_call() {
         body.contains("app.emit(\"migration-done\""),
         "done 事件不能跳过"
     );
-    let guard = body
-        .find("&& !e2e_no_exit")
-        .expect("退出必须受开关约束");
+    let guard = body.find("&& !e2e_no_exit").expect("退出必须受开关约束");
     let exit = body.find("app.exit(0);").expect("仍要自动退出");
     assert!(guard < exit, "app.exit(0) 必须在 NO_EXIT 条件之后");
     assert_eq!(

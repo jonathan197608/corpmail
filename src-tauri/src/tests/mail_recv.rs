@@ -955,7 +955,8 @@ const RECV_RS: &str = include_str!("../mail/recv.rs");
 
 #[test]
 fn unreadable_fetch_keeps_a_placeholder_row() {
-    let raw = b"Subject: \xe6\xb5\x8b\xe8\xaf\x95\r\nFrom: a@b.com\r\nMessage-ID: <x@y>\r\n\r\nhello";
+    let raw =
+        b"Subject: \xe6\xb5\x8b\xe8\xaf\x95\r\nFrom: a@b.com\r\nMessage-ID: <x@y>\r\n\r\nhello";
     // 正常解析：原样入库，不落占位
     let good = parse_incoming(7, 42, false, Some(100), raw).expect("正常邮件可解析");
     let ok = mail_or_placeholder(7, 42, false, Some(100), Some(good), raw);
@@ -1002,11 +1003,7 @@ fn uidvalidity_change_does_not_duplicate_mail_without_message_id() {
         attachments: Vec::new(),
         too_large: false,
     };
-    assert_eq!(
-        store_incoming(&state, &[mk(1)]).unwrap(),
-        1,
-        "首封应入库"
-    );
+    assert_eq!(store_incoming(&state, &[mk(1)]).unwrap(), 1, "首封应入库");
     assert_eq!(
         store_incoming(&state, &[mk(2)]).unwrap(),
         0,
@@ -1034,8 +1031,5 @@ fn fetch_loop_routes_every_returned_uid_through_placeholder_guard() {
         body.contains("mail_or_placeholder("),
         "普通 FETCH 分支必须经占位决策"
     );
-    assert!(
-        !body.contains("无 BODY，跳过"),
-        "缺 BODY 不得再被静默跳过"
-    );
+    assert!(!body.contains("无 BODY，跳过"), "缺 BODY 不得再被静默跳过");
 }

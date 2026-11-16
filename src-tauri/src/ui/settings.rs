@@ -174,10 +174,7 @@ pub(super) fn settings_ctx(
     };
     // A9：附件占用跟着统计缓存走，非 storage tab 不再全目录递归（这些数值
     // 只在存储 pane 渲染）。`db_size_bytes` 只是 metadata，保留每次读取。
-    let (attach_bytes, attach_files) = storage_stats
-        .as_ref()
-        .map(|(_, _, a)| *a)
-        .unwrap_or((0, 0));
+    let (attach_bytes, attach_files) = storage_stats.as_ref().map(|(_, _, a)| *a).unwrap_or((0, 0));
     let db_bytes = state.db_size_bytes();
     let total = db_bytes + attach_bytes;
     // 空库时两段占比均为 0（不能把 100% 错记到附件段）

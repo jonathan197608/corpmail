@@ -173,8 +173,7 @@ pub struct MigrationGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for MigrationGuard {
     fn drop(&mut self) {
-        self.0
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1089,10 +1088,7 @@ impl AppState {
             return; // 无中断标记 = 不是我们的半成品，一个字节都不碰
         }
         match recover_incomplete_migration(&target) {
-            Ok(()) => eprintln!(
-                "[state] 已清理上次被中断的迁移残留：{}",
-                target.display()
-            ),
+            Ok(()) => eprintln!("[state] 已清理上次被中断的迁移残留：{}", target.display()),
             Err(e) => eprintln!("[state] 清理上次迁移残留失败：{e}"),
         }
     }
@@ -1479,13 +1475,7 @@ impl AppState {
 
     /// 存储页统计（clean::estimate + 旧目录备份 + 附件占用）：短 TTL 缓存，
     /// 避免每次打开存储页/迁移返回时重复全库扫描（大库下可达秒级）
-    pub fn storage_stats(
-        &self,
-    ) -> (
-        crate::clean::Estimate,
-        Option<(u64, u64)>,
-        (u64, u64),
-    ) {
+    pub fn storage_stats(&self) -> (crate::clean::Estimate, Option<(u64, u64)>, (u64, u64)) {
         let now = std::time::Instant::now();
         // 先取目录快照：不要把 data_dir() 放进 stats_cache 锁的作用域里
         let dir = self.data_dir();
@@ -2704,7 +2694,15 @@ fn copy_dir_recursive(
         }
         let to = dest.join(entry.file_name());
         if md.is_dir() {
-            copy_dir_recursive(&entry.path(), &to, written, copied, total, emit_files, depth + 1)?;
+            copy_dir_recursive(
+                &entry.path(),
+                &to,
+                written,
+                copied,
+                total,
+                emit_files,
+                depth + 1,
+            )?;
         } else if md.is_file() {
             std::fs::copy(entry.path(), &to).map_err(|e| format!("复制文件失败：{e}"))?;
             let n = copied.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

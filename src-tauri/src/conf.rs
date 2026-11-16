@@ -53,8 +53,15 @@ pub fn is_config_key(key: &str) -> bool {
 /// `broken-*` 备份只保留最近 3 份，避免反复启动把锚点目录塞满。
 pub fn load(anchor: &Path) -> Result<BTreeMap<String, String>, String> {
     let path = anchor.join(CONFIG_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    // A8：按字节读 + 显式 UTF-8 校验。`read_to_string` 遇非法 UTF-8 返回
+    // InvalidData，落进下方「IO 失败」的致命 Err——同一文件若是合法 UTF-8
+    // 但 TOML 语法错反而能备份自愈，口径不一致。编码损坏与语法错同走
+    // `broken_fallback`（备份 → 按未配置继续；备份失败 → Err，C16 不变）
+    let text = match std::fs::read(&path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => return broken_fallback(anchor, &path, "文件编码异常（非 UTF-8）"),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => {
             return Err(format!(
@@ -65,34 +72,41 @@ pub fn load(anchor: &Path) -> Result<BTreeMap<String, String>, String> {
     };
     match toml::from_str::<BTreeMap<String, String>>(&text) {
         Ok(map) => Ok(map.into_iter().filter(|(k, _)| is_config_key(k)).collect()),
-        Err(err) => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let backup = anchor.join(format!("{CONFIG_FILE}.broken-{stamp}"));
-            let kept = std::fs::rename(&path, &backup).is_ok();
-            eprintln!(
-                "[conf] 配置文件解析失败（{err}）；{}",
-                if kept {
-                    format!("原文已备份为 {}，本次按未配置启动", backup.display())
-                } else {
-                    "原文备份失败（保留原文件），已拒绝继续启动".to_string()
-                }
-            );
-            // C16：备份失败时绝不能返回空 map。原文仍含可能有效的 data_dir_override，
-            // 按「未配置」走完向导后 save() 会原子覆盖它，用户唯一的目录指针就没了。
-            // 与「IO 失败」同口径返回 Err，由启动链给出明确提示，交用户处理权限。
-            if !kept {
-                return Err(format!(
-                    "配置文件格式异常且原文备份失败（{}）：为避免向导覆盖仍含数据目录指针的原文，已停止启动。请检查文件权限或磁盘状态后重试",
-                    path.display()
-                ));
-            }
-            prune_broken_backups(anchor, 3);
-            Ok(BTreeMap::new())
-        }
+        Err(err) => broken_fallback(anchor, &path, &err.to_string()),
     }
+}
+
+/// 解析失败（TOML 语法错 / 编码损坏）的统一回退：原文改名备份后按未配置继续。
+/// C16：备份失败时绝不能返回空 map。原文仍含可能有效的 data_dir 指针，
+/// 按「未配置」走完向导后 save() 会原子覆盖它，用户唯一的目录指针就没了。
+/// 与「IO 失败」同口径返回 Err，由启动链给出明确提示，交用户处理权限
+fn broken_fallback(
+    anchor: &Path,
+    path: &Path,
+    reason: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = anchor.join(format!("{CONFIG_FILE}.broken-{stamp}"));
+    let kept = std::fs::rename(path, &backup).is_ok();
+    eprintln!(
+        "[conf] 配置文件解析失败（{reason}）；{}",
+        if kept {
+            format!("原文已备份为 {}，本次按未配置启动", backup.display())
+        } else {
+            "原文备份失败（保留原文件），已拒绝继续启动".to_string()
+        }
+    );
+    if !kept {
+        return Err(format!(
+            "配置文件格式异常且原文备份失败（{}）：为避免向导覆盖仍含数据目录指针的原文，已停止启动。请检查文件权限或磁盘状态后重试",
+            path.display()
+        ));
+    }
+    prune_broken_backups(anchor, 3);
+    Ok(BTreeMap::new())
 }
 
 /// 只保留最近 `keep` 份 `corpmail.toml.broken-<ts>` 备份（文件名里的时间戳即排序键）。

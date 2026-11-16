@@ -16,6 +16,24 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A2 专用临时目录：base/{data,external…} 两棵树——data 是 AppState 的数据
+/// 目录，external* 放在数据目录之外（模拟软链指向的"用户外部文件"，
+/// 与真实扩容场景 /Volumes/BigDisk 一致而非藏在数据目录内部）
+#[cfg(unix)]
+fn temp_dir_a2(tag: &str) -> (AppState, PathBuf) {
+    let base = std::env::temp_dir().join(format!("corpmail-a2-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let data = base.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    (AppState::open(&data), base)
+}
+
+/// A2 整树清理（data_dir 与外部目录同属一个临时根）
+#[cfg(unix)]
+fn cleanup_a2(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 直接插一封邮件（绕过业务层；测试造过期数据）
 fn insert_email(state: &AppState, folder: &str, direction: &str, status: &str, time: i64) -> i64 {
     state.with_conn(|conn| {
@@ -331,4 +349,88 @@ fn estimate_matches_pending_cleanup() {
     let est2 = estimate(&state);
     assert_eq!(est2, Estimate::default(), "清理后预估归零");
     cleanup(&dir);
+}
+
+/// A2：孤儿回收不得跟随符号链接删除数据目录之外的文件。
+/// `attachments/2026-01 → 外部目录` 是指向数据目录之外的软链时，旧实现的
+/// `path.is_dir()` 跟随链接、`remove_file` 沿链接前缀 unlink 外部真实文件
+/// （audit 2026-11-16 §A2 实测复现）。要求：软链目录不递归、外部文件不删、
+/// 不计孤儿数
+#[cfg(unix)]
+#[test]
+fn orphan_sweep_never_follows_symlinked_month_dir() {
+    let (state, dir) = temp_dir_a2("symlink-month");
+    let root = state.data_dir().join("attachments");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 外部目录（含子目录层——不造子层时 month 枚举出的文件在 edir 层即被
+    // is_dir() 拦下，走不到缺陷路径）：mtime 拨回 2 小时前（远超宽限期，
+    // 旧实现必判孤儿并删除）
+    let ext = dir.join("external");
+    let keep = ext.join("sub").join("keep.txt");
+    std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
+    std::fs::write(&keep, "用户数据，绝不许动").unwrap();
+    let f = std::fs::File::options().write(true).open(&keep).unwrap();
+    f.set_modified(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * ORPHAN_GRACE_SECS),
+    )
+    .unwrap();
+
+    // 月度目录是软链 → 外部目录
+    std::os::unix::fs::symlink(&ext, root.join("2026-01")).unwrap();
+
+    let report = run(&state).unwrap();
+    assert_eq!(report.orphan_files, 0, "软链目录下的文件不得计为孤儿");
+    assert!(keep.exists(), "外部文件绝不能被删（数据丢失事故）");
+    assert!(
+        std::fs::symlink_metadata(root.join("2026-01"))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "软链本身保留（不删链接，宁留勿错删）"
+    );
+    cleanup_a2(&dir);
+}
+
+/// A2：文件级软链（`attachments/2026-01/123/1_x.gz → 外部大文件`）不得计入
+/// estimate 的释放体积，也不得被孤儿回收删除
+#[cfg(unix)]
+#[test]
+fn orphan_sweep_ignores_and_spares_symlinked_files() {
+    let (state, dir) = temp_dir_a2("symlink-file");
+    let root = state.data_dir().join("attachments");
+
+    // 外部大文件（4096 字节，远超宽限期）
+    let ext = dir.join("external-big.bin");
+    std::fs::write(&ext, vec![7u8; 4096]).unwrap();
+    let f = std::fs::File::options().write(true).open(&ext).unwrap();
+    f.set_modified(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * ORPHAN_GRACE_SECS),
+    )
+    .unwrap();
+
+    // 真实目录结构中的孤儿位放一个软链 → 外部大文件
+    let e_dir = root.join("2026-01/123");
+    std::fs::create_dir_all(&e_dir).unwrap();
+    std::os::unix::fs::symlink(&ext, e_dir.join("1_x.gz")).unwrap();
+    // 同目录一个真实孤儿文件（40 字节，对照组：应被正常回收）
+    let real = e_dir.join("2_orphan.bin.gz");
+    std::fs::write(&real, vec![7u8; 40]).unwrap();
+    let f2 = std::fs::File::options().write(true).open(&real).unwrap();
+    f2.set_modified(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * ORPHAN_GRACE_SECS),
+    )
+    .unwrap();
+
+    let est = estimate(&state);
+    assert_eq!(est.orphan_files, 1, "软链文件不入孤儿统计");
+    assert_eq!(
+        est.bytes, 40,
+        "预估体积只含真实孤儿（40），不含软链目标的 4096"
+    );
+
+    let report = run(&state).unwrap();
+    assert_eq!(report.orphan_files, 1, "只回收真实孤儿");
+    assert!(ext.exists(), "软链指向的外部大文件绝不能被删");
+    assert!(!real.exists(), "真实孤儿应被回收");
+    cleanup_a2(&dir);
 }
