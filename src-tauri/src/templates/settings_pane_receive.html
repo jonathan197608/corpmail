@@ -30,9 +30,19 @@
             </select>
         </div>
 
+        {# A3（audit 2026-11-16）：拆页后本页无 form，「测试收信」原先带不上
+           未保存的新密码——改密前无法先验证。此处独立挂一个密码输入（不入任何
+           form），经按钮的 hx-include 显式并入 POST；后端 trimmed_field 分支
+           原样生效，留空则回落已保存凭据 #}
+        <div class="sfield">
+            <label for="recv-test-password">测试用密码{{ ic.tip('仅用于本次测试收信，不保存；留空 = 按已保存密码测试') }}</label>
+            <input type="password" id="recv-test-password" name="password" autocomplete="off"
+                title="填写尚未保存的新密码可先验证再改密；留空则按已保存凭据测试">
+        </div>
+
         <div class="settings-actions">
             <button type="button" class="btn" hx-post="/settings/account/test-imap" hx-target="#imap-result"
-                hx-swap="innerHTML" hx-disabled-elt="this">测试收信</button>
+                hx-swap="innerHTML" hx-include="#recv-test-password" hx-disabled-elt="this">测试收信</button>
             <span id="imap-result" class="test-inline"></span>
         </div>
     </div>

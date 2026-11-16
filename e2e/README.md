@@ -31,7 +31,10 @@ macOS 上的 Tauri GUI 自动化只有一条正路，原因是硬限制：
 L4 视觉回归（可选）  截图基线 + 像素/SSIM 阈值，防「功能对但样式崩」
 L3 原生外壳层        scripts/e2e-shell-macos.sh：窗口存在、Cmd+W 隐藏、进程常驻、窗口截图
 L2 GUI 功能层（主体）e2e/specs/*.spec.mjs：真实 app + 真实 WKWebView + mock 邮件服务器
-L1 单元/集成层       cargo test --lib（352 项，覆盖路由/解析/游标/凭据）
+L1.5 前端行为层      e2e/unit/*.test.mjs：Node vm 执行 app.js / office-preview.js 带
+                     锚点的 core 段（假 DOM/假时钟/假 fetch），覆盖迁移模态失败
+                     分支、预览代次令牌、确认取消链路（run.sh 第 0 步自动跑）
+L1 单元/集成层       cargo test --lib（覆盖路由/解析/游标/凭据）
 ```
 
 要点：L2 跑的是**打包前的真二进制**（`target/debug/corpmail`），不是浏览器里的 HTML

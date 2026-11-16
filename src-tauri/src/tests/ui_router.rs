@@ -30,6 +30,10 @@ struct FakeTester {
     imap_ok: bool,
 }
 
+/// 最近一次 imap() 收到的密码（A3：断言收信页独立密码输入原样传到测试器；
+/// 用 static 而非 FakeTester 字段，避免改动全部 221 处字面量构造）
+static LAST_IMAP_PASSWORD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 impl ConnTester for FakeTester {
     fn smtp(
         &self,
@@ -56,8 +60,12 @@ impl ConnTester for FakeTester {
         _port: u16,
         _mode: crate::net::TlsMode,
         _account: &str,
-        _password: &str,
+        password: &str,
     ) -> TestOutcome {
+        LAST_IMAP_PASSWORD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace_range(.., password);
         TestOutcome {
             ok: self.imap_ok,
             elapsed_ms: 4,
@@ -5139,12 +5147,10 @@ fn settings_send_and_receive_panes_disable_readonly_fields() {
         );
         assert!(!send.contains(field), "{field} 不应出现在发信页");
     }
-    // 可编辑字段不得带禁用态，且只在发信页
-    for field in [
-        "name=\"password\"",
-        "name=\"display_name\"",
-        "name=\"signature\"",
-    ] {
+    // 可编辑字段不得带禁用态。display_name/signature 只在发信页；
+    // password（A3）：发信页保存用 + 收信页 #recv-test-password 测试专用
+    // （仅并入「测试收信」POST，不入任何 form、不随保存提交）
+    for field in ["name=\"display_name\"", "name=\"signature\""] {
         let idx = send
             .find(field)
             .unwrap_or_else(|| panic!("发信页应有可编辑字段 {field}"));
@@ -5155,6 +5161,27 @@ fn settings_send_and_receive_panes_disable_readonly_fields() {
         );
         assert!(!recv.contains(field), "{field} 不应出现在收信页");
     }
+    let pw_idx = send.find("name=\"password\"").expect("发信页应有密码字段");
+    let pw_end = send[pw_idx..].find('>').unwrap() + pw_idx;
+    assert!(
+        !send[pw_idx..pw_end].contains("disabled"),
+        "发信页密码字段必须可编辑"
+    );
+    // 收信页的测试密码输入：可编辑 + 不在任何 form 内（页面无 <form>）
+    let recv_pw = recv
+        .find("name=\"password\"")
+        .expect("A3：收信页应带测试密码输入");
+    let recv_pw_end = recv[recv_pw..].find('>').unwrap() + recv_pw;
+    assert!(
+        recv[..recv_pw_end]
+            .rfind("<form")
+            .is_none_or(|f| { recv[f..recv_pw_end].contains("</form>") }),
+        "收信页密码输入不得处于 form 内（避免随保存提交）"
+    );
+    assert!(
+        !recv[recv_pw..recv_pw_end].contains("disabled"),
+        "收信页测试密码输入必须可编辑"
+    );
     // 登录账号展示为完整地址的只读回显（两页都有）
     assert!(send.contains("demo@chinatelecom.cn") && recv.contains("demo@chinatelecom.cn"));
     assert!(
@@ -9931,5 +9958,106 @@ fn contacts_query_failure_is_reported_not_mistaken_for_empty_list() {
         !html.contains("还没有联系人"),
         "不得把读取失败渲染成空通讯录"
     );
+    cleanup(&dir);
+}
+
+// ---------- A3（audit 2026-11-16）：收信页独立密码输入 ----------
+
+/// A3：收信页拆分后无 form，「测试收信」带不上未保存的新密码——后端回落
+/// 已存旧凭据，改密前无法先验证。修复后页面挂独立 #recv-test-password
+/// 输入并 hx-include，POST 的 password 字段应原样传给 IMAP 测试器
+#[test]
+fn settings_receive_test_imap_takes_typed_password() {
+    let (state, dir) = temp_state("a3-recv-pw");
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    // 页面结构：独立密码输入 + 按钮 hx-include
+    let page = body(&route(
+        &state,
+        &assets(),
+        &req("GET", "/settings/receive", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    ));
+    assert!(
+        page.contains("id=\"recv-test-password\"")
+            && page.contains("type=\"password\"")
+            && page.contains("name=\"password\""),
+        "收信页应含独立密码输入 #recv-test-password：{page}"
+    );
+    assert!(
+        page.contains("hx-include=\"#recv-test-password\""),
+        "测试收信按钮应显式并入该输入：{page}"
+    );
+
+    // 带新密码 POST → 测试器收到 newpw（而非库内旧值）
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/test-imap",
+            &form(&[
+                ("account_prefix", "unit.router"),
+                ("password", "brand-new-pw"),
+                ("recv_host", "imap.test.cn"),
+                ("recv_port", "993"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(
+        LAST_IMAP_PASSWORD.lock().unwrap().as_str(),
+        "brand-new-pw",
+        "POST 的 password 应原样传给 IMAP 测试器（用未保存的新密码测试）"
+    );
+
+    // 回落口径不变：留空 → 已保存凭据（wizard_pairs 的密码）
+    let saved = state
+        .retrieve_password("unit.router@chinatelecom.cn")
+        .into_password()
+        .unwrap_or_default();
+    assert!(!saved.is_empty(), "向导应已存入密码");
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/test-imap",
+            &form(&[
+                ("account_prefix", "unit.router"),
+                ("password", ""),
+                ("recv_host", "imap.test.cn"),
+                ("recv_port", "993"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(
+        LAST_IMAP_PASSWORD.lock().unwrap().as_str(),
+        saved,
+        "留空应回落已保存凭据"
+    );
+    assert!(body(&resp).contains("收信通道"), "应返回收信通道结果");
+    state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }

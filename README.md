@@ -97,8 +97,9 @@ scripts/dev-macos.sh             # 构建 → 重签 → 启动
 cd src-tauri
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -- --test-threads=1    # 单测各自持临时目录 + 钥匙串走 keyfile 分支，须串行
-cargo audit                            # 依赖 CVE 扫描（npm 侧见 e2e/package.json）
-cd .. && ./e2e/run.sh                   # 完整 GUI E2E（三阶段）
+cargo audit                             # 依赖 CVE 扫描（npm 侧见 e2e/package.json）
+cd .. && node --test e2e/unit/*.test.mjs  # 前端行为测试（Node vm 假 DOM/假时钟；已并入 run.sh 第 0 步）
+cd .. && ./e2e/run.sh                   # 完整 GUI E2E（三阶段；第 0 步含前端行为测试）
 ```
 
 E2E 三个阶段：主链路 `specs/*.spec.mjs` → 重装复用 `specs/phase2/08-*` → 生产后台迁移链

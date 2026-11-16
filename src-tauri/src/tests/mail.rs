@@ -1846,3 +1846,54 @@ fn backoff_secs_is_exponential_and_capped() {
     assert_eq!(backoff_secs(3, 60, 600), 240);
     assert_eq!(backoff_secs(5, 60, 600), 600);
 }
+
+// ---------- A14（audit 2026-11-16）：Windows 保存白名单 ----------
+
+/// A14：Windows 白名单抽成平台无关纯函数，macOS 上注入模拟环境量 + `sep='\'`
+/// 断言行为（macOS 无法运行 Windows 测试二进制；windows-gnu 只做 clippy 门禁）。
+/// 旧 4 变量黑名单在 `var_os` 取不到时退化成全放行：
+/// `C:\inetpub\wwwroot\shell.aspx` 一路绿灯
+#[test]
+fn windows_save_whitelist_blocks_system_locations() {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    let env: HashMap<&str, &str> = [
+        ("USERPROFILE", r"C:\Users\e2e"),
+        ("TEMP", r"C:\Users\e2e\AppData\Local\Temp"),
+        ("SystemRoot", r"C:\Windows"),
+    ]
+    .into_iter()
+    .collect();
+    let get = move |k: &str| env.get(k).map(|v| OsString::from(*v));
+    let roots = windows_roots(&get);
+    let judge = |p: &str| allowed(&p.to_lowercase(), &roots, '\\');
+
+    assert!(!judge(r"C:\Windows\System32\x.txt"), "系统目录必须拒绝");
+    assert!(
+        !judge(r"C:\inetpub\wwwroot\shell.aspx"),
+        "Web 根必须拒绝（旧黑名单取不到变量时此处放行）"
+    );
+    assert!(
+        judge(r"C:\Users\e2e\Documents\x.txt"),
+        "用户目录（USERPROFILE 下）放行"
+    );
+    assert!(
+        judge(r"C:\Users\e2e\AppData\Local\Temp\eml\x.eml"),
+        "临时目录放行"
+    );
+    assert!(
+        judge(r"D:\out\x.txt"),
+        "非系统盘任意路径放行（存到 D 盘是常见诉求）"
+    );
+    assert!(judge(r"E:\"), "非系统盘根放行");
+
+    // 环境量全缺失（服务进程/精简环境）：非系统盘白名单兜底仍在，
+    // 系统盘上未放大的位置继续被拦——黑名单形态会退化成全放行
+    let roots2 = windows_roots(&|_| None);
+    let judge2 = |p: &str| allowed(&p.to_lowercase(), &roots2, '\\');
+    assert!(
+        !judge2(r"C:\Windows\System32\x.txt"),
+        "缺环境量时系统目录仍必须拒绝"
+    );
+    assert!(judge2(r"D:\out\x.txt"), "缺环境量时非系统盘仍可用");
+}

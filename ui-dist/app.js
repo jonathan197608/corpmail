@@ -82,9 +82,19 @@ function mbxModalOpen(root, scope) {
 // window.confirm 只会返回 false 且不弹窗，故改用页面内模态（跨平台一致）。
 // message 支持换行（CSS white-space: pre-line）；onLeave 在用户点确认按钮时调用。
 // okLabel/cancelLabel 可选（默认「放弃并离开/继续编辑」，模板降级等场景可换文案）。
-function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
+// onCancel（A10）：取消路径（点遮罩 / 取消按钮 / Esc）回调——发送确认链路用它
+// 清掉本次已置位的确认标志，防止「确认正文 → 主题确认取消 → 改动正文再清空」
+// 后静默跳过正文确认。onLeave 放行分支的语义不变（afterRequest 才是唯一清理点）。
+function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel, onCancel) {
     var old = document.getElementById('mbx-leave-confirm');
-    if (old) old.remove();
+    if (old) {
+        // A17：先释放旧模态的焦点陷阱、解除它设的 inert，再移除节点——只
+        // remove() 会让旧模态留在 body 子节点上的 inert 永远无人解除
+        // （mbxModalOpen 对已 inert 的节点不 push bg，新模态的 release
+        // 覆盖不到它们），后续模态一关，.app 等页面容器就永久不可点
+        if (typeof old.__mbxRelease === 'function') old.__mbxRelease();
+        old.remove();
+    }
     var mask = document.createElement('div');
     mask.id = 'mbx-leave-confirm';
     mask.className = 'mbx-leave-mask';
@@ -99,20 +109,23 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel) {
     mask.querySelector('[data-leave-ok]').textContent = okLabel || '放弃并离开';
     document.body.appendChild(mask);
     // 焦点陷阱 + 背景 inert（R51/R80）：Tab 只在两个按钮间循环，
-    // 焦点回到打开模态前的元素（通常是触发删除的那个按钮）
+    // 焦点回到打开模态前的元素（通常是触发删除的那个按钮）。
+    // A17：release 挂到 mask 上，二次进入 / 外部清理可凭 __mbxRelease 释放
     var release = mbxModalOpen(mask);
-    function close() {
+    mask.__mbxRelease = release;
+    function close(cancelled) {
         release();
         if (mask.parentNode) mask.remove();
+        if (cancelled && onCancel) onCancel();
     }
     mask.addEventListener('click', function (ev) {
-        if (ev.target === mask) { close(); return; } // 点遮罩 = 取消
-        if (ev.target.closest('[data-leave-cancel]')) { close(); return; }
-        if (ev.target.closest('[data-leave-ok]')) { close(); if (onLeave) onLeave(); return; }
+        if (ev.target === mask) { close(true); return; } // 点遮罩 = 取消
+        if (ev.target.closest('[data-leave-cancel]')) { close(true); return; }
+        if (ev.target.closest('[data-leave-ok]')) { close(false); if (onLeave) onLeave(); return; }
     });
     // Esc = 取消
     mask.addEventListener('keydown', function (ev) {
-        if (ev.key === 'Escape') { ev.stopPropagation(); close(); }
+        if (ev.key === 'Escape') { ev.stopPropagation(); close(true); }
     });
 }
 
@@ -295,6 +308,9 @@ async function mbxExportMd(emailId, filename) {
     }
 }
 
+// --- A4 migration modal core START ---
+// （本锚点供 e2e/unit/migration-modal.test.mjs 在 Node vm 中原样执行：
+//  全局状态 + mbxMoveDataDir + 模态开/停/关闭/看门狗/监听/进度/确认链路）
 // 数据目录迁移（M5 后台化）：系统对话框选目录 → POST 启动后台迁移（协议回调秒回，
 // 不再同步跑 VACUUM/附件复制阻塞前端）→ 弹阻塞进度模态，经 __TAURI__.event 收
 // 进度/结果。迁移完成由后端自动退出，用户重开即用新目录。
@@ -345,11 +361,16 @@ async function mbxMoveDataDir() {
             mbxMigCloseModal();
             return;
         }
+        // A4：失败先 abort（停看门狗/解绑/复位/释放焦点陷阱），再写失败文案——
+        // 顺序不能反：ShowError 只改文案不清状态，遗留看门狗 30 分钟后会把
+        // 409 覆盖成「仍在启动」确认态
+        mbxMigAbort();
         // 409（冻结期）等非 2xx：纯文本提示，走失败态 + 「返回」
         mbxMigShowError(res.ok ? '迁移结果无法显示，请刷新存储页确认'
             : (text.trim() || ('HTTP ' + res.status)));
     } catch (e) {
         console.error('[mbx] 迁移启动失败', e);
+        mbxMigAbort();
         mbxMigShowError('迁移启动失败：' + (e && e.message ? e.message : e));
     } finally {
         mbxMoveBusy = false;
@@ -366,6 +387,12 @@ function mbxMigApplyPane(html) {
     if (!next) return false;
     old.replaceWith(next);
     if (window.htmx && typeof window.htmx.process === 'function') window.htmx.process(next);
+    // A12：fetch 换入的 pane 不经 htmx 生命周期，change 检测的 rebaselineAll
+    // 只听 htmx:afterSettle——不派发的话换入的 storage pane 没有基线，
+    // 保存按钮恒可点、改值后离开确认被跳过。detail.target 对齐 htmx 事件形状
+    next.dispatchEvent(new CustomEvent('htmx:afterSettle', {
+        bubbles: true, detail: { target: next }
+    }));
     return true;
 }
 
@@ -468,6 +495,26 @@ function mbxMigStartWatchdog() {
     }, 1000);
 }
 // --- C19 watchdog core END ---
+
+// --- A4 migration abort core START ---
+// 迁移启动失败态的统一清理：停看门狗 + 解绑 Tauri 事件监听 + 复位阶段状态 +
+// 释放焦点陷阱（幂等）。不隐藏遮罩——失败文案留在屏上由 mbxMigShowError 接管
+// （「返回」按钮仍走 migration-close → mbxMigCloseModal）。此前 409 / fetch
+// 异常 / pane 应用失败三条分支只改文案不清理：看门狗按 starting 阶段跑满
+// 30 分钟后把 409 文案覆盖成「仍在启动（是否继续等待）」，用户点继续等待
+// 即永久等一个从未启动的迁移；且定时器/监听/焦点陷阱全部泄漏。
+function mbxMigAbort() {
+    mbxMigStopWatchdog();
+    if (mbxMigUnlisten) {
+        try { mbxMigUnlisten(); } catch (e) { /* 已解绑 */ }
+        mbxMigUnlisten = null;
+    }
+    mbxMigPhase = '';
+    mbxMigLastEvent = 0;
+    var mask = document.getElementById('migrate-mask');
+    if (mask && typeof mask.__mbxRelease === 'function') mask.__mbxRelease();
+}
+// --- A4 migration abort core END ---
 
 // C4：终态统一收起两个动作按钮。旧实现只在 migration-progress 收起「继续等待」，
 // done / error 后确认态按钮仍在：错误态点它会把错误文案覆盖成「继续等待…」并
@@ -585,6 +632,7 @@ function mbxMigKeepWaiting() {
     mbxMigLastEvent = Date.now();
     mbxMigStartWatchdog();
 }
+// --- A4 migration modal core END ---
 
 // 向导页数据目录选择（与设置·存储页 mbxMoveDataDir 同源，仅选目录不迁移——
 // 迁移由向导保存时按表单值处理）：选中后写回表单 input，用户仍可手改
@@ -606,6 +654,10 @@ function mbxPrintEmail() {
 
 // 附件预览（M5）：img / pdf / text 三类内嵌渲染
 // text 类服务端强制 text/plain 返回（防 text/html 脚本执行），前端 pre 渲染
+
+// A5：text 预览的代次令牌（office 分支由 office-preview.js 内部的 state.seq
+// 承担；text 分支的 fetch 不经过那套状态，需要本侧独立的代次）
+let mbxPreviewSeq = 0;
 
 function mbxPreviewAttachment(url, kind, name) {
     const modal = document.getElementById('preview-modal');
@@ -637,15 +689,21 @@ function mbxPreviewAttachment(url, kind, name) {
         frame.title = name;
         body.appendChild(frame);
     } else if (kind === 'text') {
+        // A5：入口先换代次（Office 复位只管 office 状态，text 分支的 fetch
+        // 不在其中）——慢 text 请求完成后若用户已切换到别的附件，直接丢弃，
+        // 不把旧内容追加进新面板、也不把旧错误写进新面板
+        const my = ++mbxPreviewSeq;
         fetch(url)
             .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
             .then(t => {
+                if (my !== mbxPreviewSeq) return; // A5：过期响应丢弃
                 const pre = document.createElement('pre');
                 pre.className = 'pm-text';
                 pre.textContent = t;
                 body.appendChild(pre);
             })
             .catch(() => {
+                if (my !== mbxPreviewSeq) return; // A5：过期错误丢弃
                 body.textContent = '预览加载失败';
             });
     } else {
@@ -859,8 +917,12 @@ function mbxRefreshSide() {
     }
     const side = document.querySelector('aside.side');
     if (side) {
+        // A11：htmx.ajax 返回 Promise，reject（网络/协议层失败）无兜底会成为
+        // unhandledRejection——与 mbxRefreshList 同形补 toast
         htmx.ajax('GET', '/side/frame?folder=' + folder, {
             target: 'aside.side', swap: 'outerHTML'
+        }).catch(function () {
+            if (typeof mbxToast === 'function') mbxToast('侧栏刷新失败', 'err', 6000);
         });
     }
 }
@@ -1596,11 +1658,18 @@ function mbxComposePrecheck(ev) {
         // 重入校验时凭标志放行，避免再次弹窗死循环
         if (elt.dataset.mbxBodyOk !== '1') {
             ev.preventDefault();
+            // A10 onCancel：取消（点遮罩/Esc/返回修改）= 用户回到编辑态——本次
+            // 链路已置位的确认标志全部作废（bodyOk 丢失或 subjOk 残留都会
+            // 让「改完再清空」的下一轮静默跳过确认）。放行分支照旧不清（C14）
+            var resetConfirmed = function () {
+                delete elt.dataset.mbxBodyOk;
+                delete elt.dataset.mbxSubjOk;
+            };
             mbxConfirmLeave('正文为空，仅发送附件，确定吗？', function () {
                 elt.dataset.mbxBodyOk = '1';
                 // 550ms 后重触发：避开按钮 hx-trigger 的 500ms 防抖窗口
                 setTimeout(function () { elt.click(); }, 550);
-            }, '仍要发送', '返回修改');
+            }, '仍要发送', '返回修改', resetConfirmed);
             return;
         }
         // C14：不放行态的 delete 已移除，标志留给 afterRequest 统一清理
@@ -1611,10 +1680,16 @@ function mbxComposePrecheck(ev) {
     if (!field('subject')) {
         if (elt.dataset.mbxSubjOk !== '1') {
             ev.preventDefault();
+            // A10 onCancel：主题确认被取消 = 整条确认链路作废（此时 bodyOk
+            // 常已置位——不清掉就成了 audit A10 的核心复现路径）
+            var resetConfirmed2 = function () {
+                delete elt.dataset.mbxBodyOk;
+                delete elt.dataset.mbxSubjOk;
+            };
             mbxConfirmLeave('主题为空，确定直接发送吗？', function () {
                 elt.dataset.mbxSubjOk = '1';
                 setTimeout(function () { elt.click(); }, 550);
-            }, '仍要发送', '返回修改');
+            }, '仍要发送', '返回修改', resetConfirmed2);
             return;
         }
         // C14：同上，不在放行分支清标志

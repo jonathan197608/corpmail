@@ -8,6 +8,8 @@
 // - iframe sandbox=""（无脚本、无同源），CSP 仅允许 data: 图片与内联样式；
 // - 解析失败时 DOCX/XLSX 可降级纯文本；PPTX 按产品要求提示下载。
 
+// --- A5 office preview core START ---
+// （锚点供 e2e/unit/office-preview.test.mjs 在 Node vm 中执行代次令牌逻辑）
 (function () {
     'use strict';
 
@@ -19,13 +21,18 @@
     const MAX_INLINE_IMAGE = 8 * 1024 * 1024;
     const FETCH_TIMEOUT = 20000;
 
+    // A5 代次令牌：open() 取 ++seq，每个 await 之后与 show* 入口校验
+    // my === state.seq，过期即静默 return——慢附件 A 的完成回调（渲染/错误/
+    // 加载态）绝不覆盖用户已切换到的附件 B 的预览面
     const state = {
         kind: '',
         url: '',
         pv: null,
         wb: null,
         sheets: [],
-        objectUrl: ''
+        objectUrl: '',
+        seq: 0,
+        abortCtrl: null
     };
 
     function $(id) { return document.getElementById(id); }
@@ -66,6 +73,13 @@
 
     // ---------- 状态复位 ----------
     function reset() {
+        // A5：作废所有在途 open（代次 +1 使其后续 await 全部短路），abort 在
+        // 途 fetchBytes（慢附件 A 已发出的请求尽早释放）
+        state.seq++;
+        if (state.abortCtrl) {
+            try { state.abortCtrl.abort(); } catch (e) { /* 忽略 */ }
+            state.abortCtrl = null;
+        }
         if (state.objectUrl) {
             try { URL.revokeObjectURL(state.objectUrl); } catch (e) { /* 忽略 */ }
             state.objectUrl = '';
@@ -95,7 +109,10 @@
     }
 
     async function fetchBytes(url) {
+        // A5：控制器挂到 state——reset()（新附件 open）时在途请求被 abort，
+        // 慢附件的迟到响应不再有覆盖新预览的机会
         const ctrl = new AbortController();
+        state.abortCtrl = ctrl;
         const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
         try {
             const r = await fetch(url, { signal: ctrl.signal });
@@ -209,8 +226,10 @@
             + '<style>' + sanitizeCss(css) + '</style></head><body>' + html + '</body></html>';
     }
 
-    async function showIframe(html, css) {
+    async function showIframe(html, css, my) {
+        if (my !== undefined && my !== state.seq) return; // A5：过期渲染直接丢弃
         const clean = await prepareHtml(html);
+        if (my !== undefined && my !== state.seq) return;
         // 用 Blob URL 承载（Tauri CSP 已允许 frame-src blob:），比 srcdoc 在各
         // WebView 引擎下更一致；sandbox="" 保证无脚本、无同源权限
         if (state.objectUrl) {
@@ -230,7 +249,8 @@
 
     /// 工作表 tab：条在面板内（原生 DOM，可交互），内容仍在 sandbox iframe。
     /// 每个工作表一个 tab，切换即换 iframe 的 blob 内容（不重建解析结果）。
-    async function showSheetTabs(sheets, css) {
+    async function showSheetTabs(sheets, css, my) {
+        if (my !== undefined && my !== state.seq) return; // A5
         const b = bodyEl();
         if (!b) return;
         b.innerHTML = '';
@@ -239,6 +259,7 @@
         for (const s of sheets) {
             cleaned.push({ name: s.name, note: s.note, html: await prepareHtml(s.html) });
         }
+        if (my !== undefined && my !== state.seq) return; // A5：await 后再校验
         const bar = document.createElement('div');
         bar.className = 'pm-sheet-tabs';
         bar.setAttribute('role', 'tablist');
@@ -280,7 +301,8 @@
         show(0);
     }
 
-    function showLoading(text) {
+    function showLoading(text, my) {
+        if (my !== undefined && my !== state.seq) return; // A5
         const b = bodyEl();
         if (!b) return;
         b.innerHTML = '';
@@ -307,7 +329,7 @@
     }
 
     // ---------- DOCX ----------
-    async function renderDocx(buf) {
+    async function renderDocx(buf, my) {
         await loadFor('docx');
         const bodyHost = document.createElement('div');
         const styleHost = document.createElement('div');
@@ -323,7 +345,7 @@
         // styleHost.innerHTML 含 <style> 标签，直接拼会与外层 <style> 嵌套导致
         // DOCX_CSS 失效；取 textContent 得纯 CSS 文本，再由 buildSrcdoc 统一包裹
         const css = styleHost.textContent + DOCX_CSS;
-        await showIframe(bodyHost.innerHTML, css);
+        await showIframe(bodyHost.innerHTML, css, my);
     }
 
     // ---------- XLSX / XLS ----------
@@ -353,7 +375,7 @@
         return r.e.r + 1 > MAX_ROWS || r.e.c + 1 > MAX_COLS;
     }
 
-    async function renderXlsx(buf) {
+    async function renderXlsx(buf, my) {
         await loadFor(state.kind);
         const wb = window.XLSX.read(new Uint8Array(buf), { type: 'array' });
         state.wb = wb;
@@ -370,11 +392,11 @@
                     limitSheet(ws, MAX_ROWS, MAX_COLS), { editable: false })
             };
         });
-        await showSheetTabs(sheets, XLSX_CSS);
+        await showSheetTabs(sheets, XLSX_CSS, my);
     }
 
     // ---------- PPTX ----------
-    async function renderPptx(buf) {
+    async function renderPptx(buf, my) {
         await loadFor('pptx');
         // 先探测幻灯片尺寸（4:3 / 16:9），再按真实宽高比初始化，避免黑边/裁切
         const probeHost = document.createElement('div');
@@ -401,7 +423,8 @@
             if (el) parts.push(el.outerHTML);
         }
         if (!parts.length) throw new Error('幻灯片渲染结果为空。');
-        await showIframe(parts.join('\n'), PPTX_CSS);
+        if (my !== undefined && my !== state.seq) return; // A5
+        await showIframe(parts.join('\n'), PPTX_CSS, my);
     }
     // ---------- 文本兜底 / 错误 ----------
     async function showTextFallback() {
@@ -427,7 +450,8 @@
         }
     }
 
-    function showError(message, allowText) {
+    function showError(message, allowText, my) {
+        if (my !== undefined && my !== state.seq) return; // A5：过期错误不落屏
         const b = bodyEl();
         if (!b) return;
         b.innerHTML = '';
@@ -455,6 +479,9 @@
     // ---------- 入口 ----------
     async function open(url, kind, name) {
         reset();
+        // A5：代次令牌。reset 已 ++seq，本 open 持有的 my 即当前代——此后任何
+        // 新的 open/reset 都会再次 ++seq，本代全部后续 await 校验失败即静默退出
+        const my = ++state.seq;
         state.kind = kind;
         state.url = url;
         const m = modal();
@@ -464,25 +491,32 @@
         p.classList.add('office');
         const nameEl = $('pm-name');
         if (nameEl && name) nameEl.textContent = name;
-        showLoading('正在加载…');
+        showLoading('正在加载…', my);
         try {
             const buf = await fetchBytes(endpoint(url, 'office'));
-            showLoading('正在解析…');
+            if (my !== state.seq) return; // A5：等待期间用户已切换附件
+            showLoading('正在解析…', my);
             // 让浏览器先画一帧加载态，再做同步解析
             await new Promise(r => setTimeout(r, 20));
-            if (kind === 'docx') await renderDocx(buf);
-            else if (kind === 'xlsx' || kind === 'xls') await renderXlsx(buf);
-            else if (kind === 'pptx') await renderPptx(buf);
+            if (my !== state.seq) return;
+            if (kind === 'docx') await renderDocx(buf, my);
+            else if (kind === 'xlsx' || kind === 'xls') await renderXlsx(buf, my);
+            else if (kind === 'pptx') await renderPptx(buf, my);
             else throw new Error('不支持的预览类型');
         } catch (e) {
+            // A5：过期代次的任何错误（含被 abort 的 fetch）不得写进新预览面
+            if (my !== state.seq) return;
             let msg = (e && e.message) ? e.message : '预览失败';
             // PPTX 不做文本降级：解析失败统一提示下载（加密/超限等明确原因保留）
             if (kind === 'pptx' && !/加密|上限|不支持|损坏/.test(msg)) {
                 msg = '该 PPTX 暂无法预览，请下载后用 Microsoft PowerPoint 打开。';
             }
-            showError(msg, kind === 'docx' || kind === 'xlsx' || kind === 'xls');
+            showError(msg, kind === 'docx' || kind === 'xlsx' || kind === 'xls', my);
         }
     }
+
+    // 当前代次只读视图（A5：Node vm 行为测试断言过期代被作废的依据）
+    window.mbxOfficeSeq = function () { return state.seq; };
 
     window.mbxPreviewOffice = function (url, kind, name) {
         if (KINDS.indexOf(kind) < 0) {
@@ -522,3 +556,4 @@
         .pptx-preview-slide-wrapper:last-child { margin-bottom: 0 !important; }
     `;
 })();
+// --- A5 office preview core END ---

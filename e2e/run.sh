@@ -93,14 +93,16 @@ wait_wal_quiet() {
     return 0
 }
 
-# C19/C14/C15/A10：前端状态机与请求编排的**行为**测试（假时钟 / 假 DOM /
-# 假 htmx）。Rust 侧只有 APP_JS.contains 静态护栏，改坏看门狗三元阈值、把
-# 确认标志的 delete 挪回放行分支、删掉刷新 URL 的搜索词拼接、把草稿 flush
-# 挪到迁移 POST 之后都能全绿；这里用 Node vm 直接执行 app.js 里带锚点的
-# core 段，不启动 app、不依赖 wdio 与签名。
+# C19/C14/C15/A10/A4/A5/A11/A17：前端状态机与请求编排的**行为**测试（假时钟 /
+# 假 DOM / 假 htmx / 假 fetch）。Rust 侧只有 APP_JS.contains 静态护栏，改坏看门狗
+# 三元阈值、把确认标志的 delete 挪回放行分支、删掉刷新 URL 的搜索词拼接、把草稿
+# flush 挪到迁移 POST 之后、去掉迁移失败分支的 abort、预览代次校验缺失都能全绿；
+# 这里用 Node vm 直接执行 app.js / office-preview.js 里带锚点的 core 段，
+# 不启动 app、不依赖 wdio 与签名。
+# T1（audit 2026-11-16）：glob 收口——新增 unit/*.test.mjs 自动纳入门禁，
+# 旧实现写死 4 个文件，新增第 5 个永远不被执行、却让人以为门禁会跑
 echo "== 0/7 前端行为测试（node --test unit/） =="
-node --test unit/migration-watchdog.test.mjs unit/compose-confirm.test.mjs \
-    unit/list-refresh.test.mjs unit/migration-draft-flush.test.mjs
+node --test unit/*.test.mjs
 
 echo "== 1/7 构建 E2E 二进制（cargo build --features e2e） =="
 (cd "$ROOT/src-tauri" && cargo build --features e2e)

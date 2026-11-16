@@ -3187,13 +3187,62 @@ pub fn guard_save_dest(state: &AppState, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 路径 `target` 是否位于 `root` 之下（含相等；两侧均已小写归一）
-fn path_within(target: &str, root: &str) -> bool {
+/// 路径 `target` 是否位于 `root` 之下（含相等；两侧均已小写归一），分隔符
+/// 参数化以便 macOS 上以 `sep='\'` 走 Windows 形态的纯函数单测（A14）
+fn path_within_sep(target: &str, root: &str, sep: char) -> bool {
     if root.is_empty() {
         return false;
     }
-    let sep = std::path::MAIN_SEPARATOR;
     target == root || target.starts_with(&format!("{root}{sep}"))
+}
+
+/// 通用白名单判定（平台无关纯函数，A14）：`target`（已归一）是否落在任一
+/// `roots`（已归一）之下。windows 生产分支与 macOS 上的注入式单测共用
+fn allowed(target: &str, roots: &[String], sep: char) -> bool {
+    roots.iter().any(|r| path_within_sep(target, r, sep))
+}
+
+/// Windows 白名单根集合（平台无关纯函数，A14）：环境量经回调注入，
+/// 行为可在 macOS 单测里以模拟变量断言（判定侧 allowed/path_within_sep
+/// 才需要分隔符参数）。
+///
+/// 收集：`%USERPROFILE%`、`%TEMP%`/`%TMP%`、`%LOCALAPPDATA%`（存在才收），
+/// 以及**非系统盘的所有盘符根**（`D:\`…`Z:\`；系统盘取 `%SystemRoot%` 的
+/// 盘符，缺失时按 C 盘兜底——真实安装的系统盘恒有此变量）。
+///
+/// 与旧 4 变量黑名单的差异（audit A14）：黑名单取不到变量时会**退化成全放行**
+/// （`C:\inetpub\wwwroot\shell.aspx`、`C:\Windows\System32\x` 均通过）；
+/// 白名单即使环境量全部缺失，至少仍拦住系统盘根之外的系统目录位置
+/// （系统盘上只有用户目录/临时目录被放大）
+#[cfg(any(windows, test))] // mac 非测试构建不编译（save_dest_allowed 的 unix 分支不用它）
+fn windows_roots(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for key in ["USERPROFILE", "TEMP", "TMP", "LOCALAPPDATA"] {
+        if let Some(v) = get(key) {
+            let low = comparable_path(Path::new(&v));
+            if !low.is_empty() {
+                roots.push(low);
+            }
+        }
+    }
+    let system_drive = get("SystemRoot")
+        .and_then(|v| {
+            let t = v.to_string_lossy();
+            t.trim_start_matches(r"\")
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_uppercase())
+        })
+        .unwrap_or('C');
+    for letter in 'A'..='Z' {
+        if letter != system_drive {
+            // 盘符根收 "d:"（不带尾分隔符）——path_within_sep 匹配时自拼分隔符，
+            // 根里预置会造成 "d:\\" 双分隔符永不匹配
+            let low = letter.to_ascii_lowercase();
+            roots.push(format!("{low}:"));
+        }
+    }
+    roots
 }
 
 #[cfg(not(windows))]
@@ -3208,23 +3257,14 @@ fn save_dest_allowed(p: &Path) -> bool {
     for m in ["/Volumes", "/media", "/mnt"] {
         roots.push(comparable_path(Path::new(m)));
     }
-    roots.iter().any(|r| path_within(&target, r))
+    allowed(&target, &roots, std::path::MAIN_SEPARATOR)
 }
 
 #[cfg(windows)]
 fn save_dest_allowed(p: &Path) -> bool {
     let target = comparable_path(p);
-    let denied: Vec<String> = [
-        "SystemRoot",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramData",
-    ]
-    .iter()
-    .filter_map(std::env::var_os)
-    .map(|v| comparable_path(Path::new(&v)))
-    .collect();
-    !denied.iter().any(|r| path_within(&target, r))
+    let roots = windows_roots(&|k| std::env::var_os(k));
+    allowed(&target, &roots, '\\')
 }
 
 /// 附件是否可导出/可预览：**只查元数据与文件是否存在，不解压不读字节**
