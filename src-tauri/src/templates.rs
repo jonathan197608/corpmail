@@ -37,8 +37,12 @@ pub(crate) const TEMPLATES: &[(&str, &str)] = &[
     ("side.html", include_str!("templates/side.html")),
     ("settings.html", include_str!("templates/settings.html")),
     (
-        "settings_pane_account.html",
-        include_str!("templates/settings_pane_account.html"),
+        "settings_pane_send.html",
+        include_str!("templates/settings_pane_send.html"),
+    ),
+    (
+        "settings_pane_receive.html",
+        include_str!("templates/settings_pane_receive.html"),
     ),
     (
         "settings_pane_sync.html",

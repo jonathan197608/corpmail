@@ -709,23 +709,24 @@ fn dynamic(state: &AppState, req: &Req, tester: &dyn ConnTester) -> Option<Resp>
         ("POST", "/welcome/setup/save") => Some(wizard_save(state, req, tester)),
         ("GET", "/welcome/done") => Some(wizard_done(state)),
         // ?tab=sync 等深链（详情页「远程图片已阻止」提示直达开关所在 pane）
-        ("GET", "/settings") => Some(settings_page(
-            state,
-            req.query_param("tab")
-                .filter(|t| valid_tab(t))
-                .unwrap_or_else(|| "account".into())
-                .as_str(),
-        )),
-        ("GET", "/settings/account")
+        ("GET", "/settings") => {
+            let raw = req.query_param("tab");
+            let tab = normalize_tab(raw.as_deref().unwrap_or("send"));
+            Some(settings_page(state, if valid_tab(tab) { tab } else { "send" }))
+        }
+        // 「账号」是拆分前旧名，保留为 /settings/send 的别名（旧书签/深链）
+        ("GET", "/settings/send")
+        | ("GET", "/settings/receive")
+        | ("GET", "/settings/account")
         | ("GET", "/settings/sync")
         | ("GET", "/settings/storage")
         | ("GET", "/settings/templates")
         | ("GET", "/settings/about") => {
-            let tab = req.path.rsplit('/').next().unwrap_or("account");
+            let tab = normalize_tab(req.path.rsplit('/').next().unwrap_or("send"));
             Some(settings_page(state, tab))
         }
         ("GET", p) if p.starts_with("/settings/panes/") => {
-            let tab = p.strip_prefix("/settings/panes/").unwrap_or("");
+            let tab = normalize_tab(p.strip_prefix("/settings/panes/").unwrap_or(""));
             valid_tab(tab).then(|| settings_pane_fragment(state, tab))
         }
         // B2 邮件模板：保存/删除后回设置页模板片段（htmx 局部刷新）
@@ -800,8 +801,16 @@ fn template_delete(state: &AppState, req: &Req) -> Resp {
     )
 }
 
+/// 原「账号」tab 拆成发信/收信两页后，旧 URL 与旧深链统一落到发信页
+fn normalize_tab(tab: &str) -> &str {
+    if tab == "account" { "send" } else { tab }
+}
+
 fn valid_tab(tab: &str) -> bool {
-    matches!(tab, "account" | "sync" | "storage" | "templates" | "about")
+    matches!(
+        tab,
+        "send" | "receive" | "sync" | "storage" | "templates" | "about"
+    )
 }
 
 // ---------- 页面 ----------
@@ -3179,7 +3188,7 @@ fn wizard_done(state: &AppState) -> Resp {
         reuse_note: (mails > 0).then(|| {
             format!("数据目录中已有 {mails} 封历史邮件，已直接沿用；收件将从既有进度继续增量拉取，不重新全量收取")
         }),
-        // 与应用内账号页同一判定（缓存来源 / 库内 keyfile 记录），刷新完成页仍正确
+        // 与应用内发信页同一判定（缓存来源 / 库内 keyfile 记录），刷新完成页仍正确
         degraded: state.secrets_degraded(&full_address(
             &g(keys::ACCOUNT_PREFIX),
             &g(keys::ACCOUNT_DOMAIN),

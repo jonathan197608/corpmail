@@ -18,6 +18,11 @@ import path from 'node:path'
 const COMPOSE = { to: 'input[name="to_addrs"]', subject: 'input[name="subject"]', body: '#body-text' }
 
 async function openRowBySubject(text) {
+  // 同 07：ui:// 冷启动导航返回时首帧可能尚未渲染，waitBoot() 会立即通过
+  await browser.waitUntil(
+    async () => (await $$('.mail-row')).length > 0,
+    { timeout: 20000, timeoutMsg: '邮件列表 20s 内未渲染出 .mail-row' },
+  )
   const rows = await $$('.mail-row')
   for (const row of rows) {
     if ((await row.getText()).includes(text)) {
@@ -60,6 +65,34 @@ describe('05 撰写与发送', () => {
     )
     expect(opts.some((t) => t.includes('E2E 撰写页预置模板'))).toBe(true)
     await shot('撰写-初始态含模板下拉')
+  })
+
+  it('D1b 撰写页垂直间距：行距 9px、字段行 margin 归零（不再叠加成 26px）', async () => {
+    await goto('/compose')
+    await $('input[name="to_addrs"]').waitForExist({ timeout: 20000 })
+    const m = await browser.execute(() => {
+      const form = document.querySelector('.compose-card form')
+      const fields = [...document.querySelectorAll('.compose-card .sfield')]
+      const gaps = []
+      for (let i = 1; i < fields.length; i++) {
+        gaps.push(Math.round(
+          fields[i].getBoundingClientRect().top - fields[i - 1].getBoundingClientRect().bottom))
+      }
+      const emptyLists = [...document.querySelectorAll('.compose-card .att-list:empty')]
+      return {
+        gap: getComputedStyle(form).rowGap,
+        margins: fields.map((f) => getComputedStyle(f).marginBottom),
+        gaps,
+        emptyListDisplay: emptyLists.map((el) => getComputedStyle(el).display),
+      }
+    })
+    expect(m.gap).toBe('9px')
+    expect(m.margins.every((v) => v === '0px')).toBe(true)
+    expect(m.gaps.length).toBeGreaterThan(0)
+    expect(m.gaps.every((g) => g >= 0 && g <= 12)).toBe(true)
+    expect(m.emptyListDisplay.length).toBeGreaterThan(0)
+    expect(m.emptyListDisplay.every((v) => v === 'none')).toBe(true)
+    await shot('撰写-收紧后的垂直间距')
   })
 
   it('D2 草稿自动保存：停止输入 5s 后 hint 显示「已自动保存」', async () => {

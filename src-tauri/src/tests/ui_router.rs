@@ -2932,7 +2932,7 @@ fn settings_panes_never_show_ct_guides() {
     };
     for path in [
         "/settings",
-        "/settings/account",
+        "/settings/send",
         "/settings/panes/sync",
         "/welcome/setup",
     ] {
@@ -3101,7 +3101,7 @@ fn settings_page_renders_account_pane() {
         html.contains("id=\"settings-pane\""),
         "设置页应含 pane 容器"
     );
-    assert!(html.contains("发信（SMTP）"), "默认打开账号 tab");
+    assert!(html.contains("发信（SMTP）"), "默认打开发信 tab");
     assert!(html.contains("收件同步"), "tab 条应完整");
     // 直接 URL 指定 tab
     let resp = route(
@@ -3332,7 +3332,7 @@ fn remote_images_blocked_until_enabled() {
 
 /// 远程图片被阻止时详情页必须说明「为什么图是空的」并给出开启入口；
 /// 打开开关后提示消失。`/settings?tab=sync` 深链要直达开关所在 pane，
-/// 否则用户点提示后落在账号页、找不到开关（审计 R4/R36）。
+/// 否则用户点提示后落在发信页、找不到开关（审计 R4/R36）。
 #[test]
 fn remote_image_notice_and_settings_deeplink() {
     let (state, dir) = temp_state("remote-notice");
@@ -4072,7 +4072,7 @@ fn wizard_save_prefilled_current_dir_redirects() {
 
 #[test]
 fn settings_account_ignores_readonly_submissions() {
-    // 需求：账号页仅密码与发件显示名可修改。账号/域名/双通道服务器/加密方式
+    // 需求：发信页仅密码与发件显示名可修改。账号/域名/双通道服务器/加密方式
     // 一律取已存值——即使客户端绕过禁用态提交了这些字段也不得生效
     let (state, dir) = temp_state("acc-readonly");
     let _ = route(
@@ -4163,7 +4163,7 @@ fn settings_account_ignores_readonly_submissions() {
 
 #[test]
 fn settings_account_save_requires_configured_account() {
-    // 账号页只读化：账号由首次配置确定——未配置时不得经设置页落库
+    // 发信页只读化：账号由首次配置确定——未配置时不得经设置页落库
     let (state, dir) = temp_state("acc-chg");
     let resp = route(
         &state,
@@ -4443,7 +4443,7 @@ fn dump_smoke_html() {
         ])
         .unwrap();
 
-    // 已配置：完成页 + 主界面 + 设置四 tab
+    // 已配置：完成页 + 主界面 + 设置六 tab
     dump("done.html", get("/welcome/done"));
 
     // M2 种子数据：草稿 ×2 + 收件 ×1（列表/详情/撰写冒烟用）
@@ -4897,7 +4897,8 @@ fn dump_smoke_html() {
         );
     }
 
-    dump("settings-account.html", get("/settings"));
+    dump("settings-send.html", get("/settings"));
+    dump("settings-receive.html", get("/settings/receive"));
     dump("settings-sync.html", get("/settings/sync"));
     dump("settings-storage.html", get("/settings/storage"));
     dump("settings-about.html", get("/settings/about"));
@@ -5094,52 +5095,64 @@ fn router_tolerates_malformed_requests() {
 
 /// 设置·账号：加密方式落盘（conf 键）且端口推断生效；表单非法值回落已存值
 #[test]
-fn settings_account_pane_disables_readonly_fields() {
-    // 需求：账号页只有密码与发件显示名允许修改——其余字段渲染为禁用态
+fn settings_send_and_receive_panes_disable_readonly_fields() {
+    // 需求：发信页拆成发信/收信两页后，发信页只有密码/显示名/签名档可改，
+    // 收信页全为只读回显；各自通道的服务器/端口/加密方式只出现在自己的 pane。
     let (state, dir) = temp_state("acct-readonly-ui");
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let html = body(&route(
-        &state,
-        &assets(),
-        &req("GET", "/settings/account", b""),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    ));
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let html = |path: &str| body(&route(&state, &assets(), &req("GET", path, b""), &tester));
+    let send = html("/settings/send");
+    let recv = html("/settings/receive");
     for field in [
         "name=\"smtp_host\"",
         "name=\"smtp_port\"",
         "name=\"smtp_security\"",
+    ] {
+        let idx = send
+            .find(field)
+            .unwrap_or_else(|| panic!("发信页应有字段 {field}"));
+        let tag_end = send[idx..].find('>').unwrap() + idx;
+        assert!(send[idx..tag_end].contains("disabled"), "{field} 应为禁用态");
+        assert!(!recv.contains(field), "{field} 不应出现在收信页");
+    }
+    for field in [
         "name=\"recv_host\"",
         "name=\"recv_port\"",
         "name=\"recv_security\"",
     ] {
-        let idx = html
+        let idx = recv
             .find(field)
-            .unwrap_or_else(|| panic!("账号页应有字段 {field}"));
-        let tag_end = html[idx..].find('>').unwrap() + idx;
-        assert!(
-            html[idx..tag_end].contains("disabled"),
-            "{field} 应为禁用态：{}",
-            &html[idx..tag_end]
-        );
+            .unwrap_or_else(|| panic!("收信页应有字段 {field}"));
+        let tag_end = recv[idx..].find('>').unwrap() + idx;
+        assert!(recv[idx..tag_end].contains("disabled"), "{field} 应为禁用态");
+        assert!(!send.contains(field), "{field} 不应出现在发信页");
     }
-    // 可编辑字段不得带禁用态
-    for field in ["name=\"password\"", "name=\"display_name\""] {
-        let idx = html.find(field).expect("应有可编辑字段 {field}");
-        let tag_end = html[idx..].find('>').unwrap() + idx;
+    // 可编辑字段不得带禁用态，且只在发信页
+    for field in [
+        "name=\"password\"",
+        "name=\"display_name\"",
+        "name=\"signature\"",
+    ] {
+        let idx = send
+            .find(field)
+            .unwrap_or_else(|| panic!("发信页应有可编辑字段 {field}"));
+        let tag_end = send[idx..].find('>').unwrap() + idx;
         assert!(
-            !html[idx..tag_end].contains("disabled"),
+            !send[idx..tag_end].contains("disabled"),
             "{field} 必须可编辑"
         );
+        assert!(!recv.contains(field), "{field} 不应出现在收信页");
     }
-    // 登录账号展示为完整地址的只读回显
-    assert!(html.contains("demo@chinatelecom.cn"), "应展示完整登录账号");
+    // 登录账号展示为完整地址的只读回显（两页都有）
+    assert!(send.contains("demo@chinatelecom.cn") && recv.contains("demo@chinatelecom.cn"));
     assert!(
-        html.contains("仅可修改密码与发件显示名"),
+        send.contains("仅可修改密码与发件显示名"),
         "应说明可修改范围"
     );
     cleanup(&dir);
@@ -8868,7 +8881,8 @@ fn settings_hints_use_tip_and_no_emoji_icons() {
     };
     // 每个页面至少应有的气泡数（存储页随备份/待生效状态增减，取基础项）
     for (path, min_tips) in [
-        ("/settings/account", 3),
+        ("/settings/send", 3),
+        ("/settings/receive", 1),
         ("/settings/sync", 1),
         ("/settings/storage", 2),
         ("/settings/templates", 2),
@@ -9312,7 +9326,7 @@ fn wizard_rejects_current_dir_store_of_other_account() {
     cleanup(&dir);
 }
 
-/// 发件显示名留空：完成页/侧栏/账号页都从发件箱 From 自动补齐并写回配置
+/// 发件显示名留空：完成页/侧栏/发信页都从发件箱 From 自动补齐并写回配置
 #[test]
 fn display_name_autofill_is_visible_in_ui() {
     let (state, dir) = temp_state("display-ui");
@@ -9361,46 +9375,105 @@ fn display_name_autofill_is_visible_in_ui() {
     let settings = body(&route(&state, &assets(), &req("GET", "/settings", b""), &t));
     assert!(
         settings.contains("value=\"张伟\""),
-        "账号页应回显写回后的显示名"
+        "发信页应回显写回后的显示名"
     );
     cleanup(&dir);
 }
 
-/// 账号页两栏布局：发信 / 收信+签名档并排，且所有字段仍在同一个 form
+/// 发信页拆成发信/收信两页：字段与测试按钮各归其位，旧 URL 与深链仍归一到发信
 #[test]
-fn account_pane_uses_two_column_layout() {
-    let (state, dir) = temp_state("acct-two-col");
+fn settings_account_tab_is_split_into_send_and_receive() {
+    let (state, dir) = temp_state("acct-split");
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let html = body(&route(
+    let tester = FakeTester {
+        smtp_ok: true,
+        imap_ok: true,
+    };
+    let html = |path: &str| body(&route(&state, &assets(), &req("GET", path, b""), &tester));
+    let send = html("/settings/send");
+    let recv = html("/settings/receive");
+
+    // 正向断言：两个 pane 各自的标题、专属字段与提交入口
+    assert!(send.contains("发信（SMTP）") && send.contains("签名档"));
+    assert!(send.contains("hx-post=\"/settings/account/save\""));
+    assert!(send.contains("hx-post=\"/settings/account/test-smtp\""));
+    assert!(recv.contains("收信（IMAP）"));
+    assert!(recv.contains("hx-post=\"/settings/account/test-imap\""));
+    // 互不串页（配合上面的正向断言才有鉴别力）
+    assert!(!send.contains("收信（IMAP）"));
+    assert!(!send.contains("hx-post=\"/settings/account/test-imap\""));
+    assert!(!recv.contains("发信（SMTP）"));
+    assert!(!recv.contains("hx-post=\"/settings/account/save\""));
+    assert!(!recv.contains("name=\"signature\""));
+
+    // 六个 tab 的 tab 条与片段路由都可达
+    for tab in ["send", "receive", "sync", "storage", "templates", "about"] {
+        assert!(
+            send.contains(&format!("hx-get=\"/settings/panes/{tab}\"")),
+            "tab 条缺 {tab}"
+        );
+        let resp = route(
+            &state,
+            &assets(),
+            &req("GET", &format!("/settings/panes/{tab}"), b""),
+            &tester,
+        );
+        assert_eq!(resp.status, 200, "pane {tab} 应可渲染");
+        assert!(!body(&resp).contains("<html"), "pane {tab} 应为片段");
+    }
+    // 旧 URL / 旧深链 / 旧 pane 片段别名归一到发信
+    let alias = html("/settings/account");
+    assert!(alias.contains("发信（SMTP）") && !alias.contains("收信（IMAP）"));
+    let mut deep = req("GET", "/settings", b"");
+    deep.query = "tab=account".into();
+    let deep_html = body(&route(&state, &assets(), &deep, &tester));
+    assert!(
+        deep_html.contains("发信（SMTP）"),
+        "旧 ?tab=account 深链应归一到发信"
+    );
+    let frag = html("/settings/panes/account");
+    assert!(
+        frag.contains("发信（SMTP）") && !frag.contains("<html"),
+        "旧 pane 别名应回发信片段"
+    );
+    // 非法 tab 仍 404（别名归一化不能吞掉校验）
+    let bad = route(
         &state,
         &assets(),
-        &req("GET", "/settings/account", b""),
-        &FakeTester {
-            smtp_ok: true,
-            imap_ok: true,
-        },
-    ));
-    assert!(html.contains("class=\"settings-pane on account-pane\""));
-    assert!(html.contains("class=\"account-grid\""), "应为两栏容器");
-    assert!(html.contains("class=\"acct-side\""), "右栏应存在");
-    assert!(html.contains("rows=\"3\""), "签名档默认 3 行以压缩高度");
-    let a = html.find("<form").unwrap();
-    let b = html.find("</form>").unwrap();
-    for field in [
-        "name=\"password\"",
-        "name=\"display_name\"",
-        "name=\"signature\"",
-        "hx-post=\"/settings/account/test-smtp\"",
-        "hx-post=\"/settings/account/test-imap\"",
-    ] {
-        let at = html
-            .find(field)
-            .unwrap_or_else(|| panic!("缺少字段 {field}"));
-        assert!(at > a && at < b, "{field} 必须留在同一个 form 内");
-    }
+        &req("GET", "/settings/panes/nope", b""),
+        &tester,
+    );
+    assert_eq!(bad.status, 404);
+    // 旧两栏布局已移除，字段统一走 .sfield 左标签右控件
+    assert!(!send.contains("account-grid"));
+    assert!(!send.contains("class=\"pair\""));
+    assert!(
+        send.matches("class=\"sfield").count() >= 6,
+        "发信页字段应全部为 .sfield 行"
+    );
+    assert!(
+        recv.matches("class=\"sfield").count() >= 3,
+        "收信页字段应全部为 .sfield 行"
+    );
+    assert!(send.contains("rows=\"3\""), "签名档默认 3 行");
     cleanup(&dir);
+}
+
+/// 固定宽度与撰写页间距：CSS 令牌/作用域规则钉死；
+/// 真实对齐与行距由 E2E 03/05 的 getBoundingClientRect 断言覆盖
+#[test]
+fn settings_form_width_and_compose_spacing_are_pinned_in_css() {
+    let css = include_str!("../../../ui-dist/app.css");
+    assert!(css.contains("--settings-form-width: 760px;"));
+    assert!(css.contains("--settings-label-width: 148px;"));
+    assert!(css.contains("width: min(var(--settings-form-width), 100%);"));
+    assert!(css.contains("grid-template-columns: var(--settings-label-width) minmax(0, 1fr);"));
+    assert!(css.contains(".compose-card .sfield { margin-bottom: 0; }"));
+    assert!(css.contains(".att-list:empty { display: none; }"));
+    assert!(!css.contains(".account-grid {"), "旧两栏 CSS 不应残留");
+    assert!(!css.contains(".pf input {"), "旧 .pair 双字段 CSS 不应残留");
 }
 
 /// 首启向导两栏布局（2026-11-11）：账号凭据+数据目录在左、服务器+拉取范围在右。

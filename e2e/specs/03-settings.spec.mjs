@@ -1,15 +1,40 @@
 import { browser, $, expect } from '@wdio/globals'
 import { goto, shot, waitBoot, openSplit } from '../support/helpers.mjs'
 
+// pane 有 0.16s 入场动画（opacity 0→1）；waitForExist 会在首帧就通过，
+// 直接截图会得到半透明页面。截图前等动画落定，断言本身不受 opacity 影响。
+async function waitPaneVisible() {
+  await browser.waitUntil(
+    async () => browser.execute(() =>
+      getComputedStyle(document.getElementById('settings-pane')).opacity === '1'),
+    { timeout: 5000, timeoutMsg: '设置 pane 入场动画未结束' },
+  )
+}
+
 // 03：设置页签 + 收件状态条 + 连接测试（E1–E5 / F1）
 // 数据目录迁移（A6）已移到 95-migration：迁移成功会冻结整个进程的写入（R2），
 // 必须放在主链路最末，否则其后的 04-07 全部写不进去
 describe('03 设置与收件状态', () => {
-  it('账号页签：显示当前账号与凭据保管状态', async () => {
+  it('发信页签：显示当前账号与凭据保管状态', async () => {
     await goto('/settings')
     const text = await $('body').getText()
     expect(text).toContain('e2e@corpmail.test')
-    await shot('设置-账号')
+    expect(text).toContain('发信（SMTP）')
+    await shot('设置-发信')
+  })
+
+  it('收信页签：IMAP 只读回显，测试收信入口在本页', async () => {
+    await goto('/settings/receive')
+    await $('#settings-pane').waitForExist({ timeout: 20000 })
+    const text = await $('#settings-pane').getText()
+    expect(text).toContain('收信（IMAP）')
+    expect(text).not.toContain('发信（SMTP）')
+    await expect($('input[name="recv_host"]')).toBeExisting()
+    await expect($('button[hx-post="/settings/account/test-imap"]')).toBeExisting()
+    // 收信页没有可编辑字段 → 不放保存表单，避免误导用户
+    expect(await $('#settings-pane form').isExisting()).toBe(false)
+    await waitPaneVisible()
+    await shot('设置-收信')
   })
 
   it('同步页签：间隔与首拉范围回显已保存值', async () => {
@@ -27,7 +52,7 @@ describe('03 设置与收件状态', () => {
   })
 
   it('E3 连接测试按钮：SMTP/IMAP 双通道打真 mock 显示结果', async () => {
-    await goto('/settings/account')
+    await goto('/settings/send')
     const smtpBtn = await $('button[hx-post="/settings/account/test-smtp"]')
     await smtpBtn.click()
     await browser.waitUntil(
@@ -42,6 +67,9 @@ describe('03 设置与收件状态', () => {
     expect(smtpText).not.toContain('失败')
     await shot('设置-SMTP测试通过')
 
+    // 收信测试已拆到独立页：同一页不再同时存在两个通道的按钮
+    await goto('/settings/receive')
+    await $('#settings-pane').waitForExist({ timeout: 20000 })
     await $('button[hx-post="/settings/account/test-imap"]').click()
     await browser.waitUntil(
       async () => (await $('#imap-result').getText()).length > 0,
@@ -51,6 +79,57 @@ describe('03 设置与收件状态', () => {
     expect(imapText).toContain('收信通道')
     expect(imapText).not.toContain('失败')
     await shot('设置-IMAP测试通过')
+  })
+
+  it('设置表单固定宽度：六个 tab 同宽，发信页标签左对齐 / 控件右对齐', async () => {
+    const widths = []
+    for (const tab of ['send', 'receive', 'sync', 'storage', 'templates', 'about']) {
+      await goto(`/settings/${tab}`)
+      await $('#settings-pane').waitForExist({ timeout: 20000 })
+      widths.push(
+        await browser.execute(() =>
+          Math.round(document.getElementById('settings-pane').getBoundingClientRect().width),
+        ),
+      )
+    }
+    expect(new Set(widths).size).toBe(1)
+    expect(widths[0]).toBeLessThanOrEqual(760)
+    expect(widths[0]).toBeGreaterThan(0)
+
+    await goto('/settings/send')
+    await $('#settings-pane').waitForExist({ timeout: 20000 })
+    const m = await browser.execute(() => {
+      const declared = getComputedStyle(document.documentElement)
+        .getPropertyValue('--settings-form-width').trim()
+      const pane = document.getElementById('settings-pane')
+      const fields = [...pane.querySelectorAll('.sfield')]
+      const rights = [...new Set(fields.map((f) =>
+        Math.round(f.lastElementChild.getBoundingClientRect().right)))]
+      const lefts = [...new Set(fields.map((f) =>
+        Math.round(f.querySelector('label').getBoundingClientRect().left)))]
+      const actions = pane.querySelector('.settings-actions')
+      const save = actions.querySelector('button[type="submit"]')
+      const s = document.querySelector('.settings')
+      const cs = getComputedStyle(s)
+      const avail = s.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+      return {
+        declared,
+        width: Math.round(pane.getBoundingClientRect().width),
+        expected: Math.min(760, Math.round(avail)),
+        rights,
+        lefts,
+        saveRight: Math.round(save.getBoundingClientRect().right),
+        justify: getComputedStyle(actions).justifyContent,
+      }
+    })
+    expect(m.declared).toBe('760px')
+    expect(m.width).toBe(m.expected)
+    expect(m.lefts.length).toBe(1) // 所有标签左边缘同线
+    expect(m.rights.length).toBe(1) // 所有控件右边缘同线
+    expect(m.saveRight).toBe(m.rights[0]) // 动作行也收在控件右边缘
+    expect(m.justify).toBe('flex-end')
+    await waitPaneVisible()
+    await shot('设置-固定宽度与对齐')
   })
 
   it('E2b 同步间隔保存回显：改 5 分钟提交 → pane 回显 5', async () => {

@@ -1,4 +1,4 @@
-//! 设置页子系统：四 tab（账号/收件同步/存储管理/关于）的页面/片段渲染与表单保存
+//! 设置页子系统：六 tab（发信/收信/收件同步/存储管理/模板/关于）的页面/片段渲染与表单保存
 //!
 //! 与 router.rs 拆分边界：SettingsCtx/CleanView/BackupDeleteView 模板上下文、
 //! settings_* 系列 handler、账号凭据迁移、存储迁移/清理/备份删除交互。
@@ -19,12 +19,12 @@ use std::collections::HashMap;
 const INLINE_ATTACH_MIN_MB: u32 = 1;
 const INLINE_ATTACH_MAX_MB: u32 = 2048;
 
-/// 设置页（四 tab 全量上下文：整页与 pane 片段共用一份）
+/// 设置页（六 tab 全量上下文：整页与 pane 片段共用一份）
 #[derive(Serialize)]
 pub(super) struct SettingsCtx {
     frame: FrameCtx,
     tab: String,
-    // 账号 tab
+    // 发信 / 收信 tab
     smtp_host: String,
     smtp_port: String,
     /// 加密方式（auto|implicit|starttls|plain；auto = 按端口推断）
@@ -282,10 +282,11 @@ pub(super) fn settings_ctx(
     }
 }
 
-pub(super) fn account_pane(state: &AppState, saved: bool, error: &str) -> Resp {
+/// 发信 pane：账号保存后的回显（成功提示 / 失败原因都在这张卡里）
+pub(super) fn send_pane(state: &AppState, saved: bool, error: &str) -> Resp {
     render_html(
-        &pane_template("account"),
-        &settings_ctx(state, "account", saved, error, None, None),
+        &pane_template("send"),
+        &settings_ctx(state, "send", saved, error, None, None),
     )
 }
 
@@ -312,8 +313,8 @@ pub(super) fn storage_pane_error(state: &AppState, error: &str) -> Resp {
     )
 }
 
-/// 设置·账号 tab：测试连接（SMTP）/测试收信（IMAP）
-/// 密码取值：表单优先，留空读已保存凭据（设计 §8.2）
+/// 设置·发信页「测试连接」/ 收信页「测试收信」：双通道打 ConnTester
+/// 密码取值：表单优先，留空读已保存凭据（收信页无密码框，走回落；设计 §8.2）
 pub(super) fn settings_account_test(
     state: &AppState,
     req: &Req,
@@ -321,7 +322,7 @@ pub(super) fn settings_account_test(
     imap_channel: bool,
 ) -> Resp {
     let form = parse_form(&req.body);
-    // 账号页仅密码/显示名可改：账号字段为禁用态（不随表单提交），
+    // 发信页仅密码/显示名/签名档可改：账号字段为禁用态（不随表单提交），
     // 缺失时回落到已存配置——测试连接的意义是校验"新密码 + 现有服务器"
     let (prefix, domain) = match trimmed_field(&form, "account_prefix") {
         Some(p) => (p, domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT)),
@@ -380,7 +381,7 @@ pub(super) fn settings_account_test(
     test_fragment(vec![test_view(label, &outcome)], "", true)
 }
 
-/// 账号配置键值对装配（向导"测试并保存"与设置·账号 tab 保存共用）：
+/// 账号配置键值对装配（向导"测试并保存"与设置·发信页保存共用）：
 /// 账号三要素 + 双通道主机/端口/加密方式。端口与方式传字符串（表单/已存值统一形态）
 #[allow(clippy::too_many_arguments)]
 pub(super) fn account_pairs<'a>(
@@ -407,7 +408,7 @@ pub(super) fn account_pairs<'a>(
     ]
 }
 
-/// 设置·账号 tab：保存。**仅允许修改密码与发件显示名**——账号/域名/双通道
+/// 设置·发信 tab：保存。**仅允许修改密码、发件显示名与签名档**——账号/域名/双通道
 /// 服务器与加密方式由首次配置确定：一律取已存值，表单同名字段被忽略
 /// （页面渲染为禁用态不提交；服务端再拦一道，防绕过 UI 的提交改掉配置）。
 /// 密码留空 = 不变。
@@ -416,7 +417,7 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     let d = defaults();
     let prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
     if prefix.is_empty() {
-        return account_pane(state, false, "尚未配置账号，请先完成首次配置向导");
+        return send_pane(state, false, "尚未配置账号，请先完成首次配置向导");
     }
     let account = full_address(
         &prefix,
@@ -461,7 +462,7 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         &recv_security,
     )
     .to_vec();
-    // 签名档随账号 tab 一并保存（多行文本，空 = 不启用）
+    // 签名档随发信 tab 一并保存（多行文本，空 = 不启用）
     pairs.push((keys::SIGNATURE, signature.as_str()));
     // 用户主动清空显示名 → 写标记阻止自动推断回填；重新填写 → 清标记。
     // 自动推断本身不写此标记（审计 C2：避免错误结果被永久固化）
@@ -471,15 +472,15 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     ));
     // 1) 配置先落盘：写失败即返回，凭据保持原样（旧密码不会因配置失败而丢失）
     if let Err(e) = state.set_batch(&pairs) {
-        return account_pane(state, false, &format!("保存失败：{e}"));
+        return send_pane(state, false, &format!("保存失败：{e}"));
     }
     // 2) 配置已生效再写凭据（失败时配置不回滚，但已存密码不会被清掉）
     if let Some(p) = trimmed_field(&form, "password")
         && let Err(e) = state.store_password(&account, &p)
     {
-        return account_pane(state, false, &format!("密码保存失败：{e}"));
+        return send_pane(state, false, &format!("密码保存失败：{e}"));
     }
-    account_pane(state, true, "")
+    send_pane(state, true, "")
 }
 
 /// 设置·收件同步 tab：保存（参数在 M4 收件实施时生效）

@@ -21,6 +21,13 @@ function exportDir() {
 }
 
 async function openRowBySubject(text) {
+  // ui:// 下 navigateTo 返回时首帧可能仍是上一页（上一 spec 停在设置模板页时
+  // 截图已复现），#boot 不存在会让 waitBoot() 立即通过。必须等目标容器出现，
+  // 否则会偶发「列表中找不到 XXX」的假失败。
+  await browser.waitUntil(
+    async () => (await $$('.mail-row')).length > 0,
+    { timeout: 20000, timeoutMsg: '邮件列表 20s 内未渲染出 .mail-row' },
+  )
   const rows = await $$('.mail-row')
   for (const row of rows) {
     if ((await row.getText()).includes(text)) {

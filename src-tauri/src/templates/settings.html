@@ -14,8 +14,10 @@
         </div>
 
         <div class="settings-tabs">
-            <span class="stab{% if tab == "account" %} on{% endif %}" hx-get="/settings/panes/account"
-                hx-target="#settings-pane" hx-swap="outerHTML">账号</span>
+            <span class="stab{% if tab == "send" %} on{% endif %}" hx-get="/settings/panes/send"
+                hx-target="#settings-pane" hx-swap="outerHTML">发信</span>
+            <span class="stab{% if tab == "receive" %} on{% endif %}" hx-get="/settings/panes/receive"
+                hx-target="#settings-pane" hx-swap="outerHTML">收信</span>
             <span class="stab{% if tab == "sync" %} on{% endif %}" hx-get="/settings/panes/sync"
                 hx-target="#settings-pane" hx-swap="outerHTML">收件同步</span>
             <span class="stab{% if tab == "storage" %} on{% endif %}" hx-get="/settings/panes/storage"
