@@ -2515,8 +2515,8 @@ fn attachment_views(conn: &rusqlite::Connection, email_id: i64) -> Vec<AttachVie
 /// 星标翻转（M2-1）：单语句原子取反，返回翻转后的状态。
 /// 本地语义（不上 IMAP）；收件同步按 remote_uid 查重后仅 INSERT 新行、
 /// 不 UPDATE 已有行，星标不会被同步覆盖（recv.rs store_incoming_conn）。
-/// None = 邮件不存在（404）
-pub fn toggle_star(state: &AppState, id: i64) -> Option<bool> {
+/// None = 邮件不存在（404）；Err = 写库失败（P3-2：不再吞成 404）
+pub fn toggle_star(state: &AppState, id: i64) -> Result<Option<bool>, String> {
     let flipped: Result<Option<bool>, String> = state.with_conn(|conn| {
         let changed = conn
             .execute(
@@ -2534,7 +2534,9 @@ pub fn toggle_star(state: &AppState, id: i64) -> Option<bool> {
             .map_err(e)?;
         Ok(Some(v == 1))
     });
-    flipped.unwrap_or(None)
+    // P3-2：写失败不再被 unwrap_or(None) 吞成「行不存在」——
+    // 否则 router 回 not_found / 不 emit 事件，用户以为操作成功
+    flipped
 }
 
 /// 本地标记已读（IMAP 服务器回写由 seen worker 批量完成；§6.1）。
@@ -2565,16 +2567,19 @@ pub fn mark_read(state: &AppState, id: i64) -> Result<bool, String> {
 }
 
 /// 标为未读（A5 配套）：详情页主动留待办。只改本地 unread，
-/// 不写 seen_pending（IMAP 无"反向已读"语义，不存在要回写的操作）。
-/// 返回是否发生翻转（已是未读时为 false，幂等）。
-pub fn mark_unread(state: &AppState, id: i64) -> bool {
+/// 不向服务器写反向已读（IMAP 的 STORE -Seen 有副作用，不在本地撤销时用）。
+/// P2-2：但同时必须清 seen_pending——否则打开邮件写入的待回写标志会在 1.5s
+/// 合并窗口后被 worker 执行 `STORE +FLAGS (\Seen)`，把用户刚标的未读又覆盖成
+/// 服务器已读，本地/服务器状态长期不一致。
+/// 返回是否发生翻转（已是未读时为 false，幂等）；写库失败以 Err 传播（P3-2）。
+pub fn mark_unread(state: &AppState, id: i64) -> Result<bool, String> {
     state.with_conn(|conn| {
         conn.execute(
-            "UPDATE emails SET unread = 1 WHERE id = ?1 AND unread = 0",
+            "UPDATE emails SET unread = 1, seen_pending = 0 WHERE id = ?1 AND unread = 0",
             [id],
         )
         .map(|n| n == 1)
-        .unwrap_or(false)
+        .map_err(e)
     })
 }
 
@@ -2725,7 +2730,8 @@ pub(crate) fn collapse_control(s: &str) -> String {
 /// 文件名净化：非法字符与控制字符统一替换为 `_`，按字节截断到 200
 /// （文件名组件上限通常 255 字节；中文多字节需按字节而非字符计）。
 /// 入参来自邮件 MIME 头的 filename——恶意邮件可控，是落盘路径的唯一屏障。
-fn safe_filename(name: &str) -> String {
+/// P1-1：inline_images[].name 也走这里（ui/router.rs 源头 + insert_attachment 兜底）。
+pub(crate) fn safe_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len().min(200));
     let mut bytes = 0usize;
     for c in name.chars() {
@@ -2765,6 +2771,9 @@ fn insert_attachment(
     orig: &[u8],
     written: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
+    // P1-1 写盘兜底：所有调用点（含 inline_images / 转发复制 / 收件）统一净化，
+    // 防止任一出口忘记净化导致 `..` 或分隔符穿越 root。safe_filename 幂等。
+    let filename = safe_filename(filename);
     let gz = gzip(orig).map_err(e)?;
     let sha = hex_sha256(orig);
     let size_orig = orig.len() as i64;
@@ -2876,6 +2885,8 @@ pub fn add_attachments(
     // 拒绝读取库/密钥/配置自身（防"读库+读密钥 → 外泄 keyfile 密码"原语）
     for p in paths {
         guard_sensitive_path(state, p)?;
+        // P2-3 读来源白名单（对称写目标 guard_save_dest）
+        guard_attach_source(p)?;
     }
     let result = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
@@ -3143,6 +3154,37 @@ pub fn guard_sensitive_path(state: &AppState, raw: &str) -> Result<(), String> {
     if hit {
         return Err(format!(
             "目标路径属于应用数据文件（数据库/密钥/配置），已拒绝：{raw}"
+        ));
+    }
+    Ok(())
+}
+
+/// 附件读来源白名单（P2-3）：`attach_paths` 来自表单，与 guard_save_dest 对称。
+/// 一旦 WebView 被注入，脚本可伪造 POST 把任意本地文件（ssh 私钥等）加入草稿
+/// 并在撤销窗口后自动外发——写目标已有白名单，读来源此前只有 3 个应用文件的
+/// 黑名单。规则与写一致：绝对路径、无 `..`、落在用户目录/临时/外部卷。
+pub fn guard_attach_source(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("附件路径为空".to_string());
+    }
+    let p = Path::new(raw);
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("附件路径不能包含 ..：{raw}"));
+    }
+    if !p.is_absolute() {
+        return Err(format!("附件路径必须是绝对路径：{raw}"));
+    }
+    // 符号链接指向白名单外文件同样要拒绝（metadata 跟随、这里用 symlink_metadata）
+    if let Ok(md) = std::fs::symlink_metadata(p)
+        && md.file_type().is_symlink()
+    {
+        return Err(format!("附件不能是符号链接：{raw}"));
+    }
+    if !save_dest_allowed(p) {
+        return Err(format!(
+            "为安全起见，只能添加用户目录、临时目录或外部磁盘中的文件：{raw}"
         ));
     }
     Ok(())

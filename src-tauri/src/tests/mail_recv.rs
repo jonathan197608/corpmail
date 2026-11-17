@@ -1033,3 +1033,35 @@ fn fetch_loop_routes_every_returned_uid_through_placeholder_guard() {
     );
     assert!(!body.contains("无 BODY，跳过"), "缺 BODY 不得再被静默跳过");
 }
+
+#[test]
+fn fetch_missing_uid_also_drops_placeholder_not_skip() {
+    // P1-2：FETCH 完全未返回某 UID 时，仍必须落占位。否则该 UID 计入
+    // batch_uids 抬高游标 bmax、却无库行，下一轮增量不再包含它 → 永久漏收
+    let body = &RECV_RS[RECV_RS.find("for &uid in &run.uids").unwrap()..];
+    let body = &body[..body.find("// 双阈值 flush").unwrap()];
+    // 定位 None 兜底分支（在 None if run.over 之后）
+    let none_pos = body.rfind("None =>").unwrap();
+    let tail = &body[none_pos..];
+    assert!(
+        tail.contains("placeholder_mail("),
+        "服务器未返回的 UID 必须落最小占位，不得静默跳过"
+    );
+    assert!(
+        !tail.contains("跳过"),
+        "不得保留旧的静默跳过文案（游标越过即漏收）"
+    );
+}
+
+#[test]
+fn resolve_uids_guards_u32_max_cursor() {
+    // P3-1：last.uid= u32::MAX 时 +1 溢出（debug panic / release wrap 空转），
+    // 必须用 checked_add 并提前返回等待 UIDVALIDITY 变化
+    let body = &RECV_RS[RECV_RS.find("fn resolve_uids").unwrap()..];
+    let body = &body[..body.find("uids.sort_unstable()").unwrap()];
+    assert!(body.contains("checked_add(1)"), "UID 游标 +1 必须防溢出");
+    assert!(
+        body.contains("return Ok(Vec::new())"),
+        "u32::MAX 时应直接返回空、等 UIDVALIDITY 变化"
+    );
+}

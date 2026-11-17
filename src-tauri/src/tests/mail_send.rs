@@ -774,6 +774,60 @@ fn dispatch_due_scheduled_picks_only_due_drafts() {
     cleanup(&dir);
 }
 
+/// P1-3 静态护栏：dispatch 的 draft→queued UPDATE 必须带 scheduled_at 到点条件，
+/// 且与 SELECT 同处一个 with_conn 事务闭包内。单线程变异无法鉴别并发 TOCTOU，
+/// 用源码形态断言挡住"拆开事务/去掉条件"的回归。
+#[test]
+fn dispatch_enqueue_is_transactional_with_sched_condition() {
+    const SEND_SRC: &str = include_str!("../mail/send.rs");
+    let start = SEND_SRC
+        .find("pub fn dispatch_due_scheduled")
+        .expect("dispatch 函数存在");
+    let end = SEND_SRC[start..]
+        .find("\n}\n")
+        .map(|p| start + p)
+        .unwrap_or(SEND_SRC.len());
+    let body = &SEND_SRC[start..end];
+    assert!(body.contains("with_conn(|conn|"), "SELECT+UPDATE 须在同一 with_conn 闭包");
+    assert!(body.contains("conn.transaction()"), "须在同一事务内");
+    let upd = body
+        .find("UPDATE emails SET status = 'queued'")
+        .expect("存在到点入队 UPDATE");
+    let tail = &body[upd..];
+    assert!(
+        tail.contains("scheduled_at > 0") && tail.contains("scheduled_at <= ?2"),
+        "入队 UPDATE 必须复核 scheduled_at 到点，防撤销 TOCTOU"
+    );
+    // 不得再调用旧的 enqueue_draft（它只判 status，是 TOCTOU 根因）
+    assert!(!body.contains("enqueue_draft(state, id)"), "不得回退到非原子 enqueue_draft");
+}
+
+/// P1-3 撤销 TOCTOU：dispatch 的条件 UPDATE 必须在 scheduled_at 被清 0 后拒绝入队。
+/// 即使拿到一个"到点草稿"的 id，只要 cancel 已把 scheduled_at 清零，
+/// 就不允许从 draft 转 queued（否则用户看到"已撤销"后邮件照样发出）。
+#[test]
+fn dispatch_does_not_enqueue_after_scheduled_at_cleared() {
+    let (state, dir) = temp_state("sched-undo-toctou");
+    let now = now_epoch();
+    let id = save_draft(
+        &state,
+        &DraftInput {
+            scheduled_at: now - 60,
+            ..draft("撤销后不得发", "内容")
+        },
+    )
+    .unwrap();
+    // 模拟 cancel_scheduled_send 在派发前介入：status 仍 draft，scheduled_at 清 0
+    assert!(cancel_scheduled_send(&state, id));
+    assert_eq!(dispatch_due_scheduled(&state), 0, "已撤销的定时草稿不得派发");
+    let status: String = state.with_conn(|c| {
+        c.query_row("SELECT status FROM emails WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(status, "draft", "撤销后必须保持草稿态，不得被入队");
+    cleanup(&dir);
+}
+
 /// enqueue 路径清定时（M4-2）：立即发送一个定时草稿 → queued 且 scheduled_at 归零
 #[test]
 fn enqueue_draft_clears_scheduled_at() {

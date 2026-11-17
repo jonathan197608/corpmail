@@ -91,6 +91,25 @@ fn cleanup(dir: &std::path::PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn p1_inline_image_name_is_sanitized_before_filename_build() {
+    // P1-1 源头：f.name 客户端可控，`../` 与分隔符必须被 safe_filename 替换，
+    // 否则原样进入 add_inline_images 的相对路径造成落盘穿越
+    let mut form: HashMap<String, String> = HashMap::new();
+    form.insert(
+        "inline_images".to_string(),
+        r#"[{"name":"x/../../../../tmp/pwned\\evil.png","mime":"image/png","data":"AQID"}]"#.to_string(),
+    );
+    let imgs = parse_inline_images(&form);
+    assert_eq!(imgs.len(), 1, "合法 base64 应解码为一张图");
+    let name = &imgs[0].filename;
+    assert!(!name.contains('/'), "filename 不得含 /：{name}");
+    assert!(!name.contains('\\'), "filename 不得含 \\：{name}");
+    // 无分隔符的 `..` 不是路径组件（OS 不会把 `x_.._.._tmp` 解析为穿越）；
+    // 真正的不变式是分隔符已被替换，见 insert_attachment 兜底测试
+    assert!(name.starts_with("image-"), "仍保留前缀：{name}");
+}
+
 fn req(method: &str, path: &str, body: &[u8]) -> Req {
     Req {
         method: method.to_string(),
@@ -1646,6 +1665,89 @@ fn compose_draft_with_attachments_and_keep_ids() {
     );
     let detail = mail::get(&state, 1).unwrap();
     assert_eq!(detail.attach_cnt, 0, "keep_ids 空应裁剪全部既有附件");
+    cleanup(&dir);
+}
+
+#[test]
+fn p1_past_scheduled_at_rejected_on_every_compose_entry() {
+    // P1-4：过去时刻不得经任何入口（存草稿为这里覆盖的代表）落库，
+    // 否则调度线程当轮即发出，用户以为只是存草稿
+    let (state, dir) = temp_state("p14-past-sched");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let past = mail::sched_local_value(mail::now_epoch() - 3600);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("subject", "过去时刻"),
+                ("body_text", "正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+                ("scheduled_at", &past),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    // 拒绝：不应出现 saved=1 的成功跳转
+    let saved = resp.extra_headers.iter().any(|(k, v)| k == "HX-Redirect" && v.contains("saved=1"));
+    assert!(!saved, "过去时刻必须被拒绝，不得存草稿成功");
+    let cnt: i64 = state.with_conn(|c| {
+        c.query_row("SELECT count(*) FROM emails WHERE folder='draft'", [], |r| r.get(0)).unwrap()
+    });
+    assert_eq!(cnt, 0, "过去时刻不得落库");
+    cleanup(&dir);
+}
+
+#[test]
+fn p2_autosave_preserves_existing_scheduled_at() {
+    // P2-1：在途 autosave 携旧表单(scheduled_at 空)晚到，不得抹掉已设定的定时
+    let (state, dir) = temp_state("p21-autosave-sched");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let future = mail::now_epoch() + 3600;
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "定时草稿".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: future,
+        },
+    )
+    .unwrap();
+    // autosave 带空 scheduled_at（模拟旧表单），且非空 body 避开 trivial 短路
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "自动保存改过的正文"),
+                ("scheduled_at", ""),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=?1", [id], |r| r.get(0)).unwrap()
+    });
+    assert_eq!(at, future, "autosave 不得覆写已有定时时刻");
     cleanup(&dir);
 }
 

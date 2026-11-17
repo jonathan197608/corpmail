@@ -1,7 +1,7 @@
 //! 已读回写批处理单测（src/mail/seen.rs 内联测试，经 #[path] 引入）
 
 use super::*;
-use crate::mail::{IncomingMail, LastCursor, mark_read, store_incoming};
+use crate::mail::{IncomingMail, LastCursor, mark_read, mark_unread, store_incoming};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -549,5 +549,37 @@ fn flush_self_wakes_for_backlog_beyond_round_limit() {
     assert_eq!(calls[0].4.len(), 500, "第一轮 500 条");
     assert_eq!(calls[1].4.len(), 100, "第二轮恰为剩余 100 条");
     state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// P2-2：标为未读必须清掉打开邮件时写入的 seen_pending，
+/// 否则 1.5s 合并窗口到点后 worker 仍会 STORE +\Seen 覆盖用户刚标的未读
+#[test]
+fn mark_unread_clears_pending_seen_writeback() {
+    let (state, dir) = temp_state("p22-unread");
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    body_text, unread, created_at, seen_pending, remote_uid)
+                 VALUES ('in','inbox','delivered','a@b.cn','me@c.cn','标题','正文',0,?1,1,'7:42')",
+                [crate::mail::now_epoch()],
+            )
+            .unwrap();
+        });
+    let id: i64 = state.with_conn(|c| {
+        c.query_row("SELECT max(id) FROM emails", [], |r| r.get(0)).unwrap()
+    });
+    assert!(mark_unread(&state, id).unwrap(), "应翻转成功");
+    let (unread, pending): (i64, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT unread, seen_pending FROM emails WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(unread, 1, "本地未读");
+    assert_eq!(pending, 0, "必须清掉待回写标志，防 worker 覆盖为服务器已读");
     cleanup(&dir);
 }

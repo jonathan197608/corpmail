@@ -244,8 +244,15 @@ fn resolve_uids<T: std::io::Read + std::io::Write>(
     uidvalidity: u32,
 ) -> Result<Vec<u32>, String> {
     let mut uids: Vec<u32> = if last.uid > 0 && last.uidvalidity == uidvalidity {
+        // P3-1：u32::MAX 是 IMAP UID 类型上界，+1 在 debug 溢出 panic、
+        // release wrap 成 0 导致 "0:*" 搜索全被 `> last.uid` 滤掉、空转。
+        // 此处 UID 空间已耗尽，等服务器 UIDVALIDITY 变化触发全量重拉即可
+        let Some(next_uid) = last.uid.checked_add(1) else {
+            eprintln!("[recv] UID 游标已达 u32::MAX，等待 UIDVALIDITY 变化触发重拉");
+            return Ok(Vec::new());
+        };
         let inc: Vec<u32> = sess
-            .uid_search(format!("{}:*", last.uid + 1))
+            .uid_search(format!("{}:*", next_uid))
             .map_err(|e| format!("检索新邮件失败：{e}"))?
             .into_iter()
             .filter(|u| *u > last.uid)
@@ -598,7 +605,21 @@ impl RealFetcher {
                             max_mail_bytes,
                         ));
                     }
-                    None => eprintln!("[fetch] uid={uid} 服务器未返回，跳过"),
+                    // 正常邮件服务器未返回：与超限分支对称落最小占位。
+                    // 否则 uid 计入 batch_uids 抬高 bmax、游标越过却无库行，
+                    // 下一轮增量不再包含它 → 永久静默漏收（与 C2 护栏同意图）
+                    None => {
+                        eprintln!("[fetch] uid={uid} 服务器未返回，落最小占位避免游标越过");
+                        batch.push(placeholder_mail(
+                            uidvalidity,
+                            uid,
+                            false,
+                            None,
+                            &[],
+                            size.unwrap_or(0),
+                            max_mail_bytes,
+                        ));
+                    }
                 }
                 // 双阈值 flush：封数或累计字节任一超限即入库，控制解析峰值内存
                 if batch_uids.len() >= BATCH || batch_bytes >= BATCH_MAX_BYTES {

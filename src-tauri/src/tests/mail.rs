@@ -750,6 +750,50 @@ fn attachments_inline_and_file_tiers() {
     cleanup(&dir);
 }
 
+#[test]
+fn p1_inline_image_writeback_cannot_escape_attach_root() {
+    // P1-1 写盘兜底：即使调用方漏净化，insert_attachment 也必须把 filename
+    // 净化后再拼相对路径，`..`/分隔符不得让文件落到 attachments 根目录外
+    let (state, dir) = temp_state("inline-escape");
+    let id = save_draft(&state, &draft("内嵌图", "正文")).unwrap();
+    // 设 inline 上限为 1MB，造 >1MB 载荷走 file 分支（触发落盘路径拼接）
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO settings(k, v) VALUES('inline_attach_max_mb','1')
+             ON CONFLICT(k) DO UPDATE SET v='1'",
+            [],
+        )
+        .unwrap();
+    });
+    let big = vec![7u8; 1024 * 1024 + 64];
+    let evil = InlineImage {
+        filename: "x/../../../../../../tmp/pwned\\evil.png".to_string(),
+        mime: "image/png".to_string(),
+        bytes: big,
+    };
+    let n = add_inline_images(&state, id, &[evil]).unwrap();
+    assert_eq!(n, 1);
+    // DB filename 必须已被净化
+    let stored: String = state.with_conn(|c| {
+        c.query_row("SELECT filename FROM attachments WHERE email_id=?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert!(!stored.contains('/') && !stored.contains('\\'),
+        "DB filename 的分隔符已净化：{stored}");
+    // 实际落盘文件必须在 attachments root 内
+    let root = dir.join("attachments");
+    let paths: Vec<String> = state.with_conn(|c| {
+        let mut st = c.prepare("SELECT file_path FROM attachments WHERE email_id=?1").unwrap();
+        st.query_map([id], |r| r.get::<_, String>(0)).unwrap().filter_map(Result::ok).collect()
+    });
+    assert_eq!(paths.len(), 1);
+    let dest = root.join(&paths[0]);
+    assert!(dest.exists(), "落盘文件应存在");
+    assert!(dest.starts_with(&root), "落盘路径不得穿越 root：{:?}", dest);
+    assert!(!dir.join("tmp").exists(), "不得在 data_dir 下创建逃逸目录");
+    cleanup(&dir);
+}
+
 /// 后缀推断（2026-11-11）：附件名后缀 > MIME 映射 > .bin；纯数字尾巴不算后缀；
 /// 用户已填后缀（含自定义）一律尊重；文件名取 basename 防目录穿越
 #[test]
@@ -832,6 +876,40 @@ fn save_dest_whitelist_blocks_system_paths() {
             "用户主目录应放行"
         );
     }
+    cleanup(&dir);
+}
+
+/// P2-3 读来源白名单：attach_paths 来自表单，脚本伪造 POST 可读任意本地文件
+/// 加入草稿并自动外发。写目标已有白名单，读来源此前只有 3 个应用文件黑名单。
+#[cfg(not(windows))]
+#[test]
+fn attach_source_whitelist_blocks_system_paths() {
+    for bad in [
+        "/etc/corpmail-guard-test.key",
+        "/usr/local/bin/x",
+        "relative/x.txt",
+        "/tmp/../etc/passwd",
+    ] {
+        assert!(guard_attach_source(bad).is_err(), "应拒绝不安全来源：{bad}");
+    }
+    // 临时目录（用户合法附件常见落点）与用户主目录放行
+    let ok = std::env::temp_dir().join("corpmail-guard-test.txt");
+    assert!(guard_attach_source(&ok.to_string_lossy()).is_ok());
+    if let Some(home) = std::env::var_os("HOME") {
+        let in_home = Path::new(&home).join("corpmail-guard-test.txt");
+        assert!(guard_attach_source(&in_home.to_string_lossy()).is_ok());
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn add_attachments_rejects_out_of_whitelist_source() {
+    // P2-3 端到端：即便调用方忘调守卫，add_attachments 内部也必须拒绝
+    let (state, dir) = temp_state("p23-readguard");
+    let id = save_draft(&state, &draft("外泄测试", "正文")).unwrap();
+    let err = add_attachments(&state, id, &["/etc/passwd".into()]).unwrap_err();
+    assert!(err.contains("用户目录") || err.contains("绝对路径"), "{err}");
+    assert_eq!(get(&state, id).unwrap().attach_cnt, 0, "不得加入系统文件附件");
     cleanup(&dir);
 }
 
@@ -1949,4 +2027,25 @@ fn prune_empty_dirs_still_removes_real_empty_dirs() {
     assert!(!empty_edir.exists(), "真实空目录应被回收");
     assert!(!root.join("2026-01").exists(), "变空后月目录也应回收");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// P3-2：写失败必须上抛，不能被吞成「未翻转 / 行不存在」导致 UI 误判成功
+#[test]
+fn flag_writes_report_sql_failure() {
+    let (state, dir) = temp_state("p32-writefail");
+    let id = save_draft(&state, &draft("写失败", "正文")).unwrap();
+    // 触发器拦 unread 与 starred 的 UPDATE（RAISE(ABORT) 让 execute 返回 Err）
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER p32_no_unread BEFORE UPDATE OF unread ON emails
+                 BEGIN SELECT RAISE(ABORT, 'injected-unread'); END;
+                 CREATE TRIGGER p32_no_star BEFORE UPDATE OF starred ON emails
+                 BEGIN SELECT RAISE(ABORT, 'injected-star'); END;",
+            )
+        })
+        .unwrap();
+    assert!(mark_unread(&state, id).is_err(), "标未读失败必须 Err");
+    assert!(toggle_star(&state, id).is_err(), "星标失败必须 Err");
+    cleanup(&dir);
 }

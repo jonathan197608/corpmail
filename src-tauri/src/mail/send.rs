@@ -175,9 +175,10 @@ fn split_addrs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 草稿 → 排队（原子 CAS：仅 status='draft' 可入队；重复提交 0 行返回 false，幂等 §7）。
-/// 入队即清 scheduled_at（M4-2）：队列中的邮件不再属于定时计划，
-/// 立即发送路径同时承担"取消定时"语义
+/// 测试辅助：草稿 → 排队的 CAS（仅 status='draft' 可入队，重复提交返回 false）。
+/// 生产派发已统一走 `dispatch_due_scheduled` 内的事务 CAS（带 scheduled_at 条件，
+/// 防撤销 TOCTOU）；此函数只用于既有入队流程单测，不再作为生产入口。
+#[cfg(test)]
 pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
     state.with_conn(|conn| {
         exec_one(
@@ -231,33 +232,56 @@ pub fn dispatch_due_scheduled(state: &AppState) -> usize {
         return 0;
     }
     let now = now_epoch();
-    let due: Vec<i64> = state.with_conn(|conn| {
-        conn.prepare(
-            "SELECT id FROM emails
-              WHERE folder = 'draft' AND status = 'draft'
-                AND scheduled_at > 0 AND scheduled_at <= ?1
-              ORDER BY scheduled_at, id",
-        )
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([now], |r| r.get::<_, i64>(0))?;
-            Ok(rows.filter_map(Result::ok).collect::<Vec<_>>())
+    // P1-3 撤销 TOCTOU：SELECT 到点草稿与 draft→queued 的 CAS 必须在同一事务
+    // （with_conn 全局锁）内完成。否则 SELECT 后、enqueue 前的窗口里用户点
+    // undo-send 清了 scheduled_at，仍会被旧 enqueue_draft 只判 status 而入队，
+    // 用户看到"已撤销"却照样发出。UPDATE 同样带 scheduled_at 到点条件，
+    // 即便未来有人拆开事务也不会复发。
+    let dispatched = state
+        .with_conn(|conn| {
+            let tx = conn.transaction().map_err(e)?;
+            let ids: Vec<i64> = tx
+                .prepare(
+                    "SELECT id FROM emails
+                      WHERE folder = 'draft' AND status = 'draft'
+                        AND scheduled_at > 0 AND scheduled_at <= ?1
+                      ORDER BY scheduled_at, id",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([now], |r| r.get::<_, i64>(0))?;
+                    Ok(rows.filter_map(Result::ok).collect::<Vec<_>>())
+                })
+                .map_err(e)?;
+            let mut queued = Vec::new();
+            for id in ids {
+                let n = tx
+                    .execute(
+                        "UPDATE emails SET status = 'queued', error = NULL, scheduled_at = 0
+                         WHERE id = ?1 AND status = 'draft'
+                           AND scheduled_at > 0 AND scheduled_at <= ?2",
+                        rusqlite::params![id, now],
+                    )
+                    .map_err(e)?;
+                if n == 1 {
+                    queued.push(id);
+                }
+            }
+            tx.commit().map_err(e)?;
+            Ok::<_, String>(queued)
         })
         .unwrap_or_else(|err| {
-            eprintln!("[sched] 定时邮件扫描失败（下轮重试）：{err}");
+            eprintln!("[sched] 定时邮件派发事务失败（下轮重试）：{err}");
             Vec::new()
-        })
-    });
-    let mut dispatched = 0usize;
-    for id in due {
-        if enqueue_draft(state, id) {
-            state.enqueue_send(id);
-            dispatched += 1;
-        }
+        });
+    let mut count = 0usize;
+    for id in dispatched {
+        state.enqueue_send(id);
+        count += 1;
     }
-    if dispatched > 0 {
-        eprintln!("[sched] 定时到点派发 {dispatched} 封");
+    if count > 0 {
+        eprintln!("[sched] 定时到点派发 {count} 封");
     }
-    dispatched
+    count
 }
 
 /// 崩溃恢复：把残留的 `sending` 分开处理（返回复位行数）。

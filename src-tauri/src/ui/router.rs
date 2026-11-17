@@ -1355,9 +1355,18 @@ fn email_unread(state: &AppState, req: &Req) -> Resp {
     let folder = mail::get(state, id)
         .map(|d| d.folder)
         .unwrap_or_else(|| "inbox".into());
-    mail::mark_unread(state, id);
-    state.poke_tray(); // 未读数 +1：刷托盘角标
-    Resp::hx_redirect(&detail_back_href(req, &folder))
+    // P3-2：写失败必须回显，不能再无条件 poke_tray + 成功跳转（角标与实际不符）
+    match mail::mark_unread(state, id) {
+        Ok(_) => {
+            state.poke_tray(); // 未读数 +1：刷托盘角标
+            Resp::hx_redirect(&detail_back_href(req, &folder))
+        }
+        Err(err) => {
+            eprintln!("[unread] 标为未读失败：{err}");
+            // 纯文本错误由 app.js 的 htmx:responseError 落到 toast（协议层同款）
+            Resp::text(500, "标为未读失败，请重试")
+        }
+    }
 }
 
 /// 星标翻转（POST /emails/{id}/star，M2-1）。返回空体 + mbx:starDone 事件
@@ -1368,11 +1377,16 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
         return Resp::not_found();
     };
     match mail::toggle_star(state, id) {
-        Some(starred) => Resp::html(String::new()).with_event_detail(
+        Ok(Some(starred)) => Resp::html(String::new()).with_event_detail(
             "mbx:starDone",
             &serde_json::json!({ "starred": starred }).to_string(),
         ),
-        None => Resp::not_found(),
+        Ok(None) => Resp::not_found(),
+        // P3-2：写失败不再吞成 404（不 emit 成功事件、由 responseError toast）
+        Err(err) => {
+            eprintln!("[star] 星标写入失败：{err}");
+            Resp::text(500, "星标保存失败，请重试")
+        }
     }
 }
 
@@ -1840,7 +1854,11 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
         .trim()
         .to_string();
     if !addr.is_empty() {
-        let _ = state.with_conn(|conn| mail::contacts::remove(conn, &addr));
+        // P3-2：写失败不再完全静默——至少落日志（列表片段仍按实际库状态重渲染，
+        // 用户看到该联系人还在，不会误以为删除成功）
+        if let Err(err) = state.with_conn(|conn| mail::contacts::remove(conn, &addr)) {
+            eprintln!("[contacts] 删除联系人失败：{err}");
+        }
     }
     // 保留搜索词：删除后回到同一过滤视图
     let q = form
@@ -2451,7 +2469,9 @@ fn parse_inline_images(form: &HashMap<String, String>) -> Vec<mail::InlineImage>
                 .decode(f.data.as_bytes())
                 .ok()
                 .map(|bytes| mail::InlineImage {
-                    filename: format!("image-{}-{}", mail::now_epoch(), f.name),
+                    // P1-1 源头净化：f.name 客户端可控，未净化会让 `..`/分隔符
+                    // 进入 add_inline_images → insert_attachment 的相对路径。
+                    filename: format!("image-{}-{}", mail::now_epoch(), mail::safe_filename(&f.name)),
                     mime: f.mime,
                     bytes,
                 })
@@ -2471,7 +2491,7 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
     } else {
         format!("&{ctx_qs}")
     };
-    match save_compose_form(state, req) {
+    match save_compose_form(state, req, false) {
         Ok((id, skipped, _)) => Resp::hx_redirect(&format!(
             "/compose?draft_id={id}&saved=1{}{ctx_suffix}",
             skipped_suffix(skipped)
@@ -2513,7 +2533,9 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     if trivial {
         return Resp::json("{\"ok\":true,\"draft_id\":0}".into());
     }
-    match save_compose_form(state, req) {
+    // P2-1：autosave 必须保留库中已有的 scheduled_at——在途 autosave 携带旧表单
+    // （scheduled_at 空 → 0）晚于点发送到达时，不覆写 send 设下的撤销窗口时刻
+    match save_compose_form(state, req, true) {
         Ok((id, _skipped, _converted)) => {
             Resp::json(serde_json::json!({ "ok": true, "draft_id": id }).to_string())
         }
@@ -2526,7 +2548,13 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
 /// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回 (邮件 id, 被跳过的空文件数)。
 /// scheduled_at（M4-2）：datetime-local 原始字符串 → epoch 秒；空/非法按 0 处理
 /// （存草稿保留既有定时，清空选择器即取消定时；立即发送路径由调用方写 0）
-fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize), (i64, String)> {
+/// `preserve_sched`（P2-1）：autosave 为 true——携带旧表单的 scheduled_at=0 不得
+/// 覆写库中已有的定时/撤销窗口时刻；存草稿/发送为 false（用户显式意图可清）。
+fn save_compose_form(
+    state: &AppState,
+    req: &Req,
+    preserve_sched: bool,
+) -> Result<(i64, usize, usize), (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
@@ -2541,7 +2569,7 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
     };
     // 定时发送（M4-2）：控件原始字符串解析（空 = 非定时；非法格式丢弃并记日志）
     let sched_raw = form.get("scheduled_at").cloned().unwrap_or_default();
-    let scheduled_at = if sched_raw.trim().is_empty() {
+    let mut scheduled_at = if sched_raw.trim().is_empty() {
         0
     } else {
         mail::sched_epoch_of(&sched_raw).unwrap_or_else(|| {
@@ -2549,6 +2577,36 @@ fn save_compose_form(state: &AppState, req: &Req) -> Result<(i64, usize, usize),
             0
         })
     };
+    // P1-4 统一过去时刻校验：所有写入口（存草稿/自动保存/发送）都走这里，
+    // 过去时刻不得落库（否则调度线程当轮即发出，用户以为只是存草稿）
+    if scheduled_at > 0 && scheduled_at <= mail::now_epoch() + 60 {
+        return Err((
+            draft_id.unwrap_or(0),
+            "定时时间需晚于当前时间 1 分钟以上，请重新选择".to_string(),
+        ));
+    }
+    // P2-1：autosave 携带的 scheduled_at=0 不得抹掉库中已有的定时/撤销窗口。
+    // 仅当表单解析为 0（空/非法）且是已有草稿时回读库值；用户显式选了未来时刻
+    // 则照常写入。存草稿/发送 preserve_sched=false，可显式清空定时。
+    if preserve_sched
+        && scheduled_at == 0
+        && let Some(id) = draft_id
+    {
+        let current: Option<i64> = state
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT scheduled_at FROM emails WHERE id = ?1 AND folder = 'draft'",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+            })
+            .ok()
+            .flatten();
+        if let Some(at) = current.filter(|at| *at > 0) {
+            scheduled_at = at;
+        }
+    }
     let input = mail::DraftInput {
         id: draft_id,
         from_addr: full_address(&g(keys::ACCOUNT_PREFIX), &g(keys::ACCOUNT_DOMAIN)),
@@ -2648,7 +2706,7 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             &form,
         );
     }
-    match save_compose_form(state, req) {
+    match save_compose_form(state, req, false) {
         Ok((id, skipped, converted)) => {
             // 定时（M4-2）：保存已落 scheduled_at（DraftInput），跳过 enqueue；
             // 回草稿详情页展示「已定时」状态（调度线程到点自动入队发送）
