@@ -40,6 +40,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B5 只看未读：⋯ 菜单开关后所有行都带 unread 类，再点同一项切回恢复全量', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6：ui:// 首帧可能是上一页，等行挂载再取基线
     const before = (await $$('.mail-row')).length
     expect(before).toBeGreaterThanOrEqual(2) // 02 已读过季度报表，欢迎/会议仍未读
 
@@ -325,6 +326,7 @@ describe('04 列表筛选与批量操作', () => {
   it('B11 批量删除：勾选 1 行 → 确认模态 → 行数 -1（放最后）', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6：等列表行挂载再取 before 基线
     const before = (await $$('.mail-row')).length
     const rows = await $$('.mail-row')
     await rows.at(-1).$('.mbx-item').click() // 删最后一行：保住 05 依赖的「会议纪要」

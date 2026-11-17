@@ -389,6 +389,7 @@ fn store_falls_back_when_keychain_backend_unavailable() {
     let account = "a1-nobackend@chinatelecom.cn";
     let g = fake_keyring::Guard::install();
     g.make_set_fail(); // 未 preset：get_password → None（相当于无默认钥匙串）
+    g.make_delete_backend_absent(); // delete 报 "default keychain could not be found"（E2E 实测形态）
     cache_drop(account);
 
     let degraded = store(&c, &kf, account, "P2").unwrap();
@@ -412,25 +413,58 @@ fn store_falls_back_when_keychain_backend_unavailable() {
     cleanup(&kf);
 }
 
-/// A1 决策口径：旧条目「当下可读」才存在复活路径。ACL 拒读（get 失败）
-/// 的旧条目重启后同样读不到，回退安全——无需删除成功
+/// A1 / 复查 R1：旧条目**在**但当下读不到（钥匙串锁定 / ACL 拒读，get→None）
+/// 且删不掉时，必须返回 Err 且**不写 enc:**。否则静默双写，重启解锁后
+/// retrieve 走 keychain 优先读回 P1，新密码 P2 永不生效、degraded 无提示——
+/// 与原始 bug 同态。旧实现用 `get().is_some()` 判断复活路径，会把「条目在
+/// 但读不到」误判成「无条目」而跳过删除，正是本用例要钉死的偏差。
 #[test]
-fn store_falls_back_when_old_entry_unreadable() {
-    // fake 的 get 不可注入失败，本用例用「无条目」近似（读不到的两种形态
-    // 在决策上等价：is_none 即放行）；真正的 ACL 拒读只能靠上一用例的
-    // 后端不可用覆盖。此测钉住「读不到 → 不调 delete 也放行」的短路
+fn store_fails_when_old_entry_unreadable_and_undeletable() {
     let c = conn();
     let kf = temp_key_path("a1-unreadable");
     let account = "a1-unreadable@chinatelecom.cn";
     let g = fake_keyring::Guard::install();
-    g.make_set_fail();
-    g.make_delete_fail(); // delete 必失败：若错误地先调 delete 会挡保存
+    g.preset(account, "P1"); // 旧条目确实在
+    g.make_set_fail(); // 写 P2 失败 → 走回退决策
+    g.make_get_fail(); // 但当下读不到（模拟钥匙串锁定）
+    g.make_delete_fail(); // 且删不掉 → 必须 Err，不得写 enc:
     cache_drop(account);
 
-    let degraded = store(&c, &kf, account, "P2").unwrap();
-    assert!(degraded, "读不到旧条目时 delete 失败也不得挡 keyfile 回退");
-    assert_eq!(retrieve(&c, &kf, account), GetResult::Keyfile("P2".into()));
+    let result = store(&c, &kf, account, "P2");
+    assert!(result.is_err(), "旧条目在但删不掉必须 Err，不得静默双写");
+    assert!(
+        matches!(keyfile_retrieve(&c, &kf, account), GetResult::Missing),
+        "Err 分支绝不能写 enc:（否则重启解锁后读回 P1）"
+    );
     drop(g);
     cache_drop(account);
     cleanup(&kf);
+}
+
+/// 复查 R1：后端「根本不存在」（放行）与「存在但删不掉」（上抛）必须分类正确。
+/// 前者是 e2e 隔离 HOME 实测形态（首次保存不能挡），后者是原始 bug 同态
+/// （钥匙串锁定/ACL 拒删，写 enc: 会埋下重启复活旧密码的坏态）。
+#[test]
+fn keychain_backend_absent_classifies_only_absent_storage() {
+    // 放行：后端根本不存在（macOS 无默认 keychain / keyring 无默认 store）
+    for msg in [
+        "Platform failure: A default keychain could not be found.",
+        "SecKeychainCopyDefault: a default keychain could not be found",
+        "No default store has been set",
+    ] {
+        assert!(keychain_backend_absent(msg), "应识别为后端不存在：{msg}");
+    }
+    // 上抛：后端存在但被锁 / ACL 拒绝 —— 此时旧条目可能存在，不能放行
+    for msg in [
+        "Couldn't access platform storage: The keychain was locked",
+        "Platform failure: User interaction is not allowed",
+        "注入的 keychain 删除失败",
+        "",
+    ] {
+        assert!(!keychain_backend_absent(msg), "不得误判为后端不存在：{msg}");
+    }
+    // 归一：后端不存在 → Ok(false)；其它错误原样上抛
+    assert_eq!(normalize_delete(Err("a default keychain could not be found".into())), Ok(false));
+    assert!(normalize_delete(Err("keychain was locked".into())).is_err());
+    assert_eq!(normalize_delete(Ok(true)), Ok(true));
 }

@@ -31,7 +31,9 @@ struct FakeTester {
 }
 
 /// 最近一次 imap() 收到的密码（A3：断言收信页独立密码输入原样传到测试器；
-/// 用 static 而非 FakeTester 字段，避免改动全部 221 处字面量构造）
+/// 用 static 而非 FakeTester 字段，避免改动全部 221 处字面量构造）。
+/// R8：用例开头必须显式清零，且本测试套件以 --test-threads=1 串行运行
+/// （README 门禁命令），否则并行下跨例互相覆盖会伪造 PASS
 static LAST_IMAP_PASSWORD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 impl ConnTester for FakeTester {
@@ -10021,6 +10023,8 @@ fn contacts_query_failure_is_reported_not_mistaken_for_empty_list() {
 /// 输入并 hx-include，POST 的 password 字段应原样传给 IMAP 测试器
 #[test]
 fn settings_receive_test_imap_takes_typed_password() {
+    // R8：static 在用例开头清零，避免其它 imap() 用例残留值伪造本例断言
+    LAST_IMAP_PASSWORD.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let (state, dir) = temp_state("a3-recv-pw");
     let _ = route(
         &state,

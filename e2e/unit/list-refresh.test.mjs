@@ -115,3 +115,40 @@ test('不在列表页时不发请求', () => {
     h.ctx.mbxRefreshList();
     assert.equal(h.calls.urls.length, 0);
 });
+
+test('A11：mbxRefreshSide 的 htmx.ajax reject 有 toast 兜底（无 unhandledRejection）', async () => {
+    // C15 锚点外的侧栏刷新：直接截取整段源码进 vm，替换 htmx.ajax 为 reject
+    const fnStart = APP_JS.indexOf('function mbxRefreshSide()');
+    assert.ok(fnStart > 0, 'mbxRefreshSide 必须存在');
+    const fnEnd = APP_JS.indexOf('\n}\n', fnStart) + 3; // 顶层函数收尾 + 空行
+    const src = APP_JS.slice(fnStart, fnEnd);
+    assert.match(src, /\.catch/, 'A11：mbxRefreshSide 必须带 .catch 兜底');
+
+    let toastMsg = null;
+    let rejectionUnhandled = false;
+    const ctx = vm.createContext({
+        document: {
+            querySelector: (sel) =>
+                sel === 'aside.side .folder.on'
+                    ? { getAttribute: () => '/list?folder=sent' }
+                    : sel === 'aside.side' ? {} : null,
+        },
+        htmx: {
+            ajax: () => Promise.reject(new Error('协议层失败')),
+        },
+        mbxToast: (m) => { toastMsg = m; },
+    });
+    ctx.addEventListener = () => {};
+    // R9：只移除本用例新增的监听器——removeAllListeners 会误删 node:test 自身的
+    const onReject = () => { rejectionUnhandled = true; };
+    process.on('unhandledRejection', onReject);
+    try {
+        vm.runInContext(src + '\nmbxRefreshSide();', ctx);
+        // 等微任务队列排空（reject 的 catch 在 Promise 链上）
+        await new Promise((r) => setTimeout(r, 20));
+        assert.ok(!rejectionUnhandled, '不得产生 unhandledRejection');
+        assert.ok(toastMsg && toastMsg.includes('侧栏刷新失败'), `应有 toast（实际 ${toastMsg}）`);
+    } finally {
+        process.removeListener('unhandledRejection', onReject);
+    }
+});

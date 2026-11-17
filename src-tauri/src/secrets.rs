@@ -77,18 +77,45 @@ fn keychain_set_password(account: &str, password: &str) -> Result<(), String> {
     entry.set_password(password).map_err(|e| e.to_string())
 }
 
-/// 删 keychain 条目：Ok(已删条目)；NoEntry 视为已清空（幂等语义）
+/// 判定 keychain 平台后端是否**根本不存在**（vs 存在但被锁/ACL 拒绝）。
+///
+/// macOS 无默认 keychain 时报 "...a default keychain could not be found..."，
+/// 这种环境里 keychain 中不可能存有旧密码——删不掉也应放行 keyfile 回退，
+/// 否则 e2e 隔离 HOME 的首次保存会被挡死（复查 R1 实测回归）。
+/// 独立成纯函数 + 单测钉死：字符串匹配只针对这个特定系统错误，锁定（
+/// NoStorageAccess）/ ACL 拒绝的文本不含这些短语，一律走 Err 上抛。
+fn keychain_backend_absent(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("default keychain could not be found")
+        || m.contains("no default keychain")
+        || m.contains("no default store")
+}
+
+/// 删除结果的语义归一（生产与 fake 共用，保证单测覆盖真分支）：
+/// `Ok(true)`=删掉旧条目；`Ok(false)`=NoEntry；`Err` 且后端根本不存在→无旧
+/// 条目可放行；其它 `Err`（NoStorageAccess 锁定 / ACL 拒绝）→旧条目可能存在，
+/// 上抛且不写 enc:（复查 R1）。
+fn normalize_delete(result: Result<bool, String>) -> Result<bool, String> {
+    match result {
+        Ok(b) => Ok(b),
+        Err(e) if keychain_backend_absent(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// 删 keychain 条目：Ok(已删条目)；NoEntry / 后端不存在视为已清空（幂等语义）
 fn keychain_delete_credential(account: &str) -> Result<bool, String> {
     #[cfg(test)]
     if fake_keyring::active() {
-        return fake_keyring::delete_credential(account);
+        return normalize_delete(fake_keyring::delete_credential(account));
     }
     let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
+    let raw = match entry.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
         Err(e) => Err(e.to_string()),
-    }
+    };
+    normalize_delete(raw)
 }
 
 fn keychain_get_password(account: &str) -> Option<String> {
@@ -112,6 +139,12 @@ mod fake_keyring {
         entries: HashMap<String, String>,
         fail_set: bool,
         fail_delete: bool,
+        /// 条目仍在 entries 中，但 get_password 返回 None（钥匙串锁定 / ACL 拒读）。
+        /// 用于钉死 store 的回退决策必须看 delete 结果而非 get 可读性（复查 R1）
+        fail_get: bool,
+        /// delete 报「无默认 keychain」（e2e 隔离 HOME 形态）：后端根本不存在，
+        /// 归一化后应放行 keyfile 回退（复查 R1 实测回归）
+        delete_backend_absent: bool,
     }
 
     thread_local! {
@@ -142,6 +175,10 @@ mod fake_keyring {
             let Some(f) = guard.as_mut() else {
                 return Ok(false);
             };
+            if f.delete_backend_absent {
+                // 与 macOS keyring/security-framework 的错误文本一致
+                return Err("Platform failure: A default keychain could not be found.".into());
+            }
             if f.fail_delete {
                 return Err("注入的 keychain 删除失败".into());
             }
@@ -151,9 +188,12 @@ mod fake_keyring {
 
     pub(super) fn get_password(account: &str) -> Option<String> {
         FAKE.with(|c| {
-            c.borrow()
-                .as_ref()
-                .and_then(|f| f.entries.get(account).cloned())
+            c.borrow().as_ref().and_then(|f| {
+                if f.fail_get {
+                    return None;
+                }
+                f.entries.get(account).cloned()
+            })
         })
     }
 
@@ -184,6 +224,22 @@ mod fake_keyring {
             FAKE.with(|c| {
                 if let Some(f) = c.borrow_mut().as_mut() {
                     f.fail_delete = true;
+                }
+            });
+        }
+        /// 条目仍在，但 get 返回 None（模拟钥匙串锁定 / ACL 拒读）
+        pub(super) fn make_get_fail(&self) {
+            FAKE.with(|c| {
+                if let Some(f) = c.borrow_mut().as_mut() {
+                    f.fail_get = true;
+                }
+            });
+        }
+        /// delete 报「无默认 keychain」（e2e 隔离 HOME 形态）
+        pub(super) fn make_delete_backend_absent(&self) {
+            FAKE.with(|c| {
+                if let Some(f) = c.borrow_mut().as_mut() {
+                    f.delete_backend_absent = true;
                 }
             });
         }
@@ -299,18 +355,19 @@ pub fn store(
     Ok(true)
 }
 
-/// keychain 可用时的 store 主链：写 keychain；写失败走「按可读性决策」的回退（A1）。
+/// keychain 可用时的 store 主链：写 keychain；写失败走「删旧条目 → keyfile」回退（A1 / 复查 R1）。
 ///
 /// 风险的本质：重启后两段式读取（keychain 优先）读回旧密码 P1、`enc:` 的新密码
 /// P2 永不生效，且 `degraded()` 因返回 Keychain 不提示——改密静默失效死循环。
-/// 而复活路径**当且仅当旧条目当下可读**：此刻 `keychain_get_password` 读不到
-/// （无默认钥匙串的环境级失败 / NoEntry / ACL 拒读），重启后同样读不到，
-/// 回退 keyfile 绝对安全——e2e 的隔离 HOME（无默认钥匙串）正是这种形态，
-/// 不能把「环境里根本没有可用 keychain」当成「降级失败」挡住保存。
+/// 决策依据是**删除结果**而非「旧条目当下是否可读」：
+/// - 无条目（`keychain_delete_credential` 把 NoEntry 归一为 `Ok(false)`）→ 无复活
+///   路径，回退 keyfile 安全——e2e 隔离 HOME（无默认钥匙串）正是这种形态，必须放行；
+/// - 条目存在且删除成功（`Ok(true)`）→ 旧密码已清除，回退安全；
+/// - 条目存在但删不掉（`Err`，如钥匙串锁定 / ACL 拒删）→ 返回 `Err` 且**不写 enc:**，
+///   绝不制造「看似保存成功、重启后失效」的坏态。
 ///
-/// 旧密码可读但删不掉（ACL 拒删等）才是必须报错的状态：返回 `Err` 且
-/// **不写 enc:**——绝不制造「看似保存成功、重启后失效」的坏态；这比静默
-/// 双写（两处不一致地各存新旧密码）安全得多
+/// 不可用 `keychain_get_password(account).is_some()` 判断是否有复活路径：钥匙串
+/// 锁定时条目仍在但 get 返回 None，跳过删除会静默双写，与原始 bug 同态（复查 R1）。
 fn store_keychain(
     conn: &Connection,
     key_file: &Path,
@@ -320,9 +377,10 @@ fn store_keychain(
     match keychain_set_password(account, password) {
         Ok(()) => finish_keychain_store(conn, account, password),
         Err(_) => {
-            if keychain_get_password(account).is_some()
-                && let Err(e) = keychain_delete_credential(account)
-            {
+            // 无条件删除旧条目：无条目（NoEntry → Ok(false)）放行回退；删不掉（Err）
+            // 上抛且不写 enc:。注意不能依赖 get 的可读性——条目在但当下读不到时
+            // 仍必须删，否则重启解锁后读回旧密码（复查 R1）
+            if let Err(e) = keychain_delete_credential(account) {
                 return Err(format!(
                     "钥匙串中仍存有旧密码且无法清除，本次修改未保存（{e}）。请解锁钥匙串或授权后重试"
                 ));

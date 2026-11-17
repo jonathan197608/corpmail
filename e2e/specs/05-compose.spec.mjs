@@ -8,6 +8,7 @@ import {
   confirmModalText,
   acceptConfirm,
   cancelConfirm,
+  waitMailRows,
 } from '../support/helpers.mjs'
 import { sentMails } from '../support/mock.mjs'
 import fs from 'node:fs'
@@ -219,6 +220,7 @@ describe('05 撰写与发送', () => {
   it('D6 回复预填：收件人=原发件人，正文含引用', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6：ui:// 首帧竞态，等行挂载
     const rows = await $$('.mail-row')
     let id = null
     for (const row of rows) {
@@ -241,6 +243,7 @@ describe('05 撰写与发送', () => {
   it('D7 回复全部：标题为「回复全部」', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6
     const id = await (await $$('.mail-row'))[0].getAttribute('data-mail-id')
     await goto(`/compose?reply_all_to=${id}`)
     await waitBoot()
@@ -251,6 +254,7 @@ describe('05 撰写与发送', () => {
   it('D8 转发：主题 Fwd: 前缀 +「将携带 1 个附件」提示', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6
     const rows = await $$('.mail-row')
     for (const row of rows) {
       if ((await row.getText()).includes('季度报表')) {
@@ -270,6 +274,7 @@ describe('05 撰写与发送', () => {
   it('D9 附加 .eml 转发（B6）：提示以 xxx.eml 附件加入', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6
     const rows = await $$('.mail-row')
     const id = await rows[0].getAttribute('data-mail-id')
     await goto(`/compose?attach_eml=${id}`)

@@ -427,13 +427,16 @@
         await showIframe(parts.join('\n'), PPTX_CSS, my);
     }
     // ---------- 文本兜底 / 错误 ----------
-    async function showTextFallback() {
+    // 复查 R3：兜底按钮的 fetch 同样带代次。此前该函数无 my、绕过 open() 链路，
+    // 用户点「纯文本预览」后切附件时，迟到的 innerHTML=''+文本会覆盖新面板
+    async function showTextFallback(my) {
         const b = bodyEl();
         if (!b) return;
-        showLoading('正在提取文本…');
+        showLoading('正在提取文本…', my);
         try {
             const r = await fetch(endpoint(state.url, 'office-text'));
             const text = await r.text();
+            if (my !== state.seq) return; // A5/R3：过期兜底响应丢弃
             if (!r.ok) throw new Error(text || '文本提取失败');
             b.innerHTML = '';
             b.classList.add('office');
@@ -446,7 +449,8 @@
             b.appendChild(note);
             b.appendChild(pre);
         } catch (e) {
-            showError((e && e.message) || '文本提取失败', false);
+            if (my !== state.seq) return; // A5/R3：过期兜底错误丢弃
+            showError((e && e.message) || '文本提取失败', false, my);
         }
     }
 
@@ -467,7 +471,7 @@
         const actions = document.createElement('div');
         actions.className = 'pm-error-actions';
         if (allowText) {
-            actions.appendChild(button('纯文本预览', '提取文字内容（版式丢失）', () => showTextFallback()));
+            actions.appendChild(button('纯文本预览', '提取文字内容（版式丢失）', () => showTextFallback(my)));
         }
         actions.appendChild(button('关闭', '关闭预览', () => window.mbxClosePreview && window.mbxClosePreview()));
         wrap.appendChild(title);

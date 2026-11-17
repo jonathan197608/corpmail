@@ -50,6 +50,7 @@ describe('90 失败链路', () => {
     // 配置未被破坏：主列表仍可访问且有邮件（收发件端口/账号原样保留）
     await goto('/')
     await waitBoot()
+    await waitMailRows() // T4/R6：ui:// 首帧竞态，等行挂载再断言
     expect((await $$('.mail-row')).length).toBeGreaterThan(0)
     await shot('失败-通道未保存且配置完好')
   })
@@ -116,6 +117,19 @@ describe('90 失败链路', () => {
       const obs = new MutationObserver(check)
       obs.observe(document.body, { childList: true, subtree: true, attributes: true })
       window.__MBX_MASK_OBS__ = obs
+
+      // R4（复查审计）：mbxMigApplyPane fetch 换入 pane 后必须派发
+      // htmx:afterSettle（detail.target = 换入节点），否则 rebaselineAll 无基线。
+      // 在 body 上监听并记录事件形状，验证真实点击链路（非字符串断言）
+      window.__SETTLE_EVENTS__ = []
+      window.__SETTLE_LISTENER__ = (ev) => {
+        window.__SETTLE_EVENTS__.push({
+          type: ev.type,
+          bubbles: ev.bubbles,
+          targetId: ev.detail && ev.detail.target && ev.detail.target.id,
+        })
+      }
+      document.body.addEventListener('htmx:afterSettle', window.__SETTLE_LISTENER__)
       btn.click()
       return 'clicked'
     }, occupied)
@@ -133,9 +147,21 @@ describe('90 失败链路', () => {
       // hidden 必须真的生效（A2：作者样式 display:flex 会压过 UA [hidden]）
       const mask = await $('#migrate-mask')
       expect(await mask.isDisplayed()).toBe(false)
+      // R4：真实 mbxMoveDataDir 换入存储 pane 后必须派发冒泡的 afterSettle，
+      // detail.target 是换入的 #settings-pane（rebaselineAll 依赖它建基线）
+      const settles = await browser.execute(() =>
+        window.__SETTLE_EVENTS__.filter((e) => e.type === 'htmx:afterSettle'))
+      expect(settles.length).toBeGreaterThan(0, 'pane 换入后应派发 afterSettle')
+      expect(settles.some((e) => e.bubbles && e.targetId === 'settings-pane'))
+        .toBe(true, `afterSettle 应冒泡且 detail.target=settings-pane（实际 ${JSON.stringify(settles)}）`)
       await shot('失败-点击式迁移错误可见且模态已关')
     } finally {
       await browser.execute(() => {
+        if (window.__SETTLE_LISTENER__) {
+          document.body.removeEventListener('htmx:afterSettle', window.__SETTLE_LISTENER__)
+          delete window.__SETTLE_LISTENER__
+        }
+        delete window.__SETTLE_EVENTS__
         if (window.__MBX_MASK_OBS__) {
           window.__MBX_MASK_OBS__.disconnect()
           delete window.__MBX_MASK_OBS__

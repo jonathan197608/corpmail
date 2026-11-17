@@ -191,6 +191,38 @@ test('A4：background 分支保持监听（不误伤正常后台迁移）', asyn
     assert.ok(h.intervalCount() >= 1, 'background 分支必须保留看门狗');
 });
 
+test('A4：200 空响应（pane 应用失败）第三分支同样 abort（复查 R5）', async () => {
+    // fetch 200、无 background 头、body 空白 → mbxMigApplyPane 返回 false →
+    // 走「迁移结果无法显示」失败态。此分支也必须停看门狗/解绑，否则 30 分钟后
+    // 同样的「继续等待」覆盖问题（此前无用例，删掉 abort 无人发现）
+    const h = harness({
+        fetchImpl: async () => ({
+            ok: true, status: 200,
+            headers: { get: () => null }, // 非 background
+            text: async () => '   ', // 空白 → applyPane false
+        }),
+    });
+    await h.run();
+    assert.equal(vm.runInContext('mbxMigWatchdog', h.ctx), null, '第三分支必须停看门狗');
+    assert.equal(vm.runInContext('mbxMigUnlisten', h.ctx), null, '第三分支必须解绑监听');
+    assert.ok(
+        h.dom.detail.textContent.includes('迁移结果无法显示'),
+        `应显示「迁移结果无法显示」（实际：${h.dom.detail.textContent}）`,
+    );
+});
+
+test('A4：二次 mbxMigOpen 复位上次失败态（复查 R5）', async () => {
+    // 点名覆盖：二次进入模态时进度条/详情文案/失败按钮复位——复用旧 DOM 时
+    // 若不复位，用户带着上一轮「迁移冻结中 + 返回」进场，一点就关掉正在跑的迁移
+    const h = harness();
+    // 先把共享 detail/bar 污损成上一轮失败态（mask 已由 fakeDom 提供，走复用分支）
+    h.dom.detail.textContent = '迁移冻结中（上次失败）';
+    h.dom.bar.style.width = '90%';
+    vm.runInContext('mbxMigOpen();', h.ctx);
+    assert.equal(h.dom.detail.textContent, '准备迁移…', '二次 open 应复位详情文案');
+    assert.equal(h.dom.bar.style.width, '0%', '二次 open 应复位进度条');
+});
+
 test('A17：二次进入 mbxConfirmLeave 先释放旧模态的 focus trap', () => {
     // 用真实 app.js 的 mbxConfirmLeave（在 C14 之外的通用模态段）验证：
     // 连开两次（不关第一次），第一次的 release 必须被调用、body 无残留 inert
@@ -361,48 +393,50 @@ test('A10：主题确认取消后，标志清空——再清空正文会重新�
     assert.match(confirms[2], /正文为空/);
 });
 
-test('A11：mbxRefreshSide 的 htmx.ajax reject 有 toast 兜底（无 unhandledRejection）', async () => {
-    // C15 锚点外的 mbxRefreshSide：直接截取整段源码进 vm，替换 htmx.ajax 为 reject
-    const fnStart = APP_JS.indexOf('function mbxRefreshSide()');
-    assert.ok(fnStart > 0, 'mbxRefreshSide 必须存在');
-    const fnEnd = APP_JS.indexOf('\n}\n', fnStart) + 3; // 顶层函数收尾 + 空行
-    const src = APP_JS.slice(fnStart, fnEnd);
-    assert.match(src, /\.catch/, 'A11：mbxRefreshSide 必须带 .catch 兜底');
-
-    let toastMsg = null;
-    let rejectionUnhandled = false;
-    const ctx = vm.createContext({
-        document: {
-            querySelector: (sel) =>
-                sel === 'aside.side .folder.on'
-                    ? { getAttribute: () => '/list?folder=sent' }
-                    : sel === 'aside.side' ? {} : null,
-        },
-        htmx: {
-            ajax: () => Promise.reject(new Error('协议层失败')),
-        },
-        mbxToast: (m) => { toastMsg = m; },
-    });
-    ctx.addEventListener = () => {};
-    process.on('unhandledRejection', () => { rejectionUnhandled = true; });
-    try {
-        vm.runInContext(src + '\nmbxRefreshSide();', ctx);
-        // 等微任务队列排空（reject 的 catch 在 Promise 链上）
-        await new Promise((r) => setTimeout(r, 20));
-        assert.ok(!rejectionUnhandled, '不得产生 unhandledRejection');
-        assert.ok(toastMsg && toastMsg.includes('侧栏刷新失败'), `应有 toast（实际 ${toastMsg}）`);
-    } finally {
-        process.removeAllListeners('unhandledRejection');
-    }
-});
-
-test('A12：mbxMigApplyPane 换入后派发 htmx:afterSettle（rebaseline 依赖）', () => {
+test('A12：mbxMigApplyPane 换入后派发 htmx:afterSettle 且事件形状正确（rebaseline 依赖）', () => {
     const fnStart = APP_JS.indexOf('function mbxMigApplyPane(');
     const fnEnd = APP_JS.indexOf('\n}', fnStart) + 2;
     assert.ok(fnStart > 0, 'mbxMigApplyPane 必须存在');
     const src = APP_JS.slice(fnStart, fnEnd);
-    assert.match(src, /htmx:afterSettle/, 'A12：换入 pane 后必须派发 afterSettle');
-    assert.match(src, /bubbles:\s*true/, '事件必须冒泡（rebaselineAll 挂在 body）');
+
+    // 捕获真实派发的事件对象——只做源码字符串断言无法鉴别 detail.target 写错
+    const dispatched = [];
+    const oldPane = { replaceWith(next) { oldPane._replaced = next; } };
+    const nextPane = {
+        _events: [],
+        dispatchEvent(ev) { this._events.push(ev); dispatched.push(ev); return true; },
+    };
+    const ctx = vm.createContext({
+        document: {
+            getElementById: (id) => (id === 'settings-pane' ? oldPane : null),
+            createElement: (tag) => {
+                assert.equal(tag, 'template');
+                return {
+                    set innerHTML(v) { this._html = v; },
+                    get innerHTML() { return this._html || ''; },
+                    content: { firstElementChild: nextPane },
+                };
+            },
+        },
+        // CustomEvent 桩：保留构造参数供断言（vm 内无原生 CustomEvent）
+        CustomEvent: class {
+            constructor(type, init) {
+                this.type = type;
+                this.bubbles = !!(init && init.bubbles);
+                this.detail = init && init.detail;
+            }
+        },
+        window: { htmx: { process() { nextPane._processed = true; } } },
+    });
+    vm.runInContext(src + '\nmbxMigApplyPane("<div class=settings-pane></div>");', ctx);
+
+    assert.equal(oldPane._replaced, nextPane, '旧 pane 应被 new 替换');
+    assert.equal(nextPane._processed, true, '新 pane 应被 htmx.process');
+    assert.equal(dispatched.length, 1, '应恰派发一个事件');
+    const ev = dispatched[0];
+    assert.equal(ev.type, 'htmx:afterSettle', `事件类型应为 afterSettle（实际 ${ev.type}）`);
+    assert.equal(ev.bubbles, true, '事件必须冒泡（rebaselineAll 挂在 body）');
+    assert.equal(ev.detail && ev.detail.target, nextPane, 'detail.target 必须是换入的 pane 节点');
 });
 
 test('mbxPaneDirty：无 form 的收信页必须返回 false（dirty 不误报）', () => {

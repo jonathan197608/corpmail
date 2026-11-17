@@ -199,8 +199,13 @@ describe('03 设置与收件状态', () => {
         firstCol,
         saveRight: save ? Math.round(save.getBoundingClientRect().right) : null,
         justify: actions ? getComputedStyle(actions).justifyContent : null,
+        // R10：tip 必须留在 label 内（A16 只去交互属性，不移 DOM 位置）
+        tipsInLabel: fields.reduce(
+          (n, f) => n + f.querySelectorAll('label [data-tip]').length, 0),
+        tipsTotal: pane.querySelectorAll('.sfield [data-tip]').length,
       }
     })
+    expect(m.tipsInLabel).toBe(m.tipsTotal) // tip 全在 label 内，未被移出到控件列
     expect(m.declared).toBe('760px')
     expect(m.width).toBe(m.expected)
     expect(m.fieldCount).toBeGreaterThanOrEqual(1)
@@ -381,15 +386,27 @@ describe('03 设置与收件状态', () => {
   })
 
   it('收取新邮件：状态条完成「运行/空闲」状态转变、阶段 DOM 值有效（无错误）', async () => {
-    // T5：状态机断言升级——除「进入已知态」外，抓一次 data-running 的翻转
-    //（true→false 即一轮完整状态转变；快机可能一次轮询直接空闲，两次采样
-    // 至少都应终态为 false），并断言空闲态的阶段文案三类之一
+    // T5/R7：用 MutationObserver 记录 data-running==='true' **曾出现**，再断
+    // 终态回 false——两段合起来才是「运行→空闲」。旧断言第一段接受空闲文案，
+    // 坏实现（根本不置 true）会假通过
     await goto('/')
     await waitBoot()
     // 2026-11 改版：「收取新邮件」收进顶栏 ⋯ 菜单（.tb-more），先展开再点
     await openSplit('.tb-more [data-split-toggle]')
+    // 点击前装观察器：状态片段由 htmx 换入，running 可能极短，轮询会错过
+    await browser.execute(() => {
+      const bar = document.getElementById('fetch-status')
+      window.__FETCH_RAN__ = !!(bar && bar.dataset.running === 'true')
+      const obs = new MutationObserver(() => {
+        const b = document.getElementById('fetch-status')
+        if (b && b.dataset.running === 'true') window.__FETCH_RAN__ = true
+      })
+      obs.observe(document.body, { childList: true, subtree: true, attributes: true,
+        attributeFilter: ['data-running'] })
+      window.__FETCH_OBS__ = obs
+    })
     await $('#fetch-btn').click()
-    // 第一段：进入运行态或直接空转完成（running 分支可能极短，允许错过）
+    // 第一段：进入运行态或直接空转完成（文案层兜底，running 的真实性由观察器断）
     await browser.waitUntil(
       async () => {
         const bar = await $('#fetch-status')
@@ -405,6 +422,14 @@ describe('03 设置与收件状态', () => {
         document.getElementById('fetch-status')?.dataset.running === 'false'),
       { timeout: 60000, timeoutMsg: '状态条未回到空闲态（data-running 恒 true）' },
     )
+    // R7：running 必须真的出现过——否则「空闲文案 + 终态 false」会让坏实现
+    // 假通过（从不置 running=true 也能过）。观察器在点击前已装好，此刻读标志
+    const ran = await browser.execute(() => {
+      const seen = window.__FETCH_RAN__ === true
+      if (window.__FETCH_OBS__) { window.__FETCH_OBS__.disconnect(); window.__FETCH_OBS__ = null }
+      return seen
+    })
+    expect(ran).toBe(true, '收取期间 data-running 必须曾为 true（运行→空闲两段式）')
     const idle = await browser.execute(() => {
       const el = document.getElementById('fetch-status')
       return {

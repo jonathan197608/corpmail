@@ -203,6 +203,23 @@ function harness({ fetchPlan, noAbort = false } = {}) {
     };
 }
 
+/// 递归找按钮 / 收集文本（R3 纯文本兜底用例用）
+function findButton(node, label) {
+    if (!node || typeof node !== 'object') return null;
+    if (node.textContent === label && node._l && node._l.click) return node;
+    for (const kid of node._kids || []) {
+        const found = findButton(kid, label);
+        if (found) return found;
+    }
+    return null;
+}
+function collectText(node, out = []) {
+    if (!node || typeof node !== 'object') return out;
+    if (node._t) out.push(node._t);
+    for (const kid of node._kids || []) collectText(kid, out);
+    return out;
+}
+
 test('A5：慢附件 A 完成前点 B，最终面板只有 B 的内容', async () => {
     const h = harness({
         fetchPlan: {
@@ -279,6 +296,38 @@ test('A5：blob URL 生命周期——每次渲染 revoke 旧的，无孤儿堆�
     // 连续两次成功 open 不应堆积未 revoke 的 blob（第二条生成时第一条应被 revoke）
     assert.ok(h.blobUrls.size <= 2, `活跃 blob 数应受控（实际 ${h.blobUrls.size}）`);
     assert.ok(h.revoked.size >= 1, `旧 blob 应被 revoke（不泄漏，实际 revoked=${h.revoked.size}）`);
+});
+
+test('R3：纯文本兜底 fetch 在途时切附件，迟到文本不得覆盖新面板', async () => {
+    // A 的 office 主链失败（plan.error）→ showError 带「纯文本预览」按钮。
+    // 点按钮触发 showTextFallback（office-text 延迟 120ms）+ 期间 open B。
+    // 旧实现 showTextFallback 无 my 校验：A 的迟到文本 b.innerHTML='' 覆盖 B。
+    const h = harness({
+        fetchPlan: {
+            '/emails/1/attachments/a/office': { delayMs: 0, error: '解析失败A' },
+            '/emails/1/attachments/a/office-text': { delayMs: 120, text: 'A-FALLBACK-TEXT' },
+            '/emails/1/attachments/b/office': { delayMs: 0, tag: 'ATTACH-B' },
+        },
+    });
+    // A 主链失败 → 错误态出现「纯文本预览」按钮
+    await h.open('/emails/1/attachments/a/view', 'docx', 'A-失败.docx');
+    await new Promise((r) => setTimeout(r, 10));
+    const btn = findButton(h.body, '纯文本预览');
+    assert.ok(btn, '失败态应提供「纯文本预览」按钮');
+    // 点按钮：触发 showTextFallback（A 的文本提取延迟 120ms 在途）
+    const click = btn._l.click[0];
+    click();
+    await new Promise((r) => setTimeout(r, 5));
+    // 用户切到 B（立即完成渲染）
+    await h.open('/emails/1/attachments/b/view', 'docx', 'B-快.docx');
+    await new Promise((r) => setTimeout(r, 10));
+    // B 先渲染完成；等 A 的纯文本迟到响应（若未拦，会覆盖 B）
+    await new Promise((r) => setTimeout(r, 160));
+    const text = collectText(h.body).join('\n');
+    assert.ok(
+        !text.includes('A-FALLBACK-TEXT'),
+        `迟到的纯文本兜底响应不得覆盖 B（body 文本：${text.slice(0, 200)}）`,
+    );
 });
 
 test('A5：abort 未生效时，fetch 之后的代次校验必须拦下迟到渲染（V4 兜底）', async () => {

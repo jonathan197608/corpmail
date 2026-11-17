@@ -310,10 +310,24 @@ fn build_md_uses_relative_attachment_path_only() {
         !md.contains(&abs),
         "导出不得含数据目录绝对路径（{abs}）：{md}"
     );
-    assert!(
-        !md.contains("/Users/"),
-        "不得出现任何本机绝对路径形态：{md}"
-    );
-    assert!(!md.contains("/Library/"), "同上：{md}");
+    // R12：原两条 `!/Users/`、`!/Library/` 恒真（temp_state 落在系统 T 目录，
+    // 永不含这些前缀）——换成对真实路径行的判别式：附件路径必须相对、以
+    // attachments/ 开头且绝不以 / 开头。实现若回退到绝对路径，此断言必 fail
+    let path_lines: Vec<&str> = md
+        .lines()
+        .filter(|l| l.contains("attachments/") || l.contains(".xlsx.gz"))
+        .collect();
+    assert!(!path_lines.is_empty(), "应存在附件路径行：{md}");
+    for line in path_lines {
+        let trimmed = line.trim_start_matches([' ', '-', '*', '`']);
+        assert!(
+            !trimmed.starts_with('/'),
+            "附件路径行不得是绝对路径：{line}"
+        );
+        assert!(
+            trimmed.contains("attachments/") || trimmed.starts_with(".xlsx"),
+            "附件路径行应相对：{line}"
+        );
+    }
     cleanup(&dir);
 }

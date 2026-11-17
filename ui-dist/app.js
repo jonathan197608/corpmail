@@ -655,8 +655,10 @@ function mbxPrintEmail() {
 // 附件预览（M5）：img / pdf / text 三类内嵌渲染
 // text 类服务端强制 text/plain 返回（防 text/html 脚本执行），前端 pre 渲染
 
-// A5：text 预览的代次令牌（office 分支由 office-preview.js 内部的 state.seq
-// 承担；text 分支的 fetch 不经过那套状态，需要本侧独立的代次）
+// --- A5 preview dispatch core START ---
+// （锚点供 e2e/unit/preview-dispatch.test.mjs 在 Node vm 中执行跨类型代次逻辑）
+// A5：text 预览的代次令牌（office 分支另有 office-preview.js 内部的 state.seq；
+// text 分支的 fetch 不经过那套状态，需要本侧独立的代次）
 let mbxPreviewSeq = 0;
 
 function mbxPreviewAttachment(url, kind, name) {
@@ -664,6 +666,11 @@ function mbxPreviewAttachment(url, kind, name) {
     const body = document.getElementById('pm-body');
     const nameEl = document.getElementById('pm-name');
     if (!modal || !body) return;
+    // 复查 R2：入口对**所有 kind**统一换代次。Office 分支的异步由
+    // office-preview.js 的 state.seq 管，但本侧 text fetch 不经过那套状态——
+    // 若只在 text 分支递增，慢 text A 在途时切到 Office B（只调 mbxOfficeReset），
+    // 本侧令牌不变，A 的迟到响应会把文本塞进 B 的面板（跨类型错配）
+    const my = ++mbxPreviewSeq;
     // 每次打开先复位 Office 专用状态（宽版面板/工具栏/渲染实例）
     if (window.mbxOfficeReset) window.mbxOfficeReset();
     if (nameEl) nameEl.textContent = name;
@@ -689,10 +696,9 @@ function mbxPreviewAttachment(url, kind, name) {
         frame.title = name;
         body.appendChild(frame);
     } else if (kind === 'text') {
-        // A5：入口先换代次（Office 复位只管 office 状态，text 分支的 fetch
-        // 不在其中）——慢 text 请求完成后若用户已切换到别的附件，直接丢弃，
-        // 不把旧内容追加进新面板、也不把旧错误写进新面板
-        const my = ++mbxPreviewSeq;
+        // A5/R2：代次已在入口对全部 kind 递增。慢 text 请求完成后若用户
+        // 已切到别的附件（含 Office），直接丢弃——不把旧内容追加进新面板、
+        // 也不把旧错误写进新面板
         fetch(url)
             .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
             .then(t => {
@@ -716,6 +722,7 @@ function mbxPreviewAttachment(url, kind, name) {
     modal.hidden = false;
     mbxPreviewTrap(modal);
 }
+// --- A5 preview dispatch core END ---
 
 // 预览模态的焦点陷阱（R51/R80）：只在面板内循环（遮罩不可聚焦），
 // 关闭时由 mbxClosePreview 释放，焦点回到打开前的元素
