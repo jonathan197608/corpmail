@@ -101,3 +101,28 @@ fn summary_collapses_control_chars_in_subject() {
         "通知正文不得含控制字符：{out:?}"
     );
 }
+
+#[test]
+fn p52_notify_hook_resolves_db_path_inside_callback() {
+    // 复查五 P2-2：首启向导会在同一会话内直切数据目录（不重启）。若通知钩子
+    // 在注册时捕获 db_path，切库后仍指向旧锚点库 → 幽灵空库 + 永不通知。
+    // 护栏要求回调闭包内动态 try_state::<AppState>() 取当前 data_dir。
+    const LIB: &str = include_str!("../lib.rs");
+    let hook_at = LIB
+        .find("state.set_notify_hook")
+        .expect("通知钩子注册点存在");
+    let body = &LIB[hook_at..];
+    let body = &body[..body.find("state.set_tray_hook").unwrap_or(body.len())];
+    assert!(
+        body.contains("try_state::<state::AppState>()"),
+        "通知钩子必须回调内动态取 AppState（首设直切数据目录场景）"
+    );
+    assert!(
+        body.contains("st.data_dir().join(\"corpmail.db\")"),
+        "通知查询的库路径必须来自回调时的当前 data_dir，不得注册时捕获"
+    );
+    assert!(
+        !body.contains("let db_path = state.data_dir()"),
+        "注册点仍存在静态 db_path 捕获"
+    );
+}

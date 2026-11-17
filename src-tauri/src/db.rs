@@ -244,9 +244,9 @@ fn migrate_v13(tx: &Connection) -> rusqlite::Result<()> {
         tx.execute_batch(
             "UPDATE emails SET placeholder = 1
               WHERE too_large = 1
-                 OR body_text LIKE '（该邮件%'
-                 OR body_text LIKE '（邮件内容无法解析%'
-                 OR body_text LIKE '（邮件头无法解析%';",
+                 OR (body_text LIKE '（该邮件%'
+                     AND (body_text LIKE '%正文与附件未下载。%'
+                       OR body_text LIKE '%正文与附件未保存。%'));",
         )?;
     }
     Ok(())

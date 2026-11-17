@@ -1794,6 +1794,121 @@ fn p2_autosave_preserves_existing_scheduled_at() {
 }
 
 #[test]
+fn p51_autosave_preserves_body_when_old_schedule_slides_into_60s_window() {
+    // 复查五 P1-1：定时草稿持续编辑，剩余进入 <=60s 窗口后，表单携带的是
+    // 库中**未改动的旧值**（非用户新设），autosave 必须放行正文更新；
+    // 否则最后 1 分钟编辑全丢，到点按旧正文发出。
+    let (state, dir) = temp_state("p51-autosave-near-window");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 取一个截断到分钟后仍严格落在 (now, now+60] 的值：+60s 格式化到分钟，
+    // 回读必然在 (now, now+60]，既命中校验窗口又保持 > now
+    let near_str = mail::sched_local_value(mail::now_epoch() + 60);
+    let near = mail::sched_epoch_of(&near_str).unwrap();
+    assert!(near > mail::now_epoch() && near <= mail::now_epoch() + 60, "测试构造须落在窗口内");
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "临近窗口草稿".into(),
+            body_text: "旧正文".into(),
+            in_reply_to: None,
+            scheduled_at: near,
+        },
+    )
+    .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "最后一分钟编辑的新正文"),
+                ("scheduled_at", &near_str),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let json = body(&resp);
+    assert!(json.contains("\"ok\":true"), "未改动的旧定时不得拦下 autosave：{json}");
+    let (text, at): (String, i64) = state.with_conn(|c| {
+        c.query_row("SELECT body_text, scheduled_at FROM emails WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    });
+    assert_eq!(text, "最后一分钟编辑的新正文", "正文必须落库");
+    assert_eq!(at, near, "定时时刻不得被改动");
+    cleanup(&dir);
+}
+
+#[test]
+fn p52_sched_cleared_flag_stops_near_term_resurrection() {
+    // 复查五 P1-2：用户清空临近（撤销窗口内）定时，autosave 携 sched_cleared=1
+    // 必须写 0，不得被回读复活（否则界面显示已取消、实际到点照发）
+    let (state, dir) = temp_state("p52-sched-cleared");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 直接把库值设为 now+5（严格落在回读窗口 (now, now+AUTOSAVE_PRESERVE_WINDOW] 内），
+    // 避开 datetime-local 分钟精度导致的边界漂移——否则坏实现也可能碰巧通过
+    let near = mail::now_epoch() + 5;
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "临近定时草稿".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: 0,
+        },
+    )
+    .unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET scheduled_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, near],
+        )
+    })
+    .unwrap();
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "用户主动清空"),
+                ("scheduled_at", ""),
+                ("sched_cleared", "1"),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=?1", [id], |r| r.get(0)).unwrap()
+    });
+    assert_eq!(at, 0, "显式清空标记必须阻止临近定时复活");
+    cleanup(&dir);
+}
+
+#[test]
 fn p4_autosave_allows_clearing_future_schedule() {
     // 复查四 P1-2：用户主动清空远期定时时，空 scheduled_at 必须落 0，
     // 不能被 preserve_sched 回读逻辑复活（否则到点误发）
@@ -9950,6 +10065,42 @@ fn migration_freeze_skips_get_page_size_persistence() {
 /// A10：冻结位一旦置位，`POST /compose/autosave` 必被路由层 409，编辑只能留在
 /// 内存里，迁移完成 1.5s 后自动退出即全丢。所以冻结期根本不该放出撰写表单。
 /// 用「冻结前确实有表单 / 冻结后确实没有」的对照钉死，避免负向断言假通过。
+/// 复查五 P2-5：autosave 响应必须回传保存后草稿的全部附件 id，供前端刷新
+/// keep_ids 隐藏域，避免下一轮裁剪删掉刚入库的附件。
+#[test]
+fn p55_autosave_returns_full_keep_ids() {
+    let (state, dir) = temp_state("p55-autosave-keepids");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    // 用临时文件作为新附件（guard_attach_source 允许 TEMP）
+    let tmp = std::env::temp_dir().join(format!("p55-attach-{}.txt", std::process::id()));
+    std::fs::write(&tmp, b"p55 payload").unwrap();
+    let resp = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "带附件正文"),
+                ("keep_ids", "[]"),
+                ("attach_paths", &format!("[\"{}\"]", tmp.to_string_lossy())),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["ok"], true, "autosave 应成功：{resp}");
+    let ids = v["keep_ids"].as_array().expect("响应须含 keep_ids 数组");
+    assert_eq!(ids.len(), 1, "刚入库的附件须在 keep_ids 中：{resp}");
+    let detail = mail::get(&state, v["draft_id"].as_i64().unwrap()).unwrap();
+    assert_eq!(detail.attachments[0].id, ids[0].as_i64().unwrap());
+    let _ = std::fs::remove_file(&tmp);
+    cleanup(&dir);
+}
+
 #[test]
 fn migration_freeze_blocks_compose_page_and_autosave() {
     let base = std::env::temp_dir().join(format!("mbx-router-a10-{}", std::process::id()));
@@ -10152,6 +10303,41 @@ fn retry_body_truncates_on_char_boundary() {
     assert!(decoded.len() <= RETRY_BODY_LIMIT, "超长正文按上限截断");
     assert_eq!(decoded.len() % 3, 0, "截断点必须落在 UTF-8 字符边界");
     assert!(decoded.chars().all(|c| c == '汉'));
+}
+
+/// 复查五 P2-4：失败回跳查询串必须带定时与转发上下文，避免重存变立即发送
+#[test]
+fn p54_retry_form_keeps_schedule_and_forward_context() {
+    let mut f = HashMap::new();
+    let sched = mail::sched_local_value(mail::now_epoch() + 3600);
+    f.insert("scheduled_at".to_string(), sched.clone());
+    f.insert("attach_eml_from".to_string(), "42".into());
+    f.insert("forward_from".to_string(), "43".into());
+    let qs = retry_form_qs(&f);
+    assert!(qs.contains("&sched="), "定时必须进回跳串：{qs}");
+    assert!(qs.contains("&attach_eml_from=42"), "EML 转发来源必须保留：{qs}");
+    assert!(qs.contains("&forward_from=43"), "转发来源必须保留：{qs}");
+
+    // compose_page 回显：时刻可解析、来源为正整数才接受，畸形值丢弃
+    let (state, dir) = temp_state("p54-retry-ctx");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let mut retry_req = req("GET", "/compose", &[]);
+    retry_req.query = format!(
+        "sched={}&attach_eml_from=42&forward_from=notnum",
+        urlencode(&sched)
+    );
+    let html = body(&route(
+        &state,
+        &assets(),
+        &retry_req,
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    assert!(html.contains(&format!("value=\"{sched}\"")), "合法定时须回显：{html}");
+    assert!(html.contains("name=\"attach_eml_from\" value=\"42\""), "EML 转发来源须回显");
+    assert!(!html.contains("name=\"forward_from\" value=\"notnum\""), "畸形来源不得回显");
+    cleanup(&dir);
 }
 
 /// C8：收件同步 / 存储管理四个保存失败分支旧实现都返回「与点击前逐字节相同」

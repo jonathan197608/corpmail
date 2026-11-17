@@ -16,12 +16,20 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_JS = readFileSync(path.join(here, '../../ui-dist/app.js'), 'utf8');
 const START = '// --- A5 preview dispatch core START ---';
 const END = '// --- A5 preview dispatch core END ---';
+const CLOSE_START = '// --- P5 preview close core START ---';
+const CLOSE_END = '// --- P5 preview close core END ---';
+
+function between(startMark, endMark) {
+    const start = APP_JS.indexOf(startMark);
+    const end = APP_JS.indexOf(endMark);
+    assert.ok(start >= 0 && end > start, `app.js 必须带 ${startMark} 锚点`);
+    return APP_JS.slice(start, end);
+}
 
 function core() {
-    const start = APP_JS.indexOf(START);
-    const end = APP_JS.indexOf(END);
-    assert.ok(start >= 0 && end > start, 'app.js 必须带 A5 preview dispatch core 锚点');
-    return APP_JS.slice(start, end);
+    // 复查五 P3-1：关闭函数与入口必须同段执行——mbxPreviewSeq 是 let，
+    // 分两次 vm.runInContext 会是不同词法作用域，关闭就无法换代次。
+    return between(START, END) + '\n' + between(CLOSE_START, CLOSE_END);
 }
 
 function harness({ fetchPlan } = {}) {
@@ -90,6 +98,7 @@ function harness({ fetchPlan } = {}) {
     return {
         ctx, body, nameEl, officeCalls, resetCalls, getTextNodes,
         preview: (url, kind, name) => ctx.mbxPreviewAttachment(url, kind, name),
+        close: () => ctx.mbxClosePreview(),
     };
 }
 
@@ -121,4 +130,18 @@ test('R2：正常 text 单附件渲染不受影响（无回归）', async () => 
     h.preview('/only/view', 'text', '唯一.txt');
     await new Promise((r) => setTimeout(r, 30));
     assert.ok(h.getTextNodes().some((t) => t.includes('ONLY-TEXT')), 'text 分支应正常渲染');
+});
+
+test('P3-1：慢 text 在途关闭预览，迟到响应不得写入隐藏面板', async () => {
+    const h = harness({
+        fetchPlan: { '/slow/view': { delayMs: 120, text: 'SHOULD-NOT-APPEAR' } },
+    });
+    h.preview('/slow/view', 'text', '慢.txt'); // text fetch 在途
+    await new Promise((r) => setTimeout(r, 10));
+    h.close(); // 关闭：应换代次
+    await new Promise((r) => setTimeout(r, 160)); // 等迟到响应
+    assert.ok(
+        !h.getTextNodes().some((t) => t.includes('SHOULD-NOT-APPEAR')),
+        `关闭后迟到的 text 不得塞回隐藏面板（body：${h.getTextNodes().join('\n')}）`,
+    );
 });

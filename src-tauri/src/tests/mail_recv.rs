@@ -1111,3 +1111,69 @@ fn p43_placeholder_row_is_backfilled_on_refetch() {
     assert_eq!((rows[0].3, rows[0].4), (0, 0), "占位/超限标记必须清除");
     cleanup(&dir);
 }
+
+#[test]
+fn p51_normal_body_with_placeholder_prefix_is_not_backfilled() {
+    // 复查五 P2-1：正文恰以「（该邮件」开头的正常邮件，旧版 v13 迁移靠前缀
+    // 会误标 placeholder=1，重拉时被回填覆盖正文——静默数据损坏。
+    // 现在识别需同时命中固定尾部，正常正文不得被改写。
+    assert!(!looks_like_placeholder_body("（该邮件我已读，详见附件。这是正常正文。"));
+    assert!(looks_like_placeholder_body(
+        "（该邮件内容无法解析，或服务器未返回正文，正文与附件未保存。可用网页邮箱查看完整内容。）"
+    ));
+    assert!(looks_like_placeholder_body(
+        "（该邮件约 3.2 MB，超过本地单封收件上限 2.0 MB，正文与附件未下载。）"
+    ));
+
+    let (state, dir) = temp_state("p51-normal-prefix");
+    // 正常正文（仅前缀相同、无占位尾部）先入库
+    let original = incoming(11, false, "（该邮件说明", "<p51@x.cn>");
+    let mut original = original;
+    original.body_text = "（该邮件我已读，详见附件。这是正常正文，不可被覆盖。".into();
+    original.placeholder = true; // 模拟旧库被前缀误标
+    assert_eq!(store_incoming(&state, &[original]).unwrap(), 1);
+    let changed = IncomingMail {
+        subject: "服务器重拉的其它内容".into(),
+        body_text: "这是重拉得到的新正文，不应覆盖正常邮件。".into(),
+        ..incoming(11, false, "（该邮件说明", "<p51@x.cn>")
+    };
+    // 去重命中且 placeholder=1，但 WHERE 双保险要求占位尾部，故不回填
+    assert_eq!(store_incoming(&state, &[changed]).unwrap(), 0);
+    let text: String = state.with_conn(|c| {
+        c.query_row(
+            "SELECT body_text FROM emails WHERE remote_uid = '42:11'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(text, "（该邮件我已读，详见附件。这是正常正文，不可被覆盖。");
+    cleanup(&dir);
+}
+
+#[test]
+fn p53_backfill_commit_failure_cleans_written_attachments() {
+    // 复查五 P3-3：回填事务提交失败必须清理已落盘附件，避免孤儿文件。
+    const SRC: &str = include_str!("../mail/recv.rs");
+    let at = SRC
+        .find("fn backfill_placeholder_conn")
+        .expect("回填函数存在");
+    let end = SRC[at..]
+        .find("\n}\n")
+        .map(|p| at + p)
+        .unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    let commit = body
+        .find("tx.commit()")
+        .expect("回填须在事务内提交");
+    let tail = &body[commit..];
+    assert!(
+        tail.contains("remove_file(f)"),
+        "commit 失败路径也必须清理 written 附件，不留孤儿文件"
+    );
+    assert_eq!(
+        body.matches("remove_file(f)").count(),
+        2,
+        "写入失败与提交失败两条路径都要清理附件"
+    );
+}

@@ -242,11 +242,21 @@ impl Drop for FreezeGuard<'_> {
 
 /// 冻结期不要不可逆地消费已有工作项（复查四 P2-1）：send worker 取到 id 后
 /// 若遇冻结，在此阻塞等待解冻再继续派发；失败解冻（FreezeGuard::drop）后
-/// 无需重启。用 200ms 轮询而非自旋，退出由进程/通道关闭接管。
-fn wait_while_frozen(flag: &std::sync::atomic::AtomicBool) {
+/// 无需重启。用 200ms 轮询而非自旋。
+/// 复查五 P1-3：成功迁移的冻结是**永久态**（keep() 一直保持到重启），此时
+/// 若只等 flag 反转就会永久 sleep——退出流程虽 drop 了 sender，worker 却
+/// 卡在这里、`exited` 永不置位，stop_send_worker 只能空等满 SEND_STOP_WAIT。
+/// 因此额外接受 `stop` 判据（进程退出位）：一旦请求退出立即返回 false，
+/// 调用方直接收手，id 留 DB queued 由重启后的残留扫描补发（迁移成功时新库
+/// 同样含该行）。返回 true = 已解冻，可继续派发。
+fn wait_while_frozen(flag: &std::sync::atomic::AtomicBool, stop: impl Fn() -> bool) -> bool {
     while flag.load(std::sync::atomic::Ordering::SeqCst) {
+        if stop() {
+            return false;
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    !stop()
 }
 
 /// 存储页统计缓存项（clean::estimate + 旧目录备份，避免反复全库扫描）
@@ -1932,7 +1942,12 @@ impl AppState {
                 // 迁移失败解冻后只能等重启补发。
                 if migration_flag.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!("[send] 迁移冻结中，邮件 {id} 保持排队，解冻后继续派发");
-                    wait_while_frozen(&migration_flag);
+                    // 复查五 P1-3：成功迁移的冻结是永久态，必须同时看退出位；
+                    // 返回 false = 正在退出，直接收手（id 留 queued，重启补发）
+                    if !wait_while_frozen(&migration_flag, crate::shutdown_requested) {
+                        exited.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
                 }
                 // 发送参数快照：每封派发前重读配置（corpmail.toml；改动即时生效，
                 // 不落库——验收拍板简化）

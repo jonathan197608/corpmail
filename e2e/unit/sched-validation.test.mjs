@@ -51,10 +51,19 @@ test('过去时刻与 60 秒内都必须在前端拦下', () => {
     );
 });
 
-test('远期合法时刻放行，min 属性随当前时间滚动', () => {
+test('远期合法时刻放行，min 属性随当前时间滚动（秒非零也必须可选）', () => {
     const now = new Date(2026, 10, 17, 15, 0, 0).getTime();
     assert.equal(sandbox.mbxSchedValidationError(localInput(now + 3600_000), now), '');
     const min = sandbox.mbxSchedLocalMin(now);
     assert.match(min, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
-    assert.ok(new Date(min).getTime() >= now + 60_000 - 60_000, 'min 不得早于 now+1 分钟所在分钟');
+    assert.ok(new Date(min).getTime() >= now + 60_000, 'min 不得早于 now+1 分钟');
+    // 复查五 P2-3：秒数≠0 时 min 向上取整，控件允许的最小值必须能通过校验，
+    // 否则用户选了 min 仍被拒，必须手动跳到下一分钟
+    const skewed = new Date(2026, 10, 17, 15, 0, 30).getTime();
+    const skewedMin = sandbox.mbxSchedLocalMin(skewed);
+    assert.ok(new Date(skewedMin).getTime() >= skewed + 60_000, '秒非零时 min 需向上取整');
+    assert.equal(
+        sandbox.mbxSchedValidationError(skewedMin, skewed), '',
+        '控件允许的 min 值不得被前端校验拒绝'
+    );
 });

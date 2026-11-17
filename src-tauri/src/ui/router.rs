@@ -2549,7 +2549,13 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     // （scheduled_at 空 → 0）晚于点发送到达时，不覆写 send 设下的撤销窗口时刻
     match save_compose_form(state, req, true) {
         Ok((id, _, _, _)) => {
-            Resp::json(serde_json::json!({ "ok": true, "draft_id": id }).to_string())
+            // 复查五 P2-5：回传本轮保存后草稿的**全部**附件 id。前端据此刷新
+            // keep_ids 隐藏域并清空已消费的 attach-paths——否则下轮 autosave
+            // 按旧列表裁剪会删掉刚入库的附件，源文件一旦移走就静默丢失。
+            let keep_ids: Vec<i64> = mail::get(state, id)
+                .map(|d| d.attachments.iter().map(|a| a.id).collect())
+                .unwrap_or_default();
+            Resp::json(serde_json::json!({ "ok": true, "draft_id": id, "keep_ids": keep_ids }).to_string())
         }
         // 自动保存失败不打断编辑（下次防抖/手动保存重试），前端只提示静默
         Err(_) => Resp::json("{\"ok\":false}".into()),
@@ -2590,23 +2596,16 @@ fn save_compose_form(
             0
         })
     };
-    // P1-4 统一过去时刻校验：所有写入口（存草稿/自动保存/发送）都走这里，
-    // 过去时刻不得落库（否则调度线程当轮即发出，用户以为只是存草稿）
-    if scheduled_at > 0 && scheduled_at <= mail::now_epoch() + 60 {
-        return Err((
-            draft_id.unwrap_or(0),
-            "定时时间需晚于当前时间 1 分钟以上，请重新选择".to_string(),
-        ));
-    }
-    // P2-1 / 复查四 P1-2：autosave 携带的 scheduled_at=0 不得抹掉「撤销窗口」
-    // 中由点发送写入的时刻；但用户主动清空远期定时也是同一个空值形态，
-    // 因此只回读 at <= now + AUTOSAVE_PRESERVE_WINDOW（约 10s）的近端时刻。
-    if preserve_sched
-        && scheduled_at == 0
-        && let Some(id) = draft_id
-    {
-        let now = mail::now_epoch();
-        let current: Option<i64> = state
+    // 复查五 P1-1/P1-2：autosave 需要区分三种同为「定时」的表单形态——
+    //  (a) 在途旧表单携 scheduled_at=0（无清空标记）→ 保留撤销窗口时刻；
+    //  (b) 用户主动清空（sched_cleared=1）→ 必须写 0，不得复活；
+    //  (c) 表单携带未改动的库中旧值随时间滑入 60s 窗口 → 只更新正文，
+    //      不能整单拒绝（否则用户最后 1 分钟编辑全部丢失、到点按旧正文发出）。
+    // 因此 autosave 先回读库中当前定时一次，供三处共用。
+    let now = mail::now_epoch();
+    let sched_cleared = form.get("sched_cleared").map(|s| s == "1").unwrap_or(false);
+    let current_sched = match draft_id {
+        Some(id) if preserve_sched => state
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT scheduled_at FROM emails
@@ -2617,8 +2616,24 @@ fn save_compose_form(
                 .optional()
             })
             .ok()
-            .flatten();
-        if let Some(at) = current.filter(|at| *at > now && *at <= now + AUTOSAVE_PRESERVE_WINDOW) {
+            .flatten(),
+        _ => None,
+    };
+    // P1-4 统一过去时刻校验：新设的过去时刻不得落库（否则调度线程当轮即发出）。
+    // 例外仅一处：autosave 携带的是**库中未改动的旧定时**，它随时间进入窗口，
+    // 不是用户新意图；放行以保住正文编辑（复查五 P1-1）。
+    if scheduled_at > 0 && scheduled_at <= now + 60 {
+        let unchanged_old = preserve_sched && scheduled_at > now && current_sched == Some(scheduled_at);
+        if !unchanged_old {
+            return Err((
+                draft_id.unwrap_or(0),
+                "定时时间需晚于当前时间 1 分钟以上，请重新选择".to_string(),
+            ));
+        }
+    } else if scheduled_at == 0 && preserve_sched && !sched_cleared {
+        // P2-1 / 复查四 P1-2：无清空标记的 0 值视为在途旧表单，仅回读撤销窗口
+        // 内的近端时刻；远期定时仍可被用户主动清空（复查四 P1-2 口径不变）。
+        if let Some(at) = current_sched.filter(|at| *at > now && *at <= now + AUTOSAVE_PRESERVE_WINDOW) {
             scheduled_at = at;
         }
     }
@@ -2897,6 +2912,16 @@ fn retry_form_qs(form: &HashMap<String, String>) -> String {
             urlencode(&truncate_utf8(body, RETRY_BODY_LIMIT))
         ));
     }
+    // 复查五 P2-4：失败回跳不得丢失定时与转发上下文，否则用户重存变立即
+    // 发送 / 无引用附件。两个字段都必须来自本表单，不信任 query 反向注入。
+    if let Some(v) = form.get("scheduled_at").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("&sched={}", urlencode(v)));
+    }
+    for field in ["attach_eml_from", "forward_from"] {
+        if let Some(n) = form_i64(form, field).filter(|n| *n > 0) {
+            out.push_str(&format!("&{field}={n}"));
+        }
+    }
     out
 }
 
@@ -2927,20 +2952,31 @@ fn apply_retry_form(req: &Req, ctx: &mut ComposeCtx) {
     if let Some(v) = req.query_param("subject") {
         ctx.subject = v;
     }
-    let Some(body) = req.query_param("body") else {
-        return;
-    };
-    if req.query_param("mode").as_deref() == Some("html") {
-        let clean = mail::sanitize_html(&body);
-        if !clean.trim().is_empty() {
-            ctx.body_text = mail::strip_html(&clean);
-            ctx.body_html = mail::unwrap_top_div(&clean);
-            ctx.body_mode = "html".into();
+    if let Some(body) = req.query_param("body") {
+        if req.query_param("mode").as_deref() == Some("html") {
+            let clean = mail::sanitize_html(&body);
+            if !clean.trim().is_empty() {
+                ctx.body_text = mail::strip_html(&clean);
+                ctx.body_html = mail::unwrap_top_div(&clean);
+                ctx.body_mode = "html".into();
+            }
+        } else {
+            ctx.body_text = body;
+            ctx.body_html = String::new();
+            ctx.body_mode = "plain".into();
         }
-    } else {
-        ctx.body_text = body;
-        ctx.body_html = String::new();
-        ctx.body_mode = "plain".into();
+    }
+    // 复查五 P2-4：定时与转发上下文回显（URL 值同样不可信——时刻须可解析）
+    if let Some(s) = req.query_param("sched")
+        && mail::sched_epoch_of(&s).is_some()
+    {
+        ctx.sched_local = s;
+    }
+    if let Some(n) = req.query_param("attach_eml_from").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0) {
+        ctx.attach_eml_from = n;
+    }
+    if let Some(n) = req.query_param("forward_from").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0) {
+        ctx.forward_from = n;
     }
 }
 
@@ -3638,7 +3674,10 @@ const PER_DEFAULT: i64 = 10;
 
 /// 撤销发送窗口（A1）：点发送后先等这么多秒才真正入队，
 /// 窗口内 toast 提供「撤销发送」。与 app.js 的倒计时保持一致。
-const UNDO_SEND_SECS: i64 = 8;
+/// 撤销窗口：后端给 9s（now_epoch 为整秒，实际窗口 8~9s），前端倒计时
+/// 固定 8s 收手——保证按钮可见期间撤销必然成功（复查五 P3-2：旧值 8s
+/// 时后端实际窗口可短至 7s，最后约 1s 按钮在但撤销必失败）。
+const UNDO_SEND_SECS: i64 = 9;
 
 /// autosave 回读 scheduled_at 的最大剩余窗口：只保护撤销窗口在途请求，
 /// 不复活用户主动清空的远期定时（复查四 P1-2）。

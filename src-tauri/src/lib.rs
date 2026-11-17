@@ -135,14 +135,19 @@ pub fn run() {
             state.start_send_worker();
             // 新邮件通知钩子（收件轮完成 → 本轮窗口内未读新件汇总一条系统通知）
             // notify 自建独立连接查询（WAL 下与主库读写不互阻，收件线程回调零锁竞争）。
-            // db_path 直接取自手上的 state（勿用 app.state()：本注册点在 manage() 之前，
-            // state() 会 panic "called before manage()"）
+            // 复查五 P2-2：db_path 不能在注册时捕获——首启向导可能在同一会话内
+            // 直切自定义数据目录（switch_data_dir_first_run/adopt，不重启），此时
+            // 回调若仍指向旧锚点库，db::open 会凭空建一个幽灵空库并永不通知。
+            // 注册点在 manage() 之前不能 state()，但**回调执行时**注入已完成，
+            // 因此改为在闭包内动态取当前 AppState 的数据目录。
             {
                 let handle: tauri::AppHandle = app.handle().clone();
-                let db_path = state.data_dir().join("corpmail.db");
                 let notify_handle = handle.clone();
                 state.set_notify_hook(std::sync::Arc::new(move |since, _added| {
-                    notify::on_fetch_finished(&notify_handle, &db_path, since);
+                    if let Some(st) = notify_handle.try_state::<state::AppState>() {
+                        let db_path = st.data_dir().join("corpmail.db");
+                        notify::on_fetch_finished(&notify_handle, &db_path, since);
+                    }
                     // 收件轮结束未读数必已变化：同步刷新托盘角标
                     tray::refresh_badge(&notify_handle);
                 }));
@@ -355,7 +360,7 @@ fn startup_fatal(app: &tauri::App, detail: &str) -> Box<dyn std::error::Error> {
 /// 不再发起收件/发送/清理，不再写库，避免与正在收尾的进程抢 SQLite 写锁
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn shutdown_requested() -> bool {
+pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
 }
 

@@ -1255,7 +1255,12 @@ fn remap_old_uidvalidity(
 /// 存量占位行识别（v13 之前没有 placeholder 列）：这些文案均由本程序生成，
 /// 前缀固定；只用于旧库迁移/兜底，新行一律以列为准。
 fn looks_like_placeholder_body(body: &str) -> bool {
-    body.starts_with("（该邮件") || body.starts_with("（邮件内容无法解析")
+    // 复查五 P2-1：仅凭「（该邮件」前缀会误伤以该词开头的正常正文，重拉时
+    // 被当成占位回填覆盖（数据损坏）。必须同时命中文案固定尾部——本程序
+    // 生成的两种占位正文都以「正文与附件未下载/未保存。」收束，用户正文
+    // 极难巧合同时满足，与 db.rs migrate_v13 的 SQL 口径一致。
+    body.starts_with("（该邮件")
+        && (body.contains("正文与附件未下载。") || body.contains("正文与附件未保存。"))
 }
 
 /// 统一写附件 + 回写统计，正常入库与占位回填共用（复查四 P1-3）。
@@ -1306,7 +1311,12 @@ fn backfill_placeholder_conn(
                     to_addrs = ?5, cc_addrs = ?6, body_text = ?7, body_kind = ?8,
                     body_html = ?9, raw_headers = ?10, too_large = 0, placeholder = 0,
                     subject_tokens = ?11, body_tokens = ?12, thread_key = ?13
-             WHERE id = ?1 AND placeholder = 1",
+             WHERE id = ?1 AND placeholder = 1
+               AND (too_large = 1
+                    OR (body_text LIKE '（该邮件%'
+                        AND (body_text LIKE '%正文与附件未下载。%'
+                          OR body_text LIKE '%正文与附件未保存。%')))
+             ",
             rusqlite::params![
                 id,
                 m.subject,
@@ -1331,7 +1341,13 @@ fn backfill_placeholder_conn(
     let mut written: Vec<PathBuf> = Vec::new();
     let result = write_incoming_attachments(&tx, &root, id, &m.attachments, limit, &mut written);
     match result {
-        Ok(()) => tx.commit().map_err(e),
+        // 复查五 P3-3：commit 失败同样要清理已落盘附件，否则 DB 回滚后
+        // 文件残留成孤儿（与正常入库路径及下方 Err 分支口径一致）
+        Ok(()) => tx.commit().inspect_err(|_| {
+            for f in &written {
+                let _ = std::fs::remove_file(f);
+            }
+        }).map_err(e),
         Err(err) => {
             drop(tx);
             for f in &written {

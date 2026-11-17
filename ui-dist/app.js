@@ -733,15 +733,20 @@ function mbxPreviewTrap(modal) {
     modal.__mbxRelease = mbxModalOpen(modal, panel);
 }
 
+// --- P5 preview close core START ---
 function mbxClosePreview() {
     const modal = document.getElementById('preview-modal');
     if (!modal) return;
-    if (modal.__mbxRelease) { modal.__mbxRelease(); modal.__mbxRelease = null; }
+    // 复查五 P3-1：关闭同样是一次「预览代次更替」——否则慢 text 请求在关闭后
+    // 迟到，my===mbxPreviewSeq 仍成立，会把 <pre> 塞回已清空的隐藏面板。
+    if (typeof mbxPreviewSeq === 'number') mbxPreviewSeq++;
     if (window.mbxOfficeReset) window.mbxOfficeReset();
+    if (modal.__mbxRelease) { modal.__mbxRelease(); modal.__mbxRelease = null; }
     modal.hidden = true;
     const body = document.getElementById('pm-body');
     if (body) body.innerHTML = '';  // 释放 img/iframe 资源
 }
+// --- P5 preview close core END ---
 
 // Esc 关闭预览
 document.addEventListener('keydown', ev => {
@@ -1480,6 +1485,15 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
                             if (idEl && (!idEl.value || idEl.value === '0')) {
                                 idEl.value = String(res.draft_id);
                             }
+                            // 复查五 P2-5：用服务端返回的完整附件 id 刷新 keep_ids，
+                            // 并清空已落库的待选文件——否则下一轮按旧列表裁剪会
+                            // 删掉刚入库的附件；源文件此时被移走则静默丢失。
+                            if (Array.isArray(res.keep_ids)) {
+                                var keepEl = form.querySelector('#keep-ids');
+                                if (keepEl) keepEl.value = JSON.stringify(res.keep_ids);
+                                pickedPaths.length = 0;
+                                renderPicked();
+                            }
                         }
                     }
                     finish({ ok: ok, status: xhr ? xhr.status : 0 });
@@ -1576,7 +1590,10 @@ function mbxSchedValidationError(pickerValue, nowMs) {
     return '';
 }
 function mbxSchedLocalMin(nowMs) {
-    var d = new Date(nowMs + 60 * 1000);
+    // 复查五 P2-3：datetime-local 精度到分钟，min 必须**向上**取整到下一分钟，
+    // 否则 now=15:00:30 时 min 写 15:01，用户选它却被校验(15:01:00 <= 15:01:30)拒绝。
+    // 与后端 now+60s 校验共用同一口径：min >= now+60s。
+    var d = new Date(Math.ceil((nowMs + 60 * 1000) / 60000) * 60000);
     function p2(n) { return String(n).padStart(2, '0'); }
     return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
         + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes());
@@ -1592,6 +1609,9 @@ function mbxSchedLocalMin(nowMs) {
 (function () {
     function hidden() { return document.getElementById('sched-at'); }
     function picker() { return document.getElementById('sched-input'); }
+    // 复查五 P1-2：显式区分「用户主动清空」与「在途旧表单携空值」——
+    // 清空时置 1，重选/手输合法时刻时清 0；后端据此决定是否回读撤销窗口时刻。
+    function cleared() { return document.getElementById('sched-cleared'); }
     function note(msg) {
         var n = document.createElement('div');
         n.className = 'compose-note err';
@@ -1601,8 +1621,9 @@ function mbxSchedLocalMin(nowMs) {
         setTimeout(function () { if (n.parentNode) n.remove(); }, 4000);
     }
     function sync() {
-        var h = hidden(), p = picker();
+        var h = hidden(), p = picker(), c = cleared();
         if (h && p) h.value = p.value || '';
+        if (c) c.value = (p && !p.value) ? '1' : '0';
     }
     // 复查四 P3-1：控件自带 min，用户选过去时刻即可见，不必等后端整页跳回
     var initialPicker = picker();

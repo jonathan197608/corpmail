@@ -2594,15 +2594,32 @@ fn p44_wait_while_frozen_resumes_after_thaw_and_send_worker_uses_it() {
         std::thread::sleep(std::time::Duration::from_millis(80));
         toggle.store(false, std::sync::atomic::Ordering::SeqCst);
     });
-    wait_while_frozen(&flag);
+    wait_while_frozen(&flag, || false);
     assert!(!flag.load(std::sync::atomic::Ordering::SeqCst), "解冻后应返回");
+
+    // 复查五 P1-3：成功迁移的冻结是永久态（flag 恒 true），退出位一置必须立刻返回
+    let stuck = std::sync::atomic::AtomicBool::new(true);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let t0 = std::time::Instant::now();
+    let resumed = wait_while_frozen(&stuck, || stop.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!resumed, "退出判据置位时必须中止等待");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "永久冻结 + 退出不得挂满 stop 超时"
+    );
+    assert!(stuck.load(std::sync::atomic::Ordering::SeqCst), "中止不应改动冻结位");
 
     const STATE_SRC: &str = include_str!("../state.rs");
     let start = STATE_SRC.find("std::thread::spawn(move || {\n            for id in rx").unwrap();
     let body = &STATE_SRC[start..];
     let body = &body[..body.find("\n        })").unwrap_or(body.len())];
     assert!(
-        body.contains("wait_while_frozen(&migration_flag)"),
-        "send worker 冻结分支必须等待解冻，不得 continue 丢弃 id"
+        body.contains("wait_while_frozen(&migration_flag, crate::shutdown_requested)"),
+        "send worker 冻结分支必须同时传入退出判据，避免成功迁移后永久 sleep"
     );
 }

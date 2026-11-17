@@ -127,6 +127,7 @@
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this"
                             title="到定时时刻自动发送（期间驻留草稿箱）">{{ ic.icon('clock') }} 定时发送</button>
                     <input type="hidden" name="scheduled_at" id="sched-at" value="{{ sched_local }}">
+                    <input type="hidden" name="sched_cleared" id="sched-cleared" value="0">
                     <button type="button" class="btn primary big"
                             hx-post="/compose/send" hx-include="closest form"
                             hx-trigger="click throttle:500ms" hx-disabled-elt="this">{{ ic.icon('send') }} 发送</button>
