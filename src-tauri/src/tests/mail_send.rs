@@ -783,8 +783,9 @@ fn dispatch_enqueue_is_transactional_with_sched_condition() {
     let start = SEND_SRC
         .find("pub fn dispatch_due_scheduled")
         .expect("dispatch 函数存在");
+    // 截到下一个文档注释边界：函数体内可能有顶格 `}`，`find("\n}\n")` 会误截
     let end = SEND_SRC[start..]
-        .find("\n}\n")
+        .find("\n/// ")
         .map(|p| start + p)
         .unwrap_or(SEND_SRC.len());
     let body = &SEND_SRC[start..end];
@@ -798,8 +799,14 @@ fn dispatch_enqueue_is_transactional_with_sched_condition() {
         tail.contains("scheduled_at > 0") && tail.contains("scheduled_at <= ?2"),
         "入队 UPDATE 必须复核 scheduled_at 到点，防撤销 TOCTOU"
     );
-    // 不得再调用旧的 enqueue_draft（它只判 status，是 TOCTOU 根因）
-    assert!(!body.contains("enqueue_draft(state, id)"), "不得回退到非原子 enqueue_draft");
+    // 不得再调用旧的 enqueue_draft（它只判 status，是 TOCTOU 根因）。
+    // 只看非注释行，避免注释里提到函数形态就误伤
+    let code: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!code.contains("enqueue_draft("), "不得回退到非原子 enqueue_draft");
 }
 
 /// P1-3 撤销 TOCTOU：dispatch 的条件 UPDATE 必须在 scheduled_at 被清 0 后拒绝入队。

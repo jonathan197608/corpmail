@@ -393,13 +393,12 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
     let worker_handle = handle.clone();
     std::thread::spawn(move || {
         let mut failures = 0u32;
+        // 复查四 P2-1：冻结期丢掉的唤醒不能就此消失，解冻后要主动补一轮
+        let mut thaw_pending = false;
         loop {
-            // failures == 0：阻塞等待唤醒（空闲零开销；channel 断开说明状态已销毁），
-            // 醒来后合并窗口把连点合成一批；failures > 0：上一轮失败且退避已睡完，
-            // 直接重试（旧实现睡完回 recv 阻塞——退避被架空成"等用户再点一封"，
-            // 瞬时网络抖动后必须等用户下一次点击才补得上）。
-            // 用 recv_timeout 而不是 recv：退出时线程要能自己收手（审计 R62）
-            if failures == 0 {
+            // failures == 0 且非待补发：阻塞等待唤醒；failures > 0 或 thaw_pending：
+            // 直接进入本轮（退避/解冻补偿不被 recv 阻塞架空）。
+            if failures == 0 && !thaw_pending {
                 loop {
                     if shutdown_requested() {
                         return;
@@ -418,12 +417,22 @@ fn spawn_seen_worker<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                 }
                 while rx.try_recv().is_ok() {}
             }
+            // 解冻补偿只做一轮，之后恢复常规等待
+            thaw_pending = false;
             let state = worker_handle.state::<state::AppState>();
-            // R14：迁移冻结期（进行中或待重启）不连 IMAP，也不写即将被抛弃的旧库。
-            // 跳过零损失——seen_pending 标志留在库里，重启后 worker 自唤醒补发
+            // R14：迁移冻结期不连 IMAP，也不写即将被抛弃的旧库。
+            // 复查四 P2-1：标志留在库里，但要记住「解冻后补一轮」，否则
+            // 迁移失败原地继续运行时这些行要等到用户再点一封才回写。
             if state.migration_pending() {
-                eprintln!("[seen] 迁移冻结中，跳过本轮已读回写（重启后补发）");
+                eprintln!("[seen] 迁移冻结中，跳过本轮已读回写（解冻后自动补发，无需重启）");
                 failures = 0;
+                thaw_pending = true;
+                if !wait_or_stop(
+                    std::time::Duration::from_millis(500),
+                    std::time::Duration::from_millis(500),
+                ) {
+                    return;
+                }
                 continue;
             }
             match mail::seen::flush(&state, &mail::RealFetcher) {
@@ -553,25 +562,30 @@ fn spawn_clean_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
         ) {
             return;
         }
+        // 复查四 P2-1：冻结期跳过的清理不能等满下一个 24h，解冻后立刻补一轮
+        let mut thaw_pending: bool;
         loop {
             let state = handle.state::<state::AppState>();
-            // 迁移冻结（R2）：清理器会删库行与附件文件，冻结期整轮跳过。
-            // R9：进行中与待重启分开留痕——两种状态日志若都写「待重启」，
-            // 线上排查时分不清那一刻迁移到底跑完没有
             if state.migration_pending() {
                 let why = match state.migration_phase() {
                     state::MigrationPhase::Running => "迁移进行中",
                     _ => "迁移待重启",
                 };
                 eprintln!("[clean] {why}，跳过本轮清理");
-            } else if let Err(err) = clean::run(&state) {
-                eprintln!("[clean] 清理器执行失败：{err}");
+                thaw_pending = true;
+            } else {
+                if let Err(err) = clean::run(&state) {
+                    eprintln!("[clean] 清理器执行失败：{err}");
+                }
+                thaw_pending = false;
             }
-            // 24h 也用可中断等待：退出时不必等满一个周期才收手
-            if !wait_or_stop(
-                std::time::Duration::from_secs(24 * 3600),
-                std::time::Duration::from_secs(30),
-            ) {
+            // 冻结期/刚解冻时用 30s 分片轮询，正常态仍维持 24h 周期
+            let period = if thaw_pending {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::from_secs(24 * 3600)
+            };
+            if !wait_or_stop(period, std::time::Duration::from_secs(30)) {
                 return;
             }
         }

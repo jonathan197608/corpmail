@@ -486,3 +486,13 @@ fn referenced_attachment_survives_orphan_sweep_after_grace() {
     assert!(path.exists(), "被引用附件超宽限期后仍必须保留（数据丢失防护）");
     cleanup(&dir);
 }
+
+#[test]
+fn p45_negative_retention_days_are_clamped_not_future_cutoff() {
+    // 复查四 P3-2：非 UI 途径写 -1 不得让 cutoff 跑到未来清空全库
+    assert_eq!(parse_days(Some("-1".into())), Some(0));
+    assert_eq!(parse_days(Some("  -365  ".into())), Some(0));
+    assert_eq!(parse_days(Some("30".into())), Some(30));
+    assert_eq!(parse_days(Some(String::new())), None);
+    assert_eq!(parse_days(None), None);
+}

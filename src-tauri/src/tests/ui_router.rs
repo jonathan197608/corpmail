@@ -35,6 +35,8 @@ struct FakeTester {
 /// R8：用例开头必须显式清零，且本测试套件以 --test-threads=1 串行运行
 /// （README 门禁命令），否则并行下跨例互相覆盖会伪造 PASS
 static LAST_IMAP_PASSWORD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// 最近一次 imap() 收到的 host（复查四 P1-1：断言测试连接不会把真密码送到表单伪造的主机）
+static LAST_IMAP_HOST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 impl ConnTester for FakeTester {
     fn smtp(
@@ -58,12 +60,16 @@ impl ConnTester for FakeTester {
 
     fn imap(
         &self,
-        _host: &str,
+        host: &str,
         _port: u16,
         _mode: crate::net::TlsMode,
         _account: &str,
         password: &str,
     ) -> TestOutcome {
+        LAST_IMAP_HOST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace_range(.., host);
         LAST_IMAP_PASSWORD
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1669,8 +1675,8 @@ fn compose_draft_with_attachments_and_keep_ids() {
 }
 
 #[test]
-fn p1_past_scheduled_at_rejected_on_every_compose_entry() {
-    // P1-4：过去时刻不得经任何入口（存草稿为这里覆盖的代表）落库，
+fn p1_past_scheduled_at_rejected_on_draft_entry() {
+    // P1-4：过去时刻不得经「存草稿」入口落库，
     // 否则调度线程当轮即发出，用户以为只是存草稿
     let (state, dir) = temp_state("p14-past-sched");
     state
@@ -1705,13 +1711,49 @@ fn p1_past_scheduled_at_rejected_on_every_compose_entry() {
 }
 
 #[test]
+fn p4_past_scheduled_at_rejected_on_send_and_autosave_entries() {
+    // 复查四 P3-4：三个写入口共用 save_compose_form，但每个入口都要有断言，
+    // 避免「every_entry」式命名掩盖某个端点不再走校验的回归
+    let past = mail::sched_local_value(mail::now_epoch() - 3600);
+    for path in ["/compose/send", "/compose/autosave"] {
+        let (state, dir) = temp_state(&format!("p46-{}", path.replace('/', "-")));
+        state
+            .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+            .unwrap();
+        let resp = route(
+            &state,
+            &assets(),
+            &req(
+                "POST",
+                path,
+                &form(&[
+                    ("to_addrs", "peer@x.cn"),
+                    ("subject", "过去时刻"),
+                    ("body_text", "正文"),
+                    ("keep_ids", "[]"),
+                    ("attach_paths", "[]"),
+                    ("scheduled_at", &past),
+                ]),
+            ),
+            &FakeTester { smtp_ok: true, imap_ok: true },
+        );
+        let cnt: i64 = state.with_conn(|c| {
+            c.query_row("SELECT count(*) FROM emails WHERE folder='draft'", [], |r| r.get(0)).unwrap()
+        });
+        assert_eq!(cnt, 0, "{path} 的过去时刻不得落库：{}", body(&resp));
+        cleanup(&dir);
+    }
+}
+
+#[test]
 fn p2_autosave_preserves_existing_scheduled_at() {
     // P2-1：在途 autosave 携旧表单(scheduled_at 空)晚到，不得抹掉已设定的定时
     let (state, dir) = temp_state("p21-autosave-sched");
     state
         .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
         .unwrap();
-    let future = mail::now_epoch() + 3600;
+    // 只保护撤销窗口：now + UNDO_SEND_SECS（远期定时可被用户主动清空）
+    let future = mail::now_epoch() + UNDO_SEND_SECS;
     let id = mail::save_draft(
         &state,
         &mail::DraftInput {
@@ -1747,7 +1789,54 @@ fn p2_autosave_preserves_existing_scheduled_at() {
     let at: i64 = state.with_conn(|c| {
         c.query_row("SELECT scheduled_at FROM emails WHERE id=?1", [id], |r| r.get(0)).unwrap()
     });
-    assert_eq!(at, future, "autosave 不得覆写已有定时时刻");
+    assert_eq!(at, future, "autosave 不得覆写撤销窗口时刻");
+    cleanup(&dir);
+}
+
+#[test]
+fn p4_autosave_allows_clearing_future_schedule() {
+    // 复查四 P1-2：用户主动清空远期定时时，空 scheduled_at 必须落 0，
+    // 不能被 preserve_sched 回读逻辑复活（否则到点误发）
+    let (state, dir) = temp_state("p42-autosave-clear");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let future = mail::now_epoch() + 3600;
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "远期定时草稿".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: future,
+        },
+    )
+    .unwrap();
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "用户清空定时后自动保存"),
+                ("scheduled_at", ""),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=?1", [id], |r| r.get(0)).unwrap()
+    });
+    assert_eq!(at, 0, "用户主动清空远期定时后不得被回读复活");
     cleanup(&dir);
 }
 
@@ -4308,7 +4397,9 @@ fn settings_account_save_requires_configured_account() {
 }
 
 #[test]
-fn settings_account_test_uses_saved_credential() {
+fn settings_account_test_uses_saved_credential_and_server() {
+    LAST_IMAP_HOST.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    LAST_IMAP_PASSWORD.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let (state, dir) = temp_state("acc-test");
     let _ = route(
         &state,
@@ -4323,7 +4414,7 @@ fn settings_account_test_uses_saved_credential() {
             imap_ok: true,
         },
     );
-    // 密码留空 → 读已保存凭据测试
+    // 密码留空 → 读已保存凭据；服务器字段伪造为攻击主机 → 必须被忽略
     let resp = route(
         &state,
         &assets(),
@@ -4331,10 +4422,11 @@ fn settings_account_test_uses_saved_credential() {
             "POST",
             "/settings/account/test-imap",
             &form(&[
-                ("account_prefix", "unit.router"),
+                ("account_prefix", "evil.attacker"),
                 ("password", ""),
-                ("recv_host", "imap.test.cn"),
-                ("recv_port", "993"),
+                ("recv_host", "evil.example.com"),
+                ("recv_port", "143"),
+                ("recv_security", "plain"),
             ]),
         ),
         &FakeTester {
@@ -4345,6 +4437,16 @@ fn settings_account_test_uses_saved_credential() {
     let html = body(&resp);
     assert!(html.contains("收信通道"), "应返回收信通道结果");
     assert!(html.contains("class=\"ic\""), "假测试器应成功（SVG 勾）");
+    assert_eq!(
+        LAST_IMAP_HOST.lock().unwrap_or_else(|e| e.into_inner()).as_str(),
+        "imap.test.cn",
+        "已配置状态下必须连接已存主机，不得把真密码送到表单伪造的主机"
+    );
+    assert_eq!(
+        LAST_IMAP_PASSWORD.lock().unwrap_or_else(|e| e.into_inner()).as_str(),
+        "pw-test",
+        "密码留空应回读已存凭据"
+    );
     state.clear_password("unit.router@chinatelecom.cn");
     cleanup(&dir);
 }

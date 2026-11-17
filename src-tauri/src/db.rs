@@ -30,7 +30,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -85,6 +85,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         9 => migrate_v10(tx),
         10 => migrate_v11(tx),
         11 => migrate_v12(tx),
+        12 => migrate_v13(tx),
         _ => Ok(()),
     }
 }
@@ -229,6 +230,24 @@ fn migrate_v11(tx: &Connection) -> rusqlite::Result<()> {
 fn migrate_v12(tx: &Connection) -> rusqlite::Result<()> {
     if !emails_has_column(tx, "seen_account")? {
         tx.execute_batch("ALTER TABLE emails ADD COLUMN seen_account TEXT")?;
+    }
+    Ok(())
+}
+
+/// v12 → v13：占位邮件标记（复查四 P1-3）。
+/// 旧实现靠 too_large 或 body_text 前缀猜占位，无法与真实正文区分；
+/// 显式列让 FETCH 漏 UID / 解析失败行在重拉命中 remote_uid 时可回填正文与附件。
+/// 存量行按既有占位文案前缀一次性标记（都是本程序生成的固定文案）。
+fn migrate_v13(tx: &Connection) -> rusqlite::Result<()> {
+    if !emails_has_column(tx, "placeholder")? {
+        tx.execute_batch("ALTER TABLE emails ADD COLUMN placeholder INTEGER NOT NULL DEFAULT 0")?;
+        tx.execute_batch(
+            "UPDATE emails SET placeholder = 1
+              WHERE too_large = 1
+                 OR body_text LIKE '（该邮件%'
+                 OR body_text LIKE '（邮件内容无法解析%'
+                 OR body_text LIKE '（邮件头无法解析%';",
+        )?;
     }
     Ok(())
 }

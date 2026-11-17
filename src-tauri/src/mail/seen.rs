@@ -15,6 +15,7 @@
 use super::{MailFetcher, seen_params_of};
 use crate::mail::recv::ERR_UIDVALIDITY_CHANGED;
 use crate::state::AppState;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// 合并窗口：最后一次点击后等这么久再发（连点 N 封 = 1 次登录）
@@ -132,6 +133,35 @@ pub fn abandon(state: &AppState) -> Result<usize, String> {
     })
 }
 
+/// 复查四 P2-2：出队后再核对一次本地状态。合并窗口 + IMAP 建连期间用户可能
+/// 已点「标为未读」（清 seen_pending 且 unread=1）；这些 UID 不能再发 STORE，
+/// 否则本地未读会被服务器 +Seen 覆盖。标志仍留在库中，后续由用户再次打开触发。
+fn still_pending(state: &AppState, ids: &[i64]) -> Result<HashSet<i64>, String> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let marks = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id FROM emails WHERE id IN ({marks}) AND unread = 0 AND seen_pending = 1"
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let live = state.with_conn(|conn| {
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params.as_slice(), |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        let mut set = HashSet::new();
+        for r in rows {
+            set.insert(r.map_err(|e| e.to_string())?);
+        }
+        Ok::<_, String>(set)
+    })?;
+    Ok(live)
+}
+
 /// 执行一轮回写：返回本轮成功同步的封数。
 ///
 /// 按 uidvalidity 分组（同一账号下 UIDVALIDITY 变化意味着 UID 空间重置，
@@ -155,8 +185,33 @@ pub fn flush(state: &AppState, fetcher: &dyn MailFetcher) -> Result<usize, Strin
     for r in &rows {
         groups.entry(r.uidvalidity).or_default().push(r);
     }
+    // P2-2：出队后二次核对，已变未读/已清标志的行不进入 STORE
+    let all_ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let live = still_pending(state, &all_ids)?;
+    // 被跳过的行若仍留 pending 会每轮自唤醒成紧循环；用户已标未读时这个标志
+    // 本就不该存在，直接清掉，后续由用户再次打开重新置位。
+    let skipped: Vec<i64> = rows
+        .iter()
+        .filter(|r| !live.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    if !skipped.is_empty() {
+        clear_pending(state, &skipped)?;
+    }
+    let groups: std::collections::BTreeMap<u32, Vec<&Pending>> = groups
+        .into_iter()
+        .map(|(uv, group)| {
+            (
+                uv,
+                group.into_iter().filter(|r| live.contains(&r.id)).collect(),
+            )
+        })
+        .collect();
     let mut done = 0usize;
     for (uidvalidity, group) in groups {
+        if group.is_empty() {
+            continue;
+        }
         let uids: Vec<u32> = group.iter().map(|r| r.uid).collect();
         let ids: Vec<i64> = group.iter().map(|r| r.id).collect();
         match fetcher.mark_seen_batch(

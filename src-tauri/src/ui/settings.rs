@@ -319,20 +319,22 @@ pub(super) fn settings_account_test(
     imap_channel: bool,
 ) -> Resp {
     let form = parse_form(&req.body);
-    // 发信页仅密码/显示名/签名档可改：账号字段为禁用态（不随表单提交），
-    // 缺失时回落到已存配置——测试连接的意义是校验"新密码 + 现有服务器"
-    let (prefix, domain) = match trimmed_field(&form, "account_prefix") {
-        Some(p) => (p, domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT)),
-        None => {
-            let d = defaults();
-            let p = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
-            if p.is_empty() {
-                return test_fragment(Vec::new(), "尚未配置账号，请先完成首次配置向导", false);
-            }
-            (
-                p,
-                state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
-            )
+    let d = defaults();
+    // P1（复查四）：测试连接与保存端点必须同口径——配置完成后，账号/服务器/
+    // 端口/加密方式一律取已存值，忽略表单同名字段。否则同源注入可用空密码触发
+    // retrieve_password 取回真密码，再把 host 换成攻击主机，造成凭据外泄。
+    // 仅 password 允许表单覆盖（用于校验新密码）；未配置（向导阶段）才信表单。
+    let saved_prefix = state.get_or(keys::ACCOUNT_PREFIX, &d).unwrap_or_default();
+    let configured = !saved_prefix.trim().is_empty();
+    let (prefix, domain) = if configured {
+        (
+            saved_prefix,
+            state.get_or(keys::ACCOUNT_DOMAIN, &d).unwrap_or_default(),
+        )
+    } else {
+        match trimmed_field(&form, "account_prefix") {
+            Some(p) => (p, domain_or(&form, state::ACCOUNT_DOMAIN_DEFAULT)),
+            None => return test_fragment(Vec::new(), "尚未配置账号，请先完成首次配置向导", false),
         }
     };
     let account = full_address(&prefix, &domain);
@@ -349,10 +351,34 @@ pub(super) fn settings_account_test(
             }
         },
     };
+    let server_value = |key: &str, fallback: &str| -> String {
+        if configured {
+            state
+                .get_or(key, &d)
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| fallback.to_string())
+        } else {
+            fallback.to_string()
+        }
+    };
     let (label, host, port, mode) = if imap_channel {
-        let host = host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT);
-        let port = port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT);
-        let security = security_or(&form, state, keys::RECV_SECURITY);
+        let host = if configured {
+            server_value(keys::RECV_HOST, state::RECV_HOST_DEFAULT)
+        } else {
+            host_state_or(&form, state, keys::RECV_HOST, state::RECV_HOST_DEFAULT)
+        };
+        let port = if configured {
+            server_value(keys::RECV_PORT, &RECV_PORT_DEFAULT.to_string())
+                .parse()
+                .unwrap_or(RECV_PORT_DEFAULT)
+        } else {
+            port_state_or(&form, state, keys::RECV_PORT, RECV_PORT_DEFAULT)
+        };
+        let security = if configured {
+            server_value(keys::RECV_SECURITY, state::SECURITY_DEFAULT)
+        } else {
+            security_or(&form, state, keys::RECV_SECURITY)
+        };
         (
             "收信通道",
             host,
@@ -360,9 +386,23 @@ pub(super) fn settings_account_test(
             crate::net::TlsMode::resolve(port, &security),
         )
     } else {
-        let host = host_state_or(&form, state, keys::SMTP_HOST, state::SMTP_HOST_DEFAULT);
-        let port = port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT);
-        let security = security_or(&form, state, keys::SMTP_SECURITY);
+        let host = if configured {
+            server_value(keys::SMTP_HOST, state::SMTP_HOST_DEFAULT)
+        } else {
+            host_state_or(&form, state, keys::SMTP_HOST, state::SMTP_HOST_DEFAULT)
+        };
+        let port = if configured {
+            server_value(keys::SMTP_PORT, &SMTP_PORT_DEFAULT.to_string())
+                .parse()
+                .unwrap_or(SMTP_PORT_DEFAULT)
+        } else {
+            port_state_or(&form, state, keys::SMTP_PORT, SMTP_PORT_DEFAULT)
+        };
+        let security = if configured {
+            server_value(keys::SMTP_SECURITY, state::SECURITY_DEFAULT)
+        } else {
+            security_or(&form, state, keys::SMTP_SECURITY)
+        };
         (
             "发信通道",
             host,

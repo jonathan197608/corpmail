@@ -2584,3 +2584,25 @@ fn recover_done_normal_path_still_cleans_both_markers_and_keeps_data() {
     assert!(!dest.join(MIGRATION_MARKER).exists());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn p44_wait_while_frozen_resumes_after_thaw_and_send_worker_uses_it() {
+    // 复查四 P2-1：冻结期取出的 channel id 不能 continue 丢掉，必须等待解冻
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let toggle = flag.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        toggle.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    wait_while_frozen(&flag);
+    assert!(!flag.load(std::sync::atomic::Ordering::SeqCst), "解冻后应返回");
+
+    const STATE_SRC: &str = include_str!("../state.rs");
+    let start = STATE_SRC.find("std::thread::spawn(move || {\n            for id in rx").unwrap();
+    let body = &STATE_SRC[start..];
+    let body = &body[..body.find("\n        })").unwrap_or(body.len())];
+    assert!(
+        body.contains("wait_while_frozen(&migration_flag)"),
+        "send worker 冻结分支必须等待解冻，不得 continue 丢弃 id"
+    );
+}

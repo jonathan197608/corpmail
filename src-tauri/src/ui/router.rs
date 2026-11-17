@@ -1291,9 +1291,21 @@ fn email_export_eml(state: &AppState, req: &Req) -> Resp {
     if let Err(e) = mail::guard_save_dest(state, &dest) {
         return toast("err", &e);
     }
-    match mail::eml::build_eml(state, id) {
-        Ok(bytes) => match std::fs::write(&dest, bytes) {
-            Ok(()) => toast("ok", &format!("已导出到 {dest}")),
+    match mail::eml::build_eml_report(state, id) {
+        Ok(eml) => match std::fs::write(&dest, &eml.bytes) {
+            Ok(()) => {
+                if eml.skipped_attachments > 0 {
+                    toast(
+                        "ok",
+                        &format!(
+                            "已导出到 {dest}（注意：{} 个附件已按清理策略移除，未包含在文件中）",
+                            eml.skipped_attachments
+                        ),
+                    )
+                } else {
+                    toast("ok", &format!("已导出到 {dest}"))
+                }
+            }
             Err(e) => toast("err", &format!("写入失败：{e}")),
         },
         Err(e) => toast("err", &e),
@@ -2492,9 +2504,9 @@ fn compose_draft_save(state: &AppState, req: &Req) -> Resp {
         format!("&{ctx_qs}")
     };
     match save_compose_form(state, req, false) {
-        Ok((id, skipped, _)) => Resp::hx_redirect(&format!(
+        Ok((id, skipped, _, detached)) => Resp::hx_redirect(&format!(
             "/compose?draft_id={id}&saved=1{}{ctx_suffix}",
-            skipped_suffix(skipped)
+            skipped_suffix(skipped + detached)
         )),
         // 保存失败：草稿未落库，把表单值随重定向带回（否则用户刚写的内容全丢）
         Err((draft_id, e)) => compose_retry_redirect(draft_id, &e, &ctx_qs, &form),
@@ -2536,7 +2548,7 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     // P2-1：autosave 必须保留库中已有的 scheduled_at——在途 autosave 携带旧表单
     // （scheduled_at 空 → 0）晚于点发送到达时，不覆写 send 设下的撤销窗口时刻
     match save_compose_form(state, req, true) {
-        Ok((id, _skipped, _converted)) => {
+        Ok((id, _, _, _)) => {
             Resp::json(serde_json::json!({ "ok": true, "draft_id": id }).to_string())
         }
         // 自动保存失败不打断编辑（下次防抖/手动保存重试），前端只提示静默
@@ -2545,16 +2557,17 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
 }
 
 /// 撰写表单公共保存（存草稿/自动保存/发送共用 §9）：落草稿 → keep 裁剪 → 新附件追加。
-/// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回 (邮件 id, 被跳过的空文件数)。
+/// 失败返回 (原 draft_id, 原因) 供回撰写页提示；成功返回
+/// (邮件 id, 被跳过的空文件数, 转附件数, 转发 EML 中被清理的附件数)。
 /// scheduled_at（M4-2）：datetime-local 原始字符串 → epoch 秒；空/非法按 0 处理
 /// （存草稿保留既有定时，清空选择器即取消定时；立即发送路径由调用方写 0）
-/// `preserve_sched`（P2-1）：autosave 为 true——携带旧表单的 scheduled_at=0 不得
-/// 覆写库中已有的定时/撤销窗口时刻；存草稿/发送为 false（用户显式意图可清）。
+/// `preserve_sched`（P2-1 / 复查四 P1-2）：autosave 为 true——只保留撤销窗口内的
+/// 时刻，远期定时可被用户主动清空；存草稿/发送为 false（显式意图可清）。
 fn save_compose_form(
     state: &AppState,
     req: &Req,
     preserve_sched: bool,
-) -> Result<(i64, usize, usize), (i64, String)> {
+) -> Result<(i64, usize, usize, usize), (i64, String)> {
     let form = parse_form(&req.body);
     let d = defaults();
     let g = |k: &str| state.get_or(k, &d).unwrap_or_default();
@@ -2585,17 +2598,19 @@ fn save_compose_form(
             "定时时间需晚于当前时间 1 分钟以上，请重新选择".to_string(),
         ));
     }
-    // P2-1：autosave 携带的 scheduled_at=0 不得抹掉库中已有的定时/撤销窗口。
-    // 仅当表单解析为 0（空/非法）且是已有草稿时回读库值；用户显式选了未来时刻
-    // 则照常写入。存草稿/发送 preserve_sched=false，可显式清空定时。
+    // P2-1 / 复查四 P1-2：autosave 携带的 scheduled_at=0 不得抹掉「撤销窗口」
+    // 中由点发送写入的时刻；但用户主动清空远期定时也是同一个空值形态，
+    // 因此只回读 at <= now + AUTOSAVE_PRESERVE_WINDOW（约 10s）的近端时刻。
     if preserve_sched
         && scheduled_at == 0
         && let Some(id) = draft_id
     {
+        let now = mail::now_epoch();
         let current: Option<i64> = state
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT scheduled_at FROM emails WHERE id = ?1 AND folder = 'draft'",
+                    "SELECT scheduled_at FROM emails
+                     WHERE id = ?1 AND folder = 'draft' AND status = 'draft'",
                     [id],
                     |r| r.get::<_, i64>(0),
                 )
@@ -2603,7 +2618,7 @@ fn save_compose_form(
             })
             .ok()
             .flatten();
-        if let Some(at) = current.filter(|at| *at > 0) {
+        if let Some(at) = current.filter(|at| *at > now && *at <= now + AUTOSAVE_PRESERVE_WINDOW) {
             scheduled_at = at;
         }
     }
@@ -2643,6 +2658,7 @@ fn save_compose_form(
     // 以「已存在同名 message/rfc822 附件」判定是否已附加：既能防重存重复添加，
     // 也覆盖首次附加失败后重试的场景（此时页面仍带 attach_eml_from）。
     let attach_eml_from = form_i64(&form, "attach_eml_from").unwrap_or(0);
+    let mut detached_skipped = 0usize;
     if attach_eml_from > 0 {
         let name = form
             .get("attach_eml_name")
@@ -2657,9 +2673,10 @@ fn save_compose_form(
             })
             .unwrap_or(false);
         if !already {
-            let bytes = mail::eml::build_eml(state, attach_eml_from)
+            let report = mail::eml::build_eml_report(state, attach_eml_from)
                 .map_err(|e| (id, format!("转发邮件生成失败：{e}")))?;
-            mail::add_attachment_bytes(state, id, &name, "message/rfc822", &bytes)
+            detached_skipped = report.skipped_attachments;
+            mail::add_attachment_bytes(state, id, &name, "message/rfc822", &report.bytes)
                 .map_err(|e| (id, format!("转发邮件附加失败：{e}")))?;
         }
     }
@@ -2674,7 +2691,7 @@ fn save_compose_form(
     let inlines = parse_inline_images(&form);
     let converted = mail::add_inline_images(state, id, &inlines)
         .map_err(|e| (id, format!("内嵌图片转附件失败：{e}")))?;
-    Ok((id, skipped, converted))
+    Ok((id, skipped, converted, detached_skipped))
 }
 
 /// 发送（POST /compose/send §9）：先存最新内容 → 原子排队（重复提交 0 行，幂等 §7）
@@ -2707,14 +2724,15 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
         );
     }
     match save_compose_form(state, req, false) {
-        Ok((id, skipped, converted)) => {
+        Ok((id, skipped, converted, detached)) => {
+            let unavailable = skipped + detached;
             // 定时（M4-2）：保存已落 scheduled_at（DraftInput），跳过 enqueue；
             // 回草稿详情页展示「已定时」状态（调度线程到点自动入队发送）
             if sched_epoch.is_some() {
-                if skipped > 0 {
+                if unavailable > 0 {
                     return redirect_compose(
                         id,
-                        &format!("已跳过 {skipped} 个 0 字节文件（未附加），请确认附件后再定时"),
+                        &format!("已跳过 {unavailable} 个不可用附件（空文件或已被清理），请确认后再定时"),
                     );
                 }
                 let mut target = format!("/emails/{id}");
@@ -2724,11 +2742,11 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
                 }
                 return Resp::hx_redirect(&target);
             }
-            // 空文件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
-            if skipped > 0 {
+            // 空文件/已清理附件被跳过 → 回撰写页确认；超大图片已转附件 → 提示后正常发出
+            if unavailable > 0 {
                 return redirect_compose(
                     id,
-                    &format!("已跳过 {skipped} 个 0 字节文件（未附加），请确认附件后再次发送"),
+                    &format!("已跳过 {unavailable} 个不可用附件（空文件或已被清理），请确认后再次发送"),
                 );
             }
             if converted > 0 {
@@ -3621,6 +3639,10 @@ const PER_DEFAULT: i64 = 10;
 /// 撤销发送窗口（A1）：点发送后先等这么多秒才真正入队，
 /// 窗口内 toast 提供「撤销发送」。与 app.js 的倒计时保持一致。
 const UNDO_SEND_SECS: i64 = 8;
+
+/// autosave 回读 scheduled_at 的最大剩余窗口：只保护撤销窗口在途请求，
+/// 不复活用户主动清空的远期定时（复查四 P1-2）。
+const AUTOSAVE_PRESERVE_WINDOW: i64 = UNDO_SEND_SECS + 2;
 
 /// URL per 参数归一：非法/缺省 → None，越界钳到 [PER_MIN, PER_MAX]
 fn clamp_per(raw: Option<&str>) -> Option<i64> {

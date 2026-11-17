@@ -106,6 +106,7 @@ fn incoming(uidvalidity: u32, uid: u32) -> IncomingMail {
         raw_headers: String::new(),
         attachments: Vec::new(),
         too_large: false,
+        placeholder: false,
     }
 }
 
@@ -174,6 +175,38 @@ fn flush_batches_all_pending_into_single_call() {
             .unwrap()
     });
     assert_eq!(unread, 0);
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+/// 复查四 P2-2：出队后用户又标未读的行不得进入 STORE +\Seen
+#[test]
+fn flush_skips_rows_marked_unread_after_enqueue() {
+    let (state, dir, ids) = fixture("race-unread", &[(42, 1), (42, 2), (42, 3)]);
+    for id in &ids {
+        mark_read(&state, *id).unwrap();
+    }
+    // 模拟用户在合并窗口内点了「标为未读」，但尚未清理 pending 标志的边界态
+    state
+        .with_conn(|c| {
+            c.execute("UPDATE emails SET unread = 1 WHERE id = ?1", [ids[1]])
+        })
+        .unwrap();
+    let fetcher = FakeFetcher::ok();
+    let done = flush(&state, &fetcher).unwrap();
+    assert_eq!(done, 2, "变未读的行不得回写");
+    let calls = fetcher.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].4, vec![1, 3], "不得对已标未读的 UID 发 STORE +Seen");
+    let (unread, pending): (i64, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT unread, seen_pending FROM emails WHERE id = ?1",
+            [ids[1]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!((unread, pending), (1, 0), "跳过的行保留未读且不留悬挂标志");
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
 }
@@ -517,9 +550,9 @@ fn flush_self_wakes_for_backlog_beyond_round_limit() {
             c.execute(
                 "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
                                       subject_tokens, body_tokens, created_at, remote_uid,
-                                      seen_pending, seen_account)
+                                      seen_pending, seen_account, unread)
                  VALUES ('in','inbox','received','b','a@x.cn','demo@chinatelecom.cn','','',0,
-                         ?1, 1, 'demo@chinatelecom.cn')",
+                         ?1, 1, 'demo@chinatelecom.cn', 0)",
                 [format!("42:{uid}")],
             )
             .unwrap();

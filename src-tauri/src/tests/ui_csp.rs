@@ -74,6 +74,10 @@ fn csp_header_matches_tauri_conf() {
         csp, CSP_POLICY,
         "tauri.conf.json 的 csp 与 ui::CSP_POLICY 不一致"
     );
+    // 复查四 P3-3：约束表单提交目标与 base 标签覆盖，挡住注入脚本把凭据
+    // 提交到外部主机（服务端 P1-1 之外的浏览器侧纵深防御）
+    assert!(csp.contains("form-action 'self'"), "CSP 必须限制 form-action");
+    assert!(csp.contains("base-uri 'none'"), "CSP 必须禁止 base-uri 覆盖");
 }
 
 /// `withGlobalTauri` 仍为 true：app.js 依赖 `window.__TAURI__.dialog`

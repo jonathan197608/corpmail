@@ -240,6 +240,15 @@ impl Drop for FreezeGuard<'_> {
     }
 }
 
+/// 冻结期不要不可逆地消费已有工作项（复查四 P2-1）：send worker 取到 id 后
+/// 若遇冻结，在此阻塞等待解冻再继续派发；失败解冻（FreezeGuard::drop）后
+/// 无需重启。用 200ms 轮询而非自旋，退出由进程/通道关闭接管。
+fn wait_while_frozen(flag: &std::sync::atomic::AtomicBool) {
+    while flag.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// 存储页统计缓存项（clean::estimate + 旧目录备份，避免反复全库扫描）
 struct StorageStatsCache {
     at: std::time::Instant,
@@ -1918,11 +1927,12 @@ impl AppState {
             .unwrap_or_default();
         std::thread::spawn(move || {
             for id in rx {
-                // 迁移冻结（R2）：已投递事实尚未落定就可能被本进程写回旧库，
-                // 直接跳过不派发——邮件保持 queued，重启后由残留扫描补发
+                // 迁移冻结（R2 / 复查四 P2-1）：已取出的 id 必须保留到解冻后继续，
+                // 旧实现 `continue` 会永久丢掉 channel 中的 id（DB 仍 queued），
+                // 迁移失败解冻后只能等重启补发。
                 if migration_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    eprintln!("[send] 迁移冻结中，邮件 {id} 保持排队（重启后补发）");
-                    continue;
+                    eprintln!("[send] 迁移冻结中，邮件 {id} 保持排队，解冻后继续派发");
+                    wait_while_frozen(&migration_flag);
                 }
                 // 发送参数快照：每封派发前重读配置（corpmail.toml；改动即时生效，
                 // 不落库——验收拍板简化）

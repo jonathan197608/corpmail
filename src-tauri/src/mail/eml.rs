@@ -198,7 +198,20 @@ fn push_body(out: &mut Vec<u8>, detail: &super::EmailDetail, email_id: i64) {
 /// 峰值内存 ≈ 成品大小 + 单个最大附件，而不是"全部附件 + 4 倍 base64 拷贝"。
 /// 附件结构必须先定，故先用 `attachment_available` 做一次只查元数据/存在性的
 /// 预检（不解压不读字节）
+/// EML 构建结果：bytes 为报文，skipped_attachments 是被清理/不可用的附件数。
+/// 调用方必须展示后者，避免「导出成功但附件少了几封」的静默数据丢失。
+pub struct EmlBuild {
+    pub bytes: Vec<u8>,
+    pub skipped_attachments: usize,
+}
+
+/// 兼容只关心字节的既有单测；生产导出必须使用 `build_eml_report` 以展示被清理附件数。
+#[cfg(test)]
 pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
+    Ok(build_eml_report(state, email_id)?.bytes)
+}
+
+pub fn build_eml_report(state: &AppState, email_id: i64) -> Result<EmlBuild, String> {
     let detail = crate::mail::get(state, email_id).ok_or("邮件不存在".to_string())?;
     // 时间与 Message-ID 需单独取（EmailDetail 只带展示文本）
     let (epoch, message_id): (i64, String) = state
@@ -228,6 +241,7 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
         .filter(|a| crate::mail::attachment_available(state, email_id, a.id))
         .map(|a| (a.filename.clone(), a.mime.clone(), a.id))
         .collect();
+    let mut skipped_attachments = detail.attachments.len() - parts.len();
 
     let boundary = format!("=_corpmail_{email_id}_{:x}", super::now_epoch());
     let mut out: Vec<u8> = Vec::new();
@@ -251,7 +265,7 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
 
     if parts.is_empty() {
         push_body(&mut out, &detail, email_id);
-        return Ok(out);
+        return Ok(EmlBuild { bytes: out, skipped_attachments });
     }
     out.extend_from_slice(
         format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n")
@@ -262,6 +276,7 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
         // 读取失败（预检后被删/被占用）只跳过该附件：正文与其余附件照常导出
         let Some((_, bytes)) = crate::mail::attachment_bytes(state, email_id, *attach_id) else {
             eprintln!("[eml] 附件「{filename}」读取失败，导出时跳过");
+            skipped_attachments += 1;
             continue;
         };
         let mime = if mime.trim().is_empty() {
@@ -273,5 +288,5 @@ pub fn build_eml(state: &AppState, email_id: i64) -> Result<Vec<u8>, String> {
         // bytes 在此丢弃：下一个附件重新读，不累积整封的附件字节
     }
     out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Ok(out)
+    Ok(EmlBuild { bytes: out, skipped_attachments })
 }

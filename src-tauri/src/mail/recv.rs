@@ -125,6 +125,8 @@ pub struct IncomingMail {
     pub attachments: Vec<IncomingAttach>,
     /// 超过单封上限：只拉了信头，正文/附件未下载（正文为占位说明）
     pub too_large: bool,
+    /// 占位行（超限 / FETCH 漏 UID / 解析失败）：重拉命中 remote_uid 时应回填而非跳过
+    pub placeholder: bool,
 }
 
 /// 收件游标（settings 的 last_uidvalidity/last_uid 快照）
@@ -907,6 +909,7 @@ fn placeholder_mail(
         raw_headers: raw_header_block(header),
         attachments: Vec::new(),
         too_large: true,
+        placeholder: true,
     }
 }
 
@@ -952,6 +955,7 @@ fn unreadable_mail(
         raw_headers: raw_header_block(raw),
         attachments: Vec::new(),
         too_large: false,
+        placeholder: true,
     }
 }
 
@@ -1016,6 +1020,7 @@ fn parse_incoming(
         raw_headers: raw_header_block(raw),
         attachments,
         too_large: false,
+        placeholder: false,
     })
 }
 
@@ -1247,6 +1252,96 @@ fn remap_old_uidvalidity(
     Ok(true)
 }
 
+/// 存量占位行识别（v13 之前没有 placeholder 列）：这些文案均由本程序生成，
+/// 前缀固定；只用于旧库迁移/兜底，新行一律以列为准。
+fn looks_like_placeholder_body(body: &str) -> bool {
+    body.starts_with("（该邮件") || body.starts_with("（邮件内容无法解析")
+}
+
+/// 统一写附件 + 回写统计，正常入库与占位回填共用（复查四 P1-3）。
+fn write_incoming_attachments(
+    tx: &rusqlite::Connection,
+    root: &Path,
+    email_id: i64,
+    attachments: &[IncomingAttach],
+    limit: u64,
+    written: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let month = month_dir_conn(tx, email_id);
+    for a in attachments {
+        insert_attachment(
+            &AttachCtx {
+                tx,
+                root,
+                month: &month,
+                email_id,
+                limit,
+            },
+            &safe_filename(&a.filename),
+            &a.mime,
+            &a.data,
+            written,
+        )?;
+    }
+    sync_attach_stats(tx, email_id)
+}
+
+/// 占位行回填：用重拉到的完整邮件覆盖正文/头/附件，保留本地状态（未读/星标/
+/// 已读回写标志）与原 received_at。任何失败整封回滚并清理已写盘文件。
+fn backfill_placeholder_conn(
+    conn: &mut rusqlite::Connection,
+    data_dir: &Path,
+    id: i64,
+    m: &IncomingMail,
+) -> Result<(), String> {
+    let root = attach_root_of(data_dir);
+    let tx = conn.transaction().map_err(e)?;
+    let limit = inline_limit_conn(&tx);
+    let st = tokenize(&m.subject);
+    let bt = tokenize(&m.body_text);
+    let tk = thread_key_of(&m.subject);
+    let changed = tx
+        .execute(
+            "UPDATE emails SET subject = ?2, from_addr = ?3, from_name = ?4,
+                    to_addrs = ?5, cc_addrs = ?6, body_text = ?7, body_kind = ?8,
+                    body_html = ?9, raw_headers = ?10, too_large = 0, placeholder = 0,
+                    subject_tokens = ?11, body_tokens = ?12, thread_key = ?13
+             WHERE id = ?1 AND placeholder = 1",
+            rusqlite::params![
+                id,
+                m.subject,
+                m.from_addr,
+                m.from_name,
+                m.to_addrs,
+                m.cc_addrs,
+                m.body_text,
+                m.body_kind,
+                m.body_html,
+                m.raw_headers,
+                st,
+                bt,
+                tk,
+            ],
+        )
+        .map_err(e)?;
+    if changed == 0 {
+        // 并发下另一个连接已回填/删除：按普通重复处理，不重复写附件
+        return Ok(());
+    }
+    let mut written: Vec<PathBuf> = Vec::new();
+    let result = write_incoming_attachments(&tx, &root, id, &m.attachments, limit, &mut written);
+    match result {
+        Ok(()) => tx.commit().map_err(e),
+        Err(err) => {
+            drop(tx);
+            for f in &written {
+                let _ = std::fs::remove_file(f);
+            }
+            Err(err)
+        }
+    }
+}
+
 /// 收件入库核心（独立连接版：收件线程使用，不依赖 AppState）。
 /// 每封邮件一个事务：正文行 + 附件行原子提交（避免"正文已入库、附件缺失"的半状态）；
 /// 单封失败回滚该封并中止整批（已提交的前序邮件保留，与 §6.1 取舍一致）。
@@ -1282,14 +1377,21 @@ pub fn store_incoming_conn(
         // ④ message_id 命中本地行（remote_uid IS NULL，本地已发送/草稿副本）→
         //    服务器已有同一封，跳过插入。
         if let Some(remote_uid) = remote.as_deref() {
-            let same_uid: bool = conn
+            // 复查四 P1-3：命中占位行必须用重拉到的完整正文/附件回填，
+            // 否则「清游标重拉」永远被去重挡住，正文/附件永久缺失。
+            let existing: Option<(i64, bool, String)> = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM emails WHERE remote_uid = ?1)",
+                    "SELECT id, placeholder, COALESCE(body_text,'')
+                     FROM emails WHERE remote_uid = ?1",
                     [remote_uid],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .optional()
                 .map_err(e)?;
-            if same_uid {
+            if let Some((id, placeholder, body)) = existing {
+                if placeholder || looks_like_placeholder_body(&body) {
+                    backfill_placeholder_conn(conn, data_dir, id, m)?;
+                }
                 continue;
             }
         }
@@ -1371,9 +1473,9 @@ pub fn store_incoming_conn(
                                 cc_addrs, subject, body_text, body_kind, subject_tokens,
                                 body_tokens, attach_cnt, attach_bytes, unread, remote_uid,
                                 message_id, created_at, received_at, sent_at, too_large,
-                                body_html, thread_key, raw_headers)
+                                body_html, thread_key, raw_headers, placeholder)
              VALUES (?17, ?18, ?19, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     ?13, ?14, ?15, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 m.from_addr,
                 m.from_name,
@@ -1400,30 +1502,13 @@ pub fn store_incoming_conn(
                 m.body_html,
                 tk,
                 m.raw_headers,
+                m.placeholder,
             ],
         )
         .map_err(e)?;
         let id = tx.last_insert_rowid();
-        let month = month_dir_conn(&tx, id);
         let mut written: Vec<PathBuf> = Vec::new();
-        let stored = (|| -> Result<(), String> {
-            for a in &m.attachments {
-                insert_attachment(
-                    &AttachCtx {
-                        tx: &tx,
-                        root: &root,
-                        month: &month,
-                        email_id: id,
-                        limit,
-                    },
-                    &safe_filename(&a.filename),
-                    &a.mime,
-                    &a.data,
-                    &mut written,
-                )?;
-            }
-            sync_attach_stats(&tx, id)
-        })();
+        let stored = write_incoming_attachments(&tx, &root, id, &m.attachments, limit, &mut written);
         let stored = stored.and_then(|()| {
             // 联系人采集（v4，2026-11-09 口径修正）：与邮件行同事务落库。
             // 只把「直接往来」计入 hits（收件=发件人；发件=收件人/抄送），

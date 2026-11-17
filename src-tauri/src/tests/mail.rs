@@ -1897,7 +1897,9 @@ fn eml_export_skips_cleaned_attachment() {
         })
         .unwrap();
 
-    let raw = String::from_utf8(eml::build_eml(&state, id).unwrap()).unwrap();
+    let report = eml::build_eml_report(&state, id).unwrap();
+    assert_eq!(report.skipped_attachments, 1, "必须回报被清理的附件数，禁止静默导出");
+    let raw = String::from_utf8(report.bytes).unwrap();
     assert!(raw.starts_with("From: "), "导出应成功：{raw}");
     assert!(
         !raw.contains("multipart/mixed"),

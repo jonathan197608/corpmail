@@ -27,7 +27,7 @@ pub const MIGRATION_BACKGROUND_HEADER: &str = "X-CorpMail-Migration";
 /// 约束：`script-src 'self'` 禁止内联脚本与事件属性，模板里的 `on*` 已全部
 /// 迁到 `data-mbx-action` 委托（app.js）；`style-src` 保留 `'unsafe-inline'`，
 /// 因为 wangEditor 与内联 `style="..."` 需要。
-pub const CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self' blob:; object-src 'none'; connect-src 'self'";
+pub const CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self' blob:; object-src 'none'; connect-src 'self'; form-action 'self'; base-uri 'none'";
 
 /// 平台无关路由结果 → 协议层 HTTP 响应
 pub fn to_http_response(resp: Resp) -> Response<Cow<'static, [u8]>> {

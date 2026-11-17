@@ -187,6 +187,7 @@ fn incoming(uid: u32, seen: bool, subject: &str, message_id: &str) -> IncomingMa
         raw_headers: String::new(),
         attachments: Vec::new(),
         too_large: false,
+        placeholder: false,
     }
 }
 
@@ -1002,6 +1003,7 @@ fn uidvalidity_change_does_not_duplicate_mail_without_message_id() {
         raw_headers: String::new(),
         attachments: Vec::new(),
         too_large: false,
+        placeholder: false,
     };
     assert_eq!(store_incoming(&state, &[mk(1)]).unwrap(), 1, "首封应入库");
     assert_eq!(
@@ -1058,10 +1060,54 @@ fn resolve_uids_guards_u32_max_cursor() {
     // P3-1：last.uid= u32::MAX 时 +1 溢出（debug panic / release wrap 空转），
     // 必须用 checked_add 并提前返回等待 UIDVALIDITY 变化
     let body = &RECV_RS[RECV_RS.find("fn resolve_uids").unwrap()..];
-    let body = &body[..body.find("uids.sort_unstable()").unwrap()];
+    // 用代码行 Ok(uids) 作终点，注释改字不会误伤/误空跑
+    let body = &body[..body.find("Ok(uids)").unwrap()];
     assert!(body.contains("checked_add(1)"), "UID 游标 +1 必须防溢出");
     assert!(
         body.contains("return Ok(Vec::new())"),
         "u32::MAX 时应直接返回空、等 UIDVALIDITY 变化"
     );
+}
+
+#[test]
+fn p43_placeholder_row_is_backfilled_on_refetch() {
+    // 复查四 P1-3：占位行已占用 remote_uid，清游标重拉拿到完整正文后
+    // 必须回填，不能因去重命中而永远停在占位文案
+    let (state, dir) = temp_state("p43-backfill");
+    let placeholder = IncomingMail {
+        subject: "（邮件内容无法解析）".into(),
+        body_text: "（该邮件内容无法解析，或服务器未返回正文，正文与附件未保存。）".into(),
+        placeholder: true,
+        ..incoming(9, false, "占位", "<p43@x.cn>")
+    };
+    assert_eq!(store_incoming(&state, &[placeholder]).unwrap(), 1);
+    let full = IncomingMail {
+        subject: "完整正文已取回".into(),
+        body_text: "这才是真正的正文。".into(),
+        attachments: vec![IncomingAttach {
+            filename: "补回的附件.txt".into(),
+            mime: "text/plain".into(),
+            data: b"backfilled".to_vec(),
+        }],
+        ..incoming(9, false, "占位", "<p43@x.cn>")
+    };
+    // 完整邮件被去重跳过（added=0），但占位行应被就地回填
+    assert_eq!(store_incoming(&state, &[full]).unwrap(), 0);
+    let rows: Vec<(String, String, i64, i64, i64)> = state.with_conn(|c| {
+        c.prepare(
+            "SELECT body_text, subject, attach_cnt, placeholder, too_large FROM emails
+             WHERE remote_uid = '42:9'",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    });
+    assert_eq!(rows.len(), 1, "回填不得新增重复行");
+    assert_eq!(rows[0].0, "这才是真正的正文。");
+    assert_eq!(rows[0].1, "完整正文已取回");
+    assert_eq!(rows[0].2, 1, "附件应随回填落库");
+    assert_eq!((rows[0].3, rows[0].4), (0, 0), "占位/超限标记必须清除");
+    cleanup(&dir);
 }

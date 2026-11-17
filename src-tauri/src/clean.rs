@@ -63,6 +63,14 @@ pub struct Estimate {
 /// 孤儿文件 mtime 宽限（秒）：新落盘附件不立即判孤儿，防与收件线程竞态
 const ORPHAN_GRACE_SECS: u64 = 3600;
 
+/// 天数设置语义：数字 → Some（负数钳到 0 = 立即，绝不把 cutoff 推到未来）；
+/// 留空/非法/未设 → None（永久保留）。UI 用 u32 挡了负数，这里对非 UI 途径
+/// （手工改锚点 toml）再兜一道（复查四 P3-2）。
+fn parse_days(raw: Option<String>) -> Option<i64> {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|d| d.max(0))
+}
+
 /// 清理策略快照（锁外读取；None = 永久保留）
 struct Policy {
     clean_sent_bulk_days: Option<i64>,
@@ -72,11 +80,7 @@ struct Policy {
 
 /// 天数设置语义：数字（含 0 = 立即）→ Some；留空/非法/未设 → None（永久保留）
 fn policy(state: &AppState) -> Policy {
-    let days = |k: &str| {
-        state
-            .get_or(k, &crate::state::defaults())
-            .and_then(|v| v.trim().parse::<i64>().ok())
-    };
+    let days = |k: &str| parse_days(state.get_or(k, &crate::state::defaults()));
     Policy {
         clean_sent_bulk_days: days(keys::CLEAN_SENT_BULK_DAYS),
         keep_inbox_days: days(keys::KEEP_INBOX_DAYS),

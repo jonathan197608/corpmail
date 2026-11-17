@@ -1566,6 +1566,22 @@ function mbxMigAfterFlush(flush, actions) {
 })();
 
 // ---------- 撰写页：定时发送（M4-2） ----------
+// --- P4 sched validation core START ---
+// 抽成纯函数供 Node vm 单测直接驱动；与后端 save_compose_form 的 now+60s 同口径。
+function mbxSchedValidationError(pickerValue, nowMs) {
+    if (!pickerValue) return '';
+    var at = new Date(pickerValue).getTime();
+    if (!isFinite(at)) return '定时时刻格式无效';
+    if (at <= nowMs + 60 * 1000) return '定时时间需晚于当前时间 1 分钟以上，请重新选择';
+    return '';
+}
+function mbxSchedLocalMin(nowMs) {
+    var d = new Date(nowMs + 60 * 1000);
+    function p2(n) { return String(n).padStart(2, '0'); }
+    return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate())
+        + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+}
+// --- P4 sched validation core END ---
 // 状态承载：#sched-at 隐藏域存 datetime-local 控件原始值（"YYYY-MM-DDTHH:MM"），
 // 服务端 save_compose_form 统一解析成 epoch。两条发送路径同端点同表单：
 // - 立即发送（button[hx-post="/compose/send"]:not(#sched-send-btn)）→ 点击即清空
@@ -1576,10 +1592,21 @@ function mbxMigAfterFlush(flush, actions) {
 (function () {
     function hidden() { return document.getElementById('sched-at'); }
     function picker() { return document.getElementById('sched-input'); }
+    function note(msg) {
+        var n = document.createElement('div');
+        n.className = 'compose-note err';
+        n.textContent = msg;
+        var card = document.querySelector('.compose-card');
+        if (card) card.insertBefore(n, card.firstChild);
+        setTimeout(function () { if (n.parentNode) n.remove(); }, 4000);
+    }
     function sync() {
         var h = hidden(), p = picker();
         if (h && p) h.value = p.value || '';
     }
+    // 复查四 P3-1：控件自带 min，用户选过去时刻即可见，不必等后端整页跳回
+    var initialPicker = picker();
+    if (initialPicker) initialPicker.min = mbxSchedLocalMin(Date.now());
     // 控件变化即同步隐藏域（change 覆盖清空/重选；input 覆盖手输部分）
     document.body.addEventListener('input', function (ev) {
         if (ev.target && ev.target.id === 'sched-input') sync();
@@ -1603,16 +1630,18 @@ function mbxMigAfterFlush(flush, actions) {
         var elt = detail.elt;
         if (!elt || !elt.matches || !elt.matches('#sched-send-btn')) return;
         var p = picker();
+        if (p) p.min = mbxSchedLocalMin(Date.now());
         if (!p || !p.value) {
             ev.preventDefault();
             var h = hidden();
             if (h) h.value = '';
-            var note = document.createElement('div');
-            note.className = 'compose-note err';
-            note.textContent = '请先选择定时发送时刻（或点击「发送」立即发送）';
-            var card = document.querySelector('.compose-card');
-            if (card) card.insertBefore(note, card.firstChild);
-            setTimeout(function () { if (note.parentNode) note.remove(); }, 4000);
+            note('请先选择定时发送时刻（或点击「发送」立即发送）');
+            return;
+        }
+        var err = mbxSchedValidationError(p.value, Date.now());
+        if (err) {
+            ev.preventDefault();
+            note(err);
         }
     });
 })();
