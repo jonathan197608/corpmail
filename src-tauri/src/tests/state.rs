@@ -2534,3 +2534,53 @@ fn freeze_guard_owns_early_freeze_of_background_migration() {
     state.mark_migration_finished();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// 复查 N2：done + incomplete 同时在场时，若 marker 删除失败而 done 删除成功，
+/// 旧实现抹掉「曾成功」证据，安全态 {db, done, marker} 沦为 {db, marker}，
+/// 下次 recover 把完整库当半成品删除。修法：marker 先删，只有成功才动 done。
+/// 用「marker 做成目录」让 remove_file 稳定失败（跨平台，不靠权限/占用）。
+#[test]
+fn recover_keeps_done_when_marker_delete_fails() {
+    let base = temp_dir("n2-recover-atomic");
+    let dest = base.join("moved");
+    std::fs::create_dir_all(dest.join("attachments/2026-01/1")).unwrap();
+    std::fs::write(dest.join("corpmail.db"), b"valid migrated db").unwrap();
+    std::fs::write(dest.join("attachments/2026-01/1/a.bin"), b"valid data").unwrap();
+    std::fs::write(dest.join(MIGRATION_DONE_MARKER), b"done").unwrap();
+    // marker 做成目录：exists() 为 true，但 remove_file 返回 IsADirectory（模拟删不掉）
+    std::fs::create_dir_all(dest.join(MIGRATION_MARKER)).unwrap();
+
+    let err = recover_incomplete_migration(&dest).expect_err("marker 删失败必须上报");
+    assert!(err.contains("迁移标记"), "{err}");
+    // 核心：done 哨兵必须保留——证据不能被单独抹掉
+    assert!(
+        dest.join(MIGRATION_DONE_MARKER).exists(),
+        "marker 删失败时 done 必须保留（否则下次 recover 会删库）"
+    );
+    // 数据原样
+    assert_eq!(std::fs::read(dest.join("corpmail.db")).unwrap(), b"valid migrated db");
+    assert!(dest.join("attachments/2026-01/1/a.bin").exists());
+    // 再次 recover（模拟下一轮）：只要 marker 仍在且 done 在，仍绝不删数据
+    let err2 = recover_incomplete_migration(&dest);
+    assert!(err2.is_err());
+    assert_eq!(std::fs::read(dest.join("corpmail.db")).unwrap(), b"valid migrated db");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 复查 N2：正常路径回归——两个标记都是普通文件时，done 在场只清标记、
+/// 数据保留，且两标记都被清掉（与既有 2279 用例同口径，确认原子化未破坏正常流程）
+#[test]
+fn recover_done_normal_path_still_cleans_both_markers_and_keeps_data() {
+    let base = temp_dir("n2-recover-normal");
+    let dest = base.join("moved");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("corpmail.db"), b"db").unwrap();
+    std::fs::write(dest.join(MIGRATION_DONE_MARKER), b"done").unwrap();
+    std::fs::write(dest.join(MIGRATION_MARKER), b"incomplete").unwrap();
+
+    recover_incomplete_migration(&dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("corpmail.db")).unwrap(), b"db");
+    assert!(!dest.join(MIGRATION_DONE_MARKER).exists());
+    assert!(!dest.join(MIGRATION_MARKER).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}

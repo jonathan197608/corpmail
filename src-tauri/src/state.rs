@@ -2471,17 +2471,19 @@ fn recover_incomplete_migration(dest: &Path) -> Result<(), String> {
         return Ok(());
     }
     if done.exists() {
-        // 迁移成功过：只清标记，数据必须保留。清不掉要报错——不能带着
-        // incomplete 标记放行，否则下次会被当半成品清理
-        let mut errs = Vec::new();
+        // 迁移成功过：只清标记，数据必须保留（复查 N2）。
+        // 两个哨兵的删除必须按「marker 先、done 后」串行且绑定：只有 marker
+        // 删除成功才动 done。否则「marker 删失败 + done 删成功」会抹掉「曾
+        // 成功」的唯一证据，把安全态 {db, done, marker} 翻转成 {db, marker}，
+        // 下次 recover 就会把完整数据当半成品删掉。
+        // - marker 删失败：立即 Err，done 原样保留（下次仍判成功态、不删数据）；
+        // - marker 删成功、done 删失败：Err，但此时 marker 已不在、done 还在，
+        //   下次走「无 marker」分支只清孤立 done，数据同样安全。
         if let Err(e) = std::fs::remove_file(&marker) {
-            errs.push(format!("迁移标记清理失败（{}）：{e}", marker.display()));
+            return Err(format!("迁移标记清理失败（{}）：{e}", marker.display()));
         }
         if let Err(e) = std::fs::remove_file(&done) {
-            errs.push(format!("终态哨兵清理失败（{}）：{e}", done.display()));
-        }
-        if !errs.is_empty() {
-            return Err(errs.join("；"));
+            return Err(format!("终态哨兵清理失败（{}）：{e}", done.display()));
         }
         eprintln!(
             "[state] 目标目录为已完成的迁移（终态哨兵在场），仅清理标记：{}",

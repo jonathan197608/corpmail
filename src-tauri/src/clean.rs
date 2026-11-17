@@ -21,6 +21,16 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// 把相对路径的分隔符归一成 `/`，与 DB `attachments.file_path` 的写入口径一致。
+///
+/// DB 侧 `mail/mod.rs` 用 `format!("{}/{}/{}", ...)` 拼路径，跨平台恒为 `/`；
+/// 而磁盘枚举出的 `PathBuf` 在 Windows 上 `to_string_lossy()` 产出 `\`。若直接
+/// 拿去比对引用集，Windows 上永不命中 → 被引用附件被误判孤儿删除（复查 N1）。
+/// 独立成纯函数，使本机（Unix）也能用注入的 `\` 字符串复现并钉死该分支。
+fn normalize_rel_separator(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
 /// 清理报告（run 返回；存储页展示）
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
 pub struct CleanReport {
@@ -211,7 +221,9 @@ fn orphan_files(root: &Path, referenced: &HashSet<String>, now: i64) -> Vec<(Pat
                 let Ok(rel) = path.strip_prefix(root) else {
                     continue;
                 };
-                if referenced.contains(rel.to_string_lossy().as_ref()) {
+                // 复查 N1：DB 引用键恒为 `/` 分隔，Windows 磁盘路径为 `\`；
+                // 归一后再比对，否则被引用附件在 Windows 上会被误判孤儿删除
+                if referenced.contains(normalize_rel_separator(rel).as_str()) {
                     continue;
                 }
                 // mtime 宽限：刚落盘的文件（可能是收件竞态窗口）本轮跳过；

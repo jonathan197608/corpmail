@@ -434,3 +434,55 @@ fn orphan_sweep_ignores_and_spares_symlinked_files() {
     assert!(!real.exists(), "真实孤儿应被回收");
     cleanup_a2(&dir);
 }
+
+/// 复查 N1：DB `file_path` 恒用 `/` 分隔写入，而 Windows 磁盘枚举出的相对
+/// 路径 `to_string_lossy()` 是 `\` 分隔。归一函数必须把 `\` 换成 `/`，
+/// 才能与引用集命中——否则 Windows 上被引用附件全被误判孤儿删除。
+/// 纯函数形态使本机（Unix）也能复现 Windows 口径，变异验证直接有效。
+#[test]
+fn normalize_rel_separator_matches_db_slash_on_windows_paths() {
+    // Windows 磁盘形态：month/edir/file 全用 `\`
+    assert_eq!(
+        normalize_rel_separator(Path::new("2026-11\\9\\1_x.xlsx.gz")),
+        "2026-11/9/1_x.xlsx.gz"
+    );
+    // Unix 形态不受影响（已是 `/`）
+    assert_eq!(
+        normalize_rel_separator(Path::new("2026-11/9/1_x.xlsx.gz")),
+        "2026-11/9/1_x.xlsx.gz"
+    );
+    // 混合形态（外部工具写入）也归一
+    assert_eq!(
+        normalize_rel_separator(Path::new("2026-11/9\\1_x.xlsx.gz")),
+        "2026-11/9/1_x.xlsx.gz"
+    );
+    // 归一结果必须落在 DB 引用集中（模拟 referenced.contains）
+    let referenced: HashSet<String> = ["2026-11/9/1_x.xlsx.gz".to_string()].into();
+    assert!(referenced.contains(normalize_rel_separator(Path::new("2026-11\\9\\1_x.xlsx.gz")).as_str()));
+}
+
+/// 复查 N1：端到端回归保护——磁盘上真实存在的被引用附件（mtime 超宽限期）
+/// 不得被孤儿回收删除，且估计/回收两侧口径一致（estimate 与 run 共用 orphan_files）
+#[test]
+fn referenced_attachment_survives_orphan_sweep_after_grace() {
+    let (state, dir) = temp_state("n1-referenced");
+    // 邮件用未来时间，避开步骤 2 过期删除（本测试只验步骤 3 孤儿回收）
+    let now = now_epoch();
+    let eid = insert_email(&state, "inbox", "in", "received", now);
+    let rel = "2026-11/9/1_ref.bin.gz";
+    insert_file_attachment(&state, eid, rel, &[9u8; 64]); // storage='file', detached=0
+    let path = state.data_dir().join("attachments").join(rel);
+    // 拨回 2h（远超 1h 宽限期）：仅靠引用集命中保护，不靠 mtime
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_modified(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * ORPHAN_GRACE_SECS),
+    )
+    .unwrap();
+
+    let est = estimate(&state);
+    assert_eq!(est.orphan_files, 0, "被引用的附件不是孤儿");
+    let report = run(&state).unwrap();
+    assert_eq!(report.orphan_files, 0);
+    assert!(path.exists(), "被引用附件超宽限期后仍必须保留（数据丢失防护）");
+    cleanup(&dir);
+}

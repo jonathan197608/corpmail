@@ -330,6 +330,31 @@ test('R3：纯文本兜底 fetch 在途时切附件，迟到文本不得覆盖�
     );
 });
 
+test('R3（正向）：不切附件时纯文本兜底必须真的渲染出文本（防半修复恒 return）', async () => {
+    // H1：既有 R3 迟到用例只断「A 文本不出现」，半修复（按钮回调漏传 my →
+    // my=undefined，showTextFallback 两个 await 后恒 return）也能通过。
+    // 本用例断正向路径：A 主链失败 → 点「纯文本预览」→ 不切附件 → 文本必须出现。
+    const h = harness({
+        fetchPlan: {
+            '/emails/1/attachments/a/office': { delayMs: 0, error: '解析失败A' },
+            '/emails/1/attachments/a/office-text': { delayMs: 20, text: 'FALLBACK-SHOULD-APPEAR' },
+        },
+    });
+    await h.open('/emails/1/attachments/a/view', 'docx', 'A.docx');
+    await new Promise((r) => setTimeout(r, 10));
+    const btn = findButton(h.body, '纯文本预览');
+    assert.ok(btn, '失败态应提供「纯文本预览」按钮');
+    const click = btn._l.click[0];
+    click();
+    // 等兜底 fetch（20ms）+ 两次 await 完成
+    await new Promise((r) => setTimeout(r, 80));
+    const text = collectText(h.body).join('\n');
+    assert.ok(
+        text.includes('FALLBACK-SHOULD-APPEAR'),
+        `不切附件时纯文本兜底必须渲染出文本（body：${text.slice(0, 200)}）`,
+    );
+});
+
 test('A5：abort 未生效时，fetch 之后的代次校验必须拦下迟到渲染（V4 兜底）', async () => {
     const h = harness({
         noAbort: true,

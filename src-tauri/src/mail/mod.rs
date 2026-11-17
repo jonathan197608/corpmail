@@ -2621,16 +2621,26 @@ pub fn delete(state: &AppState, id: i64) -> Result<bool, String> {
     })
 }
 
+/// 真实目录判定（`symlink_metadata` 不跟随链接）：目录且非软链（复查 N3）。
+/// 与 clean.rs 的 is_real_dir 同口径——软链目录 is_dir() 跟随会误放行，
+/// 导致 prune 递归进数据目录外、删掉外部空目录。
+fn is_real_dir_no_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|md| !md.file_type().is_symlink() && md.is_dir())
+        .unwrap_or(false)
+}
+
 /// 回收空目录（删邮件/清理器共用；孤儿文件全量回收为 M5 清理器职责）
 pub fn prune_empty_dirs(root: &Path) {
     if let Ok(months) = std::fs::read_dir(root) {
         for m in months.flatten() {
-            if !m.path().is_dir() {
+            // N3：软链月目录整棵跳过，不递归、不删
+            if !is_real_dir_no_symlink(&m.path()) {
                 continue;
             }
             if let Ok(days) = std::fs::read_dir(m.path()) {
                 for d in days.flatten() {
-                    if d.path().is_dir()
+                    if is_real_dir_no_symlink(&d.path())
                         && std::fs::read_dir(d.path())
                             .map(|mut i| i.next().is_none())
                             .unwrap_or(false)

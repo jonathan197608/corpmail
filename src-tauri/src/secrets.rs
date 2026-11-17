@@ -109,7 +109,14 @@ fn keychain_delete_credential(account: &str) -> Result<bool, String> {
     if fake_keyring::active() {
         return normalize_delete(fake_keyring::delete_credential(account));
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+    // 复查 N4：Entry::new 也可能因凭据后端初始化失败返回 NoDefaultStore
+    // （keyring 4.2 v1.rs:47-50）。该错误同样要过 normalize_delete，否则
+    // 分类器里的 "no default store" 分支在删除路径上永不可达。
+    // 后端根本不存在 → 放行（Ok(false)）；其它初始化错误原样上抛。
+    let entry = match keyring::Entry::new(KEYRING_SERVICE, account) {
+        Ok(entry) => entry,
+        Err(e) => return normalize_delete(Err(e.to_string())),
+    };
     let raw = match entry.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),

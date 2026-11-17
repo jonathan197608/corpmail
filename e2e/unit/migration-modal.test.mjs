@@ -59,6 +59,20 @@ function fakeDom() {
     const settingsPane = mk('settings-pane');
     const byId = { 'migrate-mask': mask, 'migrate-detail': detail, 'migrate-bar': bar, 'settings-pane': settingsPane };
     const body = mk('body');
+    // H2：mask 的按钮桩必须持久（同一 selector 每次返回同一对象），
+    // 否则 mbxMigHideActions 设的 hidden 无法被后续断言观测；
+    // 原桩 querySelector 恒 null → hideActions/showError 的按钮操作是 no-op。
+    const buttons = {
+        keep: mk('button-keep-waiting'),
+        close: mk('button-close'),
+        card: mk('div-migrate-card'),
+    };
+    mask.querySelector = (sel) => {
+        if (sel === '.migrate-card') return buttons.card;
+        if (sel.includes('migration-keep-waiting')) return buttons.keep;
+        if (sel.includes('migration-close')) return buttons.close;
+        return null;
+    };
     return {
         document: {
             getElementById: (id) => byId[id] || null,
@@ -66,7 +80,7 @@ function fakeDom() {
             activeElement: null,
             body,
         },
-        __dom: { mask, detail, bar, settingsPane, body },
+        __dom: { mask, detail, bar, settingsPane, body, buttons },
     };
 }
 
@@ -77,6 +91,8 @@ function harness({ fetchImpl } = {}) {
     let now = 0;
     const unlistenCalls = [];
     const toasts = [];
+    // H4：焦点陷阱释放计数——mbxModalOpen 返回的 release 被调用几次
+    let releaseCalls = 0;
     let confirmLeave = (msg, onLeave, ok, cancel, onCancel) => { if (onCancel) onCancel(); };
     // 锚点外的前置函数：桩化（聚焦 A4 本身的行为，不重复测 flush 链路）
     const confirmLeaves = [];
@@ -89,7 +105,7 @@ function harness({ fetchImpl } = {}) {
         mbxMigSet: () => {},
         mbxMigPhasePct: () => 10,
         mbxMigHideActions: () => {},
-        mbxModalOpen: () => () => {},
+        mbxModalOpen: () => () => { releaseCalls++; },
         CustomEvent: class { constructor(t, o) { this.type = t; this.detail = o && o.detail; } },
         __TAURI__: {
             dialog: { open: async () => '/tmp/dest' },
@@ -126,6 +142,7 @@ function harness({ fetchImpl } = {}) {
         ctx, timeouts, toasts, unlistenCalls, intervals,
         setNow: (v) => { now = v; },
         dom: dom.__dom,
+        releaseCalls: () => releaseCalls,
         run: () => ctx.mbxMoveDataDir(),
         runPrecheck: (ev) => ctx.mbxComposePrecheck(ev),
         runConfirmReset: (ev) => ctx.mbxComposeConfirmReset(ev),
@@ -152,6 +169,8 @@ test('A4：409 启动失败停看门狗/解绑监听/释放焦点陷阱，30 分
     // 三态全清：看门狗 interval 停、Tauri 监听解绑、焦点陷阱释放
     assert.equal(watchdog, null, '看门狗必须停');
     assert.equal(unlisten, null, '监听必须解绑');
+    // H4：abort 必须释放焦点陷阱（删 app.js:515 的 __mbxRelease 时此断言 fail）
+    assert.ok(h.releaseCalls() >= 1, '409 分支必须释放焦点陷阱（调用 __mbxRelease）');
     // 假时钟拨 30 分+：没有任何 interval 在跑 → 不会出现「继续等待」
     h.setNow(31 * 60 * 1000);
     h.fireTicks(5);
@@ -172,6 +191,7 @@ test('A4：fetch 抛异常同样 abort（catch 分支）', async () => {
     await h.run();
     assert.equal(vm.runInContext('mbxMigWatchdog', h.ctx), null, 'catch 分支也必须停看门狗');
     assert.equal(vm.runInContext('mbxMigUnlisten', h.ctx), null, 'catch 分支也必须解绑监听');
+    assert.ok(h.releaseCalls() >= 1, 'catch 分支也必须释放焦点陷阱（H4）');
     assert.ok(
         h.dom.detail.textContent.includes('迁移启动失败'),
         `应显示启动失败文案（实际：${h.dom.detail.textContent}）`,
@@ -205,6 +225,7 @@ test('A4：200 空响应（pane 应用失败）第三分支同样 abort（复查
     await h.run();
     assert.equal(vm.runInContext('mbxMigWatchdog', h.ctx), null, '第三分支必须停看门狗');
     assert.equal(vm.runInContext('mbxMigUnlisten', h.ctx), null, '第三分支必须解绑监听');
+    assert.ok(h.releaseCalls() >= 1, '第三分支也必须释放焦点陷阱（H4）');
     assert.ok(
         h.dom.detail.textContent.includes('迁移结果无法显示'),
         `应显示「迁移结果无法显示」（实际：${h.dom.detail.textContent}）`,
@@ -218,9 +239,16 @@ test('A4：二次 mbxMigOpen 复位上次失败态（复查 R5）', async () => 
     // 先把共享 detail/bar 污损成上一轮失败态（mask 已由 fakeDom 提供，走复用分支）
     h.dom.detail.textContent = '迁移冻结中（上次失败）';
     h.dom.bar.style.width = '90%';
+    // H2：失败态 mbxMigShowError 会把「返回」按钮设为可见；污损成该状态后，
+    // 二次 open 必须经 mbxMigHideActions 复位为 hidden——删 app.js:426 调用时
+    // 此断言 fail（原桩 querySelector 恒 null 无法观测该操作）。
+    h.dom.buttons.close.hidden = false;
+    h.dom.buttons.keep.hidden = false;
     vm.runInContext('mbxMigOpen();', h.ctx);
     assert.equal(h.dom.detail.textContent, '准备迁移…', '二次 open 应复位详情文案');
     assert.equal(h.dom.bar.style.width, '0%', '二次 open 应复位进度条');
+    assert.equal(h.dom.buttons.close.hidden, true, '二次 open 必须复位「返回」按钮（H2）');
+    assert.equal(h.dom.buttons.keep.hidden, true, '二次 open 必须复位「继续等待」按钮（H2）');
 });
 
 test('A17：二次进入 mbxConfirmLeave 先释放旧模态的 focus trap', () => {
@@ -401,14 +429,28 @@ test('A12：mbxMigApplyPane 换入后派发 htmx:afterSettle 且事件形状正�
 
     // 捕获真实派发的事件对象——只做源码字符串断言无法鉴别 detail.target 写错
     const dispatched = [];
-    const oldPane = { replaceWith(next) { oldPane._replaced = next; } };
+    // H3：模拟真实 DOM 换入——replaceWith 后 next 必须在 body 子树内，
+    // dispatchEvent 时记录 contains(next)。把 dispatch 移到 replaceWith 之前
+    // 则 contains=false（事件到不了挂在 body 的 rebaselineAll），此断言 fail。
+    let bodyChildren = [];
+    const body = { contains: (n) => bodyChildren.includes(n) };
+    const oldPane = {
+        replaceWith(next) { oldPane._replaced = next; bodyChildren = [next]; },
+    };
     const nextPane = {
         _events: [],
-        dispatchEvent(ev) { this._events.push(ev); dispatched.push(ev); return true; },
+        _containsAtDispatch: null,
+        dispatchEvent(ev) {
+            this._events.push(ev);
+            ev._containsAtDispatch = body.contains(this);
+            dispatched.push(ev);
+            return true;
+        },
     };
     const ctx = vm.createContext({
         document: {
             getElementById: (id) => (id === 'settings-pane' ? oldPane : null),
+            body,
             createElement: (tag) => {
                 assert.equal(tag, 'template');
                 return {
@@ -437,20 +479,32 @@ test('A12：mbxMigApplyPane 换入后派发 htmx:afterSettle 且事件形状正�
     assert.equal(ev.type, 'htmx:afterSettle', `事件类型应为 afterSettle（实际 ${ev.type}）`);
     assert.equal(ev.bubbles, true, '事件必须冒泡（rebaselineAll 挂在 body）');
     assert.equal(ev.detail && ev.detail.target, nextPane, 'detail.target 必须是换入的 pane 节点');
+    // H3：派发必须在换入之后——节点已在 body 子树，冒泡事件才能到 rebaselineAll
+    assert.equal(ev._containsAtDispatch, true, '派发时 next 必须已在 body 子树（先 replaceWith 后 dispatch）');
 });
 
-test('mbxPaneDirty：无 form 的收信页必须返回 false（dirty 不误报）', () => {
-    // mbxPaneDirty 若存在（change 检测工具），无 form 页面不得报脏
-    const idx = APP_JS.indexOf('function mbxPaneDirty');
-    if (idx < 0) return; // 函数不存在时跳过（无此工具的旧结构）
-    const end = APP_JS.indexOf('\n}', idx) + 2;
+test('mbxPaneDirty：无 form 的收信页必须返回 false（dirty 不误报）（H5）', () => {
+    // H5：旧用例用 indexOf('function mbxPaneDirty') 定位，而源码是
+    // `window.mbxPaneDirty = function ()`，子串不存在 → idx<0 直接 return，
+    // 整条用例空跑。改为定位真实定义并提取函数体用桩驱动，正反两条断言
+    // 确保用例真的执行（不再有恒不触发的护栏）。
+    const idx = APP_JS.indexOf('window.mbxPaneDirty = function ()');
+    assert.ok(idx > 0, 'mbxPaneDirty 必须存在（H5：旧定位恒 -1 使用例空跑）');
+    const tail = '\n    };';
+    const end = APP_JS.indexOf(tail, idx) + tail.length;
+    assert.ok(end > idx, 'mbxPaneDirty 函数体边界异常');
     const src = APP_JS.slice(idx, end);
+
     const ctx = vm.createContext({
-        document: {
-            querySelectorAll: () => [], // 收信页无 form
-            getElementById: () => null,
-        },
+        window: {},
+        // 有基线、快照有变化：若有 form 则应报脏；无 form 时 some 空数组 → false
+        base: { has: () => true, get: () => 'baseline' },
+        paneForms: () => [], // 收信页无 form
+        snapshot: () => 'changed',
     });
     vm.runInContext(src, ctx);
-    assert.equal(ctx.mbxPaneDirty(), false, '无 form 页面必须为 false');
+    assert.equal(ctx.window.mbxPaneDirty(), false, '无 form 页面必须为 false');
+    // 鉴别：同样的基线与快照，仅把 form 变为存在 → 必须报脏，证明用例真跑
+    ctx.paneForms = () => [{}];
+    assert.equal(ctx.window.mbxPaneDirty(), true, '有 form 且值变化必须为 true（H5 鉴别力）');
 });

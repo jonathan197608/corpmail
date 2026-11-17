@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, openSplit, waitPaneVisible } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, openSplit, waitPaneVisible, waitMailRows } from '../support/helpers.mjs'
 
 // 03：设置页签 + 收件状态条 + 连接测试（E1–E5 / F1）
 // 数据目录迁移（A6）已移到 95-migration：迁移成功会冻结整个进程的写入（R2），
@@ -391,6 +391,10 @@ describe('03 设置与收件状态', () => {
     // 坏实现（根本不置 true）会假通过
     await goto('/')
     await waitBoot()
+    // H6/T4：本用例前一条停在设置页，ui:// 首帧可能仍是旧 DOM——
+    // waitBoot() 因旧 #boot 已移除会立即通过。等列表行挂载再装观察器，
+    // 否则观察器装在旧 document 上，整页加载后 __FETCH_RAN__ 丢失（假红）
+    await waitMailRows()
     // 2026-11 改版：「收取新邮件」收进顶栏 ⋯ 菜单（.tb-more），先展开再点
     await openSplit('.tb-more [data-split-toggle]')
     // 点击前装观察器：状态片段由 htmx 换入，running 可能极短，轮询会错过

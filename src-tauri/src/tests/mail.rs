@@ -1897,3 +1897,56 @@ fn windows_save_whitelist_blocks_system_locations() {
     );
     assert!(judge2(r"D:\out\x.txt"), "缺环境量时非系统盘仍可用");
 }
+
+/// 复查 N3：prune_empty_dirs 不得跟随软链月目录去删数据目录外的空目录。
+/// 旧实现 is_dir() 跟随链接 → 递归进外部目录 → remove_dir 外部空子目录。
+#[cfg(unix)]
+#[test]
+fn prune_empty_dirs_does_not_follow_symlinked_month_dir() {
+    let base = std::env::temp_dir().join(format!("corpmail-n3-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("attachments");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 外部目录：含一个空子目录（prune 若跟随软链会删它）
+    let ext = base.join("external");
+    let empty_child = ext.join("empty-child");
+    std::fs::create_dir_all(&empty_child).unwrap();
+    // 外部非空子目录（对照组：即便跟随也不会被删，确保断言只针对空目录）
+    let non_empty = ext.join("non-empty");
+    std::fs::create_dir_all(&non_empty).unwrap();
+    std::fs::write(non_empty.join("keep.txt"), b"keep").unwrap();
+
+    // 月目录软链 → 外部目录
+    std::os::unix::fs::symlink(&ext, root.join("2026-01")).unwrap();
+
+    prune_empty_dirs(&root);
+
+    assert!(
+        empty_child.exists(),
+        "软链月目录外的空子目录绝不能被删（不跟随链接）"
+    );
+    assert!(non_empty.join("keep.txt").exists(), "外部文件不受影响");
+    assert!(
+        std::fs::symlink_metadata(root.join("2026-01"))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "软链本身保留"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 复查 N3 回归：正常真实目录的空目录仍应被回收（确认加软链判定未破坏主功能）
+#[test]
+fn prune_empty_dirs_still_removes_real_empty_dirs() {
+    let base = std::env::temp_dir().join(format!("corpmail-n3-prune-real-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("attachments");
+    let empty_edir = root.join("2026-01/123");
+    std::fs::create_dir_all(&empty_edir).unwrap();
+
+    prune_empty_dirs(&root);
+    assert!(!empty_edir.exists(), "真实空目录应被回收");
+    assert!(!root.join("2026-01").exists(), "变空后月目录也应回收");
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -451,6 +451,10 @@ fn keychain_backend_absent_classifies_only_absent_storage() {
         "Platform failure: A default keychain could not be found.",
         "SecKeychainCopyDefault: a default keychain could not be found",
         "No default store has been set",
+        // 复查 N4：keyring 4.2 `Entry::new` 在初始化失败时返回 NoDefaultStore，
+        // Display 即下面这段文本（v1.rs:47-50）。该错误现在也走 normalize_delete，
+        // 必须放行——否则分类器里的 "no default store" 分支在删除路径不可达
+        "No default store has been set, so cannot search or create entries",
     ] {
         assert!(keychain_backend_absent(msg), "应识别为后端不存在：{msg}");
     }
