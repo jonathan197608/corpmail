@@ -121,3 +121,38 @@ test('无展开菜单时 Esc 放行，保留返回列表语义（P3-2 回归）'
     const h = menuHarness({ menuOpen: false });
     assert.equal(h.calls.back, 1, '无菜单时 Esc 仍返回列表');
 });
+
+// 预览模态打开时：Esc 归预览层，其余快捷键（r/f/n/j/k…）一律不生效
+function previewHarness(key, previewOpen) {
+    const calls = { href: null, prevented: 0 };
+    const handlers = [];
+    const detail = {
+        querySelector: (sel) =>
+            sel.includes('reply_to=') ? { href: '/compose?reply_to=42' } : null,
+    };
+    const doc = {
+        body: { tagName: 'BODY' },
+        documentElement: { tagName: 'HTML' },
+        activeElement: { tagName: 'BODY', closest: () => null },
+        addEventListener: (type, fn) => { if (type === 'keydown') handlers.push(fn); },
+        getElementById: (id) => (id === 'preview-modal' ? { hidden: !previewOpen } : null),
+        querySelectorAll: () => [],
+        querySelector: (sel) => (sel === '.mail-detail' ? detail : null),
+    };
+    const win = { location: { set href(v) { calls.href = v; } } };
+    vm.runInContext(SHORTCUT_CORE, vm.createContext({ document: doc, window: win, Array, console }));
+    handlers[0]({ key, preventDefault() { calls.prevented++; } });
+    return calls;
+}
+
+test('预览打开时按 r 不跳回复页（第九轮 P2-4）', () => {
+    const h = previewHarness('r', true);
+    assert.equal(h.href, null, '预览模态不得被快捷键跳走');
+    assert.equal(h.prevented, 0);
+});
+
+test('预览关闭后 r 仍能回复（回归）', () => {
+    const h = previewHarness('r', false);
+    assert.equal(h.href, '/compose?reply_to=42');
+    assert.equal(h.prevented, 1);
+});

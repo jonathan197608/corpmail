@@ -402,6 +402,44 @@ fn preview_kind_falls_back_to_extension_for_octet_stream() {
     );
 }
 
+/// 第九轮 P2-9：自己添加的 Office 附件必须和收到的附件一样有预览入口。
+/// mime_of 旧口径把 docx/xlsx 写成老式二进制 MIME，preview_kind_of 认不出 → 空串。
+#[test]
+fn p99_added_office_attachment_has_preview_kind() {
+    for (file, kind) in [
+        ("报告.docx", "docx"),
+        ("报表.xlsx", "xlsx"),
+        ("方案.pptx", "pptx"),
+        ("旧文档.doc", ""),
+        ("旧表格.xls", "xls"),
+    ] {
+        assert_eq!(
+            preview_kind_of(mime_of(file), file),
+            kind,
+            "{file} 的预览入口应按标准 MIME 判定"
+        );
+    }
+}
+
+/// 第九轮 P2-10：任何失败路径（insert/统计/commit）都必须清掉已写盘附件。
+#[test]
+fn p910_failed_attachment_write_cleans_written_files() {
+    let (_state, dir) = temp_state("p910-attach-cleanup");
+    let a = dir.join("a.gz");
+    let b = dir.join("b.gz");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let failed: Result<(), String> = Err("forced commit failure".into());
+    assert!(finish_attachment_write(failed, &[a.clone(), b.clone()]).is_err());
+    assert!(!a.exists(), "失败后不能留下孤儿 .gz");
+    assert!(!b.exists(), "所有已写盘文件都要清");
+
+    let c = dir.join("c.gz");
+    std::fs::write(&c, b"c").unwrap();
+    assert!(finish_attachment_write(Ok(()), std::slice::from_ref(&c)).is_ok());
+    assert!(c.exists(), "成功事务的附件一个都不能删");
+}
+
 #[test]
 fn highlight_html_is_case_insensitive_and_escape_safe() {
     // ASCII 大小写不敏感 + 中文命中

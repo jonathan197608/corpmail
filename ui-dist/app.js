@@ -161,6 +161,7 @@ function escapeHtml(s) {
 
 // ---------- 撰写页：待保存附件（dialog 选路径，存草稿时随表单提交） ----------
 
+// --- R9 attach dirty core START ---
 let pickedPaths = [];
 
 async function mbxPickAttachments() {
@@ -181,9 +182,15 @@ function mbxRemovePicked(i) {
     renderPicked();
 }
 
-function renderPicked() {
+function renderPicked(notify) {
     const input = document.getElementById('attach-paths');
-    if (input) input.value = JSON.stringify(pickedPaths);
+    if (input) {
+        input.value = JSON.stringify(pickedPaths);
+        // 第九轮 P1：原生文件对话框不产生 input 事件，程序写隐藏域必须显式派发，
+        // 否则 dirty 标记与 5s 防抖 autosave 都看不到附件变更（离开页面静默丢失）。
+        // notify=false 用于服务端回填：回填不是用户编辑，不能再触发一轮 autosave。
+        if (notify !== false) input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     const ul = document.getElementById('picked-list');
     if (!ul) return;
     ul.innerHTML = pickedPaths.map((p, i) => {
@@ -206,6 +213,8 @@ function mbxRemoveKept(aid, btn) {
     } catch (e) {
         input.value = '[]';
     }
+    // 第九轮 P1：与 renderPicked 同理，移除已入库附件必须让 dirty/autosave 感知
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     // 第八轮 P2-2：移除自动附加的 .eml 时，必须同时撤销「作为附件转发」意图，
     // 否则下一次 autosave 表单仍带 attach_eml_from，服务端会重新生成刚删的 .eml。
     if (btn && btn.getAttribute && btn.getAttribute('data-eml-remove') === '1') {
@@ -215,6 +224,7 @@ function mbxRemoveKept(aid, btn) {
     btn.closest('li').remove();
 }
 // --- P8 remove eml core END ---
+// --- R9 attach dirty core END ---
 
 // 保存对话框过滤器：从推荐文件名取后缀（须为 1-8 位字母数字且含字母，
 // 与 Rust 侧 suffix_of 同口径）。取不到就不加 filters，交给服务端补后缀
@@ -1239,6 +1249,7 @@ async function mbxContactQuery(inp, state) {
     }
 }
 
+// --- R9 contact pick core START ---
 function mbxContactPick(inp, state, i) {
     const c = state.items[i];
     if (!c) return;
@@ -1249,9 +1260,10 @@ function mbxContactPick(inp, state, i) {
     inp.value = head + (head ? ' ' : '') + token + ', ';
     state.box.hidden = true;
     state.items = [];
-    inp.dispatchEvent(new Event('input'));
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
     inp.focus();
 }
+// --- R9 contact pick core END ---
 
 function mbxContactKey(inp, state, ev) {
     if (state.box.hidden || !state.items.length) return;
@@ -1555,22 +1567,34 @@ var MBX_AUTOSAVE_SEQ = 0;
 // 两路 draft_id 均为 0）若各发一次请求，后端会 INSERT 两份重复草稿（一份成幽灵）。
 // 按 form 对象身份合并：同一 form 在途请求未结束时，后续调用直接复用同一 Promise。
 // 用数组而非 WeakMap 以兼容 Node vm 测试桩（无需额外注入 Map）。
+// 第九轮 P2-3：合并不等于吞掉新内容——在途期间表单值变化时记 changed，
+// 在途结束后立刻补发一次（此时重新采集快照，取到的就是最新内容）。
 var MBX_AUTOSAVE_INFLIGHT = [];
 
-function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
-    for (var qi = 0; qi < MBX_AUTOSAVE_INFLIGHT.length; qi++) {
-        if (MBX_AUTOSAVE_INFLIGHT[qi].form === form) return MBX_AUTOSAVE_INFLIGHT[qi].promise;
-    }
+function mbxAutosaveSnapshot(form) {
     var values = {};
     try {
         new FormData(form).forEach(function (v, k) { values[k] = v; });
+        return values;
     } catch (e) {
-        return Promise.resolve({ ok: false, status: 0 });
+        return null;
+    }
+}
+
+function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
+    var values = mbxAutosaveSnapshot(form);
+    if (!values) return Promise.resolve({ ok: false, status: 0 });
+    for (var qi = 0; qi < MBX_AUTOSAVE_INFLIGHT.length; qi++) {
+        var live = MBX_AUTOSAVE_INFLIGHT[qi];
+        if (live.form === form) {
+            if (JSON.stringify(values) !== JSON.stringify(live.values)) live.changed = true;
+            return live.promise;
+        }
     }
     var limit = typeof timeoutMs === 'number' ? timeoutMs : MBX_MIG_FLUSH_TIMEOUT_MS;
     var token = 'as' + (++MBX_AUTOSAVE_SEQ);
     var url = '/compose/autosave?__at=' + token;
-    var inflight = { form: form, promise: null };
+    var inflight = { form: form, promise: null, values: values, changed: false };
     MBX_AUTOSAVE_INFLIGHT.push(inflight);
     inflight.promise = new Promise(function (resolve) {
         var settled = false;
@@ -1582,6 +1606,14 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
             if (qi >= 0) MBX_AUTOSAVE_INFLIGHT.splice(qi, 1);
             if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
             doc.body.removeEventListener('htmx:afterRequest', onDone);
+            var changed = inflight.changed;
+            inflight.changed = false;
+            // 第九轮 P2-3：在途期间有新编辑且本次成功，补发一次；补发时重新采集
+            // FormData，取到的是最终内容。失败不补发——下次防抖会重试。
+            if (r.ok && changed && form.isConnected !== false) {
+                mbxAutosaveRequest(form, doc, htx, timeoutMs).then(resolve);
+                return;
+            }
             resolve(r);
         }
         function onDone(ev) {
@@ -1623,7 +1655,7 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
                                 var keepEl = form.querySelector('#keep-ids');
                                 if (keepEl) keepEl.value = JSON.stringify(res.keep_ids);
                                 pickedPaths.length = 0;
-                                renderPicked();
+                                renderPicked(false);
                             }
                         }
                     }
@@ -2336,6 +2368,10 @@ document.addEventListener('click', function (ev) {
         }
         var modal = document.getElementById('preview-modal');
         var previewOpen = modal && !modal.hidden;
+        // 第九轮 P2-4：预览模态由焦点陷阱挡住指针与 Tab，但 document 级快捷键
+        // 不受 inert 约束。除 Esc（交给预览层关闭）外一律不响应，避免按 r/f/n
+        // 直接跳离详情、丢失正在看的附件预览。
+        if (previewOpen && ev.key !== 'Escape') return;
         if (ev.key === 'Escape') {
             if (previewOpen) return; // 预览层自己处理
             var back = document.querySelector('.topbar .back');

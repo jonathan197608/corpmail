@@ -17,7 +17,7 @@ const CORE = (() => {
 })();
 
 function harness({ isEml = false } = {}) {
-    const keepInput = { value: '[1,2]' };
+    const keepInput = { value: '[1,2]', dispatchEvent() {} };
     const emlInput = { value: '9' };
     const li = { remove() { this.removed = true; } };
     const btn = {
@@ -28,6 +28,10 @@ function harness({ isEml = false } = {}) {
         document: {
             getElementById: (id) => (id === 'keep-ids' ? keepInput : null),
             querySelector: (sel) => (sel === 'input[name="attach_eml_from"]' ? emlInput : null),
+        },
+        // 第九轮 P1：mbxRemoveKept 现在必须派发 input；桩记录事件供断言
+        Event: class {
+            constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); }
         },
         JSON,
         console,

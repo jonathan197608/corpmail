@@ -3579,6 +3579,24 @@ fn protocol_rejects_foreign_origin() {
         );
         assert_eq!(resp.status, 200, "{origin} 应放行");
     }
+    // 第九轮 P2-8：localhost / 127.0.0.1 不是本应用来源——本机任意服务都能
+    // 在这些主机上给页面，其脚本可向本应用发跨源 POST，必须按 foreign 拒绝。
+    for origin in ["http://localhost:3000", "http://127.0.0.1:8080"] {
+        let resp = route(
+            &state,
+            &assets(),
+            &req_hdr(
+                "POST",
+                "/settings/sync/save",
+                "",
+                Some(origin),
+                Some("same-origin"),
+                true,
+            ),
+            &t,
+        );
+        assert_eq!(resp.status, 403, "{origin} 必须视为外部来源");
+    }
     cleanup(&dir);
 }
 
@@ -11087,5 +11105,111 @@ fn p85_out_of_range_page_converges_to_last() {
         "page 越界须收敛到有效页，不得显示空列表：{html}"
     );
     assert_eq!(html.matches("class=\"mail-row").count(), 5, "收敛后应显示全部 5 封");
+    cleanup(&dir);
+}
+
+/// 第九轮 P2-5：测试连接与保存/向导同口径——密码中的首尾空格是合法字符，
+/// 不得 trim（trim 会让测试失败，用户误把正确密码改坏）。
+#[test]
+fn p95_settings_test_keeps_password_spaces() {
+    LAST_IMAP_PASSWORD.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let (state, dir) = temp_state("p95-test-password");
+    let _ = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/welcome/setup/save",
+            &form(&wizard_pairs(dir.to_str().unwrap())),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/test-imap",
+            &form(&[("password", " Pa55word ")]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        LAST_IMAP_PASSWORD.lock().unwrap_or_else(|e| e.into_inner()).as_str(),
+        " Pa55word ",
+        "测试连接的密码必须原样传入，与保存路径同口径"
+    );
+    cleanup(&dir);
+}
+
+/// 第九轮 P2-6：文本字段全空但带附件时自动保存不得早退，否则 draft_id=0
+/// 前端回填不到，已消费的 attach_paths 被清空 → 附件静默丢失。
+#[test]
+fn p96_autosave_with_attachment_is_not_trivial() {
+    let (state, dir) = temp_state("p96-autosave-attach");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let src = dir.join("附件.txt");
+    std::fs::write(&src, b"hello").unwrap();
+    let paths = serde_json::to_string(&vec![src.to_string_lossy().to_string()]).unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("to_addrs", ""),
+                ("subject", ""),
+                ("body_text", ""),
+                ("body_html", ""),
+                ("keep_ids", "[]"),
+                ("attach_paths", &paths),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    assert_eq!(resp.status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body(&resp)).expect("autosave 应回 JSON");
+    let id = json["draft_id"].as_i64().unwrap_or(0);
+    assert!(id > 0, "有附件时必须落库并回填 draft_id：{json}");
+    assert_eq!(
+        mail::get(&state, id).map(|d| d.attach_cnt).unwrap_or(0),
+        1,
+        "附件须随空正文草稿一起入库"
+    );
+    cleanup(&dir);
+}
+
+/// 第九轮 P2-7：标记已读写失败必须回 500，不能吞错后再派发成功事件。
+#[test]
+fn p97_read_write_failure_returns_500() {
+    let (state, dir) = temp_state("p97-read-failure");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER p97_fail_read BEFORE UPDATE ON emails
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in', 'inbox', 'received', 'a@x.cn', '', '主题', '正文', '主题', '正文', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/read", b""),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    assert_eq!(resp.status, 500, "写失败必须回显");
+    assert!(body(&resp).contains("标记已读失败"));
+    assert!(
+        !resp.extra_headers.iter().any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:sideRefresh")),
+        "失败时不得派发侧栏刷新（会伪装成成功）"
+    );
     cleanup(&dir);
 }

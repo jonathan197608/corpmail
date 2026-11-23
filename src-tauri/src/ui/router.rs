@@ -550,17 +550,17 @@ fn foreign_origin(req: &Req) -> bool {
     if !(o.starts_with("http://") || o.starts_with("https://")) {
         return false;
     }
-    // 应用自身在 Windows 上就是 http://ui.localhost/（wry 约定），必须放行
+    // 应用自身在 Windows 上就是 http://ui.localhost/（wry 约定），必须放行。
+    // 第九轮 P2-8：localhost/127.0.0.1 不是本应用来源——任何本机进程都能在
+    // 这些主机上提供页面，其脚本可向本应用发跨源 POST（Origin 校验会放行）。
+    // macOS 的 ui://localhost 无 Origin 或被判 null，已有单独放行，不受影响。
     let host = o
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .split([':', '/'])
         .next()
         .unwrap_or("");
-    !matches!(
-        host,
-        "ui.localhost" | "tauri.localhost" | "localhost" | "127.0.0.1"
-    )
+    !matches!(host, "ui.localhost" | "tauri.localhost")
 }
 
 /// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
@@ -1370,7 +1370,12 @@ fn email_read(state: &AppState, req: &Req) -> Resp {
     let Some(id) = path_id(&req.path, "/emails/") else {
         return Resp::not_found();
     };
-    mark_read_and_sync_seen(state, id);
+    // 第九轮 P2-7：写失败必须回显——与 /unread、/star 同口径。
+    // 旧实现吞错后仍发 mbx:sideRefresh，前端以为成功，未读数却不变。
+    if let Err(err) = mark_read_and_sync_seen(state, id) {
+        eprintln!("[read] 标记已读失败：{err}");
+        return Resp::text(500, "标记已读失败，请重试");
+    }
     Resp::html(String::new()).with_event("mbx:sideRefresh")
 }
 
@@ -1423,16 +1428,14 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
 ///
 /// 旧实现每次点击 spawn 一个线程做完整 IMAP 登录，连点 N 封 = N 次登录（企业服务器
 /// 易限流）。现在本地操作只落库 + 唤醒；worker 在 1.5s 合并窗口后单次连接批量回写
-fn mark_read_and_sync_seen(state: &AppState, id: i64) {
+fn mark_read_and_sync_seen(state: &AppState, id: i64) -> Result<(), String> {
     // 迁移冻结（R2）：详情页仍可只读打开，但"已读"写入会落进即将被抛弃的旧库
     if state.migration_pending() {
-        return;
+        return Ok(());
     }
-    // GET 详情页/片段渲染路径不适合因本地已读写失败整页报错；失败必须可观测，
-    // 由 db::open 的 busy_timeout 兜住绝大多数瞬时冲突，走到这里属真故障
-    if let Err(e) = mail::mark_read(state, id) {
-        eprintln!("[ui] {e}");
-    }
+    // 第九轮 P2-7：写失败上抛给 email_read 回 500（专用 POST 端点，不是渲染路径）；
+    // 失败后不再重建回写意向、不刷托盘角标，避免发出与实际状态不符的成功信号。
+    mail::mark_read(state, id)?;
     // 第七轮 P2-3：abandon/凭据缺失清标志后，再次打开已读邮件须重建回写意向；
     // STORE +\Seen 幂等。标志确被重建时唤醒 worker（翻转路径 mark_read 内已唤醒）。
     match mail::ensure_seen_recheck(state, id) {
@@ -1441,6 +1444,7 @@ fn mark_read_and_sync_seen(state: &AppState, id: i64) {
         Err(e) => eprintln!("[ui] 已读回写意向重建失败：{e}"),
     }
     state.poke_tray(); // 本地未读数变化：刷托盘角标（M4-1；调度线程兑底兑漏）
+    Ok(())
 }
 
 /// 批量操作（POST /emails/batch，M1-1）双模式：
@@ -2560,16 +2564,24 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     }
     let form = parse_form(&req.body);
     let body_empty = |f: &str| form.get(f).map(|v| v.trim()).unwrap_or("").is_empty();
-    let trivial = [
-        "to_addrs",
-        "cc_addrs",
-        "bcc_addrs",
-        "subject",
-        "body_text",
-        "body_html",
-    ]
-    .iter()
-    .all(|f| body_empty(f));
+    // 第九轮 P2-6：附件是语义字段——文本全空但新增了待存附件（或正在
+    // 转发/附带 EML）时必须落库，否则前端回填不到 draft_id 且已消费的
+    // attach_paths 被清空，用户加的附件静默丢失。
+    let has_attach = !form_json_strings(&form, "attach_paths").is_empty()
+        || ["attach_eml_from", "forward_from"]
+            .iter()
+            .any(|f| form_i64(&form, f).unwrap_or(0) > 0);
+    let trivial = !has_attach
+        && [
+            "to_addrs",
+            "cc_addrs",
+            "bcc_addrs",
+            "subject",
+            "body_text",
+            "body_html",
+        ]
+        .iter()
+        .all(|f| body_empty(f));
     if trivial {
         return Resp::json("{\"ok\":true,\"draft_id\":0}".into());
     }

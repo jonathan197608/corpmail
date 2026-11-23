@@ -338,7 +338,10 @@ pub(super) fn settings_account_test(
         }
     };
     let account = full_address(&prefix, &domain);
-    let password = match trimmed_field(&form, "password") {
+    // 第九轮 P2-5：密码与保存/向导路径同口径——原样使用，绝不 trim。
+    // 密码中的首尾空格是合法字符；trim 会让「测试连接」用错密码，用户误以为
+    // 已保存的密码错误，反复改密反而把正确密码改坏（保存端第六轮已修，此处补上）。
+    let password = match form.get("password").cloned().filter(|s| !s.is_empty()) {
         Some(p) => p,
         None => match state.retrieve_password(&account) {
             crate::secrets::GetResult::Keychain(p) | crate::secrets::GetResult::Keyfile(p) => p,

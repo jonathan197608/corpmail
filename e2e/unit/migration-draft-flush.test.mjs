@@ -187,6 +187,32 @@ test('并发两路 autosave：一路的 afterRequest 不得 settle 掉另一路�
     assert.equal((await pB).ok, false, 'B 的 ok 只由自身 status 决定');
 });
 
+test('在途期间有新编辑：结束后补发一次且携带最新值（第九轮 P2-3）', async () => {
+    const h = harness({ fireHandler: false });
+    const pA = h.ctx.mbxAutosaveRequest(h.form, h.doc, h.htmx);
+    assert.equal(h.calls.ajax.length, 1);
+    // 用户在请求在途时继续输入；第二次调用命中同一 in-flight 槽
+    h.form.values.subject = '刚刚补写的内容';
+    const pB = h.ctx.mbxAutosaveRequest(h.form, h.doc, h.htmx);
+    assert.equal(pB, pA, '在途仍须合并，避免重复 INSERT 出幽灵草稿');
+    assert.equal(h.calls.ajax.length, 1, '补发必须等在途请求结束，不得并发');
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[0].url }, xhr: { status: 200 },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(h.calls.ajax.length, 2, '在途结束后必须补发，否则新内容永远不落库');
+    assert.equal(
+        h.calls.ajax[1].opts.values.subject,
+        '刚刚补写的内容',
+        '补发必须重新采集最新 FormData，不能复用在途快照'
+    );
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[1].url }, xhr: { status: 200 },
+    });
+    assert.equal((await pA).ok, true, 'Promise 须等补发完成才 settle');
+});
+
 test('请求悬挂到超时也判失败，迁移不会被无限期挂住', async () => {
     const h = harness({ fireHandler: false });
     const pending = h.ctx.mbxFlushComposeDraft();

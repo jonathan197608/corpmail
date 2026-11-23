@@ -3061,6 +3061,18 @@ pub fn add_attachments(
 }
 
 /// 以字节形式添加附件（B6 转发为附件：.eml 在内存生成，不落临时文件）。
+/// 附件事务的最终收尾：任何失败（insert / 统计同步 / commit）都必须清掉
+/// 已写盘的 .gz，否则 DB 回滚后文件残留成孤儿（第九轮 P2-10）。
+/// 成功时一个都不能删；统一在闭包外判定，避免 `?` 绕过清理。
+fn finish_attachment_write<T>(result: Result<T, String>, written: &[PathBuf]) -> Result<T, String> {
+    if result.is_err() {
+        for path in written {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
 /// 与 add_attachments 共用 insert_attachment/统计同步；失败时回滚已写盘文件。
 pub fn add_attachment_bytes(
     state: &AppState,
@@ -3076,10 +3088,10 @@ pub fn add_attachment_bytes(
     let root = attach_root(state);
     let month = month_dir_of(state, email_id);
     let name = safe_filename(filename);
-    state.with_conn(|conn| {
+    let mut written: Vec<PathBuf> = Vec::new();
+    let result = state.with_conn(|conn| -> Result<(), String> {
         let tx = conn.transaction().map_err(e)?;
-        let mut written: Vec<PathBuf> = Vec::new();
-        let stored = insert_attachment(
+        insert_attachment(
             &AttachCtx {
                 tx: &tx,
                 root: &root,
@@ -3091,17 +3103,11 @@ pub fn add_attachment_bytes(
             mime,
             data,
             &mut written,
-        );
-        if let Err(err) = stored {
-            for p in &written {
-                let _ = std::fs::remove_file(p);
-            }
-            return Err(err);
-        }
+        )?;
         sync_attach_stats(&tx, email_id)?;
-        tx.commit().map_err(e)?;
-        Ok(())
-    })
+        tx.commit().map_err(e)
+    });
+    finish_attachment_write(result, &written)
 }
 
 /// 富文本撰写页"超大内嵌图片转附件"策略的载荷形态（前端从 data:image 抽取）
@@ -3728,10 +3734,10 @@ pub fn copy_attachments(
             skipped += 1;
             continue;
         };
-        state.with_conn(|conn| -> Result<(), String> {
+        let mut written: Vec<PathBuf> = Vec::new();
+        let result = state.with_conn(|conn| -> Result<(), String> {
             let tx = conn.transaction().map_err(e)?;
-            let mut written: Vec<PathBuf> = Vec::new();
-            let res = insert_attachment(
+            insert_attachment(
                 &AttachCtx {
                     tx: &tx,
                     root: &root,
@@ -3743,17 +3749,11 @@ pub fn copy_attachments(
                 &mime,
                 &bytes,
                 &mut written,
-            );
-            if let Err(err) = res {
-                drop(tx);
-                for f in &written {
-                    let _ = std::fs::remove_file(f);
-                }
-                return Err(err);
-            }
+            )?;
             sync_attach_stats(&tx, to_id)?;
             tx.commit().map_err(e)
-        })?;
+        });
+        finish_attachment_write(result, &written)?;
         copied += 1;
     }
     Ok((copied, skipped))
@@ -3850,8 +3850,15 @@ fn mime_of(filename: &str) -> &'static str {
         Some("gif") => "image/gif",
         Some("txt") => "text/plain",
         Some("zip") => "application/zip",
-        Some("doc") | Some("docx") => "application/msword",
-        Some("xls") | Some("xlsx") => "application/vnd.ms-excel",
+        // 第九轮 P2-9：Office 开放格式必须用标准 MIME——旧口径把 docx/xlsx 写成
+        // 二进制格式，preview_kind_of 认不出，自己加的附件没有预览入口（收到的
+        // 附件 MIME 正常，现象变成「自己加的不能预览」）；发出去的类型也不准确。
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _ => "application/octet-stream",
     }
 }
