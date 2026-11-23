@@ -462,3 +462,18 @@ fn p73_parse_addr_list_keeps_comma_in_display_name() {
         vec![("john@x.com".to_string(), "Doe, John".to_string())]
     );
 }
+
+/// 第十一轮 P2-4：手动保存姓名须与自动采集同口径折叠控制字符。
+#[test]
+fn p1124_save_manual_sanitizes_name() {
+    let (state, dir) = temp_state("p1124-name-safe");
+    state.with_conn(|c| {
+        save_manual(c, "a@x.cn", "Li\nMing\rMore", crate::mail::now_epoch()).unwrap();
+        let name: String = c
+            .query_row("SELECT name FROM contacts WHERE addr='a@x.cn'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!name.contains('\n') && !name.contains('\r'), "控制字符须折叠：{name:?}");
+        assert!(name.contains('L') && name.contains('M'), "正常字符保留：{name:?}");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

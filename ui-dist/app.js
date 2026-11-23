@@ -1447,6 +1447,13 @@ function mbxBuildEditor(initial) {
     // 让"未保存"判定与自动保存防抖都能感知正文变化（2026-11-11 R45 同批）
     if (mbxEditor) {
         mbxEditor.on('change', function () {
+            // 第十一轮 P1-1：body_html 隐藏域此前只在 htmx:configRequest 里写，
+            // 而 autosave 的 inflight 变更检测用的是 htmx.ajax 之前的 FormData
+            // 快照——两次快照的 body_html 都是上一轮遗留的旧值，富文本在途编辑
+            // 永远被判「无变化」而吞掉（慢请求场景静默丢正文）。这里在 change
+            // 时同步写隐藏域，与 configRequest 同一净化口径（表格 border）。
+            const h = document.getElementById('body-html');
+            if (h) h.value = mbxEnsureTableBorders(mbxEditor.getHtml());
             const ta = document.getElementById('body-text');
             if (ta) ta.dispatchEvent(new Event('input', { bubbles: true }));
         });
@@ -1573,6 +1580,17 @@ var MBX_AUTOSAVE_SEQ = 0;
 // 在途结束后立刻补发一次（此时重新采集快照，取到的就是最新内容）。
 var MBX_AUTOSAVE_INFLIGHT = [];
 
+// 第十一轮 P1-2：后端写失败仍回 HTTP 200 + {"ok":false}（compose_autosave
+// 的 Err 分支），只判 status 会把失败当成功、显示「已自动保存」掩盖静默丢编辑。
+// 成功契约恒有 ok:true（trivial 也回 ok:true），故 body 可解析时一律以 ok 为准；
+// 非 JSON（异常通道）保持 status 判定，避免把真成功误判为失败。
+function mbxAutosaveRespOk(xhr) {
+    if (!xhr || xhr.status < 200 || xhr.status >= 300) return false;
+    var res = null;
+    try { res = JSON.parse(xhr.responseText); } catch (e) { return true; }
+    return !res || res.ok !== false;
+}
+
 function mbxAutosaveSnapshot(form) {
     var values = {};
     try {
@@ -1625,7 +1643,7 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
             if (p.indexOf('/compose/autosave') < 0 || p.indexOf('__at=' + token) < 0) return;
             var xhr = d.xhr;
             finish({
-                ok: !!(xhr && xhr.status >= 200 && xhr.status < 300),
+                ok: mbxAutosaveRespOk(xhr),
                 status: xhr ? xhr.status : 0
             });
         }
@@ -1641,11 +1659,19 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
                 values: values,
                 handler: function (_elt, info) {
                     var xhr = info && info.xhr;
-                    var ok = !!(xhr && xhr.status === 200);
+                    var ok = mbxAutosaveRespOk(xhr);
                     if (ok) {
                         var res = null;
                         try { res = JSON.parse(xhr.responseText); } catch (e) { res = null; }
                         if (res && res.ok && res.draft_id > 0) {
+                            // 第十一轮 P2-6：服务端跳过的空/损坏附件必须让用户看见，
+                            // 否则 pickedPaths 清空后该附件静默消失。
+                            if (res.skipped > 0) {
+                                var ah = document.getElementById('autosave-hint');
+                                if (ah) ah.innerHTML = '<span class="autosave-err">'
+                                    + escapeHtml(String(res.skipped))
+                                    + ' 个空/损坏附件已跳过，请检查</span>';
+                            }
                             var idEl = form.querySelector('input[name="draft_id"]');
                             if (idEl && (!idEl.value || idEl.value === '0')) {
                                 idEl.value = String(res.draft_id);
@@ -1743,9 +1769,14 @@ function mbxMigAfterFlush(flush, actions) {
         // 与迁移前强制 flush 共用同一条请求：富文本参数注入、draft_id 回填、
         // 失败判定都只有一份实现
         mbxAutosaveRequest(form, document, htmx).then(function (r) {
-            if (!r.ok) return;
             var hint = document.getElementById('autosave-hint');
-            if (hint) hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());
+            if (!hint) return;
+            if (!r.ok) {
+                // 第十一轮 P1-2：失败必须可见——此前只 return，用户误以为在保存
+                hint.innerHTML = '<span class="autosave-err">自动保存失败，内容仍在编辑框，请手动存草稿</span>';
+                return;
+            }
+            hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());
         });
     }
 
@@ -2101,8 +2132,16 @@ function mbxSnapshotForm(form) {
     function num(id) {
         return parseInt(val(id), 10) || 0;
     }
-    // 当前筛选的检索态：检索场景禁用跨页全选（前后端口径一致）
-    function isSearch() { return (val('ba-q') || '').trim() !== ''; }
+    // 当前筛选的检索态：检索场景禁用跨页全选（前后端口径一致）。
+    // 第十一轮 P2-3：后端 has_search 涵盖 q/from/df/dt/att，前端此前只判 ba-q，
+    // 导致高级筛选下仍显示可点入口、点了却被后端拒绝（并触发批量错误）。
+    function isSearch() {
+        return (val('ba-q') || '').trim() !== ''
+            || (val('ba-from') || '').trim() !== ''
+            || (val('ba-df') || '').trim() !== ''
+            || (val('ba-dt') || '').trim() !== ''
+            || val('ba-att') === '1';
+    }
 
     function bar() { return document.getElementById('batch-bar'); }
     function items() {

@@ -3093,6 +3093,7 @@ form.setup-card .setup-actions {
     overflow: hidden;
     text-overflow: ellipsis;
 }
+.autosave-err { color: var(--err, #c0392b); }
 
 /* ---- M4-2 定时发送（撰写页操作区 + 详情页提示） ---- */
 .sched-input {

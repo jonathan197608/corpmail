@@ -1468,7 +1468,7 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
     let Some(action) =
         mail::BatchAction::parse(form.get("action").map(String::as_str).unwrap_or(""))
     else {
-        return batch_error_fragment("未知操作");
+        return batch_error_fragment(state, req, &form, "未知操作");
     };
     // 目标解析：跨页全选优先；否则 ids（两者都缺 → 无目标）
     let target = if form.get("select_all").map(|v| v == "1").unwrap_or(false) {
@@ -1521,7 +1521,7 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
                 .unwrap_or(false)
             || form.get("att").map(|v| v == "1").unwrap_or(false);
         if has_search {
-            return batch_error_fragment("检索/高级筛选结果下暂不支持跨页全选，请使用页内选择");
+            return batch_error_fragment(state, req, &form, "检索/高级筛选结果下暂不支持跨页全选，请使用页内选择");
         }
         mail::BatchTarget::SelectAll {
             exclude: form_json_i64s(&form, "exclude_ids"),
@@ -1533,10 +1533,10 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
     // 执行计数：delete 需确认——由前端 hx-confirm 承担（数量动态，见 app.js）
     let affected = match mail::batch_apply(state, &target, action) {
         Ok(n) => n,
-        Err(e) => return batch_error_fragment(&e),
+        Err(e) => return batch_error_fragment(state, req, &form, &e),
     };
     if affected == 0 {
-        return batch_error_fragment("未选中任何邮件");
+        return batch_error_fragment(state, req, &form, "未选中任何邮件");
     }
     let _ = affected;
     // 回列表片段：不带 select 上下文（操作后选择清零），保持当前 folder/筛选；
@@ -1549,12 +1549,22 @@ fn emails_batch(state: &AppState, req: &Req) -> Resp {
 }
 
 /// 批量操作的错误反馈：回当前列表片段 + 顶部错误提示（复用 error 通道，
-/// 与删除失败同交互形态）。简化实现：错误文案以 toast 形态返回给 #toast 容器。
-fn batch_error_fragment(msg: &str) -> Resp {
-    Resp::html(format!(
-        r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
-        html_escape(msg)
-    ))
+/// 与删除失败同交互形态）。
+/// 第十一轮 P1-3：旧实现只回一个 OOB toast。htmx 2.0.6 在 oobSwap 里把 OOB
+/// 节点从共享 fragment 摘除（htmx.js:1498），随后用**同一个已空的 fragment**
+/// 对 `#list-area` 做 outerHTML 主交换（:1944）——列表整块消失，必须刷新页面
+/// 才能恢复。这里改为主响应回完整的当前列表片段，toast 仅作 OOB 附加。
+fn batch_error_fragment(state: &AppState, req: &Req, form: &HashMap<String, String>, msg: &str) -> Resp {
+    let list_req = reconstruct_list_req(req, form);
+    let mut resp = list_root(state, &list_req);
+    resp.body.extend_from_slice(
+        format!(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">{}</div>"#,
+            html_escape(msg)
+        )
+        .as_bytes(),
+    );
+    resp
 }
 
 /// 从批量 POST 表单重建 GET 列表请求（list_root 需要 Req 形态）：
@@ -2594,14 +2604,19 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
     // P2-1：autosave 必须保留库中已有的 scheduled_at——在途 autosave 携带旧表单
     // （scheduled_at 空 → 0）晚于点发送到达时，不覆写 send 设下的撤销窗口时刻
     match save_compose_form(state, req, true) {
-        Ok((id, _, _, _)) => {
+        Ok((id, skipped, _, detached)) => {
             // 复查五 P2-5：回传本轮保存后草稿的**全部**附件 id。前端据此刷新
             // keep_ids 隐藏域并清空已消费的 attach-paths——否则下轮 autosave
             // 按旧列表裁剪会删掉刚入库的附件，源文件一旦移走就静默丢失。
             let keep_ids: Vec<i64> = mail::get(state, id)
                 .map(|d| d.attachments.iter().map(|a| a.id).collect())
                 .unwrap_or_default();
-            Resp::json(serde_json::json!({ "ok": true, "draft_id": id, "keep_ids": keep_ids }).to_string())
+            // 第十一轮 P2-6：0 字节/ detached 附件被跳过时此前静默丢弃，用户
+            // 以为附件已入库。回传 skipped 供前端明示（与存草稿同口径）。
+            Resp::json(serde_json::json!({
+                "ok": true, "draft_id": id, "keep_ids": keep_ids,
+                "skipped": skipped + detached
+            }).to_string())
         }
         // 自动保存失败不打断编辑（下次防抖/手动保存重试），前端只提示静默
         Err(_) => Resp::json("{\"ok\":false}".into()),
@@ -2992,6 +3007,12 @@ fn retry_form_qs(form: &HashMap<String, String>) -> String {
     if let Some(v) = form.get("scheduled_at").map(|s| s.trim()).filter(|s| !s.is_empty()) {
         out.push_str(&format!("&sched={}", urlencode(v)));
     }
+    // 第十一轮 P2-1：用户主动清空了定时（sched_cleared=1、scheduled_at 空）时，
+    // 失败回填必须携带该意图——否则 apply_retry_form 不改 sched_local，页面按
+    // 库中旧 scheduled_at 重建，用户再点存草稿就把已取消的定时复活并自动发出。
+    if form.get("sched_cleared").map(|v| v == "1").unwrap_or(false) {
+        out.push_str("&sched_cleared=1");
+    }
     for field in ["attach_eml_from", "forward_from"] {
         if let Some(n) = form_i64(form, field).filter(|n| *n > 0) {
             out.push_str(&format!("&{field}={n}"));
@@ -3046,6 +3067,11 @@ fn apply_retry_form(req: &Req, ctx: &mut ComposeCtx) {
         && mail::sched_epoch_of(&s).is_some()
     {
         ctx.sched_local = s;
+    }
+    // 第十一轮 P2-1：显式清空意图优先于库中旧定时（模板 sched_local 由库填充）。
+    // 两者同时出现时不信任 query 注入的时刻——清空即清空。
+    if req.query_param("sched_cleared").as_deref() == Some("1") {
+        ctx.sched_local.clear();
     }
     if let Some(n) = req.query_param("attach_eml_from").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0) {
         ctx.attach_eml_from = n;

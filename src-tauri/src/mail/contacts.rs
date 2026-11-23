@@ -521,12 +521,15 @@ pub fn validate_addr(addr: &str) -> Result<String, String> {
 /// 手动新增/编辑（B3）：已存在时只更新姓名（hits 与往来次数语义无关，
 /// 不因手动编辑而累加）；新增时 hits=1。
 pub fn save_manual(conn: &Connection, addr: &str, name: &str, now: i64) -> rusqlite::Result<()> {
+    // 第十一轮 P2-4：与自动采集 upsert_conn 同口径折叠控制字符——用户从邮件
+    // 签名粘贴进来的 CR/LF 不应进入建议列表与联系人页（显示注入/撑破布局）。
+    let name = name_safe(name.trim());
     // 编辑已有联系人只改姓名，不刷新 updated_at——「最近联系」是邮件往来的
     // 时间戳，改个名字不应让它变成"今天联系过"
     conn.execute(
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
          ON CONFLICT(addr) DO UPDATE SET name = excluded.name",
-        rusqlite::params![addr.trim(), name.trim(), now],
+        rusqlite::params![addr.trim(), name, now],
     )?;
     Ok(())
 }

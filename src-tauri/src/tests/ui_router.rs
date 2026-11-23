@@ -11261,3 +11261,90 @@ fn p105_all_attachments_failed_uses_error_toast() {
         "0 个已保存须用错误样式"
     );
 }
+
+/// 第十一轮 P2-6：空文件附件须在 autosave 响应中回传 skipped 计数，
+/// 否则前端清空 pickedPaths 后用户以为附件已入库。
+#[test]
+fn p1126_autosave_reports_skipped_attachment() {
+    let (state, dir) = temp_state("p1126-skip-attach");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let empty = dir.join("空文件.txt");
+    std::fs::write(&empty, b"").unwrap();
+    let paths = serde_json::to_string(&vec![empty.to_string_lossy().to_string()]).unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("to_addrs", ""),
+                ("subject", ""),
+                ("body_text", "含空附件"),
+                ("body_html", ""),
+                ("keep_ids", "[]"),
+                ("attach_paths", &paths),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let json: serde_json::Value = serde_json::from_str(&body(&resp)).expect("autosave 应回 JSON");
+    assert_eq!(json["skipped"].as_u64().unwrap_or(0), 1, "空文件须计 skipped：{json}");
+    cleanup(&dir);
+}
+
+/// 第十一轮 P2-1：用户清空定时后保存失败，回填 URL 须带 sched_cleared=1，
+/// 且 apply_retry_form 据此清空 sched_local（否则旧定时在重存时复活）。
+#[test]
+fn p1121_retry_carries_sched_cleared() {
+    const SRC: &str = include_str!("../ui/router.rs");
+    let at = SRC.find("fn retry_form_qs(").expect("retry_form_qs 存在");
+    let end = SRC[at..].find("\n}\n").map(|p| at + p).unwrap_or(SRC.len());
+    let qs = &SRC[at..end];
+    assert!(qs.contains("sched_cleared"), "回填查询串须携带清空意图");
+    assert!(qs.contains("&sched_cleared=1"), "须写明确切值 1：{qs}");
+    let ap = SRC.find("fn apply_retry_form(").expect("apply_retry_form 存在");
+    let ap_end = SRC[ap..].find("\n}\n").map(|p| ap + p).unwrap_or(SRC.len());
+    assert!(
+        SRC[ap..ap_end].contains("ctx.sched_local.clear()"),
+        "回填须清空 sched_local，且优先于库中旧定时"
+    );
+}
+
+/// 第十一轮 P1-3：批量错误响应必须是完整列表片段 + OOB toast，不能只有 OOB
+/// （htmx 2.0.6 会用空 fragment 做主 outerHTML 交换，清空 #list-area）。
+#[test]
+fn p113_batch_error_keeps_list_fragment() {
+    const SRC: &str = include_str!("../ui/router.rs");
+    let at = SRC.find("fn batch_error_fragment(").expect("batch_error_fragment 存在");
+    let end = SRC[at..].find("\n}\n").map(|p| at + p).unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    assert!(body.contains("list_root(state, &list_req)"), "错误须回主列表片段");
+    assert!(body.contains("hx-swap-oob=\"true\""), "toast 仍以 OOB 附加");
+}
+
+/// 第十一轮 P2-2：搜索与高级检索表单须保留 unread/external 筛选隐藏域。
+#[test]
+fn p1122_search_forms_keep_filter_context() {
+    const TPL: &str = include_str!("../templates/mail_list.html");
+    let search = TPL.find("<form class=\"search\"").expect("搜索表单存在");
+    let adv = TPL.find("<form class=\"adv-panel\"").expect("高级检索表单存在");
+    for (name, start, end) in [
+        ("search", search, adv),
+        ("adv-panel", adv, TPL.len()),
+    ] {
+        let frag = &TPL[start..end];
+        assert!(frag.contains("name=\"unread\""), "{name} 表单须保留 unread 筛选");
+        assert!(frag.contains("name=\"external\""), "{name} 表单须保留 external 筛选");
+    }
+}
+
+/// 第十一轮 P2-5：设置页 tab 容器须带 hx-sync 防快速连点乱序。
+#[test]
+fn p1125_settings_tabs_sync() {
+    const TPL: &str = include_str!("../templates/settings.html");
+    assert!(
+        TPL.contains("class=\"settings-tabs\"") && TPL.contains("hx-sync=\"this:replace\""),
+        "tab 容器须用 replace 策略：后发请求中止在途，避免高亮与 pane 内容错位"
+    );
+}

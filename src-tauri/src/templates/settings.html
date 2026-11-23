@@ -16,7 +16,10 @@
         {# A15（audit 2026-11-16）：tab 改 button[role=tab]——span 无焦点语义，
            键盘 Tab/Enter/Space 与读屏完全无法切换 pane。button 原生键盘可达，
            click 委托（app.js 的 .stab 匹配）继续生效 #}
-        <div class="settings-tabs" role="tablist" aria-label="设置分类">
+        {# 第十一轮 P2-5：快速连点 tab 时，多个 pane 请求并发返回会让高亮（点击
+           即同步）与最终 pane 内容（最后返回的响应）错位。hx-sync replace 让
+           后发的点击中止在途请求，保证最后点击的 pane 才是最终内容。 #}
+        <div class="settings-tabs" role="tablist" aria-label="设置分类" hx-sync="this:replace">
             <button type="button" class="stab{% if tab == "send" %} on{% endif %}" role="tab"
                 aria-selected="{% if tab == "send" %}true{% else %}false{% endif %}" aria-controls="settings-pane"
                 hx-get="/settings/panes/send" hx-target="#settings-pane" hx-swap="outerHTML">发信</button>

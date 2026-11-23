@@ -112,7 +112,11 @@
                     title="高级检索：发件人、日期区间、附件" aria-label="高级检索">{{ ic.icon('filter') }} 高级</button>
             {% endif %}
             <input type="hidden" name="folder" value="{{ folder }}">
-                        {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
+            {# 第十一轮 P2-2：搜索/高级检索须保留未读与外部筛选，否则一提交就
+               丢上下文，命中集与用户当前视图不一致（批量勾选也会作用到看不见的行） #}
+            {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
+            {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
+            {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
             {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         </form>
     </div>
@@ -125,7 +129,9 @@
           {% if not from_filter and not df and not dt and not has_attach %}hidden{% endif %}>
         <input type="hidden" name="folder" value="{{ folder }}">
         {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
-                {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
+        {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
+        {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
+        {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
         {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         <label class="adv-field">发件人
             <input type="text" name="from" value="{{ from_filter }}" placeholder="地址或姓名包含">
