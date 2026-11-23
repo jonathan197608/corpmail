@@ -2623,3 +2623,40 @@ fn p44_wait_while_frozen_resumes_after_thaw_and_send_worker_uses_it() {
         "send worker 冻结分支必须同时传入退出判据，避免成功迁移后永久 sleep"
     );
 }
+
+#[test]
+fn p62_secrets_degraded_never_holds_store_lock_into_keychain() {
+    // 第六轮 P2-2：提取 secrets_degraded 函数体，断言三段式编排——
+    // 前两段无锁（缓存/keychain），只有第三段 keyfile 才取 store.lock()；
+    // 函数体不得直接调用会带锁进 keychain_get_password 的 secrets::degraded。
+    const STATE_SRC: &str = include_str!("../state.rs");
+    let start = STATE_SRC
+        .find("pub fn secrets_degraded(&self, account: &str) -> bool {")
+        .unwrap();
+    let body = &STATE_SRC[start..];
+    let body = &body[..body.find("\n    }").unwrap_or(body.len())];
+
+    assert!(
+        body.contains("degraded_from_cache(account)"),
+        "第一段必须无锁查缓存"
+    );
+    assert!(
+        body.contains("degraded_keychain_only(account)"),
+        "第二段必须无锁探 keychain（授权弹窗期间不得占库锁）"
+    );
+    assert!(
+        body.contains("degraded_keyfile_only(&store.db"),
+        "第三段 keyfile 才持库锁"
+    );
+    // 顺序护栏：取锁点必须在无锁 keychain 探测之后，否则仍会带锁进 keychain
+    let keychain_pos = body.find("degraded_keychain_only(account)").unwrap();
+    let lock_pos = body.find("self.store.lock()").unwrap();
+    assert!(
+        keychain_pos < lock_pos,
+        "keychain 探测必须排在 store.lock() 之前，否则授权弹窗仍占全局库锁"
+    );
+    assert!(
+        !body.contains("crate::secrets::degraded("),
+        "不得直接调用会带锁进 keychain 的旧 degraded()"
+    );
+}

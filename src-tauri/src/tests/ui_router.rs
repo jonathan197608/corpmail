@@ -4171,6 +4171,66 @@ fn settings_account_save_keeps_credential_when_blank() {
 }
 
 #[test]
+fn p63_settings_account_save_does_not_trim_password() {
+    // 第六轮 P3-3：设置页改密码须原样保存，与向导口径一致。首尾空格可能是
+    // 密码的一部分；trim 会提示成功却存错，导致随后认证全面失败。
+    // 用独立账号前缀：密码缓存是全局 OnceLock（按 account key），避免与其它
+    // 共用 unit.router 的测试串味（全量串行跑时前面测试已缓存该账号的旧值）。
+    const PREFIX: &str = "p63trim";
+    const ACCOUNT: &str = "p63trim@chinatelecom.cn";
+    let (state, dir) = temp_state("p63-pw-trim");
+    let mut wizard = wizard_pairs(dir.to_str().unwrap());
+    for (k, v) in wizard.iter_mut() {
+        if *k == "account_prefix" {
+            *v = PREFIX;
+        }
+    }
+    let wiz_resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/welcome/setup/save", &form(&wizard)),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert_eq!(wiz_resp.status, 200, "向导须先配置成功");
+
+    const PW: &str = "  p@ss word  ";
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/account/save",
+            &form(&[
+                ("account_prefix", PREFIX),
+                ("password", PW),
+                ("display_name", "名字"),
+                ("smtp_host", "smtp.new.cn"),
+                ("smtp_port", "465"),
+                ("recv_host", "imap.test.cn"),
+                ("recv_port", "993"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    assert!(body(&resp).contains("已保存"));
+    assert!(
+        matches!(
+            state.retrieve_password(ACCOUNT),
+            GetResult::Keychain(p) | GetResult::Keyfile(p) if p == PW
+        ),
+        "密码须逐字节保存（含首尾空格），不得 trim"
+    );
+    state.clear_password(ACCOUNT);
+    cleanup(&dir);
+}
+
+#[test]
 fn wizard_save_with_custom_domain() {
     let (state, dir) = temp_state("wiz-domain");
     let mut pairs = wizard_pairs(dir.to_str().unwrap());

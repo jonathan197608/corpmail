@@ -152,3 +152,36 @@ test('A11：mbxRefreshSide 的 htmx.ajax reject 有 toast 兜底（无 unhandled
         process.removeListener('unhandledRejection', onReject);
     }
 });
+
+test('跨页全选：计数 total-exclude、提交 select_all + exclude_ids（第六轮护栏）', () => {
+    const START2 = '// --- B10 batch selection core START ---';
+    const END2 = '// --- B10 batch selection core END ---';
+    const c = vm.createContext({ URLSearchParams });
+    vm.runInContext(APP_JS.slice(APP_JS.indexOf(START2), APP_JS.indexOf(END2)), c);
+    const count = vm.runInContext('mbxBatchSelectedCount', c);
+    const params = vm.runInContext('mbxBatchSelectionParams', c);
+
+    const all = { mode: 'all', exclude: [3, 7], total: 10, ids: [] };
+    assert.equal(count(all), 8, 'all 模式计数 = 总数 - 排除数');
+    const p = params(all, new URLSearchParams());
+    assert.equal(p.get('select_all'), '1');
+    assert.equal(p.get('exclude_ids'), '[3,7]', '排除集合须原样提交');
+    assert.equal(p.has('ids'), false, 'all 模式不得同时带 ids');
+
+    // 排除数超过总数时计数钳到 0，不出现负数
+    assert.equal(count({ mode: 'all', exclude: [1, 2, 3], total: 2, ids: [] }), 0);
+
+    const ids = { mode: 'ids', ids: [1, 3], exclude: [], total: 10 };
+    assert.equal(count(ids), 2, 'ids 模式计数 = 勾选数');
+    const p2 = params(ids, new URLSearchParams());
+    assert.equal(p2.get('ids'), '[1,3]');
+    assert.equal(p2.has('select_all'), false);
+});
+
+test('app.js 批量状态机确实调用抽出的纯函数（不是各写一份）', () => {
+    assert.ok(
+        APP_JS.includes('return mbxBatchSelectedCount(stateBox);') &&
+            APP_JS.includes('mbxBatchSelectionParams(stateBox, params);'),
+        'selectedCount/apply 必须调用 B10 core 纯函数，否则测试覆盖的是镜像副本'
+    );
+});

@@ -2384,12 +2384,20 @@ impl AppState {
         }
     }
 
-    /// keychain 是否处于 keyfile 降级态（设置·账号提示用）
+    /// keychain 是否处于 keyfile 降级态（设置·账号提示用）。
+    /// 三段式与 `retrieve_password` 同口径：先无锁查缓存、再无锁探 keychain，
+    /// 只有 keyfile 段才持库锁——避免 macOS 授权弹窗期间占用全局 store 锁把
+    /// 收件/发信/侧栏一起冻结（第六轮 P2-2）。
     pub fn secrets_degraded(&self, account: &str) -> bool {
+        if let Some(v) = crate::secrets::degraded_from_cache(account) {
+            return v;
+        }
+        if let Some(v) = crate::secrets::degraded_keychain_only(account) {
+            return v;
+        }
         let key_file = self.key_file();
         let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = &store.db;
-        crate::secrets::degraded(conn, &key_file, account)
+        crate::secrets::degraded_keyfile_only(&store.db, &key_file, account)
     }
 
     /// 待生效的数据目录（M5 迁移）：读 corpmail.toml 指针；

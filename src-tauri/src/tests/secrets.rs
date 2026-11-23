@@ -472,3 +472,29 @@ fn keychain_backend_absent_classifies_only_absent_storage() {
     assert!(normalize_delete(Err("keychain was locked".into())).is_err());
     assert_eq!(normalize_delete(Ok(true)), Ok(true));
 }
+
+#[test]
+fn p62_degraded_three_stage_functions() {
+    // 第六轮 P2-2：三段判定纯函数各自口径正确，供 state 两段式编排调用
+    let account = "p62@x.cn";
+    let c = conn();
+    let kf = temp_key_path("p62-degraded");
+
+    // 第三段：无 keyfile 行 → 非降级
+    assert!(!degraded_keyfile_only(&c, &kf, account));
+    // 写入 keyfile 密文 → 降级态
+    keyfile_store(&c, &kf, account, "pw-p62").unwrap();
+    assert!(degraded_keyfile_only(&c, &kf, account));
+
+    // 第一段：缓存命中直接给出结论，不看库
+    // （cache 为全局静态，用独立账号避免与其它测试串味）
+    let cache_account = "p62-cache@x.cn";
+    assert_eq!(degraded_from_cache(cache_account), None);
+    cache_put(cache_account, GetResult::Keyfile("x".into()));
+    assert_eq!(degraded_from_cache(cache_account), Some(true));
+    cache_put(cache_account, GetResult::Keychain("x".into()));
+    assert_eq!(degraded_from_cache(cache_account), Some(false));
+    cache_drop(cache_account);
+
+    cleanup(&kf);
+}

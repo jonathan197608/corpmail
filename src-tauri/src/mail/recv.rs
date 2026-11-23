@@ -1224,32 +1224,55 @@ pub fn store_incoming(state: &AppState, mails: &[IncomingMail]) -> Result<usize,
 /// UV 变化后的 remote_uid 迁移（message_id 分支与 C3 的无 ID 指纹分支共用）。
 /// 候选行里只要出现**同一 UV**（服务器上确实有两封同内容邮件/群发副本），
 /// 就按合法重复处理，不迁移也不跳过；否则把最旧一行的 remote_uid 迁到新值，
-/// 保留已读/星标/本地附件，返回 true 让调用方跳过 INSERT。
+/// 保留已读/星标/本地附件，返回 Some(id) 让调用方跳过 INSERT。
+///
+/// 返回被迁移行的 id 而非 bool：若该行是占位行（超限/漏 UID 未下载正文与附件），
+/// 调用方须在 continue 前调用 `backfill_placeholder_conn` 回填——否则 UV 变化
+/// 重拉命中时只改 UID 不回填，用户以为重拉成功但正文/附件仍缺（第六轮 P3-2）。
 fn remap_old_uidvalidity(
     conn: &mut rusqlite::Connection,
     candidates: Vec<(i64, String)>,
     uv: u32,
     new_remote: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<Option<i64>, String> {
     let Some(new_remote) = new_remote else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut remap: Option<i64> = None;
     for (id, ru) in candidates {
         if remote_uidvalidity(&ru) == Some(uv) {
-            return Ok(false);
+            return Ok(None);
         }
         remap.get_or_insert(id);
     }
     let Some(id) = remap else {
-        return Ok(false);
+        return Ok(None);
     };
     conn.execute(
         "UPDATE emails SET remote_uid = ?2 WHERE id = ?1",
         rusqlite::params![id, new_remote],
     )
     .map_err(e)?;
-    Ok(true)
+    Ok(Some(id))
+}
+
+/// remap 命中后：若旧行是占位行则用本次重拉到的完整正文/附件回填。
+/// 与 remote_uid 命中分支（`:1395-1412`）同口径，避免 UV 变化路径漏回填。
+fn backfill_if_placeholder_after_remap(
+    conn: &mut rusqlite::Connection,
+    data_dir: &Path,
+    id: i64,
+    m: &IncomingMail,
+) -> Result<(), String> {
+    let placeholder: bool = conn
+        .query_row("SELECT COALESCE(placeholder,0) FROM emails WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(e)?;
+    if placeholder {
+        backfill_placeholder_conn(conn, data_dir, id, m)?;
+    }
+    Ok(())
 }
 
 /// 存量占位行识别（v13 之前没有 placeholder 列）：这些文案均由本程序生成，
@@ -1426,7 +1449,10 @@ pub fn store_incoming_conn(
                     .map_err(e)?;
                 rows.filter_map(Result::ok).collect()
             };
-            if remap_old_uidvalidity(conn, existing, m.uidvalidity, remote.as_deref())? {
+            if let Some(remapped_id) =
+                remap_old_uidvalidity(conn, existing, m.uidvalidity, remote.as_deref())?
+            {
+                backfill_if_placeholder_after_remap(conn, data_dir, remapped_id, m)?;
                 continue;
             }
             // ④ 本地副本（无 remote_uid）已存在 → 不再插入
@@ -1467,7 +1493,10 @@ pub fn store_incoming_conn(
                     .map_err(e)?;
                 rows.filter_map(Result::ok).collect()
             };
-            if remap_old_uidvalidity(conn, existing, m.uidvalidity, Some(new_remote))? {
+            if let Some(remapped_id) =
+                remap_old_uidvalidity(conn, existing, m.uidvalidity, Some(new_remote))?
+            {
+                backfill_if_placeholder_after_remap(conn, data_dir, remapped_id, m)?;
                 continue;
             }
         }

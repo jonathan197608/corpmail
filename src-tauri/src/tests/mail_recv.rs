@@ -1177,3 +1177,57 @@ fn p53_backfill_commit_failure_cleans_written_attachments() {
         "写入失败与提交失败两条路径都要清理附件"
     );
 }
+
+#[test]
+fn p62_placeholder_is_backfilled_when_uidvalidity_changes() {
+    // 第六轮 P3-2：UV 变化走 message_id/指纹 remap 路径，只改 remote_uid 不回填
+    // 会让占位正文/附件在"重拉成功"后仍缺失。断言 remap 同时回填。
+    let (state, dir) = temp_state("p62-uv-backfill");
+    let placeholder = IncomingMail {
+        subject: "（邮件内容无法解析）".into(),
+        body_text: "（该邮件正文与附件未下载。）".into(),
+        placeholder: true,
+        ..incoming(9, false, "占位", "<p62-uv@x.cn>")
+    };
+    assert_eq!(store_incoming(&state, &[placeholder]).unwrap(), 1);
+
+    let mut full = IncomingMail {
+        subject: "UV 变化后重拉的正文".into(),
+        body_text: "真正的正文内容。".into(),
+        attachments: vec![IncomingAttach {
+            filename: "uv-backfill.txt".into(),
+            mime: "text/plain".into(),
+            data: b"uv-payload".to_vec(),
+        }],
+        ..incoming(50, false, "占位", "<p62-uv@x.cn>")
+    };
+    full.uidvalidity = 43; // 服务器重编号，旧行 remote_uid='42:9'
+    // 去重命中 message_id → remap 到 '43:50' → 应就地回填（added=0）
+    assert_eq!(store_incoming(&state, &[full]).unwrap(), 0);
+
+    let rows: Vec<(String, String, i64, i64, String)> = state.with_conn(|c| {
+        c.prepare(
+            "SELECT body_text, subject, attach_cnt, placeholder, remote_uid FROM emails",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    });
+    assert_eq!(rows.len(), 1, "回填不得新增重复行");
+    assert_eq!(rows[0].0, "真正的正文内容。", "UV 变化路径也必须回填正文");
+    assert_eq!(rows[0].1, "UV 变化后重拉的正文");
+    assert_eq!(rows[0].2, 1, "附件应随回填落库");
+    assert_eq!(rows[0].3, 0, "占位标记必须清除");
+    assert_eq!(rows[0].4, "43:50", "remote_uid 应迁到新 UV");
+    cleanup(&dir);
+}

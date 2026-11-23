@@ -143,6 +143,44 @@ fn split_addrs_parses_comma_and_semicolon() {
     );
 }
 
+#[test]
+fn split_addrs_keeps_display_name_with_comma_or_semicolon_intact() {
+    // 第六轮 P2-1：通讯录姓名含逗号/分号时，`<...>` 整段不得被切开
+    assert_eq!(
+        split_addrs("Doe, John <john@x.com>"),
+        vec!["Doe, John <john@x.com>".to_string()]
+    );
+    assert_eq!(
+        split_addrs("Doe; John <john@x.com>; a@x.cn"),
+        vec![
+            "Doe; John <john@x.com>".to_string(),
+            "a@x.cn".to_string()
+        ]
+    );
+    assert_eq!(
+        split_addrs("\"Doe, John\" <john@x.com>, a@x.cn"),
+        vec![
+            "\"Doe, John\" <john@x.com>".to_string(),
+            "a@x.cn".to_string()
+        ]
+    );
+    // 多个带显示名的地址混排
+    assert_eq!(
+        split_addrs("Zhang, San <z@x.cn>; Li, Si <l@x.cn>"),
+        vec![
+            "Zhang, San <z@x.cn>".to_string(),
+            "Li, Si <l@x.cn>".to_string()
+        ]
+    );
+}
+
+#[test]
+fn parse_mailbox_accepts_unquoted_comma_in_display_name() {
+    // 第六轮 P2-1：lettre 对未加引号的含逗号显示名也能整体解析
+    let m = parse_mailbox("Doe, John <john@x.com>", "").unwrap();
+    assert_eq!(m.email.to_string(), "john@x.com");
+}
+
 /// BCC 语义护栏（M1-3）：builder.bcc 后 lettre 的默认行为——
 /// 信封 RCPT TO 含密送人（密送人能收到），MIME 头不含 Bcc（其他收件人看不到）。
 /// 升级 lettre 若此测试变红，说明默认 drop_bcc 语义不再成立，

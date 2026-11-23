@@ -135,7 +135,11 @@ impl MailSender for RealSender {
 fn parse_mailbox(raw: &str, name: &str) -> Result<lettre::message::Mailbox, String> {
     let raw = raw.trim();
     if raw.contains('<') {
-        return raw
+        // RFC 5322：显示名含逗号/分号必须加引号。通讯录拼接（`name <addr>`）与
+        // 旧草稿可能留下未加引号的 `Doe, John <a@b>`，lettre 会判 Invalid input。
+        // 兼容起见按显示名部分自动补引号后解析（第六轮 P2-1）。
+        let normalized = quote_display_name_if_needed(raw);
+        return normalized
             .parse()
             .map_err(|err| format!("邮箱地址无效 {raw}：{err}"));
     }
@@ -166,13 +170,102 @@ pub(crate) fn new_message_id(from_addr: &str) -> String {
     format!("<{}.{}@{}>", now_epoch(), nanos, domain)
 }
 
-/// 收件人/抄送串拆分（逗号或分号分隔，去空白）
+/// 为含逗号/分号但未加引号的显示名补引号，使 lettre 能整体解析。
+/// 已是 `"name" <addr>` 形态或显示名无分隔符时原样返回。
+fn quote_display_name_if_needed(raw: &str) -> String {
+    let Some(lt) = raw.find('<') else {
+        return raw.to_string();
+    };
+    let display = raw[..lt].trim();
+    if display.is_empty()
+        || display.starts_with('"')
+        || !display.chars().any(|c| c == ',' || c == ';')
+    {
+        return raw.to_string();
+    }
+    let mut escaped = String::with_capacity(display.len() + 2);
+    escaped.push('"');
+    for c in display.chars() {
+        match c {
+            '"' | '\\' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped.push('"');
+    escaped.push_str(&raw[lt..]);
+    escaped
+}
+
+/// 收件人/抄送串拆分（逗号或分号分隔，去空白）。
+///
+/// 与 `contacts::parse_addr_list` 同口径：`<...>` 显示名地址作为一个整体 token，
+/// 显示名内的逗号/分号（如通讯录姓名 `Doe, John <john@x.com>`）不参与切分。
+/// 盲切会把单个地址切成 `Doe` 和 `John <john@x.com>`，前者 `parse_mailbox` 必然
+/// 失败并连带整封发送失败（第六轮 P2-1）。纯地址串仍按分隔符切，保持原行为。
 fn split_addrs(raw: &str) -> Vec<String> {
-    raw.split([',', ';'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // 待定切点：分隔符先暂存，只有确认它与下一个分隔符之间没有 `<...>`
+    // （即它不在显示名内）才认定为真正的地址分隔。
+    let mut pending: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => {
+                // 遇到尖括号地址：显示名内的待定分隔符作废，整段取一个 token
+                if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'>') {
+                    let end = i + 1 + rel + 1; // 含 '>'，ASCII 边界切片安全
+                    let seg = raw[start..end].trim();
+                    if !seg.is_empty() {
+                        out.push(seg.to_string());
+                    }
+                    i = end;
+                    while i < bytes.len()
+                        && (bytes[i] == b',' || bytes[i] == b';' || bytes[i].is_ascii_whitespace())
+                    {
+                        i += 1;
+                    }
+                    start = i;
+                    pending = None;
+                    continue;
+                }
+                i += 1;
+            }
+            b',' | b';' => {
+                if let Some(p) = pending {
+                    // 上一个待定分隔符到本分隔符之间无 `<` → 它是真分隔
+                    let seg = raw[start..p].trim();
+                    if !seg.is_empty() {
+                        out.push(seg.to_string());
+                    }
+                    start = p + 1;
+                }
+                pending = Some(i);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(p) = pending {
+        let head = raw[start..p].trim();
+        if !head.is_empty() {
+            out.push(head.to_string());
+        }
+        let tail = raw[p + 1..].trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+    } else {
+        let seg = raw[start..].trim();
+        if !seg.is_empty() {
+            out.push(seg.to_string());
+        }
+    }
+    out
 }
 
 /// 测试辅助：草稿 → 排队的 CAS（仅 status='draft' 可入队，重复提交返回 false）。

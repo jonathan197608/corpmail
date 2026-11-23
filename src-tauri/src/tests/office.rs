@@ -257,3 +257,53 @@ fn extract_text_docx_truncates_over_limit() {
     );
     assert!(text.chars().count() <= MAX_TEXT_CHARS + 20);
 }
+
+#[test]
+fn p63_extract_text_rejects_uncompressed_bomb_via_injectable_limits() {
+    // 第六轮 P3-1：文本兜底必须过 ZIP 解压护栏。用小限额注入，避免真造数 GB 数据。
+    let small = ZipLimits {
+        max_entries: 64,
+        max_uncompressed: 512,
+        max_ratio: 200,
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\"?><w:document xmlns:w=\"w\"><w:body><w:p><w:t>{}</w:t></w:p></w:body></w:document>",
+        "x".repeat(4096)
+    );
+    let docx = zip_of(&[("word/document.xml", xml.as_bytes())]);
+    assert!(
+        matches!(
+            extract_text_with_limits(&docx, OfficeKind::Docx, small),
+            Err(OfficeError::TooLarge(_))
+        ),
+        "超解压上限的 docx 文本兜底必须被拒，不得 OOM"
+    );
+    // 默认 extract_text 走 DEFAULT_ZIP_LIMITS，对正常文档仍可用
+    assert!(extract_text(&minimal_docx(), OfficeKind::Docx).is_ok());
+}
+
+#[test]
+fn p63_extract_text_actual_decompression_is_capped() {
+    // 第六轮 P3-1 静态护栏：不能只信中央目录声明，实际解压必须 .take(max+1) 限流
+    const SRC: &str = include_str!("../mail/office.rs");
+    let start = SRC.find("fn read_zip_entry(").unwrap();
+    let body = &SRC[start..];
+    let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+    assert!(
+        body.contains(".take(cap)"),
+        "read_zip_entry 必须按 max_uncompressed+1 限流实际解压字节"
+    );
+
+    let start = SRC.find("pub fn extract_text_with_limits(").unwrap();
+    let body = &SRC[start..];
+    let body = &body[..body.find("OfficeKind::Xlsx | OfficeKind::Xls").unwrap()];
+    assert!(
+        body.contains("inspect_zip(bytes, limits)?"),
+        "文本兜底入口必须先做 ZIP 声明检查"
+    );
+    let pptx = &body[body.find("OfficeKind::Pptx").unwrap()..];
+    assert!(
+        pptx.contains(".take(cap)") && pptx.contains("<= limits.max_uncompressed"),
+        "PPTX 逐片解压必须限流且校验实际长度"
+    );
+}

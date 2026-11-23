@@ -20,7 +20,9 @@ const START = '// --- A10 migration draft flush core START ---';
 const END = '// --- A10 migration draft flush core END ---';
 
 function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
-    const calls = { ajax: [], listeners: {}, removed: [], timers: [] };
+    // listeners 用数组（第六轮 P3-4）：单槽桩无法表达两路并发 onDone，
+    // 正是它掩盖了「按 path 判身份导致两路 Promise 串线」的 bug。
+    const calls = { ajax: [], listeners: [], removed: [], timers: [] };
     const draftIdEl = { value: '0' };
     const form = {
         isConnected: true,
@@ -32,10 +34,11 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
     const doc = {
         getElementById: (id) => (id === 'autosave-hint' ? (withForm ? hint : null) : null),
         body: {
-            addEventListener: (type, fn) => { calls.listeners[type] = fn; },
+            addEventListener: (type, fn) => { calls.listeners.push({ type, fn }); },
             removeEventListener: (type, fn) => {
                 calls.removed.push(type);
-                if (calls.listeners[type] === fn) delete calls.listeners[type];
+                const i = calls.listeners.findIndex((l) => l.type === type && l.fn === fn);
+                if (i >= 0) calls.listeners.splice(i, 1);
             },
         },
     };
@@ -43,6 +46,12 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
         constructor(f) { this.entries = Object.entries(f.values || {}); }
         forEach(cb) { this.entries.forEach(([k, v]) => cb(v, k)); }
     }
+    // 真实 DOM 事件会广播给所有监听器；桩必须快照遍历，否则测不出两路 onDone 串线
+    calls.dispatch = (type, detail) => {
+        for (const l of [...calls.listeners]) {
+            if (l.type === type) l.fn({ detail });
+        }
+    };
     const ctx = vm.createContext({
         Promise,
         JSON,
@@ -88,7 +97,10 @@ test('有撰写表单时先发 autosave，200 才放行并回填 draft_id', asyn
     const r = await h.ctx.mbxFlushComposeDraft();
     assert.equal(r.ok, true, '200 才算落库成功');
     assert.equal(h.calls.ajax.length, 1);
-    assert.equal(h.calls.ajax[0].url, '/compose/autosave');
+    assert.ok(
+        h.calls.ajax[0].url.startsWith('/compose/autosave?__at='),
+        `autosave URL 须带唯一 token：${h.calls.ajax[0].url}`
+    );
     assert.equal(h.calls.ajax[0].method, 'POST');
     assert.equal(h.calls.ajax[0].opts.values.subject, '未写完的邮件');
     assert.equal(h.draftIdEl.value, '7', '新草稿必须回填隐藏域');
@@ -126,11 +138,45 @@ test('flush 成功才调用 proceed', () => {
 test('handler 未到达时 htmx:afterRequest 兜底判定，不把成功误判成失败', async () => {
     const h = harness({ fireHandler: false });
     const pending = h.ctx.mbxFlushComposeDraft();
-    assert.equal(typeof h.calls.listeners['htmx:afterRequest'], 'function');
-    h.calls.listeners['htmx:afterRequest']({
-        detail: { pathInfo: { requestPath: '/compose/autosave' }, xhr: { status: 200 } },
+    assert.ok(h.calls.listeners.some((l) => l.type === 'htmx:afterRequest'));
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[0].url }, xhr: { status: 200 },
     });
     assert.equal((await pending).ok, true);
+});
+
+test('并发两路 autosave：一路的 afterRequest 不得 settle 掉另一路（第六轮 P3-4）', async () => {
+    const h = harness({ fireHandler: false });
+    const pA = h.ctx.mbxFlushComposeDraft();
+    const pB = h.ctx.mbxFlushComposeDraft();
+    assert.equal(h.calls.ajax.length, 2);
+    assert.notEqual(
+        h.calls.ajax[0].url,
+        h.calls.ajax[1].url,
+        '两路请求须带不同 token'
+    );
+    assert.equal(
+        h.calls.listeners.filter((l) => l.type === 'htmx:afterRequest').length,
+        2,
+        '两路各装一个 onDone'
+    );
+
+    // A 的 200 响应广播：只应 settle A，B 的 onDone 须按 token 忽略
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[0].url }, xhr: { status: 200 },
+    });
+    assert.equal((await pA).ok, true, 'A 应被自身响应 settle');
+    let bSettledEarly = false;
+    pB.then(() => { bSettledEarly = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(bSettledEarly, false, 'B 不得被 A 的响应串线 settle');
+
+    // B 的 409 响应广播：B 判失败（自身 status）
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[1].url }, xhr: { status: 409 },
+    });
+    assert.equal((await pB).ok, false, 'B 的 ok 只由自身 status 决定');
 });
 
 test('请求悬挂到超时也判失败，迁移不会被无限期挂住', async () => {

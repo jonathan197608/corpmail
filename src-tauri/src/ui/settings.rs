@@ -512,7 +512,9 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
         return send_pane(state, false, &format!("保存失败：{e}"));
     }
     // 2) 配置已生效再写凭据（失败时配置不回滚，但已存密码不会被清掉）
-    if let Some(p) = trimmed_field(&form, "password")
+    // 密码原样保存、不 trim——与向导保存口径一致：首尾空格可能是密码的一部分，
+    // trim 会让界面提示成功但实际存错、随后认证全面失败（第六轮 P3-3）。
+    if let Some(p) = form.get("password").cloned().filter(|s| !s.is_empty())
         && let Err(e) = state.store_password(&account, &p)
     {
         return send_pane(state, false, &format!("密码保存失败：{e}"));

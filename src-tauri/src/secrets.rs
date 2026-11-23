@@ -488,12 +488,51 @@ pub fn clear(conn: &Connection, account: &str) -> Result<(), String> {
     res
 }
 
-/// 当前是否处于 keyfile 降级态（设置页"关于/账号"提示用）。
-/// 直接复用 retrieve：缓存命中时不再触碰 keychain（此前每次渲染设置页都调一次
-/// get_password，是 macOS 弹窗的第二个来源）。语义上要求 keyfile 记录**可解密**
-/// 才算降级——行存在但解不开属数据损坏，不该再报"密码已存本地"
+/// keychain 是否处于降级态的三段判定（第六轮 P2-2）。
+///
+/// 生产读取路径 `AppState::retrieve_password` 早已是两段式（keychain 段不持库锁），
+/// 但 `degraded` 直接复用 `retrieve`：缓存未命中时会带着调用方持有的 store 锁进
+/// keychain_get_password——macOS 授权弹窗可能等几秒到无限久，全局库锁被占会让
+/// 收件/发信/侧栏全部冻结。这里把判定拆成三段纯函数，由调用方按"先无锁探缓存 →
+/// 再无锁探 keychain → 最后持锁查 keyfile"编排，杜绝带锁进 keychain。
+///
+/// 第一段：只查进程内缓存。命中返回是否降级，未命中返回 None 让调用方继续。
+pub fn degraded_from_cache(account: &str) -> Option<bool> {
+    match cached(account) {
+        Some(GetResult::Keyfile(_)) => Some(true),
+        Some(GetResult::Keychain(_)) => Some(false),
+        Some(GetResult::Missing) | None => None,
+    }
+}
+
+/// 第二段：只探 keychain（不碰库、不碰缓存读取）。命中 Keychain 说明未降级，
+/// 返回 Some(false)；无条目/后端异常/测试短路返回 None 让调用方走 keyfile 段。
+/// 与 `keychain_get` 同口径，命中时写缓存。
+pub fn degraded_keychain_only(account: &str) -> Option<bool> {
+    keychain_get(account).map(|_| false)
+}
+
+/// 第三段：只查库内 keyfile 段（不碰 keychain）。语义上要求记录**可解密**才算
+/// 降级——行存在但解不开属数据损坏，不该报"密码已存本地"。由持锁的调用方传入
+/// 库连接。
+pub fn degraded_keyfile_only(conn: &Connection, key_file: &Path, account: &str) -> bool {
+    matches!(
+        keyfile_retrieve(conn, key_file, account),
+        GetResult::Keyfile(_)
+    )
+}
+
+/// 兼容旧调用（直接持库连接判定，缓存命中短路）。生产渲染路径已改走三段式，
+/// 保留此函数供既有测试与不愿拆段的调用方使用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn degraded(conn: &Connection, key_file: &Path, account: &str) -> bool {
-    matches!(retrieve(conn, key_file, account), GetResult::Keyfile(_))
+    if let Some(v) = degraded_from_cache(account) {
+        return v;
+    }
+    if let Some(v) = degraded_keychain_only(account) {
+        return v;
+    }
+    degraded_keyfile_only(conn, key_file, account)
 }
 
 // ---------- keyfile 回退实现（AES-256-GCM + 库外密钥文件） ----------

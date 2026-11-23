@@ -893,6 +893,28 @@ function mbxSelectionPlan(stateBox, rowIds) {
     return rowIds.map(function (id) { return !!keep[id]; });
 }
 
+// --- B10 batch selection core START ---
+// 第六轮测试护栏：跨页全选（mode='all'）的计数与提交参数此前零覆盖。
+// 抽成纯函数，vm 单测正向断言 total-exclude 与 select_all/exclude_ids 形态。
+function mbxBatchSelectedCount(stateBox) {
+    if (stateBox.mode === 'all') {
+        return Math.max(stateBox.total - stateBox.exclude.length, 0);
+    }
+    return stateBox.ids.length;
+}
+
+/** 把当前选择状态写入批量提交参数（ids 模式或 select_all 模式）。 */
+function mbxBatchSelectionParams(stateBox, params) {
+    if (stateBox.mode === 'all') {
+        params.set('select_all', '1');
+        params.set('exclude_ids', JSON.stringify(stateBox.exclude));
+    } else {
+        params.set('ids', JSON.stringify(stateBox.ids));
+    }
+    return params;
+}
+// --- B10 batch selection core END ---
+
 function mbxRefreshList() {
     if (!document.getElementById('list-area')) return;
     var box = document.querySelector('form.search input[name="q"]');
@@ -984,52 +1006,47 @@ document.body.addEventListener('mbx:starDone', function (ev) {
 // - 终态后刷新列表区+侧栏（复用收取完成同一刷新路径），"发送中"行落定
 // - 1.2s 间隔轮询；30s 未终态（SMTP 卡顿）不再打扰，提示稍后到发件箱查看
 // URL 参数即刻清除（replaceState 不触发导航），刷新页面不会重复提示
-(function () {
-    var params = new URLSearchParams(location.search);
-    var id = params.get('just_sent');
-    if (!id || !document.getElementById('list-area')) return;
-    params.delete('just_sent');
-    var clean = params.toString();
-    history.replaceState(null, '', location.pathname + (clean ? '?' + clean : ''));
-    var slot = document.getElementById('toast');
-    if (!slot) return;
+// --- P5 undo race core START ---
+// 纯决策：倒计时到点（left<=0）时，撤销请求若在途（undoPending）必须让路，
+// 不转 poll、不移除按钮——否则 undo 的迟到失败改到已脱离 DOM 的节点上，
+// 重试入口丢失，且 poll 拿到的状态与「撤销其实已生效」相反（第六轮 P3-5）。
+function mbxUndoCountdownShouldPoll(left, undoPending) {
+    return left <= 0 && !undoPending;
+}
+
+/**
+ * 撤销 toast 核心（依赖全部经 env 注入，Node vm 可驱动真实分支）。
+ * env: { doc, htmx, fetch, setInterval, clearInterval, setTimeout, now,
+ *        escapeHtml, icon, onFetchDone, toast }
+ */
+function mbxUndoToastCore(id, env) {
+    var doc = env.doc;
     var UNDO_SECS = 8;
     var left = UNDO_SECS;
-    var toast = document.createElement('div');
+    var undoPending = false;
+    var pollStarted = false;
+    var timer = null;
+    var toast = doc.createElement('div');
     toast.className = 'toast busy';
-    var label = document.createElement('span');
+    var label = doc.createElement('span');
     label.textContent = '邮件已进入发送队列（' + left + ' 秒内可撤销）';
     toast.appendChild(label);
-    var undo = document.createElement('button');
+    var undo = doc.createElement('button');
     undo.type = 'button';
     undo.className = 'btn small toast-undo';
     undo.textContent = '撤销发送';
-    undo.addEventListener('click', function () {
-        undo.disabled = true;
-        // 撤销失败必须回显（审计 R50）：网络异常/服务端 409（迁移冻结期）/
-        // 撤销窗口已过时 htmx 会 reject，早先没有 .catch 时按钮永久禁用、
-        // 用户既不知道撤销没成功，也看不到「其实已经发出去了」
-        htmx.ajax('POST', '/emails/' + id + '/undo-send', { target: 'body', swap: 'none' })
-            .catch(function () {
-                undo.disabled = false;
-                undo.textContent = '撤销失败，重试';
-                if (typeof mbxToast === 'function') mbxToast('撤销发送失败，请稍后在发件箱确认', 'err', 6000);
-            });
-    });
-    toast.appendChild(undo);
-    slot.appendChild(toast);
-    var started = Date.now();
-    // icon 前缀仅允许本文件固定 SVG 字符串；文字统一 escapeHtml 后入 innerHTML
-    // （toast 文案可能携带服务端错误信息，不能裸拼）
+
+    var started = env.now();
     var settle = function (text, cls, stayMs, icon) {
         toast.className = 'toast ' + cls;
-        toast.innerHTML = (icon ? MBX_IC[icon] + ' ' : '') + escapeHtml(text);
-        // 终态刷新：列表区（过滤/页码保持）+侧栏计数，复用收取完成路径
-        if (window.mbxOnFetchDone) mbxOnFetchDone();
-        setTimeout(function () { toast.remove(); }, stayMs);
+        toast.innerHTML = (icon ? env.icon[icon] + ' ' : '') + env.escapeHtml(text);
+        if (env.onFetchDone) env.onFetchDone();
+        env.setTimeout(function () { toast.remove(); }, stayMs);
     };
     var poll = function () {
-        fetch('/emails/' + id + '/status', { cache: 'no-store' })
+        if (pollStarted) return;
+        pollStarted = true;
+        env.fetch('/emails/' + id + '/status', { cache: 'no-store' })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (s) {
                 if (!s) return settle('发送状态查询失败，请在发件箱确认', 'err', 6000);
@@ -1037,26 +1054,81 @@ document.body.addEventListener('mbx:starDone', function (ev) {
                 if (s.status === 'failed') {
                     return settle('发送失败：' + (s.error || '未知原因'), 'err', 6000);
                 }
-                // queued/sending：继续轮询；超 30s 停止（SMTP 卡顿不动声色等太久）
-                if (Date.now() - started > 30000) {
+                if (env.now() - started > 30000) {
                     return settle('发送仍在进行，稍后可在发件箱确认', 'busy', 6000);
                 }
-                setTimeout(poll, 1200);
+                env.setTimeout(poll, 1200);
             })
             .catch(function () { return settle('网络异常，发送状态未知', 'err', 6000); });
     };
-    // 撤销倒计时；到点后移除按钮并转入发送轮询
-    var timer = setInterval(function () {
+    var startPoll = function () {
+        if (timer !== null) env.clearInterval(timer);
+        if (undo.parentNode) undo.remove();
+        label.textContent = '邮件发送中…';
+        poll();
+    };
+    // 撤销请求结束（成功/失败）：清在途标志。窗口已过 → 补转 poll 查真实状态
+    // （邮件多半已发出，重试无意义）；窗口未过 → 失败时恢复按钮可重试（审计 R50）。
+    var undoFinished = function (ok) {
+        undoPending = false;
+        if (mbxUndoCountdownShouldPoll(left, false)) {
+            if (!ok && env.toast) env.toast('撤销发送失败，请稍后在发件箱确认', 'err', 6000);
+            startPoll();
+            return;
+        }
+        if (!ok && undo.isConnected !== false) {
+            undo.disabled = false;
+            undo.textContent = '撤销失败，重试';
+            if (env.toast) env.toast('撤销发送失败，请稍后在发件箱确认', 'err', 6000);
+        }
+    };
+    undo.addEventListener('click', function () {
+        undo.disabled = true;
+        undoPending = true;
+        // 服务端 409（迁移冻结期）/窗口已过/网络异常都会 reject
+        var p = env.htmx.ajax('POST', '/emails/' + id + '/undo-send', {
+            target: 'body', swap: 'none',
+        });
+        p.then(function () { undoFinished(true); }, function () { undoFinished(false); });
+    });
+    toast.appendChild(undo);
+    var slot = doc.getElementById('toast');
+    if (!slot) return;
+    slot.appendChild(toast);
+
+    timer = env.setInterval(function () {
         left -= 1;
         if (left > 0) {
             label.textContent = '邮件已进入发送队列（' + left + ' 秒内可撤销）';
             return;
         }
-        clearInterval(timer);
-        if (undo.parentNode) undo.remove();
-        label.textContent = '邮件发送中…';
-        poll();
+        // 撤销在途：让路；由 undoFinished 在请求结束后决定转 poll
+        if (mbxUndoCountdownShouldPoll(left, undoPending)) startPoll();
     }, 1000);
+}
+// --- P5 undo race core END ---
+
+(function () {
+    var params = new URLSearchParams(location.search);
+    var id = params.get('just_sent');
+    if (!id || !document.getElementById('list-area')) return;
+    params.delete('just_sent');
+    var clean = params.toString();
+    history.replaceState(null, '', location.pathname + (clean ? '?' + clean : ''));
+    if (!document.getElementById('toast')) return;
+    mbxUndoToastCore(id, {
+        doc: document,
+        htmx: htmx,
+        fetch: fetch,
+        setInterval: setInterval,
+        clearInterval: clearInterval,
+        setTimeout: setTimeout,
+        now: function () { return Date.now(); },
+        escapeHtml: escapeHtml,
+        icon: MBX_IC,
+        onFetchDone: function () { if (window.mbxOnFetchDone) mbxOnFetchDone(); },
+        toast: function (m, c, ms) { if (typeof mbxToast === 'function') mbxToast(m, c, ms); },
+    });
 })();
 
 // ---------- 撰写页：收件人/抄送联系人建议（模糊匹配姓名或地址） ----------
@@ -1435,6 +1507,10 @@ document.body.addEventListener('htmx:configRequest', function (ev) {
 // 同一条请求（必须走 htmx.ajax，富文本 body_html / inline_images 由
 // htmx:configRequest 注入，原生 fetch 会漏参数）。Node vm 行为测试直接执行本段。
 var MBX_MIG_FLUSH_TIMEOUT_MS = 8000;
+// 第六轮 P3-4：迁移 flush 与 5s 防抖 autosave 可并发，两路的 afterRequest
+// 全局兜底若只按 path 判身份会串线（A 的响应 settle 掉 B 的 Promise）。
+// 每路生成唯一 token 注入 URL query，onDone 从 requestPath 回读比对。
+var MBX_AUTOSAVE_SEQ = 0;
 
 function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
     var values = {};
@@ -1444,6 +1520,8 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
         return Promise.resolve({ ok: false, status: 0 });
     }
     var limit = typeof timeoutMs === 'number' ? timeoutMs : MBX_MIG_FLUSH_TIMEOUT_MS;
+    var token = 'as' + (++MBX_AUTOSAVE_SEQ);
+    var url = '/compose/autosave?__at=' + token;
     return new Promise(function (resolve) {
         var settled = false;
         var timer = null;
@@ -1457,7 +1535,8 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
         function onDone(ev) {
             var d = ev.detail || {};
             var p = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
-            if (p.indexOf('/compose/autosave') < 0) return;
+            // 身份判定必须带 token：只认本路请求，避免并发串线
+            if (p.indexOf('/compose/autosave') < 0 || p.indexOf('__at=' + token) < 0) return;
             var xhr = d.xhr;
             finish({
                 ok: !!(xhr && xhr.status >= 200 && xhr.status < 300),
@@ -1471,7 +1550,7 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
             }, limit);
         }
         try {
-            var pending = htx.ajax('POST', '/compose/autosave', {
+            var pending = htx.ajax('POST', url, {
                 source: form,
                 values: values,
                 handler: function (_elt, info) {
@@ -1911,10 +1990,7 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
     }
 
     function selectedCount() {
-        if (stateBox.mode === 'all') {
-            return Math.max(stateBox.total - stateBox.exclude.length, 0);
-        }
-        return stateBox.ids.length;
+        return mbxBatchSelectedCount(stateBox);
     }
 
     function render() {
@@ -1984,12 +2060,7 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
         var dt = val('ba-dt');
         if (dt) params.set('dt', dt);
         if (val('ba-att') === '1') params.set('att', '1');
-        if (stateBox.mode === 'all') {
-            params.set('select_all', '1');
-            params.set('exclude_ids', JSON.stringify(stateBox.exclude));
-        } else {
-            params.set('ids', JSON.stringify(stateBox.ids));
-        }
+        mbxBatchSelectionParams(stateBox, params);
         // 批量删除确认：页面内模态（原 window.confirm 在 macOS WKWebView
         // 不弹窗恒返 false，批量删除会静默失效）
         var submit = function () {

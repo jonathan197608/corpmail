@@ -362,11 +362,26 @@ fn is_external_rel(e: &BytesStart<'_>) -> bool {
 
 /// 文本兜底：DOCX/PPTX 抽 XML 文本；XLSX/XLS 走 calamine。
 /// PPTX 按产品要求不提供文本降级（路由层会拒绝），此函数保留给测试/未来使用。
+///
+/// OOXML 走与主预览 `sanitize_ooxml` 同款 ZIP 护栏：先 `inspect_zip` 校验声明，
+/// 每条实际解压再 `.take(max+1)` 限流——只按压缩后 `bytes.len()` 判上限挡不住
+/// 高压缩比声明/解压炸弹（第六轮 P3-1）。XLS 是 CFB，无 ZIP 解压面。
 pub fn extract_text(bytes: &[u8], kind: OfficeKind) -> Result<String, OfficeError> {
+    extract_text_with_limits(bytes, kind, DEFAULT_ZIP_LIMITS)
+}
+
+/// 可注入 ZIP 阈值的文本兜底实现（测试用小限额构造炸弹，不必真造数 GB 数据）
+pub fn extract_text_with_limits(
+    bytes: &[u8],
+    kind: OfficeKind,
+    limits: ZipLimits,
+) -> Result<String, OfficeError> {
+    if kind != OfficeKind::Xls {
+        inspect_zip(bytes, limits)?;
+    }
     let text = match kind {
         OfficeKind::Docx => {
-            let xml = read_zip_entry(bytes, "word/document.xml")
-                .ok_or_else(|| OfficeError::Damaged("缺少 word/document.xml".into()))?;
+            let xml = read_zip_entry(bytes, "word/document.xml", limits)?;
             xml_text(&xml, XmlMode::Docx)
         }
         OfficeKind::Pptx => {
@@ -385,7 +400,10 @@ pub fn extract_text(bytes: &[u8], kind: OfficeKind) -> Result<String, OfficeErro
                     continue;
                 };
                 let mut xml = Vec::new();
-                if f.read_to_end(&mut xml).is_ok() {
+                let cap = limits.max_uncompressed.saturating_add(1);
+                if f.by_ref().take(cap).read_to_end(&mut xml).is_ok()
+                    && xml.len() as u64 <= limits.max_uncompressed
+                {
                     slides.push((no, xml_text(&xml, XmlMode::Pptx)));
                 }
             }
@@ -404,12 +422,29 @@ pub fn extract_text(bytes: &[u8], kind: OfficeKind) -> Result<String, OfficeErro
     Ok(cap_text(text))
 }
 
-fn read_zip_entry(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec())).ok()?;
-    let mut f = archive.by_name(name).ok()?;
+fn read_zip_entry(
+    bytes: &[u8],
+    name: &str,
+    limits: ZipLimits,
+) -> Result<Vec<u8>, OfficeError> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec()))
+        .map_err(|e| OfficeError::Damaged(format!("ZIP 解析失败：{e}")))?;
+    let mut f = archive
+        .by_name(name)
+        .map_err(|_| OfficeError::Damaged(format!("缺少 {name}")))?;
+    let cap = limits.max_uncompressed.saturating_add(1);
     let mut out = Vec::new();
-    f.read_to_end(&mut out).ok()?;
-    Some(out)
+    f.by_ref()
+        .take(cap)
+        .read_to_end(&mut out)
+        .map_err(|e| OfficeError::Damaged(format!("解压 {name} 失败：{e}")))?;
+    if out.len() as u64 > limits.max_uncompressed {
+        return Err(OfficeError::TooLarge(format!(
+            "文件解压后体积过大（超过 {}MB），已拒绝预览。",
+            limits.max_uncompressed / 1024 / 1024
+        )));
+    }
+    Ok(out)
 }
 
 fn slide_no(name: &str) -> Option<u32> {
