@@ -107,7 +107,8 @@
                                   title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
                             <span class="att-size">{{ a.size_orig | fmt_size }}</span>
                             <button type="button" class="btn small"
-                                    data-mbx-action="remove-kept" data-id="{{ a.id }}">移除</button>
+                                    data-mbx-action="remove-kept" data-id="{{ a.id }}"
+                                    {% if a.mime == 'message/rfc822' %}data-eml-remove="1"{% endif %}>移除</button>
                         </li>
                         {% endfor %}
                     </ul>

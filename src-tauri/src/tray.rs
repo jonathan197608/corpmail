@@ -16,8 +16,18 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 pub const TRAY_ID: &str = "corpmail-tray";
 
 /// 创建托盘（lib.rs setup 在 manage 之后调用一次；重复调用会因 id 冲突报错，
-/// 单实例插件已保证进程唯一）
-pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+/// 单实例插件已保证进程唯一）。
+/// 第八轮 P2-5：托盘初始化失败（Linux 缺 AppIndicator/DBus、沙箱禁用托盘）
+/// 只应降级为「无托盘入口」，不得把错误冒泡到 builder.build().expect 让整个
+/// 应用启动失败。返回 () 表示错误已在此吞掉并留痕；调用方无需处理。
+pub fn setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let res = setup_inner(app);
+    if let Err(e) = res {
+        eprintln!("[tray] 托盘初始化失败，应用继续运行但无托盘入口：{e}");
+    }
+}
+
+fn setup_inner<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
     let fetch = MenuItem::with_id(app, "fetch", "立即收取新邮件", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;

@@ -1220,9 +1220,13 @@ fn save_draft_impl(
     state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         if let Some(id) = input.id {
+            // 第八轮 P2-3：只判 folder='draft' 不够——点发送后 status 变
+            // queued/sending 但 folder 仍为 draft（send.rs 的 CAS 只改 status），
+            // 另一标签页的在途 autosave 会覆写已入队邮件正文，导致「发件箱显示
+            // 的正文」与「实际投递的正文」不一致。必须同时校验 status='draft'。
             let is_draft: Option<bool> = tx
                 .query_row(
-                    "SELECT folder = 'draft' FROM emails WHERE id = ?1",
+                    "SELECT folder = 'draft' AND status = 'draft' FROM emails WHERE id = ?1",
                     [id],
                     |r| r.get::<_, bool>(0),
                 )
@@ -1496,8 +1500,12 @@ fn external_sql(alias: &str) -> String {
     // 第七轮 P3-1：域名含 LIKE 元字符（_/%）时须转义，否则 SQL 侧与 Rust
     // 字面 ends_with 口径分叉（如 corp_telecom.cn 会命中 corpXtelecom.cn）。
     let dom = "replace(replace(replace(lower(ltrim(trim(:dom), '@')), '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
+    // 第八轮 P3-4：无 @ 的地址（MAILER-DAEMON/postmaster 等退信）在 Rust 侧
+    // is_external_addr 判 false，SQL 侧必须同口径——否则列表标外部、详情标内部、
+    // external_only 筛选与详情相反。加 instr(from_addr,'@')>0 对齐。
     format!(
-        "({a}from_addr <> '' AND NOT (lower({a}from_addr) LIKE '%@' || {dom} ESCAPE '\\' \
+        "(instr({a}from_addr, '@') > 0 AND lower({a}from_addr) NOT LIKE '%@' \
+         AND NOT (lower({a}from_addr) LIKE '%@' || {dom} ESCAPE '\\' \
          OR lower({a}from_addr) LIKE '%.' || {dom} ESCAPE '\\'))"
     )
 }
@@ -1507,7 +1515,9 @@ fn external_sql(alias: &str) -> String {
 /// named_params 恒绑定它，缺名会报 InvalidParameterName（第七轮 P2-2）。
 fn external_col(alias: &str, domain: &str) -> String {
     if domain.trim().trim_start_matches('@').trim().is_empty() {
-        format!("({alias}from_addr <> '' AND :dom = :dom)")
+        // 第八轮 P3-4：空域分支同样要排除无 @ 地址，与 is_external_addr 对齐
+        format!("(instr({alias}from_addr, '@') > 0 AND lower({alias}from_addr) NOT LIKE '%@' \
+                 AND :dom = :dom)")
     } else {
         external_sql(alias)
     }

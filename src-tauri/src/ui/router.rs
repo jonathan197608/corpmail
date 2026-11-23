@@ -870,7 +870,7 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
         Some("sent") | Some("draft") => req.query_param("folder").unwrap(),
         _ => "inbox".to_string(),
     };
-    let page = clamp_page(req.query_param("page").as_deref());
+    let mut page = clamp_page(req.query_param("page").as_deref());
     let unread_only = req.query_param("unread").map(|v| v == "1").unwrap_or(false);
     let external_only = req
         .query_param("external")
@@ -905,7 +905,7 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
     let date_from = mail::date_epoch_of(&df_raw, false).unwrap_or(0);
     let date_to = mail::date_epoch_of(&dt_raw, true).unwrap_or(0);
     let has_attach = req.query_param("att").map(|v| v == "1").unwrap_or(false);
-    let q = mail::ListQuery {
+    let mut q = mail::ListQuery {
         folder: folder.clone(),
         page,
         unread_only,
@@ -924,11 +924,14 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
     // 会话视图入口已下沉详情页（>1 封往来才显示「会话 · N 封往来」，
     // /threads/{id} 仍可用）；列表不再提供 mode=thread 分支。
     let mut list_error = String::new();
-    let (items, total) = {
-        let res = if q_input.is_empty() {
-            mail::list(state, &q)
+    // 查询封装为闭包：跨页删除后请求仍带旧 page（如第 5 页删空后 total 只剩 4 页），
+    // 需按首次查得的 total 把 page 收敛到有效区间并重查，否则用户停在空页
+    // （联系人列表已有同类收敛，邮件列表此前遗漏——第八轮 P3-5）。
+    let run_query = |query: &mail::ListQuery| -> Result<(Vec<EmailSummary>, i64), String> {
+        if q_input.is_empty() {
+            mail::list(state, query)
         } else {
-            match mail::search(state, &q_input, &q) {
+            match mail::search(state, &q_input, query) {
                 Ok(Some(res)) => Ok(res),
                 // 输入全为停用词/无有效查询项：检索语义上没有可匹配项 → 空集。
                 // 旧实现回落整表列表，用户搜「的了」却看到全部邮件，会以为
@@ -937,16 +940,30 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
                 // 检索本身失败不退回列表：那会把「检索不可用」显示成全部邮件
                 Err(e) => Err(e),
             }
-        };
-        match res {
-            Ok((items, total)) => (items, total),
-            Err(e) => {
-                list_error = e;
-                (Vec::new(), 0)
-            }
+        }
+    };
+    let (mut items, total) = match run_query(&q) {
+        Ok(r) => r,
+        Err(e) => {
+            list_error = e;
+            (Vec::new(), 0)
         }
     };
     let pages = (total + per - 1) / per;
+    let clamped = page.clamp(1, pages.max(1));
+    if clamped != page {
+        page = clamped;
+        q.page = page;
+        if list_error.is_empty() {
+            items = match run_query(&q) {
+                Ok((rows, _)) => rows,
+                Err(e) => {
+                    list_error = e;
+                    Vec::new()
+                }
+            };
+        }
+    }
     // 基址 = folder + q + per（不含筛选）：两个开关各自"取反自己、保留对方"，
     // 否则开关一次会丢掉另一个筛选（多筛选项并存时的常见坑）；per 恒带
     // （默认 10 除外，保持 URL 干净）
@@ -2308,7 +2325,11 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         .query_param("draft_id")
         .and_then(|v| v.parse::<i64>().ok())
     {
-        if let Some(draft) = mail::get(state, id).filter(|d| d.folder == "draft") {
+        // 第八轮 P2-3：已入队/发送中的邮件 folder 仍为 draft，不能再当草稿回填
+        // 表单（否则新一页撰写会继承已投递邮件的内容并覆写它）。
+        if let Some(draft) = mail::get(state, id)
+            .filter(|d| d.folder == "draft" && d.status == "draft")
+        {
             ctx.draft_id = id;
             ctx.in_reply_to = draft.in_reply_to.unwrap_or(0);
             ctx.to_addrs = draft.to_addrs;
@@ -2659,29 +2680,46 @@ fn save_compose_form(
     let keep_ids = form_json_i64s(&form, "keep_ids");
     let paths = form_json_strings(&form, "attach_paths");
     let forward_from = form_i64(&form, "forward_from").unwrap_or(0);
+    let attach_eml_from = form_i64(&form, "attach_eml_from").unwrap_or(0);
     let id = match html_raw {
         Some(html) => mail::save_draft_with_html(state, &input, &html),
         None => mail::save_draft(state, &input),
     }
     .map_err(|e| (draft_id.unwrap_or(0), e))?;
+    // 第八轮 P2-2：裁剪前记录用户是否明确移除了自动附加的 .eml——库中已有
+    // message/rfc822 附件却不在本次 keep_ids 中，说明用户点了「移除」。
+    // 必须在裁剪前判定：remove_attachments_except 会先删库内附件，之后再查
+    // 就只剩「从未添加」一种形态，无法区分被主动移除。
+    let eml_removed = attach_eml_from > 0
+        && mail::get(state, id)
+            .map(|d| {
+                d.attachments
+                    .iter()
+                    .any(|a| a.mime == "message/rfc822" && !keep_ids.contains(&a.id))
+            })
+            .unwrap_or(false);
     // 顺序敏感：keep_ids 裁剪只针对本次保存前已存在的附件，必须排在转发复制之前。
     // 否则首次保存转发时 keep_ids 为空，会把刚复制进来的附件全部删掉（附件永远带不过去）。
     mail::remove_attachments_except(state, id, &keep_ids)
         .map_err(|e| (id, format!("附件裁剪失败：{e}")))?;
+    // 转发链中被清理/损坏而未能携带的附件数（复制 + EML 重建两处累加）
+    let mut detached_skipped = 0usize;
     // 转发：仅在首次保存（尚无 draft_id）时把原邮件附件复制到新草稿，
     // 之后的重存由 keep_ids 机制保留（页面会带上已复制附件的 id），不会重复复制
-    if draft_id.is_none()
-        && forward_from > 0
-        && let Err(err) = mail::copy_attachments(state, forward_from, id)
-    {
-        return Err((id, format!("转发附件复制失败：{err}")));
+    // 第八轮 P2-1：copy_attachments 返回的 skipped（detached/损坏的附件）此前被
+    // 丢弃，草稿仍按源 mail 显示 N 个却只复制 N-skip 个，用户与收件人都不知情。
+    // 累加进 detached_skipped 出参，让 compose_send 的「不可用附件」提示覆盖它。
+    if draft_id.is_none() && forward_from > 0 {
+        match mail::copy_attachments(state, forward_from, id) {
+            Ok((_, copy_skipped)) => detached_skipped += copy_skipped,
+            Err(err) => return Err((id, format!("转发附件复制失败：{err}"))),
+        }
     }
     // 作为附件转发（B6）：把源邮件重建为 .eml，以 message/rfc822 附件加入草稿。
-    // 以「已存在同名 message/rfc822 附件」判定是否已附加：既能防重存重复添加，
-    // 也覆盖首次附加失败后重试的场景（此时页面仍带 attach_eml_from）。
-    let attach_eml_from = form_i64(&form, "attach_eml_from").unwrap_or(0);
-    let mut detached_skipped = 0usize;
-    if attach_eml_from > 0 {
+    // 第八轮 P2-2：用户明确移除（eml_removed）后不得重新生成；重存时若库里
+    // 仍有同名附件（未被 keep_ids 剔除）也不重复添加。旧实现只查库内同名附件，
+    // 移除后该判定变 false，下一次 autosave 把刚删的 .eml 加回，用户无法移除。
+    if attach_eml_from > 0 && !eml_removed {
         let name = form
             .get("attach_eml_name")
             .map(|s| s.trim().to_string())

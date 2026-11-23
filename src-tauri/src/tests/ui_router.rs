@@ -4751,7 +4751,10 @@ fn clamped_beyond_data_page_renders_empty_state() {
     ));
     assert!(html.contains("末页 »"), "首页应有「末页」入口");
     assert!(!html.contains("« 首页"), "首页不应出现「首页」");
-    // 页 100001 → 钳 100000：超数据范围为空态（而非 panic 或巨型 OFFSET）
+    // 页 100001 → 钳 100000：超数据范围。第八轮 P3-5 改为收敛到有效末页
+    // （旧行为渲染空态，用户需手动翻回；现直接显示第 2 页的 1 封邮件）。
+    // clamp_page 的 100000 上界仍生效（防巨型 OFFSET），但 list_ctx 会按
+    // 首次查得的 total 把 page 二次收敛到 pages.max(1)。
     let html = body(&route(
         &state,
         &assets(),
@@ -4762,8 +4765,13 @@ fn clamped_beyond_data_page_renders_empty_state() {
         },
     ));
     assert!(
-        html.contains("这里还没有邮件"),
-        "钳后页码超数据范围应渲染空态"
+        !html.contains("这里还没有邮件"),
+        "钳后页码超数据范围应收敛到有效末页，不得停在空态"
+    );
+    assert_eq!(
+        html.matches("class=\"mail-row").count(),
+        1,
+        "收敛到最后一页应显示该页的 1 封邮件"
     );
     cleanup(&dir);
 }
@@ -10819,4 +10827,265 @@ fn p73_open_detail_restores_seen_pending() {
         body.contains("Ok(true) => state.notify_seen()"),
         "标志重建后须唤醒 worker"
     );
+}
+
+/// 第八轮 P2-2：用户点「移除」删掉自动附加的 .eml 后，重存不得把它加回来
+#[test]
+fn p82_removed_eml_attachment_stays_removed() {
+    let (state, dir) = temp_state("p82-eml-removed");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','源邮件',
+                     '源正文','源 邮件','源正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    // 首次保存：附加 .eml
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/draft", &form(&[
+            ("to_addrs", "peer@189.cn"),
+            ("subject", "Fwd: 源邮件"),
+            ("body_text", "请查收"),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+            ("attach_eml_from", "1"),
+            ("attach_eml_name", "源邮件.eml"),
+        ])),
+        &tester,
+    );
+    let d = mail::get(&state, 2).unwrap();
+    assert_eq!(d.attach_cnt, 1, "首次保存应附加 .eml");
+    let aid = d.attachments[0].id;
+
+    // 用户点「移除」：keep_ids 剔除该附件 + 前端同步把 attach_eml_from 清零
+    // （模板给 eml 附件的移除按钮加 data-eml-remove 标记，见 app.js::mbxRemoveKept）
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/draft", &form(&[
+            ("draft_id", "2"),
+            ("to_addrs", "peer@189.cn"),
+            ("subject", "Fwd: 源邮件"),
+            ("body_text", "请查收"),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+            ("attach_eml_from", "0"),
+            ("attach_eml_name", "源邮件.eml"),
+        ])),
+        &tester,
+    );
+    assert_eq!(
+        mail::get(&state, 2).unwrap().attach_cnt,
+        0,
+        "移除后裁剪应删掉 .eml（id={aid}）"
+    );
+
+    // 下一次 autosave：attach_eml_from 仍为 0（意图已撤销）→ 不得复活
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/autosave", &form(&[
+            ("draft_id", "2"),
+            ("to_addrs", "peer@189.cn"),
+            ("subject", "Fwd: 源邮件"),
+            ("body_text", "继续编辑"),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+            ("attach_eml_from", "0"),
+            ("attach_eml_name", "源邮件.eml"),
+        ])),
+        &tester,
+    );
+    let d = mail::get(&state, 2).unwrap();
+    assert_eq!(d.attach_cnt, 0, "用户移除的 .eml 不得在后续保存中复活");
+    cleanup(&dir);
+}
+
+/// 第八轮 P2-1：转发源邮件含 detached 附件时，skipped 须累加进 unavailable 提示
+#[test]
+fn p81_forward_detached_attachment_is_reported() {
+    let (state, dir) = temp_state("p81-fwd-skipped");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','带附件来件',
+                     '源正文','带 附件','源正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+        // 1 个正常 inline 附件 + 1 个 detached（.gz 已被清理）
+        c.execute_batch(
+            "INSERT INTO attachments(email_id, filename, mime, storage, data, detached, size_orig, size_gz, sha256)
+             VALUES (1, 'ok.txt', 'text/plain', 'inline', X'1F8B08000000000000FF03000000000000000000', 0, 3, 20, 'x'),
+                    (1, 'gone.txt', 'text/plain', 'file', NULL, 1, 100, 0, 'y');",
+        )
+        .unwrap();
+    });
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/send", &form(&[
+            ("forward_from", "1"),
+            ("to_addrs", "peer@x.cn"),
+            ("cc_addrs", ""),
+            ("subject", "Fwd: 带附件来件"),
+            ("body_text", "转给你"),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+        ])),
+        &tester,
+    );
+    let loc = resp.extra_headers.iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    // 修复前 copy_attachments 的 skipped 被丢弃，不带 error 直接入队跳列表；
+    // 修复后 HX-Redirect 带 URL 编码的「已跳过 1 个不可用附件」error。
+    // 只断言 error= 存在（不绑具体字节编码），数量由 attach_cnt==1 反证。
+    assert!(
+        loc.contains("/compose?") && loc.contains("error="),
+        "detached 附件被跳过须显式提示：loc={loc}"
+    );
+    let d = mail::get(&state, 2).unwrap();
+    assert_eq!(d.attach_cnt, 1, "只复制 1 个可用附件");
+    cleanup(&dir);
+}
+
+/// 第八轮 P2-3：已入队（status=queued）的邮件不得被另一路的 autosave 覆写
+#[test]
+fn p83_queued_mail_cannot_be_overwritten_by_autosave() {
+    let (state, dir) = temp_state("p83-queued-overwrite");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(id, direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at)
+             VALUES (5, 'out', 'draft', 'queued', 'demo@chinatelecom.cn', 'peer@x.cn',
+                     '已发送主题', '已发送正文', '已 发送','已发送正文',0,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/compose/autosave", &form(&[
+            ("draft_id", "5"),
+            ("to_addrs", "attacker@x.cn"),
+            ("subject", "被覆写的主题"),
+            ("body_text", "被覆写的正文"),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+        ])),
+        &tester,
+    );
+    assert!(
+        body(&resp).contains("\"ok\":false") || body(&resp).contains("ok\": false"),
+        "已入队邮件的 autosave 须失败：{}",
+        body(&resp)
+    );
+    let d = mail::get(&state, 5).unwrap();
+    assert_eq!(d.subject, "已发送主题", "已入队邮件的主题不得被覆写");
+    assert_eq!(d.body_text, "已发送正文", "已入队邮件的正文不得被覆写");
+
+    // compose_page 对 queued 行也不得回填表单
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", "draft_id=5", b""),
+        &tester,
+    ));
+    assert!(
+        !html.contains("value=\"被覆写的主题\""),
+        "已入队邮件不得作为草稿回填表单"
+    );
+    cleanup(&dir);
+}
+
+/// 第八轮 P2-2 服务端防线：旧前端/竞态下移除那次仍带 attach_eml_from=1 时，
+/// 服务端须凭「裁剪前库中 eml 附件未被 keep_ids 保留」判定用户已移除，不复活。
+#[test]
+fn p82_server_detects_eml_removal_before_pruning() {
+    let (state, dir) = temp_state("p82-eml-server-guard");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, created_at, received_at)
+             VALUES ('in','inbox','received','a@189.cn','demo@chinatelecom.cn','源邮件',
+                     '源正文','源 邮件','源正文',1,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    // 首次保存：附加 .eml
+    route(&state, &assets(), &req("POST", "/compose/draft", &form(&[
+        ("to_addrs", "peer@189.cn"), ("subject", "Fwd: 源邮件"), ("body_text", "请查收"),
+        ("keep_ids", "[]"), ("attach_paths", "[]"),
+        ("attach_eml_from", "1"), ("attach_eml_name", "源邮件.eml"),
+    ])), &tester);
+    assert_eq!(mail::get(&state, 2).unwrap().attach_cnt, 1, "首次保存应附加 .eml");
+
+    // 移除那次仍带 attach_eml_from=1（旧前端未清意图）：keep_ids 为空 →
+    // 服务端裁剪前须判定「用户移除」，删除后不得重新生成
+    route(&state, &assets(), &req("POST", "/compose/draft", &form(&[
+        ("draft_id", "2"), ("to_addrs", "peer@189.cn"),
+        ("subject", "Fwd: 源邮件"), ("body_text", "请查收"),
+        ("keep_ids", "[]"), ("attach_paths", "[]"),
+        ("attach_eml_from", "1"), ("attach_eml_name", "源邮件.eml"),
+    ])), &tester);
+    assert_eq!(
+        mail::get(&state, 2).unwrap().attach_cnt,
+        0,
+        "服务端须识别用户移除，不在同次保存中复活 .eml"
+    );
+    cleanup(&dir);
+}
+
+/// 第八轮 P3-5：跨页删除后 page 越界，列表须收敛到最后一页而非停在空页
+#[test]
+fn p85_out_of_range_page_converges_to_last() {
+    let (state, dir) = temp_state("p85-page-converge");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        // 12 封收件，per=10 → 2 页
+        for i in 1..=12 {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, thread_key, unread, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','demo@chinatelecom.cn',?1,'t','b',?2,0,?3)",
+                rusqlite::params![format!("邮件{i}"), format!("t{i}"), i],
+            ).unwrap();
+        }
+    });
+    let tester = FakeTester { smtp_ok: true, imap_ok: true };
+    // page=2 时正常显示 2 行
+    let html = body(&route(&state, &assets(),
+        &req_q("GET", "/", "page=2&per=10", b""), &tester));
+    assert_eq!(html.matches("class=\"mail-row").count(), 2, "第 2 页应有 2 封");
+
+    // 删到第 5 封：总数 5 < per，pages=1，page=2 越界
+    state.with_conn(|c| {
+        c.execute("DELETE FROM emails WHERE id > 5", []).unwrap();
+    });
+    let html = body(&route(&state, &assets(),
+        &req_q("GET", "/", "page=2&per=10", b""), &tester));
+    assert!(
+        !html.contains("这里还没有邮件"),
+        "page 越界须收敛到有效页，不得显示空列表：{html}"
+    );
+    assert_eq!(html.matches("class=\"mail-row").count(), 5, "收敛后应显示全部 5 封");
+    cleanup(&dir);
 }

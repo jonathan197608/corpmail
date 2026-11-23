@@ -2665,3 +2665,29 @@ fn p62_secrets_degraded_never_holds_store_lock_into_keychain() {
         "不得直接调用会带锁进 keychain 的旧 degraded()"
     );
 }
+
+#[test]
+fn p81_set_batch_holds_config_lock_across_db_write_and_rollback() {
+    // 第八轮 P3-1：旧实现在文件段末尾释放 config 锁，DB 段失败后重新拿锁
+    // 回滚；其间另一线程写入的配置会被 prev 快照抹掉。护栏钉死 config 锁
+    // 从快照一直持到 DB 写入与回滚结束（行为侧由 set_batch_rolls_back_* 验证）。
+    const STATE_SRC: &str = include_str!("../state.rs");
+    let start = STATE_SRC.find("pub fn set_batch(&self, pairs:").unwrap();
+    let body = &STATE_SRC[start..];
+    let body = &body[..body.find("\n    /// 库键写入段").unwrap_or(body.len())];
+
+    let lock_at = body.find("let mut cfg = self.config.lock()").unwrap();
+    let snapshot_at = body.find("cfg.get(*k).cloned()").unwrap();
+    let save_at = body.find("crate::conf::save(&self.anchor_dir, &snapshot)").unwrap();
+    let db_at = body.find("&& let Err(e) = self.write_db_pairs(&db_pairs)").unwrap();
+    let rollback_at = body.find("cfg.insert(k.clone(), v.clone())").unwrap();
+    assert!(
+        lock_at < snapshot_at && snapshot_at < save_at && save_at < db_at && db_at < rollback_at,
+        "config 锁须覆盖快照→文件写→DB 写→回滚全流程，不得中途释放"
+    );
+    // 不得残留「取锁→释放→再取锁回滚」的分段形态
+    assert!(
+        !body.contains("restore_config_to("),
+        "回滚不得改用独立取锁函数（会留并发覆盖窗口）"
+    );
+}

@@ -2175,3 +2175,38 @@ fn p74_outgoing_attachments_use_capped_file_read() {
         "出站 file 附件不得裸 fs::read（无大小预检）"
     );
 }
+
+#[test]
+fn p84_no_at_addr_external_flag_matches_rust() {
+    // 第八轮 P3-4：无 @ 的地址（MAILER-DAEMON）与 user@（空域名）在
+    // SQL external_col 与 Rust is_external_addr 两侧必须同口径。
+    let (state, dir) = temp_state("p84-no-at-external");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','MAILER-DAEMON','me@chinatelecom.cn','退信1','退信1','退信1','退信1',0,1),
+            ('in','inbox','received','user@','me@chinatelecom.cn','退信2','退信2','退信2','退信2',0,2),
+            ('in','inbox','received','boss@chinatelecom.cn','me@chinatelecom.cn','正常','正常','正常','正常',0,3)",
+        )
+        .unwrap();
+    });
+    let q = ListQuery {
+        folder: "inbox".into(), page: 1, unread_only: false, external_only: false,
+        internal_domain: "@chinatelecom.cn".into(), per: 10, sort: SortKey::DateDesc,
+        from_filter: String::new(), date_from: 0, date_to: 0, has_attach: false,
+    };
+    let (items, _) = list(&state, &q).unwrap();
+    assert_eq!(items.len(), 3);
+    for it in &items {
+        assert_eq!(
+            it.from_external,
+            is_external_addr(&it.from_display, "@chinatelecom.cn"),
+            "SQL 与 Rust 外部判定须一致：{:?}",
+            it.from_display
+        );
+    }
+    // 无 @ / 空域名都是非外部，正常内部域也非外部
+    for it in &items { assert!(!it.from_external, "{} 不应标外部", it.from_display); }
+    cleanup(&dir);
+}

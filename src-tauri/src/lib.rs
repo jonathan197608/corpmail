@@ -247,7 +247,9 @@ pub fn run() {
 
             // M4-1 托盘常驻：图标 + 菜单 + 左键唤起 + 未读角标（setup 需在
             // manage 之后：refresh_badge 读 AppState）
-            tray::setup(app.handle())?;
+            // 第八轮 P2-5：托盘失败只降级（无托盘入口），不再 ? 冒泡让
+            // builder.build().expect 把整个应用启动打挂。
+            tray::setup(app.handle());
 
             // M4 收件调度 + M5 清理器 + M4-2 定时发送调度：常驻线程
             // （每轮重读设置，改参数即时生效）
@@ -279,6 +281,14 @@ pub fn run() {
         // 首次隐藏时发一条引导通知（仅一次，避免打扰）
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 第八轮 P2-5：无托盘时 hide 会让窗口彻底无法恢复（无 Dock 的
+                // Windows / 托盘初始化失败的平台），此时放行真退出。
+                {
+                    use tauri::Manager;
+                    if window.app_handle().tray_by_id(tray::TRAY_ID).is_none() {
+                        return; // 不 prevent_close：走系统默认关闭
+                    }
+                }
                 api.prevent_close();
                 let _ = window.hide();
                 #[cfg(windows)]

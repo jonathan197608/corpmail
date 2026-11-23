@@ -2196,22 +2196,23 @@ impl AppState {
         if cfg_pairs.is_empty() {
             return self.write_db_pairs(&db_pairs);
         }
-        // 文件段：单锁 read-modify-write——快照旧值、改镜像、落文件一气呵成
-        let (prev, save_res) = {
-            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-            let prev: Vec<(String, Option<String>)> = cfg_pairs
-                .iter()
-                .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
-                .collect();
-            for (k, v) in &cfg_pairs {
-                cfg.insert((*k).to_string(), (*v).to_string());
-            }
-            let snapshot = cfg.clone();
-            (prev, crate::conf::save(&self.anchor_dir, &snapshot))
-        };
+        // 文件段 + 库段 + 回滚：全程持有同一把 config 锁，杜绝回滚窗口。
+        // 第八轮 P3-1：旧实现在文件段末尾释放 config 锁，DB 段失败后由
+        // 独立回滚函数重新拿锁回滚；其间另一线程（display_name 写回等）
+        // 成功写入的配置会被 prev 快照静默抹掉。锁序 config→store 与全仓
+        // 其余路径一致（get 的 config/store 分支互斥、无 store→config 嵌套）。
+        let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        let prev: Vec<(String, Option<String>)> = cfg_pairs
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), cfg.get(*k).cloned()))
+            .collect();
+        for (k, v) in &cfg_pairs {
+            cfg.insert((*k).to_string(), (*v).to_string());
+        }
+        let snapshot = cfg.clone();
+        let save_res = crate::conf::save(&self.anchor_dir, &snapshot);
         if let Err(e) = save_res {
             // 文件没写进去：只还原镜像（文件在盘上的内容未变）
-            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             for (k, old) in prev {
                 match old {
                     Some(v) => {
@@ -2227,9 +2228,20 @@ impl AppState {
         if !db_pairs.is_empty()
             && let Err(e) = self.write_db_pairs(&db_pairs)
         {
-            // 库键失败：文件已带新值——必须把 prev 写回镜像与文件，否则
-            // 配置面（host/账号/目录指针这类关键字段）静默半生效
-            if let Err(rb) = self.restore_config_to(&prev) {
+            // 库键失败：文件已带新值——必须在同一锁内把 prev 写回镜像与文件，
+            // 否则配置面（host/账号/目录指针这类关键字段）静默半生效
+            for (k, old) in &prev {
+                match old {
+                    Some(v) => {
+                        cfg.insert(k.clone(), v.clone());
+                    }
+                    None => {
+                        cfg.remove(k);
+                    }
+                }
+            }
+            let rollback = cfg.clone();
+            if let Err(rb) = crate::conf::save(&self.anchor_dir, &rollback) {
                 eprintln!("[state] 配置回滚失败（corpmail.toml 可能与库不一致，请人工检查）：{rb}");
             }
             return Err(e);
@@ -2254,24 +2266,6 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
-    }
-
-    /// 把配置镜像恢复到 prev 快照并写回文件（set_batch 库段失败回滚用）。
-    /// 再失败只返回错误交调用方留痕：文件 IO 已坏时没有更优动作
-    fn restore_config_to(&self, prev: &[(String, Option<String>)]) -> Result<(), String> {
-        let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-        for (k, old) in prev {
-            match old {
-                Some(v) => {
-                    cfg.insert(k.clone(), v.clone());
-                }
-                None => {
-                    cfg.remove(k);
-                }
-            }
-        }
-        let snapshot = cfg.clone();
-        crate::conf::save(&self.anchor_dir, &snapshot)
     }
 
     /// 数据库文件大小（字节；设置·存储页"邮箱数据库大小"；含 WAL 与索引开销）

@@ -142,6 +142,16 @@ fn migration_exit_stops_background_threads_first() {
     );
     assert!(body.contains("wait_or_stop("), "给前端留渲染时间且可中断");
     assert!(body.contains("app.exit(0);"), "仍要自动退出");
+    // 第八轮 P3-3：三段式 e2e 显式关掉了退出调用，静态护栏须钉死完整顺序
+    // wait_or_stop → can_exit 判定 → app.exit，且 NO_EXIT 只跳过最后一段，
+    // 不能把 1.5s 渲染缓冲一起跳过（否则 e2e 与生产不同构）。
+    let wait_at = body.find("wait_or_stop(").expect("wait_or_stop 存在");
+    let can_at = body.find("can_exit && !e2e_no_exit").expect("can_exit 判定存在");
+    let exit_at = body.find("app.exit(0);").expect("exit 存在");
+    assert!(
+        wait_at < can_at && can_at < exit_at,
+        "退出顺序须为 wait_or_stop → can_exit 判定 → app.exit"
+    );
     // 退出事件里的置位必须存在（唯一的合法置位点）
     let run = LIB_RS.find("app.run(").expect("事件循环存在");
     let run_rest = &LIB_RS[run..];
@@ -653,5 +663,34 @@ fn p76_macos_reopen_shows_main_window() {
     assert!(
         !body.contains("set_focus()"),
         "Reopen 分支不得残留只聚焦不显示的旧实现"
+    );
+}
+
+#[test]
+fn p85_tray_failure_degrades_instead_of_aborting_startup() {
+    // 第八轮 P2-5：托盘初始化失败只降级为无托盘入口，不得 ? 冒泡到
+    // builder.build().expect 让应用完全无法启动；CloseRequested 在无托盘时
+    // 必须放行真退出（否则 hide 后无任何入口恢复窗口）。
+    const LIB_RS: &str = include_str!("../lib.rs");
+    assert!(
+        LIB_RS.contains("tray::setup(app.handle());"),
+        "托盘初始化不得用 ? 冒泡错误"
+    );
+    assert!(
+        !LIB_RS.contains("tray::setup(app.handle())?;"),
+        "托盘失败不得中止整个应用启动"
+    );
+    let close_at = LIB_RS.find("tauri::WindowEvent::CloseRequested").unwrap();
+    let close = &LIB_RS[close_at..];
+    let close = &close[..close.find("\n            })").unwrap_or(close.len())];
+    assert!(
+        close.contains("tray_by_id(tray::TRAY_ID).is_none()"),
+        "CloseRequested 须先判定托盘是否存在"
+    );
+    let guard_at = close.find("tray_by_id(tray::TRAY_ID).is_none()").unwrap();
+    let prevent_at = close.find("api.prevent_close()").unwrap();
+    assert!(
+        guard_at < prevent_at,
+        "无托盘时的放行判定须在 prevent_close 之前"
     );
 }

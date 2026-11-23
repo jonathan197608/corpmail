@@ -195,6 +195,7 @@ function renderPicked() {
 }
 
 // 已入库附件的移除：从 keep_ids 剔除（存草稿时服务端裁剪）
+// --- P8 remove eml core START ---
 function mbxRemoveKept(aid, btn) {
     const input = document.getElementById('keep-ids');
     try {
@@ -205,8 +206,15 @@ function mbxRemoveKept(aid, btn) {
     } catch (e) {
         input.value = '[]';
     }
+    // 第八轮 P2-2：移除自动附加的 .eml 时，必须同时撤销「作为附件转发」意图，
+    // 否则下一次 autosave 表单仍带 attach_eml_from，服务端会重新生成刚删的 .eml。
+    if (btn && btn.getAttribute && btn.getAttribute('data-eml-remove') === '1') {
+        const eml = document.querySelector('input[name="attach_eml_from"]');
+        if (eml) eml.value = '0';
+    }
     btn.closest('li').remove();
 }
+// --- P8 remove eml core END ---
 
 // 保存对话框过滤器：从推荐文件名取后缀（须为 1-8 位字母数字且含字母，
 // 与 Rust 侧 suffix_of 同口径）。取不到就不加 filters，交给服务端补后缀
@@ -828,11 +836,20 @@ document.addEventListener('click', ev => {
 });
 
 // Esc 同时收起展开中的操作菜单
+// --- P8 split-menu esc core START ---
 document.addEventListener('keydown', ev => {
     if (ev.key === 'Escape') {
-        document.querySelectorAll('.split-menu:not([hidden])').forEach(m => { m.hidden = true; });
+        // 第八轮 P3-2：确实收起了菜单时阻断传播，避免快捷键模块随后
+        // back.click() 连带退回列表（预览 Esc 已同口径处理，此路径此前遗漏）。
+        // 没有展开菜单时放行，保留 Esc 返回列表的既有语义。
+        var open = document.querySelectorAll('.split-menu:not([hidden])');
+        if (open.length > 0) {
+            open.forEach(m => { m.hidden = true; });
+            if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+        }
     }
 });
+// --- P8 split-menu esc core END ---
 
 // ---------- 收取状态：按钮/设置入口禁用 + 完成后局部刷新 ----------
 // 状态片段轮询（收取中 2s / 空闲 10s）只更新自身文字；后台收取结束时服务端
@@ -1534,8 +1551,16 @@ var MBX_MIG_FLUSH_TIMEOUT_MS = 8000;
 // 全局兜底若只按 path 判身份会串线（A 的响应 settle 掉 B 的 Promise）。
 // 每路生成唯一 token 注入 URL query，onDone 从 requestPath 回读比对。
 var MBX_AUTOSAVE_SEQ = 0;
+// 第八轮 P3-6：同一个 form 的并发 autosave（迁移 flush 与 5s 防抖同时到达，
+// 两路 draft_id 均为 0）若各发一次请求，后端会 INSERT 两份重复草稿（一份成幽灵）。
+// 按 form 对象身份合并：同一 form 在途请求未结束时，后续调用直接复用同一 Promise。
+// 用数组而非 WeakMap 以兼容 Node vm 测试桩（无需额外注入 Map）。
+var MBX_AUTOSAVE_INFLIGHT = [];
 
 function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
+    for (var qi = 0; qi < MBX_AUTOSAVE_INFLIGHT.length; qi++) {
+        if (MBX_AUTOSAVE_INFLIGHT[qi].form === form) return MBX_AUTOSAVE_INFLIGHT[qi].promise;
+    }
     var values = {};
     try {
         new FormData(form).forEach(function (v, k) { values[k] = v; });
@@ -1545,12 +1570,16 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
     var limit = typeof timeoutMs === 'number' ? timeoutMs : MBX_MIG_FLUSH_TIMEOUT_MS;
     var token = 'as' + (++MBX_AUTOSAVE_SEQ);
     var url = '/compose/autosave?__at=' + token;
-    return new Promise(function (resolve) {
+    var inflight = { form: form, promise: null };
+    MBX_AUTOSAVE_INFLIGHT.push(inflight);
+    inflight.promise = new Promise(function (resolve) {
         var settled = false;
         var timer = null;
         function finish(r) {
             if (settled) return;
             settled = true;
+            var qi = MBX_AUTOSAVE_INFLIGHT.indexOf(inflight);
+            if (qi >= 0) MBX_AUTOSAVE_INFLIGHT.splice(qi, 1);
             if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
             doc.body.removeEventListener('htmx:afterRequest', onDone);
             resolve(r);
@@ -1608,6 +1637,7 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
             finish({ ok: false, status: 0 });
         }
     });
+    return inflight.promise;
 }
 
 function mbxFlushComposeDraft() {
@@ -2272,11 +2302,19 @@ document.addEventListener('click', function (ev) {
 // 详情：r 回复、f 转发、Esc 返回列表
 // 输入框 / textarea / select / contenteditable 内的按键一律放行（Esc 仅失焦），
 // 不打断打字；附件预览打开时 Esc 归预览模块，避免同时退出两层
+// --- P8 shortcut core START ---
 (function () {
     var inField = function (el) {
         if (!el) return false;
         var tag = (el.tagName || '').toLowerCase();
         return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+    };
+    // 第八轮 P2-4：焦点在 button/a/[role=button] 上时，Enter/Space 属该控件的
+    // 原生激活，快捷键不得 preventDefault + location.href 劫持（否则「标已读」
+    // 「收取」等按钮键盘路径整体失效）。
+    var onInteractive = function (el) {
+        return !!(el && el !== document.body && el !== document.documentElement &&
+            el.closest && el.closest('button, a[href], [role=button]'));
     };
     var focusIdx = -1;
     var rows = function () {
@@ -2317,6 +2355,7 @@ document.addEventListener('click', function (ev) {
                 focusIdx = focusIdx < 0 ? 0 : Math.max(0, focusIdx - 1);
                 paint();
             } else if (ev.key === 'Enter' || ev.key === 'o') {
+                if (onInteractive(document.activeElement)) return; // 让按钮/链接的原生激活走完
                 if (focusIdx < 0) { focusIdx = 0; paint(); return; }
                 var link = items[focusIdx] && items[focusIdx].querySelector('.mr-link');
                 if (link) { ev.preventDefault(); window.location.href = link.href; }
@@ -2341,6 +2380,7 @@ document.addEventListener('click', function (ev) {
         }
     });
 })();
+// --- P8 shortcut core END ---
 
 // ---------- 撰写页：离开前未保存确认 ----------
 // 编辑过但未保存/发送时，点链接离开弹页面内确认模态（Tauri 的 macOS WKWebView

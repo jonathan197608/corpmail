@@ -81,7 +81,7 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
     const end = APP_JS.indexOf(END);
     assert.ok(start >= 0 && end > start, 'app.js 必须带 A10 core 锚点');
     vm.runInContext(APP_JS.slice(start, end), ctx);
-    return { ctx, calls, doc, draftIdEl };
+    return { ctx, calls, doc, draftIdEl, form, htmx: ctx.htmx };
 }
 
 test('非撰写页直接放行，不发 autosave 请求', async () => {
@@ -147,8 +147,16 @@ test('handler 未到达时 htmx:afterRequest 兜底判定，不把成功误判�
 
 test('并发两路 autosave：一路的 afterRequest 不得 settle 掉另一路（第六轮 P3-4）', async () => {
     const h = harness({ fireHandler: false });
-    const pA = h.ctx.mbxFlushComposeDraft();
-    const pB = h.ctx.mbxFlushComposeDraft();
+    // 第八轮 P3-6：同一 form 的并发调用已合并为一次请求（防双草稿）。
+    // token 防串线针对的是「不同 form 的两路请求」（如两个撰写上下文），
+    // 故这里用两个不同的 form 对象构造真正的两路并发。
+    const formB = {
+        isConnected: true,
+        values: { subject: '另一封' },
+        querySelector: (sel) => (sel === 'input[name="draft_id"]' ? { value: '0' } : null),
+    };
+    const pA = h.ctx.mbxAutosaveRequest(h.form, h.doc, h.htmx);
+    const pB = h.ctx.mbxAutosaveRequest(formB, h.doc, h.htmx);
     assert.equal(h.calls.ajax.length, 2);
     assert.notEqual(
         h.calls.ajax[0].url,
@@ -194,4 +202,19 @@ test('app.js 里 flush 必须排在迁移 POST 之前', () => {
     const postAt = APP_JS.indexOf("fetch('/settings/storage/move'");
     assert.ok(flushAt > 0 && postAt > flushAt,
         'flush 必须在 POST /settings/storage/move 之前，否则冻结位已置位、autosave 必被 409');
+});
+
+test('同一 form 并发两路 autosave 只发一次请求，避免双草稿（第八轮 P3-6）', async () => {
+    const h = harness();
+    // 迁移 flush 与 5s 防抖共用同一个 form：两路 draft_id 均为 0，
+    // 若各发一次 POST，后端会 INSERT 两份重复草稿（一份成幽灵）。
+    const pA = h.ctx.mbxFlushComposeDraft();
+    const pB = h.ctx.mbxFlushComposeDraft();
+    assert.equal(h.calls.ajax.length, 1, '同一 form 的两路调用须合并为一次请求');
+    assert.equal(pA, pB, '两路应复用同一个 Promise');
+    await Promise.all([pA, pB]);
+    // 请求结束后 inflight 槽须清空，下一次编辑能正常再发一次
+    const later = h.ctx.mbxFlushComposeDraft();
+    await later;
+    assert.equal(h.calls.ajax.length, 2, '在途请求结束后新调用应发新请求');
 });
