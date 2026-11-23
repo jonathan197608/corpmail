@@ -863,7 +863,7 @@ fn dispatch_does_not_enqueue_after_scheduled_at_cleared() {
     )
     .unwrap();
     // 模拟 cancel_scheduled_send 在派发前介入：status 仍 draft，scheduled_at 清 0
-    assert!(cancel_scheduled_send(&state, id));
+    assert_eq!(cancel_scheduled_send(&state, id), Ok(true));
     assert_eq!(dispatch_due_scheduled(&state), 0, "已撤销的定时草稿不得派发");
     let status: String = state.with_conn(|c| {
         c.query_row("SELECT status FROM emails WHERE id=?1", [id], |r| r.get(0))
@@ -1000,4 +1000,43 @@ fn p77_split_addrs_mixed_plain_and_display_name() {
             "li@x.cn".to_string()
         ]
     );
+}
+
+/// 第十轮 P1-1/P1-2：撤销窗口写入（设置/取消 scheduled_at）的写故障必须 Err
+/// 上抛，不能 unwrap_or(false) 与「合法 CAS miss」混成同一个 false。
+#[test]
+fn p101_p102_send_window_write_errors_are_not_swallowed() {
+    let (state, dir) = temp_state("p101-send-window-errors");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER p101_block_schedule BEFORE UPDATE ON emails
+             WHEN NEW.scheduled_at > 0 AND OLD.scheduled_at = 0
+             BEGIN SELECT RAISE(ABORT, 'forced schedule failure'); END;",
+        )
+        .unwrap();
+    });
+    let id = save_draft(&state, &draft("撤销窗口写失败", "内容")).unwrap();
+    assert!(
+        schedule_send_in(&state, id, 9).is_err(),
+        "设置撤销窗口失败必须返回 Err"
+    );
+    state.with_conn(|c| {
+        c.execute_batch(
+            "DROP TRIGGER p101_block_schedule;
+             CREATE TRIGGER p102_block_cancel BEFORE UPDATE ON emails
+             WHEN OLD.scheduled_at > 0 AND NEW.scheduled_at = 0
+             BEGIN SELECT RAISE(ABORT, 'forced cancel failure'); END;",
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE emails SET scheduled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_epoch() + 60, id],
+        )
+        .unwrap();
+    });
+    assert!(
+        cancel_scheduled_send(&state, id).is_err(),
+        "撤销发送写失败必须返回 Err，不能伪装成窗口已过"
+    );
+    cleanup(&dir);
 }

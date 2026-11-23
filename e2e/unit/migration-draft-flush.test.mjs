@@ -24,11 +24,20 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
     // 正是它掩盖了「按 path 判身份导致两路 Promise 串线」的 bug。
     const calls = { ajax: [], listeners: [], removed: [], timers: [] };
     const draftIdEl = { value: '0' };
+    const keepEl = { value: '[]' };
+    const attachEl = { value: '[]' };
     const form = {
         isConnected: true,
-        values: { to_addrs: 'a@b.test', subject: '未写完的邮件' },
+        values: {
+            to_addrs: 'a@b.test',
+            subject: '未写完的邮件',
+            keep_ids: '[]',
+            attach_paths: '[]',
+        },
         querySelector: (sel) =>
-            sel === 'input[name="draft_id"]' ? draftIdEl : null,
+            sel === 'input[name="draft_id"]' ? draftIdEl
+            : sel === '#keep-ids' ? keepEl
+            : sel === '#attach-paths' ? attachEl : null,
     };
     const hint = { closest: (sel) => (sel === 'form' ? form : null) };
     const doc = {
@@ -43,7 +52,15 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
         },
     };
     class FakeFormData {
-        constructor(f) { this.entries = Object.entries(f.values || {}); }
+        // 真实 FormData(form) 从 DOM 控件读当前值，不是函数创建时的快照；
+        // 桩以前只吐 f.values，导致回填后第二路仍读到旧 keep_ids、无限补发。
+        constructor(f) {
+            const ids = { keep_ids: '#keep-ids', attach_paths: '#attach-paths' };
+            this.entries = Object.entries(f.values || {}).map(([k, v]) => {
+                const el = ids[k] ? f.querySelector(ids[k]) : null;
+                return [k, el ? el.value : v];
+            });
+        }
         forEach(cb) { this.entries.forEach(([k, v]) => cb(v, k)); }
     }
     // 真实 DOM 事件会广播给所有监听器；桩必须快照遍历，否则测不出两路 onDone 串线
@@ -52,13 +69,19 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
             if (l.type === type) l.fn({ detail });
         }
     };
-    const ctx = vm.createContext({
+    let ctx;
+    ctx = vm.createContext({
         Promise,
         JSON,
         FormData: FakeFormData,
         setTimeout: (fn) => { calls.timers.push(fn); return calls.timers.length; },
         clearTimeout: () => {},
         document: doc,
+        // 第十轮 P1-3：autosave 回填分支会读/写 pickedPaths 并调 renderPicked
+        pickedPaths: [],
+        renderPicked: () => {
+            attachEl.value = JSON.stringify(vm.runInContext('pickedPaths', ctx));
+        },
         htmx: {
             ajax: (method, url, opts) => {
                 calls.ajax.push({ method, url, opts });
@@ -69,6 +92,7 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
                             responseText: JSON.stringify({
                                 ok: status >= 200 && status < 300,
                                 draft_id: 7,
+                                keep_ids: status >= 200 && status < 300 ? [5] : [],
                             }),
                         },
                     }));
@@ -81,7 +105,7 @@ function harness({ withForm = true, status = 200, fireHandler = true } = {}) {
     const end = APP_JS.indexOf(END);
     assert.ok(start >= 0 && end > start, 'app.js 必须带 A10 core 锚点');
     vm.runInContext(APP_JS.slice(start, end), ctx);
-    return { ctx, calls, doc, draftIdEl, form, htmx: ctx.htmx };
+    return { ctx, calls, doc, draftIdEl, keepEl, attachEl, form, htmx: ctx.htmx };
 }
 
 test('非撰写页直接放行，不发 autosave 请求', async () => {
@@ -243,4 +267,49 @@ test('同一 form 并发两路 autosave 只发一次请求，避免双草稿（�
     const later = h.ctx.mbxFlushComposeDraft();
     await later;
     assert.equal(h.calls.ajax.length, 2, '在途请求结束后新调用应发新请求');
+});
+
+test('回填不吞在途新增附件：只消费本次提交的，changed 触发补发（第十轮 P1-3）', async () => {
+    const h = harness({ fireHandler: false });
+    const pending = h.ctx.mbxAutosaveRequest(h.form, h.doc, h.htmx);
+    assert.equal(h.calls.ajax.length, 1);
+    // 请求在途时用户新增了附件 B（只走 5s 防抖，不调用 mbxAutosaveRequest）
+    h.form.values.attach_paths = JSON.stringify(['/tmp/b.pdf']);
+    h.ctx.pickedPaths.push('/tmp/b.pdf');
+    // 第一路返回：服务端报告新入库 keep_ids=[5]
+    h.calls.ajax[0].opts.handler(null, {
+        xhr: {
+            status: 200,
+            responseText: JSON.stringify({ ok: true, draft_id: 7, keep_ids: [5] }),
+        },
+    });
+    assert.deepEqual(h.ctx.pickedPaths, ['/tmp/b.pdf'], '在途新增的附件不能被响应清空');
+    assert.deepEqual(JSON.parse(h.keepEl.value), [5], '本次新入库的 id 仍须回填');
+    assert.equal(h.calls.ajax.length, 2, '有在途改动必须补发一次');
+    assert.deepEqual(
+        JSON.parse(h.calls.ajax[1].opts.values.attach_paths),
+        ['/tmp/b.pdf'],
+        '补发须携带在途新增的附件'
+    );
+    // 收尾：补发请求也回成功，Promise 才 settle
+    h.calls.dispatch('htmx:afterRequest', {
+        pathInfo: { requestPath: h.calls.ajax[1].url }, xhr: { status: 200 },
+    });
+    assert.equal((await pending).ok, true);
+});
+
+test('回填不复活在途删除的已入库附件（第十轮 P1-3）', () => {
+    const h = harness({ fireHandler: false });
+    h.keepEl.value = JSON.stringify([3]); // 提交时库中附件 id=3
+    h.ctx.mbxAutosaveRequest(h.form, h.doc, h.htmx);
+    // 用户在途删掉 id=3（真实 DOM 的 #keep-ids 值被改）
+    h.keepEl.value = '[]';
+    h.calls.ajax[0].opts.handler(null, {
+        xhr: {
+            status: 200,
+            responseText: JSON.stringify({ ok: true, draft_id: 7, keep_ids: [3, 5] }),
+        },
+    });
+    assert.deepEqual(JSON.parse(h.keepEl.value), [5], '被删的 3 不得复活，新入库的 5 须保留');
+    assert.equal(h.calls.ajax.length, 2, '删除也须补发到服务端');
 });

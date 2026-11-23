@@ -223,7 +223,9 @@ pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
 /// 撤销窗口（A1）：立即发送不再直接入队，而是先设 scheduled_at = now + secs
 /// （status 保持 draft），由调度线程到点派发；窗口内可 POST /undo-send 拦截。
 /// 返回是否设置成功（仅 draft 态可设：已入队/已发送的不动，幂等）。
-pub fn schedule_send_in(state: &AppState, id: i64, secs: i64) -> bool {
+/// 第十轮 P1-2：写故障必须与「并发下已被他人入队」的 Ok(false) 区分——
+/// 旧实现 unwrap_or(false) 让 compose_send 误报成功，邮件永久滞留 draft。
+pub fn schedule_send_in(state: &AppState, id: i64, secs: i64) -> Result<bool, String> {
     let at = now_epoch() + secs.max(1);
     state.with_conn(|conn| {
         conn.execute(
@@ -232,13 +234,15 @@ pub fn schedule_send_in(state: &AppState, id: i64, secs: i64) -> bool {
             rusqlite::params![id, at],
         )
         .map(|n| n == 1)
-        .unwrap_or(false)
+        .map_err(e)
     })
 }
 
 /// 取消待发送（A1 撤销 / 定时取消）：仅当仍在 draft 且尚未派发时生效。
 /// 返回是否真的取消（已入队/已发送返回 false，调用方据此提示窗口已过）。
-pub fn cancel_scheduled_send(state: &AppState, id: i64) -> bool {
+/// 第十轮 P1-1：写故障必须 Err 上抛，不能与「窗口已过」压成同一个 false——
+/// 否则撤销失败仍回「窗口已过」，调度线程到点照常投递用户已要求取消的邮件。
+pub fn cancel_scheduled_send(state: &AppState, id: i64) -> Result<bool, String> {
     state.with_conn(|conn| {
         conn.execute(
             "UPDATE emails SET scheduled_at = 0
@@ -246,7 +250,7 @@ pub fn cancel_scheduled_send(state: &AppState, id: i64) -> bool {
             [id],
         )
         .map(|n| n == 1)
-        .unwrap_or(false)
+        .map_err(e)
     })
 }
 

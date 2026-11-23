@@ -1757,10 +1757,13 @@ pub fn batch_apply(
                             .execute(&sql, rusqlite::params_from_iter(args.iter()))
                             .map_err(e)?;
                     } else {
+                        // 第十轮 P2-2：批量标未读与单封 mark_unread 同口径——必须清
+                        // seen_pending。否则留下 unread=1 && seen_pending=1 的边界态，
+                        // 占用 pending_rows 窗口，并依赖 worker 二次核对兜底。
                         changed += tx
                             .execute(
                                 &format!(
-                                    "UPDATE emails SET unread = {v} WHERE folder = 'inbox' AND id IN ({marks})"
+                                    "UPDATE emails SET unread = {v}, seen_pending = 0 WHERE folder = 'inbox' AND id IN ({marks})"
                                 ),
                                 rusqlite::params_from_iter(chunk.iter()),
                             )
@@ -2467,6 +2470,14 @@ fn preview_kind_of(mime: &str, filename: &str) -> &'static str {
         return "pdf";
     }
     if m.starts_with("text/") && m != "text/html" {
+        return "text";
+    }
+    // 第十轮 P2-3：标准 JSON/XML MIME 也要能预览——扩展名兜底路径早已把它们
+    // 归入 text，收到带规范 MIME 的附件反而没有入口（md.rs::text_lang_of 同口径）。
+    if matches!(
+        m.as_str(),
+        "application/json" | "application/xml" | "application/ld+json" | "application/x-ndjson"
+    ) {
         return "text";
     }
     // SVG 可携带脚本：顶层渲染会执行，不按图片内嵌预览

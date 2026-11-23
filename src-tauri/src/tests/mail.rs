@@ -2248,3 +2248,12 @@ fn p84_no_at_addr_external_flag_matches_rust() {
     for it in &items { assert!(!it.from_external, "{} 不应标外部", it.from_display); }
     cleanup(&dir);
 }
+
+/// 第十轮 P2-3：标准 JSON/XML MIME 与扩展名兜底同口径，都能文本预览。
+#[test]
+fn p103_standard_json_xml_mime_previews_as_text() {
+    assert_eq!(preview_kind_of("application/json", "data.json"), "text");
+    assert_eq!(preview_kind_of("application/xml", "data.xml"), "text");
+    assert_eq!(preview_kind_of("application/ld+json", "data.jsonld"), "text");
+    assert_eq!(preview_kind_of("text/html", "x.html"), "", "HTML 仍不可内嵌");
+}

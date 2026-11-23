@@ -1231,3 +1231,23 @@ fn p62_placeholder_is_backfilled_when_uidvalidity_changes() {
     assert_eq!(rows[0].4, "43:50", "remote_uid 应迁到新 UV");
     cleanup(&dir);
 }
+
+#[test]
+fn p101_incoming_commit_failure_cleans_written_attachments() {
+    // 第十轮 P2-1：正常收件入库的 commit 失败也要清 written，与 backfill 同口径。
+    // 旧实现只有 Err(stored) 分支清文件，commit 的 `?` 绕过清理留孤儿 .gz。
+    const SRC: &str = include_str!("../mail/recv.rs");
+    let at = SRC
+        .find("fn store_incoming_conn")
+        .expect("收件入库函数存在");
+    let end = SRC[at..]
+        .find("\n}\n")
+        .map(|p| at + p)
+        .unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    let commit = body.find("tx.commit()").expect("收件须在事务内提交");
+    assert!(
+        body[commit..].contains("remove_file(f)"),
+        "收件 commit 失败路径也必须清理 written 附件"
+    );
+}

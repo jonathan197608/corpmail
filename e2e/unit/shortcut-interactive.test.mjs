@@ -123,7 +123,7 @@ test('无展开菜单时 Esc 放行，保留返回列表语义（P3-2 回归）'
 });
 
 // 预览模态打开时：Esc 归预览层，其余快捷键（r/f/n/j/k…）一律不生效
-function previewHarness(key, previewOpen) {
+function previewHarness(key, previewOpen, modalKind = 'preview-modal', withList = false) {
     const calls = { href: null, prevented: 0 };
     const handlers = [];
     const detail = {
@@ -135,8 +135,12 @@ function previewHarness(key, previewOpen) {
         documentElement: { tagName: 'HTML' },
         activeElement: { tagName: 'BODY', closest: () => null },
         addEventListener: (type, fn) => { if (type === 'keydown') handlers.push(fn); },
-        getElementById: (id) => (id === 'preview-modal' ? { hidden: !previewOpen } : null),
-        querySelectorAll: () => [],
+        // n 键只在列表分支处理；用 withList 控制该分支是否可达
+        getElementById: (id) =>
+            id === modalKind ? { hidden: !previewOpen }
+            : id === 'mail-list' && withList ? { id } : null,
+        querySelectorAll: (sel) =>
+            withList && sel === '#mail-list .mail-row' ? [mkRow('/emails/1')] : [],
         querySelector: (sel) => (sel === '.mail-detail' ? detail : null),
     };
     const win = { location: { set href(v) { calls.href = v; } } };
@@ -155,4 +159,16 @@ test('预览关闭后 r 仍能回复（回归）', () => {
     const h = previewHarness('r', false);
     assert.equal(h.href, '/compose?reply_to=42');
     assert.equal(h.prevented, 1);
+});
+
+test('确认框打开时按 r 不跳回复页（第十轮 P2-6）', () => {
+    const h = previewHarness('r', true, 'mbx-leave-confirm');
+    assert.equal(h.href, null, '确认框的焦点陷阱不挡 document keydown，须显式拦截');
+    assert.equal(h.prevented, 0);
+});
+
+test('迁移遮罩打开时按 n 不新建邮件（第十轮 P2-6）', () => {
+    const h = previewHarness('n', true, 'migrate-mask', true);
+    assert.equal(h.href, null);
+    assert.equal(h.prevented, 0);
 });

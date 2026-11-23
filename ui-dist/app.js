@@ -1312,6 +1312,7 @@ document.addEventListener("click", function (e) {
 // 失效（e2e 第 14 轮：Enter 后 pane 不换）。显式实现激活——preventDefault
 // 兜住原生路径避免双触发（Space 原生激活在 keyup，拦下 keydown 即全覆盖），
 // 拦 e.repeat 避免长按连发请求；tab.click() 与真实点击同路（含脏拦截确认）。
+// --- R10 settings tab key core START ---
 document.addEventListener("keydown", function (e) {
     if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") { return; }
     if (e.repeat) { return; }
@@ -1320,6 +1321,7 @@ document.addEventListener("keydown", function (e) {
     e.preventDefault();
     tab.click();
 }, true);
+// --- R10 settings tab key core END ---
 
 // ---------- 向导"测试并保存"：进行中锁定表单，结束后恢复 ----------
 // 双通道真实连接测试最长 ~15s（并行后）。htmx:configRequest触发时参数已收集完毕，
@@ -1651,10 +1653,35 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
                             // 复查五 P2-5：用服务端返回的完整附件 id 刷新 keep_ids，
                             // 并清空已落库的待选文件——否则下一轮按旧列表裁剪会
                             // 删掉刚入库的附件；源文件此时被移走则静默丢失。
+                            // 第十轮 P1-3：回填不能整体覆盖在途改动。用户在请求
+                            // 飞行中新增的待存附件 / 移除的已入库附件都要保留：
+                            // 只消费本次确实提交过的路径，只合并本次新入库的 id，
+                            // 并置 changed 让 finish 补发一次最终状态。
                             if (Array.isArray(res.keep_ids)) {
+                                var parseList = function (s) {
+                                    try { var a = JSON.parse(s || '[]'); return Array.isArray(a) ? a : []; }
+                                    catch (e2) { return []; }
+                                };
+                                var submittedPaths = parseList(values.attach_paths);
+                                var submittedIds = parseList(values.keep_ids);
                                 var keepEl = form.querySelector('#keep-ids');
-                                if (keepEl) keepEl.value = JSON.stringify(res.keep_ids);
-                                pickedPaths.length = 0;
+                                var currentKeep = keepEl ? keepEl.value : values.keep_ids;
+                                var currentIds = parseList(currentKeep);
+                                var attachChanged =
+                                    JSON.stringify(pickedPaths.slice().sort()) !==
+                                    JSON.stringify(submittedPaths.slice().sort());
+                                var keepChanged =
+                                    JSON.stringify(currentIds) !== JSON.stringify(submittedIds);
+                                if (attachChanged || keepChanged) inflight.changed = true;
+                                // 保留在途新增；只移除本次已落库的路径
+                                pickedPaths = pickedPaths.filter(function (p) {
+                                    return submittedPaths.indexOf(p) < 0;
+                                });
+                                // 保留在途删除；只并入本次新入库的 id
+                                var merged = currentIds.concat(res.keep_ids.filter(function (aid) {
+                                    return submittedIds.indexOf(aid) < 0 && currentIds.indexOf(aid) < 0;
+                                }));
+                                if (keepEl) keepEl.value = JSON.stringify(merged);
                                 renderPicked(false);
                             }
                         }
@@ -1765,11 +1792,12 @@ function mbxSchedLocalMin(nowMs) {
 // --- P4 sched validation core END ---
 // 状态承载：#sched-at 隐藏域存 datetime-local 控件原始值（"YYYY-MM-DDTHH:MM"），
 // 服务端 save_compose_form 统一解析成 epoch。两条发送路径同端点同表单：
-// - 立即发送（button[hx-post="/compose/send"]:not(#sched-send-btn)）→ 点击即清空
-//   hidden（capture 阶段抢在 htmx 收集参数之前）→ 提交 scheduled_at="" = 立即发
+// - 立即发送（button[hx-post="/compose/send"]:not(#sched-send-btn)）→ 在
+//   configRequest 里按触发按钮覆盖 parameters.scheduled_at=""（不动隐藏域）
 // - 定时发送（#sched-send-btn）→ htmx:configRequest 校验控件非空（空则拦请求
 //   并提示），hidden 已由 change/input 同步为控件值 → 提交 = 定时
 // 存草稿：hidden 原样提交（定时草稿保留计划；清空控件后存草稿 = 取消定时）
+// --- R10 sched capture core START ---
 (function () {
     function hidden() { return document.getElementById('sched-at'); }
     function picker() { return document.getElementById('sched-input'); }
@@ -1799,21 +1827,19 @@ function mbxSchedLocalMin(nowMs) {
     document.body.addEventListener('change', function (ev) {
         if (ev.target && ev.target.id === 'sched-input') sync();
     });
-    // 立即发送：capture 阶段清空（htmx 用冒泡监听，capture 先行——否则参数已收集）
-    document.body.addEventListener('click', function (ev) {
-        var t = ev.target;
-        if (!t || !t.closest) return;
-        var btn = t.closest('button[hx-post="/compose/send"]');
-        if (btn && btn.id !== 'sched-send-btn') {
-            var h = hidden();
-            if (h) h.value = '';
-        }
-    }, true);
-    // 定时发送：请求前校验控件已选（空则拦下并提示，模式同 M1-2 预校验）
+    // 第十轮 P1-4：立即发送不能再于 capture 阶段清空隐藏域——一旦预校验/
+    // 确认模态取消该请求，#sched-at 永久空而 picker 仍有值，之后「定时发送」
+    // 变立即发送、存草稿丢计划。改为在 configRequest 里按触发按钮一次性覆盖
+    // 参数：请求被取消时隐藏域原封不动，下次提交仍按控件状态正确决定。
     document.body.addEventListener('htmx:configRequest', function (ev) {
         var detail = ev.detail || {};
         var elt = detail.elt;
-        if (!elt || !elt.matches || !elt.matches('#sched-send-btn')) return;
+        if (!elt || !elt.matches) return;
+        if (elt.matches('button[hx-post="/compose/send"]') && elt.id !== 'sched-send-btn') {
+            if (detail.parameters) detail.parameters.scheduled_at = '';
+            return;
+        }
+        if (!elt.matches('#sched-send-btn')) return;
         var p = picker();
         if (p) p.min = mbxSchedLocalMin(Date.now());
         if (!p || !p.value) {
@@ -1830,6 +1856,7 @@ function mbxSchedLocalMin(nowMs) {
         }
     });
 })();
+// --- R10 sched capture core END ---
 
 // ---------- 撰写页：发送前预校验（M1-2） ----------
 // 挂 htmx:configRequest、精确匹配发送按钮（存草稿允许不完整内容，不校验）。
@@ -2366,14 +2393,17 @@ document.addEventListener('click', function (ev) {
             if (ev.key === 'Escape') ev.target.blur();
             return;
         }
-        var modal = document.getElementById('preview-modal');
-        var previewOpen = modal && !modal.hidden;
-        // 第九轮 P2-4：预览模态由焦点陷阱挡住指针与 Tab，但 document 级快捷键
-        // 不受 inert 约束。除 Esc（交给预览层关闭）外一律不响应，避免按 r/f/n
-        // 直接跳离详情、丢失正在看的附件预览。
-        if (previewOpen && ev.key !== 'Escape') return;
+        // 第十轮 P2-6：守卫泛化到所有模态——焦点陷阱只挡指针与 Tab，不挡
+        // document 上的 keydown。确认框 / 迁移遮罩打开时 r/f/n/j 同样会跳页。
+        var modalIds = ['preview-modal', 'mbx-leave-confirm', 'migrate-mask'];
+        var anyModalOpen = false;
+        for (var mi = 0; mi < modalIds.length; mi++) {
+            var md = document.getElementById(modalIds[mi]);
+            if (md && !md.hidden) { anyModalOpen = true; break; }
+        }
+        if (anyModalOpen && ev.key !== 'Escape') return;
         if (ev.key === 'Escape') {
-            if (previewOpen) return; // 预览层自己处理
+            if (anyModalOpen) return; // 各模态自己的 handler 处理（已 stop 传播）
             var back = document.querySelector('.topbar .back');
             if (back) { ev.preventDefault(); back.click(); }
             return;
@@ -2715,10 +2745,14 @@ function mbxTplBuild(st) {
     st.area.hidden = false;
 }
 
+// --- R10 tpl dirty core START ---
 function mbxTplToggleSrc(st) {
     if (st.mode === 'rich') {
         // 富文本 → 源码：编辑器内容写回 textarea 展示
         st.ta.value = st.ed ? st.ed.getHtml() : '';
+        // 第十轮 P3-1：与编辑器 change / 单向升级路径对称——程序写 textarea
+        // 也必须派发可冒泡 input，否则设置页脏判定/基线不刷新。
+        st.ta.dispatchEvent(new Event('input', { bubbles: true }));
         st.ta.hidden = false;
         st.bar.hidden = true;
         st.area.hidden = true;
@@ -2735,6 +2769,7 @@ function mbxTplToggleSrc(st) {
         st.srcBtn.innerHTML = MBX_IC.keyboard + ' HTML 源码';
     }
 }
+// --- R10 tpl dirty core END ---
 
 // 纯文本 → 富文本：单向升级（与撰写页 mbxUpgradeHtml 一致），内容转为段落，
 // 升级后隐藏纯文本区与升级按钮，body_mode 置 html；HTML 不可再降级回纯文本

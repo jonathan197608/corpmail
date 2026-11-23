@@ -1276,11 +1276,17 @@ fn email_undo_send(state: &AppState, req: &Req) -> Resp {
     let Some(id) = path_id(&req.path, "/emails/") else {
         return Resp::not_found();
     };
-    if mail::cancel_scheduled_send(state, id) {
-        Resp::hx_redirect(&format!("/compose?draft_id={id}&undone=1"))
-    } else {
-        let msg = urlencode("发送已开始，撤销窗口已过（可在发件箱确认）");
-        Resp::hx_redirect(&format!("/emails/{id}?error={msg}"))
+    match mail::cancel_scheduled_send(state, id) {
+        Ok(true) => Resp::hx_redirect(&format!("/compose?draft_id={id}&undone=1")),
+        Ok(false) => {
+            let msg = urlencode("发送已开始，撤销窗口已过（可在发件箱确认）");
+            Resp::hx_redirect(&format!("/emails/{id}?error={msg}"))
+        }
+        // 第十轮 P1-1：写失败不能伪装成「窗口已过」——邮件仍会在到点时被投递
+        Err(err) => {
+            eprintln!("[undo-send] 撤销失败：{err}");
+            Resp::text(500, "撤销发送失败，请重试")
+        }
     }
 }
 
@@ -1679,11 +1685,6 @@ struct ContactListOpts<'a> {
     sort: &'a str,
 }
 
-/// 联系人列表渲染（整页 contacts.html 与删除/保存后片段 contacts_area.html 共用）
-fn contacts_ctx(state: &AppState, opts: &ContactListOpts<'_>) -> ContactsCtx {
-    contacts_ctx_full(state, opts, "", "", "")
-}
-
 fn contacts_ctx_with(
     state: &AppState,
     opts: &ContactListOpts<'_>,
@@ -1893,13 +1894,18 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
         .unwrap_or_default()
         .trim()
         .to_string();
-    if !addr.is_empty() {
-        // P3-2：写失败不再完全静默——至少落日志（列表片段仍按实际库状态重渲染，
-        // 用户看到该联系人还在，不会误以为删除成功）
-        if let Err(err) = state.with_conn(|conn| mail::contacts::remove(conn, &addr)) {
-            eprintln!("[contacts] 删除联系人失败：{err}");
-        }
-    }
+    let error = if !addr.is_empty() {
+        // 第十轮 P2-4：与 contacts_save 同口径，写失败回显到片段而不是只落日志
+        state.with_conn(|conn| mail::contacts::remove(conn, &addr))
+            .err()
+            .map(|err| {
+                eprintln!("[contacts] 删除联系人失败：{err}");
+                format!("删除失败：{err}")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // 保留搜索词：删除后回到同一过滤视图
     let q = form
         .get("q")
@@ -1919,7 +1925,7 @@ fn contacts_delete(state: &AppState, req: &Req) -> Resp {
         page,
         sort: sort.trim(),
     };
-    let ctx = contacts_ctx(state, &opts);
+    let ctx = contacts_ctx_with(state, &opts, "", &error);
     render_html("contacts_area.html", &ctx)
 }
 
@@ -2827,8 +2833,20 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             // A1 撤销窗口：不立即入队，先写 scheduled_at = now + 8s（status 仍
             // 为 draft），由调度线程到点派发；窗口内可 POST /undo-send 拦截。
             // 列表页据此启动倒计时 toast（先给撤销按钮，再轮询至终态）。
-            if mail::schedule_send_in(state, id, UNDO_SEND_SECS) {
-                just_sent = Some(id);
+            // 第十轮 P1-2：设置撤销窗口失败必须回显——旧实现吞成 Ok(false) 后
+            // 仍跳列表（无 just_sent），邮件永久停在 draft，用户却以为已发送。
+            match mail::schedule_send_in(state, id, UNDO_SEND_SECS) {
+                Ok(true) => just_sent = Some(id),
+                Ok(false) => eprintln!("[compose] 撤销窗口未设置：草稿已入队或被并发发送（id={id}）"),
+                Err(err) => {
+                    eprintln!("[compose] 撤销窗口写入失败：{err}");
+                    return compose_retry_redirect(
+                        id,
+                        &format!("已保存草稿，但设置撤销窗口失败：{err}"),
+                        &ctx_qs,
+                        &form,
+                    );
+                }
             }
             // 发送完成 → 回来源文件夹列表（保持过滤/翻页），而非停详情页。
             // ctx_qs 恒含 folder（rebuild_list_query 不再省略 inbox），
@@ -3209,8 +3227,10 @@ fn attachments_save_all(state: &AppState, req: &Req) -> Resp {
         );
     };
     match mail::save_all_attachments(state, id, &dir) {
-        Ok((saved, 0)) => Resp::html(format!(
-            r#"<div id="toast" class="toast ok" hx-swap-oob="true">已保存 {saved} 个附件</div>"#
+        // 第十轮 P2-5：全跳过（一个都没保存）不是成功——绿色 toast 会让用户
+        // 以为附件已落盘；改用 err 且文案明示 0 个已保存。
+        Ok((0, skipped)) => Resp::html(format!(
+            r#"<div id="toast" class="toast err" hx-swap-oob="true">未保存任何附件（{skipped} 个已清理/缺失，请重新添加）</div>"#
         )),
         Ok((saved, skipped)) => Resp::html(format!(
             r#"<div id="toast" class="toast ok" hx-swap-oob="true">已保存 {saved} 个附件（{skipped} 个已清理/缺失，跳过）</div>"#

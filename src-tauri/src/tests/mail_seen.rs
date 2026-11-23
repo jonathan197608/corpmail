@@ -674,3 +674,37 @@ fn p73_recheck_skips_sent_and_missing_remote_uid() {
     assert_eq!(pending_count(&state), 0);
     cleanup(&dir);
 }
+
+/// 第十轮 P2-2：批量标未读必须与单封 mark_unread 同口径清 seen_pending，
+/// 不能留下 unread=1 && seen_pending=1 的边界态。
+#[test]
+fn p102_batch_mark_unread_clears_seen_pending() {
+    let (state, dir) = temp_state("p102-batch-unread");
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, seen_pending,
+                                remote_uid, created_at, received_at)
+             VALUES ('in', 'inbox', 'received', 'a@x.cn', '', '主题', '正文', '主题', '正文', 0, 1, 77, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    let n = crate::mail::batch_apply(
+        &state,
+        &crate::mail::BatchTarget::Ids(vec![1]),
+        crate::mail::BatchAction::MarkUnread,
+    )
+    .unwrap();
+    assert_eq!(n, 1);
+    let (unread, pending): (i64, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT unread, seen_pending FROM emails WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!((unread, pending), (1, 0), "批量标未读须清回写意向");
+    cleanup(&dir);
+}

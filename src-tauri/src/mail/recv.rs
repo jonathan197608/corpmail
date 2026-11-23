@@ -1579,7 +1579,16 @@ pub fn store_incoming_conn(
         });
         match stored {
             Ok(()) => {
-                tx.commit().map_err(e)?;
+                // 第十轮 P2-1：commit 失败同样要清已写盘附件（与 backfill_placeholder_conn
+                // 的 inspect_err 同口径）——`?` 直接返回会让 DB 回滚但 .gz 残留成孤儿，
+                // 且 insert_attachment 的序号避让会跳过该序号。
+                tx.commit()
+                    .inspect_err(|_| {
+                        for f in &written {
+                            let _ = std::fs::remove_file(f);
+                        }
+                    })
+                    .map_err(e)?;
                 added += 1;
             }
             Err(err) => {

@@ -10651,16 +10651,24 @@ fn settings_tabs_are_keyboard_accessible() {
     // 有显式 keydown 委托并最终走 tab.click()（与真实点击同路、含脏拦截）。
     // 删掉该段时 e2e T3 变红（Enter 后 pane 不换），此处同步钉住
     let js = include_str!("../../../ui-dist/app.js");
+    // 第十轮 H1：旧护栏对整个 app.js 做 contains("tab.click();")，而该字符串
+    // 在「离开确认」处理器里还有第二处——删掉 A15 的 tab.click() 仍全绿。
+    // 收窄到 R10 core 段内断言。
+    let key_core = js
+        .split("// --- R10 settings tab key core START ---")
+        .nth(1)
+        .and_then(|s| s.split("// --- R10 settings tab key core END ---").next())
+        .expect("app.js 必须带 R10 settings tab key core 锚点");
     assert!(
-        js.contains("e.target.closest(\".settings-tabs .stab\")"),
+        key_core.contains("e.target.closest(\".settings-tabs .stab\")"),
         "键盘激活委托应匹配 .settings-tabs .stab（A15）"
     );
     assert!(
-        js.contains("e.key !== \"Enter\" && e.key !== \" \" && e.key !== \"Spacebar\""),
+        key_core.contains("e.key !== \"Enter\" && e.key !== \" \" && e.key !== \"Spacebar\""),
         "激活键面应覆盖 Enter/Space/Spacebar（A15）"
     );
     assert!(
-        js.contains("tab.click();"),
+        key_core.contains("tab.click();"),
         "键盘激活应最终派发原生 click（A15）"
     );
     // aria-selected 同步（e2e 第 15 轮根因）：tab 栏不在 htmx target 内，
@@ -11212,4 +11220,44 @@ fn p97_read_write_failure_returns_500() {
         "失败时不得派发侧栏刷新（会伪装成成功）"
     );
     cleanup(&dir);
+}
+
+/// 第十轮 P1-1/P1-2：两条发送窗口写路径的调用方必须把 Err 回显，不能吞成
+/// 「窗口已过」或「已发送跳列表」。
+#[test]
+fn p101_p102_send_window_route_errors_are_surfaced() {
+    const SRC: &str = include_str!("../ui/router.rs");
+    let undo_at = SRC.find("fn email_undo_send(").expect("撤销端点存在");
+    let undo = &SRC[undo_at..SRC[undo_at..].find("\n}\n").map(|p| undo_at + p).unwrap()];
+    assert!(undo.contains("Err(err) =>"), "撤销写失败须单独分支");
+    assert!(
+        undo.contains("Resp::text(500, \"撤销发送失败，请重试\")"),
+        "撤销写失败必须回 500，不能提示窗口已过"
+    );
+    let sched_at = SRC
+        .find("schedule_send_in(state, id, UNDO_SEND_SECS)")
+        .expect("发送须设置撤销窗口");
+    let sched = &SRC[sched_at..SRC[sched_at..]
+        .find("Resp::hx_redirect(&target)")
+        .map(|p| sched_at + p)
+        .unwrap()];
+    assert!(sched.contains("Err(err) =>"), "设置撤销窗口失败须单独分支");
+    assert!(
+        sched.contains("compose_retry_redirect"),
+        "设置撤销窗口失败必须带错误回到撰写页"
+    );
+}
+
+/// 第十轮 P2-5：全部附件保存失败时用错误 toast，而不是绿色「已保存 0 个」。
+#[test]
+fn p105_all_attachments_failed_uses_error_toast() {
+    const SRC: &str = include_str!("../ui/router.rs");
+    let at = SRC.find("fn attachments_save_all(").expect("全部另存端点存在");
+    let end = SRC[at..].find("\n}\n").map(|p| at + p).unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    assert!(body.contains("Ok((0, skipped))"), "全跳过分支须单独处理");
+    assert!(
+        body.contains("class=\"toast err\""),
+        "0 个已保存须用错误样式"
+    );
 }
