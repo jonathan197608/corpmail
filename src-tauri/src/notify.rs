@@ -28,6 +28,25 @@ fn notified_set() -> &'static NotifiedSet {
     SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// 进程内去重：已通知过的 id 剔除，达上限整表清空（第七轮 P3-6）。
+/// 从 `on_fetch_finished` 抽出，生产与单测共用同一份逻辑——旧测试直接操作
+/// HashSet 复刻一段等价代码，改坏生产分支的清空条件仍全绿，无鉴别力。
+fn select_pending(
+    notified: &mut std::collections::HashSet<i64>,
+    candidates: Vec<(i64, String)>,
+) -> Vec<(i64, String)> {
+    if notified.len() >= NOTIFIED_MAX {
+        notified.clear();
+    }
+    let mut out = Vec::new();
+    for (id, subject) in candidates {
+        if notified.insert(id) {
+            out.push((id, subject));
+        }
+    }
+    out
+}
+
 /// 一轮收件完成后调用：发一条新邮件摘要系统通知。
 ///
 /// `db_path`：主库路径（自建独立连接查询，WAL 下与收件/主连接不互阻）；
@@ -64,16 +83,7 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
     // 进程内去重：已通知过的 id 剔除（同轮窗口重叠/多轮重复拉取都拦在此处）
     let pending: Vec<(i64, String)> = {
         let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        if notified.len() >= NOTIFIED_MAX {
-            notified.clear();
-        }
-        let mut out = Vec::new();
-        for (id, subject) in candidates {
-            if notified.insert(id) {
-                out.push((id, subject));
-            }
-        }
-        out
+        select_pending(&mut notified, candidates)
     };
     if pending.is_empty() {
         return;

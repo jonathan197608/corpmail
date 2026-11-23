@@ -25,8 +25,10 @@ pub struct Contact {
 /// 非法片段（无 `@`）静默丢弃；地址统一去空白。
 pub fn parse_addr_list(raw: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for part in raw.split([',', ';']) {
-        let part = part.trim();
+    // 第七轮 P3-3：与发送侧共用 `<...>` 感知切分——`Doe, John <john@x.com>`
+    // 旧实现盲切逗号，姓名被污染成 "John"（发送正确但联系人库错）。
+    for token in crate::mail::split_addr_tokens(raw) {
+        let part = token.trim();
         if part.is_empty() {
             continue;
         }

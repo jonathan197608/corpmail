@@ -10802,3 +10802,21 @@ fn extract_attrs_of_controls(field_html: &str) -> Vec<String> {
     }
     out
 }
+
+#[test]
+fn p73_open_detail_restores_seen_pending() {
+    // 第七轮 P2-3：详情页打开路径必须在 mark_read 之外调用补偿函数；
+    // 静态护栏钉死调用形态（行为侧由 mail_seen::p73_* 验证）。
+    const SRC: &str = include_str!("../ui/router.rs");
+    let start = SRC.find("fn mark_read_and_sync_seen(").unwrap();
+    let body = &SRC[start..];
+    let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+    assert!(
+        body.contains("mail::ensure_seen_recheck(state, id)"),
+        "打开详情页须重建 abandon/凭据缺失清掉的已读回写意向"
+    );
+    assert!(
+        body.contains("Ok(true) => state.notify_seen()"),
+        "标志重建后须唤醒 worker"
+    );
+}

@@ -1416,6 +1416,13 @@ fn mark_read_and_sync_seen(state: &AppState, id: i64) {
     if let Err(e) = mail::mark_read(state, id) {
         eprintln!("[ui] {e}");
     }
+    // 第七轮 P2-3：abandon/凭据缺失清标志后，再次打开已读邮件须重建回写意向；
+    // STORE +\Seen 幂等。标志确被重建时唤醒 worker（翻转路径 mark_read 内已唤醒）。
+    match mail::ensure_seen_recheck(state, id) {
+        Ok(true) => state.notify_seen(),
+        Ok(false) => {}
+        Err(e) => eprintln!("[ui] 已读回写意向重建失败：{e}"),
+    }
     state.poke_tray(); // 本地未读数变化：刷托盘角标（M4-1；调度线程兑底兑漏）
 }
 

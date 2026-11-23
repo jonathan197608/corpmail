@@ -440,3 +440,25 @@ fn upsert_rejects_dirty_addresses_and_names() {
     assert_eq!(name, "张 三", "姓名控制字符应替换为空格：{name:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn p73_parse_addr_list_keeps_comma_in_display_name() {
+    // 第七轮 P3-3：发送侧 split_addrs 已能处理带逗号显示名，联系人采集
+    // 旧实现仍盲切 → 通讯录姓名被污染成 "John" 丢掉 "Doe,"。
+    assert_eq!(
+        parse_addr_list("Doe, John <john@x.com>"),
+        vec![("john@x.com".to_string(), "Doe, John".to_string())]
+    );
+    assert_eq!(
+        parse_addr_list("a@x.cn, Doe; John <john@x.com>"),
+        vec![
+            ("a@x.cn".to_string(), String::new()),
+            ("john@x.com".to_string(), "Doe; John".to_string()),
+        ]
+    );
+    // 引号包裹形态：引号由原解析逻辑 trim 掉
+    assert_eq!(
+        parse_addr_list("\"Doe, John\" <john@x.com>"),
+        vec![("john@x.com".to_string(), "Doe, John".to_string())]
+    );
+}

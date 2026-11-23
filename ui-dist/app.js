@@ -748,10 +748,20 @@ function mbxClosePreview() {
 }
 // --- P5 preview close core END ---
 
-// Esc 关闭预览
-document.addEventListener('keydown', ev => {
-    if (ev.key === 'Escape') mbxClosePreview();
-});
+// --- P7 esc preview core START ---
+// Esc 关闭预览（第七轮 P2-4）：仅当预览确实打开时才消费事件。必须
+// stopImmediatePropagation——快捷键模块也在 document 上监听 Esc 返回列表，
+// 且注册在后；若先关掉 modal（hidden=true），后一个 handler 读到
+// previewOpen=false 就会连退一层，丢失阅读位置。
+function mbxPreviewEsc(ev) {
+    if (ev.key !== 'Escape') return;
+    var modal = document.getElementById('preview-modal');
+    if (!modal || modal.hidden) return;
+    if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+    mbxClosePreview();
+}
+document.addEventListener('keydown', mbxPreviewEsc);
+// --- P7 esc preview core END ---
 
 // ---------- data-mbx-action 委托（审计 R7：CSP 落地前置） ----------
 // CSP `script-src 'self'` 会把模板里的 on* 属性整体拦掉（含 JS 用 innerHTML
@@ -1154,6 +1164,7 @@ function mbxInitContacts() {
 
         inp.addEventListener('input', () => {
             clearTimeout(state.timer);
+            mbxContactInvalidate(state);
             state.timer = setTimeout(() => mbxContactQuery(inp, state), 200);
         });
         inp.addEventListener('keydown', ev => mbxContactKey(inp, state, ev));
@@ -1161,6 +1172,18 @@ function mbxInitContacts() {
         inp.addEventListener('focus', () => { if (state.items.length) box.hidden = false; });
     });
 }
+
+// --- P7 contact suggest core START ---
+// 第七轮 P3-5：输入变化时立刻废掉旧建议并使在途响应作废。防抖窗口内
+// 旧建议仍在框里且 active=0，此时按 Enter 会把上一轮的候选插进刚改过的
+// token（R47 的 seq 只挡迟到响应，挡不住查询尚未发出时的 Enter）。
+function mbxContactInvalidate(state) {
+    state.items = [];
+    state.active = -1;
+    state.seq += 1;
+    state.box.hidden = true;
+}
+// --- P7 contact suggest core END ---
 
 // 建议查询带请求序号（审计 R47）：输入快时会有多个请求并发（200ms 防抖
 // 只能减少、不能消除），网络抖动下旧的慢响应可能后到，把「刚输入的词」
@@ -1889,21 +1912,29 @@ document.addEventListener('DOMContentLoaded', mbxRtInit);
 // 基线在每次 htmx:afterSettle 全量重建，且取「当前 DOM 里的表单」——切 tab 是
 // outerHTML 换整块，事件里的节点是旧的（R46）。
 // window.mbxPaneDirty：同一基线的脏判定，供离开确认复用（R45：改回原值即不脏）。
+// --- P7 settings snapshot core START ---
+function mbxSnapshotForm(form) {
+    var out = {}, els = form.querySelectorAll('input, select, textarea');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.disabled || !el.name) continue;
+        var t = (el.type || '').toLowerCase();
+        if (t === 'submit' || t === 'button' || t === 'file') continue;
+        // 第七轮 P2-5：同名 radio 逐个覆盖时，最后一个未选中项会把
+        // 快照写回空串——「首次拉取范围」7/30/90 互改恒不被识别为脏。
+        // radio 只取 checked 项；未选中的直接跳过。
+        if (t === 'radio') {
+            if (el.checked) out[el.name] = el.value;
+            continue;
+        }
+        out[el.name] = t === 'checkbox' ? (el.checked ? el.value : '') : el.value;
+    }
+    return JSON.stringify(out);
+}
+// --- P7 settings snapshot core END ---
 (function () {
     var base = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
-    function snapshot(form) {
-        var out = {}, els = form.querySelectorAll('input, select, textarea');
-        for (var i = 0; i < els.length; i++) {
-            var el = els[i];
-            if (el.disabled || !el.name) continue;
-            var t = (el.type || '').toLowerCase();
-            if (t === 'submit' || t === 'button' || t === 'file') continue;
-            out[el.name] = t === 'radio' || t === 'checkbox'
-                ? (el.checked ? el.value : '')
-                : el.value;
-        }
-        return JSON.stringify(out);
-    }
+    var snapshot = mbxSnapshotForm;
     function paneForms() {
         var p = document.getElementById('settings-pane');
         if (!p) return [];

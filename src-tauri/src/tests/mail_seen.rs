@@ -1,7 +1,9 @@
 //! 已读回写批处理单测（src/mail/seen.rs 内联测试，经 #[path] 引入）
 
 use super::*;
-use crate::mail::{IncomingMail, LastCursor, mark_read, mark_unread, store_incoming};
+use crate::mail::{
+    IncomingMail, LastCursor, ensure_seen_recheck, mark_read, mark_unread, store_incoming,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -614,5 +616,61 @@ fn mark_unread_clears_pending_seen_writeback() {
     });
     assert_eq!(unread, 1, "本地未读");
     assert_eq!(pending, 0, "必须清掉待回写标志，防 worker 覆盖为服务器已读");
+    cleanup(&dir);
+}
+
+#[test]
+fn p73_reopen_already_read_mail_restores_seen_pending_after_abandon() {
+    // 第七轮 P2-3：abandon 清标志后邮件已 unread=0，mark_read 的 AND unread=1
+    // 永不命中 → 服务器 \Seen 永久失同步。ensure_seen_recheck 须重建标志并
+    // 能被 flush 正常回写。
+    let (state, dir, ids) = fixture("p73-recheck", &[(42, 7)]);
+    let id = ids[0];
+    assert!(mark_read(&state, id).unwrap());
+    assert_eq!(pending_count(&state), 1);
+    abandon(&state).unwrap();
+    assert_eq!(pending_count(&state), 0, "放弃后标志清空");
+
+    // 再次打开已读邮件：mark_read 不再翻转，补偿函数须重建
+    assert!(!mark_read(&state, id).unwrap(), "已读邮件不翻转");
+    assert_eq!(pending_count(&state), 0, "单靠 mark_read 无法重建");
+    assert!(
+        ensure_seen_recheck(&state, id).unwrap(),
+        "已读行须补回写意向"
+    );
+    assert_eq!(pending_count(&state), 1);
+    // 幂等：重复调用不再重复置位
+    assert!(!ensure_seen_recheck(&state, id).unwrap());
+    let account: String = state.with_conn(|c| {
+        c.query_row("SELECT seen_account FROM emails WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(account, "demo@chinatelecom.cn");
+
+    let fetcher = FakeFetcher::ok();
+    assert_eq!(flush(&state, &fetcher).unwrap(), 1, "补偿后须能正常回写");
+    assert_eq!(fetcher.calls()[0].4, vec![7]);
+    assert_eq!(pending_count(&state), 0);
+    state.clear_password("demo@chinatelecom.cn");
+    cleanup(&dir);
+}
+
+#[test]
+fn p73_recheck_skips_sent_and_missing_remote_uid() {
+    // 补回写意向只针对收件且有 remote_uid 的行；发件/无 UID 不写服务器的 \Seen
+    let (state, dir, ids) = fixture("p73-scope", &[(42, 1)]);
+    let id = ids[0];
+    mark_read(&state, id).unwrap();
+    abandon(&state).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET direction='out', remote_uid=NULL WHERE id=?1",
+                [id],
+            )
+        })
+        .unwrap();
+    assert!(!ensure_seen_recheck(&state, id).unwrap(), "发件/无 UID 不得置位");
+    assert_eq!(pending_count(&state), 0);
     cleanup(&dir);
 }

@@ -331,11 +331,11 @@ pub fn run() {
             request_shutdown();
         }
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Reopen { .. } = _event
-            && let Some(win) = _app_handle.get_webview_window("main")
-        {
-            let _ = win.unminimize();
-            let _ = win.set_focus();
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            // 第七轮 P2-6：关窗走 hide()（isVisible=false），tao 的聚焦调用
+            // 对隐藏窗口是 no-op、applicationShouldHandleReopen 也不自动显示
+            // ——必须显式 show。复用托盘/单实例同一实现，避免三处口径分叉。
+            tray::show_main(_app_handle);
         }
     });
 }

@@ -974,3 +974,30 @@ fn dispatch_strips_control_chars_from_headers() {
     state.clear_password("demo@chinatelecom.cn");
     cleanup(&dir);
 }
+
+#[test]
+fn p77_split_addrs_mixed_plain_and_display_name() {
+    // 第七轮 P2-7：纯地址 + 带显示名地址混排时，'<' 前片段含 @ 说明
+    // 待定分隔符是真切点；旧实现无条件作废 pending 会把纯地址吞进下一 token，
+    // parse_mailbox 对合并串报错 → 整封发送失败。
+    assert_eq!(
+        split_addrs("li@x.cn, 王五 <wang@x.cn>"),
+        vec!["li@x.cn".to_string(), "王五 <wang@x.cn>".to_string()]
+    );
+    assert_eq!(
+        split_addrs("a@x.cn; b@x.cn, Doe, John <john@x.com>"),
+        vec![
+            "a@x.cn".to_string(),
+            "b@x.cn".to_string(),
+            "Doe, John <john@x.com>".to_string(),
+        ]
+    );
+    // 显示名内的分隔符仍不切（回归 R6 行为）
+    assert_eq!(
+        split_addrs("Doe, John <john@x.com>, li@x.cn"),
+        vec![
+            "Doe, John <john@x.com>".to_string(),
+            "li@x.cn".to_string()
+        ]
+    );
+}

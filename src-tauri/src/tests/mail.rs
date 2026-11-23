@@ -2051,3 +2051,127 @@ fn flag_writes_report_sql_failure() {
     assert!(toggle_star(&state, id).is_err(), "星标失败必须 Err");
     cleanup(&dir);
 }
+
+#[test]
+fn p72_thread_mails_external_flag_matches_is_external_addr() {
+    // 第七轮 P2-1：ext_col 的 :dom 与 thread_mails 的 ?1 撞号，
+    // 会让所有会话邮件误标「外部」（参数总数恰好匹配，静默错误）。
+    let (state, dir) = temp_state("p72-thread-external");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','boss@chinatelecom.cn','me@chinatelecom.cn','会话','会话','会话','会话',0,1),
+            ('in','inbox','received','peer@x.cn','me@chinatelecom.cn','Re: 会话','会话','会话','会话',0,2)",
+        )
+        .unwrap();
+    });
+    let detail = thread_mails(&state, 1, "@chinatelecom.cn").unwrap().unwrap();
+    assert_eq!(detail.items.len(), 2);
+    assert_eq!(
+        detail.items[0].from_external,
+        is_external_addr("boss@chinatelecom.cn", "@chinatelecom.cn"),
+        "内部域邮件不得误标外部（基线 :dom 撞号会恒 true）"
+    );
+    assert_eq!(
+        detail.items[1].from_external,
+        is_external_addr("peer@x.cn", "@chinatelecom.cn"),
+        "外部域邮件须标外部"
+    );
+    assert!(!detail.items[0].from_external);
+    assert!(detail.items[1].from_external);
+    cleanup(&dir);
+}
+
+#[test]
+fn p72_empty_internal_domain_keeps_list_search_batch_working() {
+    // 第七轮 P2-2：external_col 空域分支去掉 :dom，但 list/search/batch
+    // 恒绑定/传位该参数 → InvalidParameterName / InvalidParameterCount。
+    let (state, dir) = temp_state("p72-empty-domain");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','a@x.cn','me@x.cn','测试','测试','测试','测试',0,1)",
+        )
+        .unwrap();
+    });
+    let q = ListQuery {
+        folder: "inbox".into(),
+        page: 1,
+        unread_only: false,
+        external_only: false,
+        internal_domain: String::new(),
+        per: 10,
+        sort: SortKey::DateDesc,
+        from_filter: String::new(),
+        date_from: 0,
+        date_to: 0,
+        has_attach: false,
+    };
+    let (items, total) = list(&state, &q).expect("空域 list 不得报参数错");
+    assert_eq!(total, 1);
+    assert!(items[0].from_external, "空内部域时所有来信均外部");
+    assert!(
+        search(&state, "测试", &q).expect("空域 search 不得报参数错").is_some(),
+        "空域 search 须正常命中"
+    );
+    let n = batch_apply(
+        &state,
+        &BatchTarget::SelectAll {
+            exclude: vec![],
+            query: q,
+        },
+        BatchAction::MarkRead,
+    )
+    .expect("空域跨页全选不得报参数错");
+    assert_eq!(n, 1);
+    cleanup(&dir);
+}
+
+#[test]
+fn p71_external_sql_escapes_like_wildcards_in_domain() {
+    // 第七轮 P3-1：域名含 _ 时 SQL LIKE 会与 Rust ends_with 分叉。
+    let (state, dir) = temp_state("p71-like-escape");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                subject_tokens, body_tokens, thread_key, unread, created_at) VALUES
+            ('in','inbox','received','u@corpXtelecom.cn','me@corp_telecom.cn','测试','测试','测试','测试',0,1),
+            ('in','inbox','received','v@corp_telecom.cn','me@corp_telecom.cn','测试','测试','测试','测试',0,2)",
+        )
+        .unwrap();
+    });
+    let detail = thread_mails(&state, 1, "corp_telecom.cn").unwrap().unwrap();
+    assert_eq!(detail.items.len(), 2);
+    for item in &detail.items {
+        assert_eq!(
+            item.from_external,
+            is_external_addr(&item.from_display, "corp_telecom.cn"),
+            "含 _ 域名下 SQL 与 Rust 判定须一致（{:?}）",
+            item.from_display
+        );
+    }
+    // u@corpXtelecom.cn 的 _ 若未转义会被当成单字符通配命中，误判为内部
+    assert!(detail.items[0].from_external, "corpXtelecom.cn 应判外部");
+    assert!(!detail.items[1].from_external, "corp_telecom.cn 应判内部");
+    cleanup(&dir);
+}
+
+#[test]
+fn p74_outgoing_attachments_use_capped_file_read() {
+    // 第七轮 P3-4：出站附件须与预览/另存同口径走 read_attach_gz（metadata
+    // 预检 + 256MB 上限），不得裸 std::fs::read 把被篡改的大文件读进内存。
+    const SRC: &str = include_str!("../mail/mod.rs");
+    let start = SRC.find("pub fn outgoing_attachments(").unwrap();
+    let body = &SRC[start..];
+    let body = &body[..body.find("\n    let bytes = gunzip").unwrap_or(body.len())];
+    assert!(
+        body.contains("read_attach_gz(&root.join("),
+        "出站 file 附件必须走有上限的 read_attach_gz"
+    );
+    assert!(
+        !body.contains("std::fs::read("),
+        "出站 file 附件不得裸 fs::read（无大小预检）"
+    );
+}

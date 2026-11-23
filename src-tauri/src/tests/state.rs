@@ -22,6 +22,11 @@ fn first_fetch_days_parses_full_zero() {
     // 解析失败/未配置 → 兜底默认 30（与 defaults 一致）
     assert_eq!(first_fetch_days_from_raw(""), 30);
     assert_eq!(first_fetch_days_from_raw("abc"), 30);
+    // 第七轮 P3-2：配置层上限必须与 imap_since 的 clamp(1,365) 一致，
+    // 否则配 1000 天实际只拉 365 天且无提示。
+    assert_eq!(first_fetch_days_from_raw("1000"), 365);
+    assert_eq!(first_fetch_days_from_raw("3650"), 365);
+    assert_eq!(first_fetch_days_from_raw("-5"), 0, "负数钳为 0=全部");
 }
 
 #[test]

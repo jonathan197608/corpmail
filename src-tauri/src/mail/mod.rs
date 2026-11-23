@@ -1380,6 +1380,86 @@ pub struct ListQuery {
     pub has_attach: bool,
 }
 
+/// 地址串切分（逗号/分号分隔，`<...>` 显示名地址整体取一 token）。
+/// 供发送（`send::split_addrs`）与联系人采集（`contacts::parse_addr_list`）
+/// 共用，杜绝两条链对同一串口径分叉——R6 修了发送侧却漏了联系人侧（P3-3）。
+pub(crate) fn split_addr_tokens(raw: &str) -> Vec<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // 待定切点：分隔符先暂存，只有确认它与下一个分隔符之间没有 `<...>`
+    // （即它不在显示名内）才认定为真正的地址分隔。
+    let mut pending: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => {
+                // 遇到尖括号地址：若 '<' 之前的片段已含 '@'（裸地址），
+                // 则待定分隔符是真切点（如 `li@x.cn; "王五" <wang@x.cn>`），
+                // 先切出裸地址让 '<...>' 成为下一个 token；否则它在显示名内
+                // （`Doe, John <...>`），待定作废、整段取一个 token。
+                // 第七轮 P2-7：旧实现无条件作废会把混合串的裸地址吞掉。
+                if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'>') {
+                    let end = i + 1 + rel + 1; // 含 '>'，ASCII 边界切片安全
+                    if raw[start..i].contains('@')
+                        && let Some(p) = pending
+                    {
+                        let head = raw[start..p].trim();
+                        if !head.is_empty() {
+                            out.push(head.to_string());
+                        }
+                        start = p + 1;
+                    }
+                    let seg = raw[start..end].trim();
+                    if !seg.is_empty() {
+                        out.push(seg.to_string());
+                    }
+                    i = end;
+                    while i < bytes.len()
+                        && (bytes[i] == b',' || bytes[i] == b';' || bytes[i].is_ascii_whitespace())
+                    {
+                        i += 1;
+                    }
+                    start = i;
+                    pending = None;
+                    continue;
+                }
+                i += 1;
+            }
+            b',' | b';' => {
+                if let Some(p) = pending {
+                    // 上一个待定分隔符到本分隔符之间无 `<` → 它是真分隔
+                    let seg = raw[start..p].trim();
+                    if !seg.is_empty() {
+                        out.push(seg.to_string());
+                    }
+                    start = p + 1;
+                }
+                pending = Some(i);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(p) = pending {
+        let head = raw[start..p].trim();
+        if !head.is_empty() {
+            out.push(head.to_string());
+        }
+        let tail = raw[p + 1..].trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+    } else {
+        let seg = raw[start..].trim();
+        if !seg.is_empty() {
+            out.push(seg.to_string());
+        }
+    }
+    out
+}
+
+
 /// 外部发件人判定：域名与内部域相同或为其子域时为内部。
 /// 无 @ 的串（本地草稿等）不算外部；空内部域时所有带地址的来信均为外部。
 /// 与 `external_sql` 保持同一口径（单测对照两者）。
@@ -1413,17 +1493,21 @@ fn external_sql(alias: &str) -> String {
     // :dom 归一化：配置默认值形如 "@chinatelecom.cn"（含前导 @），
     // 直接拼 '%@' || :dom 会得到 '%@@chinatelecom.cn' 永不命中——
     // 必须去掉前导 @ 与空白后再比后缀，否则全部来信被误标外部。
-    let dom = "lower(ltrim(trim(:dom), '@'))";
+    // 第七轮 P3-1：域名含 LIKE 元字符（_/%）时须转义，否则 SQL 侧与 Rust
+    // 字面 ends_with 口径分叉（如 corp_telecom.cn 会命中 corpXtelecom.cn）。
+    let dom = "replace(replace(replace(lower(ltrim(trim(:dom), '@')), '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
     format!(
-        "({a}from_addr <> '' AND NOT (lower({a}from_addr) LIKE '%@' || {dom} \
-         OR lower({a}from_addr) LIKE '%.' || {dom}))"
+        "({a}from_addr <> '' AND NOT (lower({a}from_addr) LIKE '%@' || {dom} ESCAPE '\\' \
+         OR lower({a}from_addr) LIKE '%.' || {dom} ESCAPE '\\'))"
     )
 }
 
-/// 外部标记 SQL 列（空内部域时所有带地址来信都算外部）
+/// 外部标记 SQL 列（空内部域时所有带地址来信都算外部）。
+/// 空域分支也必须产出 `:dom` 命名参数占位：list/search/batch 的
+/// named_params 恒绑定它，缺名会报 InvalidParameterName（第七轮 P2-2）。
 fn external_col(alias: &str, domain: &str) -> String {
     if domain.trim().trim_start_matches('@').trim().is_empty() {
-        format!("({alias}from_addr <> '')")
+        format!("({alias}from_addr <> '' AND :dom = :dom)")
     } else {
         external_sql(alias)
     }
@@ -1802,12 +1886,15 @@ pub fn thread_mails(
         let total: i64 = conn
             .query_row(
                 "SELECT count(*) FROM emails
-                 WHERE thread_key = ?1 AND folder <> 'draft'
+                 WHERE thread_key = :id AND folder <> 'draft'
                    AND status NOT IN ('draft','failed')",
-                [&thread_key],
+                rusqlite::named_params! { ":id": thread_key },
                 |r| r.get(0),
             )
             .map_err(e)?;
+        // 第七轮 P2-1：ext_col 含 :dom，若与 WHERE 的 ?1 混用，SQLite 会把
+        // 未编号的 :dom 分配索引 1，与显式 ?1 撞号——:dom 实际绑到 thread_key，
+        // 全部来信被误标「外部」且参数总数仍匹配、静默出错。统一命名参数杜绝撞号。
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, folder, status, subject, from_addr, from_name, to_addrs, body_text,
@@ -1816,16 +1903,17 @@ pub fn thread_mails(
                         {ext_col} AS from_external, starred, scheduled_at,
                         COALESCE(body_html, '') AS body_html
                  FROM emails
-                 WHERE thread_key = ?1 AND folder <> 'draft'
+                 WHERE thread_key = :id AND folder <> 'draft'
                    AND status NOT IN ('draft','failed')
                  ORDER BY sort_time DESC, id DESC
-                 LIMIT ?2"
+                 LIMIT :lim"
             ))
             .map_err(e)?;
         let rows = stmt
-            .query_map(rusqlite::params![thread_key, THREAD_MAX_ITEMS], |r| {
-                summary_from_row(r, None)
-            })
+            .query_map(
+                rusqlite::named_params! { ":id": thread_key, ":lim": THREAD_MAX_ITEMS, ":dom": domain },
+                |r| summary_from_row(r, None),
+            )
             .map_err(e)?;
         let mut items = rows.collect::<Result<Vec<_>, _>>().map_err(e)?;
         items.reverse(); // 回到正序（早 → 晚）
@@ -2564,6 +2652,25 @@ pub fn mark_read(state: &AppState, id: i64) -> Result<bool, String> {
         state.notify_seen();
     }
     Ok(flipped)
+}
+
+/// 已读行补回写意向（第七轮 P2-3）：`mark_read` 只在 `unread: 1→0` 翻转时置
+/// `seen_pending`，故 worker 连续失败 `abandon()` / 凭据暂缺清标志后，用户再次
+/// 打开已 `unread=0` 的邮件不会重建标志，服务器 \Seen 永久不同步。
+/// 打开详情页时对本机已读、有 remote_uid、但标志已清的行补置——STORE +\Seen
+/// 幂等，重复回写无副作用；worker 仍有 5 次失败上限，不会紧循环。
+pub fn ensure_seen_recheck(state: &AppState, id: i64) -> Result<bool, String> {
+    let account = state.current_account();
+    let n = state.with_conn(|conn| {
+        conn.execute(
+            "UPDATE emails SET seen_pending = 1, seen_account = ?2
+             WHERE id = ?1 AND unread = 0 AND seen_pending = 0
+               AND direction = 'in' AND remote_uid IS NOT NULL",
+            rusqlite::params![id, account],
+        )
+        .map_err(|e| format!("已读回写意向重建失败：{e}"))
+    })?;
+    Ok(n == 1)
 }
 
 /// 标为未读（A5 配套）：详情页主动留待办。只改本地 unread，
@@ -3680,8 +3787,18 @@ pub fn outgoing_attachments(
             "inline" => {
                 data.ok_or_else(|| format!("附件「{filename}」数据缺失（inline 记录为空）"))?
             }
-            _ => std::fs::read(root.join(file_path.unwrap_or_default()))
-                .map_err(|err| format!("附件「{filename}」读取失败：{err}"))?,
+            // 第七轮 P3-4：与预览/另存同口径走 read_attach_gz（metadata 预检
+            // + 256MB 上限），避免被篡改的超大 .gz 一次性读进内存 OOM。
+            _ => read_attach_gz(&root.join(file_path.unwrap_or_default())).map_err(|err| {
+                match err {
+                    AttachIo::Missing => {
+                        format!("附件「{filename}」文件不存在，无法随本次邮件发送")
+                    }
+                    AttachIo::Unreadable(msg) => {
+                        format!("附件「{filename}」读取失败：{msg}")
+                    }
+                }
+            })?,
         };
         let bytes = gunzip(&gz).ok_or_else(|| format!("附件「{filename}」数据损坏（解压失败）"))?;
         out.push(SendAttachment {

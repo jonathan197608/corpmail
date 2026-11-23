@@ -637,3 +637,21 @@ fn wizard_path_does_not_call_migration_directly() {
         "向导引导文案必须指向 设置 → 存储管理"
     );
 }
+
+#[test]
+fn p76_macos_reopen_shows_main_window() {
+    // 第七轮 P2-6：关窗 hide() 后 tao set_focus() 对隐藏窗口是 no-op，
+    // Reopen 必须显式 show（复用 tray::show_main），否则 Dock/通知点开无窗口。
+    const SRC: &str = include_str!("../lib.rs");
+    let start = SRC.find("tauri::RunEvent::Reopen { .. }").expect("Reopen 分支存在");
+    let body = &SRC[start..];
+    let body = &body[..body.find("\n        }").unwrap_or(body.len())];
+    assert!(
+        body.contains("tray::show_main(_app_handle)"),
+        "Reopen 必须走 show_main（含 show），不得只 unminimize+set_focus"
+    );
+    assert!(
+        !body.contains("set_focus()"),
+        "Reopen 分支不得残留只聚焦不显示的旧实现"
+    );
+}

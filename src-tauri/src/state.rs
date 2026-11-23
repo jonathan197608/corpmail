@@ -2777,10 +2777,11 @@ fn count_attachment_files(dir: &Path) -> usize {
 ///
 /// 修复：旧实现 `.parse().ok().filter(|v| *v > 0).unwrap_or(7)` 把"全部"(=0)
 /// 误判为非法并回退到 7 天，导致用户在设置里选"全部"实际只拉近 7 天邮件。
-/// 上限 3650 天（10 年）：值来自配置文件/表单，负数或天文数字只会让
-/// `now - days*86400` 溢出或扫全库，钳到合理区间。
+/// 上限与 IMAP SINCE 的实际上限一致（第七轮 P3-2）：此前配置层放行到 3650 天，
+/// 但 `imap_since` 恒 clamp 到 365 天，用户配 1000 天实际只拉 365 天且无提示。
+/// 0=全部（UID SEARCH ALL）仍原样透传，不受此上限影响。
 fn first_fetch_days_from_raw(raw: &str) -> i64 {
-    raw.trim().parse::<i64>().unwrap_or(30).clamp(0, 3650)
+    raw.trim().parse::<i64>().unwrap_or(30).clamp(0, 365)
 }
 
 /// 单封收件上限（字节）：解析失败/未配置取默认 50MB；超出区间钳制到 1..=200MB

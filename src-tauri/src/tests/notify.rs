@@ -50,43 +50,26 @@ fn summary_truncates_to_max_chars() {
     assert!(out.ends_with('…'));
 }
 
-/// 进程内 id 去重：同窗口重复调用不再纳入已通知集合（用 reset 保证隔离）
+/// 进程内 id 去重：走生产同一份 `select_pending`，不再复刻镜像逻辑（第七轮 P3-6）
 #[test]
 fn notified_set_dedupes_on_repeat() {
-    reset_for_test();
-    // 复用 on_fetch_finished 的去重段逻辑等价验证：直接操作集合
-    {
-        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        notified.insert(42);
-    }
-    let dup_again = {
-        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        !notified.insert(42)
-    };
-    assert!(dup_again, "重复 id 应被识别为已通知");
-    reset_for_test();
+    let mut notified = std::collections::HashSet::new();
+    let first = select_pending(&mut notified, vec![(42, "主题".into())]);
+    assert_eq!(first.len(), 1, "首次通知须纳入");
+    let again = select_pending(&mut notified, vec![(42, "主题".into())]);
+    assert!(again.is_empty(), "重复 id 应被识别为已通知");
+    // 不触碰全局集合，天然无并行串味
 }
 
 /// 上限截断：达到 NOTIFIED_MAX 后整表清空，防止常驻进程无限增长
 #[test]
 fn notified_set_caps_growth() {
-    reset_for_test();
-    {
-        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        for i in 0..NOTIFIED_MAX as i64 {
-            notified.insert(i);
-        }
-        assert_eq!(notified.len(), NOTIFIED_MAX, "前置：集合已满");
-        // 达上限清空（与 on_fetch_finished 内联逻辑一致）
-        if notified.len() >= NOTIFIED_MAX {
-            notified.clear();
-        }
-    }
-    {
-        let notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(notified.is_empty(), "达上限应整表清空");
-    }
-    reset_for_test();
+    let mut notified: std::collections::HashSet<i64> = (0..NOTIFIED_MAX as i64).collect();
+    assert_eq!(notified.len(), NOTIFIED_MAX, "前置：集合已满");
+    // 生产函数：满表时先清空，再纳入本批候选
+    let pending = select_pending(&mut notified, vec![(99_999, "新件".into())]);
+    assert_eq!(pending.len(), 1, "清空后本批候选须纳入");
+    assert_eq!(notified.len(), 1, "集合须已清空只剩本批 id");
 }
 
 /// 安全：主题中的控制字符（CR/LF）在通知正文里折叠为空格，不打乱排版
