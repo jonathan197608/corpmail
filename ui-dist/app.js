@@ -2087,15 +2087,17 @@ function mbxSnapshotForm(form) {
     // 落在「已填写、未提交」窗口时，会把已填值误存为新基线，保存按钮禁死、
     // 提交静默失败（E2E 06 F5a 逐轮复现）。target 与 pane 有 id 关系才重建；
     // 注意设置页 swap 都是 outerHTML，ev.detail.target 是换出前的旧节点（同
-    // id），DOM 包含关系对新节点不成立，必须按 id 判（自身/祖先/后代均可）。
-    // 换入的新表单无基线，refresh 保持可点，随后立即建好基线。
+    // id），DOM 包含关系对新节点不成立，必须按 id 判（自身或祖先含 pane）。
+    // R14：不能把「scope 是 pane 的后代」也算命中——测试连接按钮 hx-target
+    // 是 #smtp-result（pane 内局部 swap），其 settle 会把当前编辑值误存为新
+    // 基线，保存按钮立刻变灰、切 tab 不再提示未保存，改动静默丢失。
+    // --- R14 settings rebaseline core START ---
     function rebaselineAll(scope) {
         if (!base) return;
         var pane = document.getElementById('settings-pane');
         if (!pane) return;
         if (scope) {
             var hit = scope.id === 'settings-pane'
-                || (scope.closest && scope.closest('#settings-pane'))
                 || (scope.querySelector && scope.querySelector('#settings-pane'));
             if (!hit) return;
         }
@@ -2105,6 +2107,7 @@ function mbxSnapshotForm(form) {
             refresh(f);
         });
     }
+    // --- R14 settings rebaseline core END ---
     document.addEventListener('input', function (ev) { refresh(paneForm(ev.target)); });
     document.addEventListener('change', function (ev) { refresh(paneForm(ev.target)); });
     // .toggle 的 onclick 先改 hidden 值，事件冒泡到这里时快照已是新值
@@ -2625,17 +2628,26 @@ document.addEventListener('click', function (ev) {
         });
     }, true);
 
-    // 保存按钮点击 → 已保存意图，放行
-    document.addEventListener('click', function (ev) {
-        var b = ev.target && ev.target.closest ? ev.target.closest('button[hx-post*="/save"], button[type="submit"]') : null;
-        if (b) leaving = true;
-    }, true);
+    // 保存意图只在 htmx 请求**真正发出**后成立（R14）：旧实现在 click 阶段
+    // 就置 leaving，HTML5 required 拦截（无请求）或服务器 4xx/5xx（不 swap）
+    // 时 leaving 卡在 true，beforeunload 直接放行，脏表单静默丢失。
+    // --- R14 settings leaving core START ---
+    document.body.addEventListener('htmx:beforeRequest', function (ev) {
+        var elt = ev.detail && ev.detail.elt;
+        if (elt && elt.closest && elt.closest('button[hx-post*="/save"], button[type="submit"]')) {
+            leaving = true;
+        }
+    });
+    document.body.addEventListener('htmx:responseError', function () { leaving = false; });
+    // required 校验失败：invalid 不冒泡，用 capture 捕获
+    document.addEventListener('invalid', function () { leaving = false; }, true);
 
     // 保存成功 / 切换 tab 后 pane 被替换 → 基线在 afterSettle 重建，这里只复位导航开关
     document.body.addEventListener('htmx:afterSwap', function (ev) {
         var t = ev.detail && ev.detail.target;
         if (t && t.id === 'settings-pane') { leaving = false; bypass = false; }
     });
+    // --- R14 settings leaving core END ---
 
     window.addEventListener('beforeunload', function (ev) {
         if (leaving) return;

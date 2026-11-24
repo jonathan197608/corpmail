@@ -384,19 +384,44 @@ fn store_keychain(
     match keychain_set_password(account, password) {
         Ok(()) => finish_keychain_store(conn, account, password),
         Err(_) => {
-            // 无条件删除旧条目：无条目（NoEntry → Ok(false)）放行回退；删不掉（Err）
-            // 上抛且不写 enc:。注意不能依赖 get 的可读性——条目在但当下读不到时
-            // 仍必须删，否则重启解锁后读回旧密码（复查 R1）
+            // R14：先写 enc: 再删旧 keychain 条目。旧实现顺序相反——删成功
+            // （或 NoEntry）后 keyfile 写失败（回退密钥损坏/库只读）时，旧
+            // 密码已删、新密码未落，账号彻底无凭据且界面无降级提示。
+            // 新顺序任何一步失败都至少有一份可用密码：
+            // - 写 enc: 失败 → keychain 旧条目原样保留；
+            // - 写成功但删除失败 → 回滚 enc: 到写前值，保留 keychain 旧条目。
+            // 仍不能用 `get().is_some()` 判复活路径：条目在但读不到时照样要删
+            // （复查 R1），删不掉才上抛。
+            let enc_key = format!("enc:{account}");
+            let prev = db::settings::get(conn, &enc_key).map_err(|e| e.to_string())?;
+            if let Err(e) = keyfile_store(conn, key_file, account, password) {
+                return Err(format!("回退密钥保存失败，钥匙串旧密码保持不变（{e}）"));
+            }
             if let Err(e) = keychain_delete_credential(account) {
+                rollback_keyfile_ciphertext(conn, account, prev);
                 return Err(format!(
                     "钥匙串中仍存有旧密码且无法清除，本次修改未保存（{e}）。请解锁钥匙串或授权后重试"
                 ));
             }
-            // 回退：AES-256-GCM 落库，密钥在库外文件（设计 §5.4）
-            keyfile_store(conn, key_file, account, password).map_err(|e| e.to_string())?;
             cache_put(account, GetResult::Keyfile(password.to_string()));
             Ok(true)
         }
+    }
+}
+
+/// 回滚 `keyfile_store` 写入的 `enc:{account}` 行：`prev` 是写前值。
+/// Some → 恢复原密文；None → 删掉本次新增行。回滚本身失败只留痕——
+/// 此时 keychain 旧条目仍在（删除失败才走到这里），凭据没有丢。
+fn rollback_keyfile_ciphertext(conn: &Connection, account: &str, prev: Option<String>) {
+    let key = format!("enc:{account}");
+    let result = match prev {
+        Some(v) => db::settings::set(conn, &key, &v),
+        None => conn
+            .execute("DELETE FROM settings WHERE k = ?1", [&key])
+            .map(|_| ()),
+    };
+    if let Err(e) = result {
+        eprintln!("[secrets] 回退密文清理失败（{key}）：{e}");
     }
 }
 
@@ -659,6 +684,25 @@ fn keyfile_key(conn: &Connection, key_file: &Path, ensure: bool) -> Result<[u8; 
     }
     if !ensure {
         return Err("回退密钥不存在".into());
+    }
+    // R14：密钥文件缺失 + 库内已有 `enc:` 密文 → 拒绝生成新密钥。
+    // 密钥文件与密文库分离存放（设计 §5.4），用户只迁移/恢复 corpmail.db、
+    // 或清理锚点目录时删掉 key 文件就会进入此态；此时若静默生成新 key，
+    // 全部旧密文永久不可解（读侧 keyfile_retrieve 把 key 错误归一为 Missing，
+    // 界面无任何提示）。与上面「文件损坏拒绝覆盖」是同一保护的两面。
+    let has_ciphertext = conn
+        .query_row(
+            "SELECT 1 FROM settings WHERE k LIKE 'enc:%' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if has_ciphertext {
+        return Err(format!(
+            "回退密钥文件缺失，但数据目录中已有加密密码；拒绝生成新密钥以免旧密码全部不可解。请找回原 {} 文件（{}）",
+            KEY_FILE,
+            key_file.display()
+        ));
     }
     // 生成新 key（熵来自 OS RNG）；**只写文件，绝不落库**
     let mut key = [0u8; 32];

@@ -331,3 +331,43 @@ fn build_md_uses_relative_attachment_path_only() {
     }
     cleanup(&dir);
 }
+
+// ---------- R14：附件名注入 / fence 长度 / 隐藏块跳过 ----------
+
+#[test]
+fn r14_escape_md_inline_neutralizes_link_injection() {
+    let evil = "[点此查看](https://evil.example)";
+    let out = escape_md_inline(evil);
+    assert!(
+        !out.contains("[点此查看]"),
+        "附件名里的 Markdown 链接语法须转义：{out}"
+    );
+    // `\](` 中的反斜杠使其失去链接语法意义；断言转义符确实存在
+    assert!(out.contains("\\[") && out.contains("\\]"), "应反斜杠转义：{out}");
+    // 普通中文名不受影响
+    assert_eq!(escape_md_inline("季度报告.pdf"), "季度报告.pdf");
+}
+
+#[test]
+fn r14_longest_backtick_run_covers_5_plus() {
+    assert_eq!(longest_backtick_run("plain"), 0);
+    assert_eq!(longest_backtick_run("a```b"), 3);
+    assert_eq!(longest_backtick_run("````\nx\n`````"), 5);
+    // fence 必须严格长于内容最长串，否则会提前闭合
+    let content = "```\na\n`````\nb";
+    let fence = "`".repeat(longest_backtick_run(content).max(2) + 1);
+    assert_eq!(fence.len(), 6, "5 连反引号需 6 反引号 fence：{fence}");
+    assert!(!content.contains(&fence), "内容不得包含闭合 fence");
+}
+
+#[test]
+fn r14_html_to_md_skips_script_style_head_title() {
+    let got = html_to_md_text(
+        "<head><title>标题</title></head><p>正文</p>\
+         <script>alert('x')</script><style>body{color:red}</style>",
+    );
+    assert!(got.contains("正文"), "正文须保留：{got}");
+    for noise in ["标题", "alert", "color:red"] {
+        assert!(!got.contains(noise), "隐藏块内容不得进 MD：{got}");
+    }
+}

@@ -498,3 +498,91 @@ fn p62_degraded_three_stage_functions() {
 
     cleanup(&kf);
 }
+
+// ---------- R14：密钥回退顺序与 keyfile 缺失保护 ----------
+
+/// R14 P1：keychain set 失败 + 旧条目删除成功后，keyfile 写入失败时
+/// 旧实现会把旧密码删掉且新密码未落 → 账号彻底无凭据。
+/// 新实现先写 enc: 再删旧条目，写失败时旧密码原样保留。
+#[test]
+fn r14_failed_keyfile_write_keeps_old_keychain_password() {
+    let c = conn();
+    let kf = temp_key_path("r14-write-fail");
+    let account = "r14-write-fail@chinatelecom.cn";
+    // 损坏的密钥文件 → keyfile_store 必失败
+    std::fs::write(&kf, b"this-is-not-a-key").unwrap();
+    let g = fake_keyring::Guard::install();
+    g.preset(account, "P1");
+    g.make_set_fail();
+    cache_drop(account);
+
+    let err = store(&c, &kf, account, "P2").unwrap_err();
+    assert!(err.contains("回退密钥保存失败"), "错误应说明写失败：{err}");
+    assert_eq!(
+        g.entry(account),
+        Some("P1".into()),
+        "写失败时 keychain 旧密码必须保留（旧实现先删导致永久丢失）"
+    );
+    cache_drop(account);
+    assert_eq!(
+        retrieve(&c, &kf, account),
+        GetResult::Keychain("P1".into()),
+        "重启后仍可读回旧密码"
+    );
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// R14 P1 配套：写 enc: 成功但删 keychain 失败时，必须回滚刚写入的
+/// 新密文，使 keychain 里的旧密码保持权威（不制造静默双写）。
+#[test]
+fn r14_failed_keychain_delete_rolls_back_new_ciphertext() {
+    let c = conn();
+    let kf = temp_key_path("r14-delete-fail");
+    let account = "r14-delete-fail@chinatelecom.cn";
+    let g = fake_keyring::Guard::install();
+    g.preset(account, "P1");
+    g.make_set_fail();
+    g.make_delete_fail();
+    cache_drop(account);
+
+    let err = store(&c, &kf, account, "P2").unwrap_err();
+    assert!(err.contains("无法清除"), "错误应说明删除失败：{err}");
+    assert_eq!(g.entry(account), Some("P1".into()), "旧条目保留");
+    assert!(
+        matches!(keyfile_retrieve(&c, &kf, account), GetResult::Missing),
+        "删除失败必须回滚本次写入的 enc:（重启读回 P1）"
+    );
+    drop(g);
+    cache_drop(account);
+    cleanup(&kf);
+}
+
+/// R14 P2：密钥文件丢失但库中已有 enc: 密文时，拒绝静默生成新密钥
+/// （旧实现生成新 key 后所有旧密文永久不可解，且无任何提示）。
+#[test]
+fn r14_missing_key_file_refuses_new_key_when_ciphertext_exists() {
+    let c = conn();
+    let kf = temp_key_path("r14-missing-key");
+    let first = "r14-missing-first@chinatelecom.cn";
+    let second = "r14-missing-second@chinatelecom.cn";
+    keyfile_store(&c, &kf, first, "pw1").unwrap();
+    std::fs::remove_file(&kf).unwrap();
+
+    let err = keyfile_store(&c, &kf, second, "pw2").unwrap_err();
+    assert!(
+        err.contains("拒绝生成新密钥"),
+        "应明确拒绝而非静默生成：{err}"
+    );
+    assert!(!kf.exists(), "失败路径不得留下新密钥文件");
+    assert!(
+        matches!(db::settings::get(&c, &format!("enc:{second}")), Ok(None)),
+        "失败路径不得写入新账号密文"
+    );
+    assert!(
+        matches!(db::settings::get(&c, &format!("enc:{first}")), Ok(Some(_))),
+        "旧密文必须仍在库中（找回原 key 文件后可解）"
+    );
+    cleanup(&kf);
+}

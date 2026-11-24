@@ -28,23 +28,30 @@ fn notified_set() -> &'static NotifiedSet {
     SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// 进程内去重：已通知过的 id 剔除，达上限整表清空（第七轮 P3-6）。
-/// 从 `on_fetch_finished` 抽出，生产与单测共用同一份逻辑——旧测试直接操作
-/// HashSet 复刻一段等价代码，改坏生产分支的清空条件仍全绿，无鉴别力。
+/// 进程内去重**筛选**：只剔除已通知过的 id，不消费（R14）。
+/// 旧实现在这里就 `insert`，而系统通知 `.show()` 可能失败（首次未授权、
+/// 通知中心不可用）；失败后本批 id 已被记为「已通知」，下一轮窗口前移后
+/// 这几封邮件在进程生命周期内再无通知机会——瞬时失败被放大成永久丢失。
+/// 提交推到通知成功后的 `commit_notified`。
 fn select_pending(
-    notified: &mut std::collections::HashSet<i64>,
+    notified: &std::collections::HashSet<i64>,
     candidates: Vec<(i64, String)>,
 ) -> Vec<(i64, String)> {
+    candidates
+        .into_iter()
+        .filter(|(id, _)| !notified.contains(id))
+        .collect()
+}
+
+/// 通知成功后提交去重：达上限整表清空（第七轮 P3-6），再纳入本批 id。
+/// 与 `select_pending` 拆开，保证「失败可重试、成功不重复」。
+fn commit_notified(notified: &mut std::collections::HashSet<i64>, ids: &[(i64, String)]) {
     if notified.len() >= NOTIFIED_MAX {
         notified.clear();
     }
-    let mut out = Vec::new();
-    for (id, subject) in candidates {
-        if notified.insert(id) {
-            out.push((id, subject));
-        }
+    for (id, _) in ids {
+        notified.insert(*id);
     }
-    out
 }
 
 /// 一轮收件完成后调用：发一条新邮件摘要系统通知。
@@ -80,10 +87,11 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
     if candidates.is_empty() {
         return;
     }
-    // 进程内去重：已通知过的 id 剔除（同轮窗口重叠/多轮重复拉取都拦在此处）
+    // 进程内去重筛选：已通知过的 id 剔除（同轮窗口重叠/多轮重复拉取都拦在此处）
+    // R14：此处只读不消费，通知成功后再 commit（失败保留重试机会）
     let pending: Vec<(i64, String)> = {
-        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
-        select_pending(&mut notified, candidates)
+        let notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        select_pending(&notified, candidates)
     };
     if pending.is_empty() {
         return;
@@ -96,8 +104,18 @@ pub fn on_fetch_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>, db_path: 
         format!("收到 {count} 封新邮件")
     };
     use tauri_plugin_notification::NotificationExt;
-    if let Err(err) = app.notification().builder().title(title).body(body).show() {
-        eprintln!("[notify] 系统通知发送失败（不影响收件）：{err}");
+    let shown = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .is_ok();
+    if shown {
+        let mut notified = notified_set().lock().unwrap_or_else(|e| e.into_inner());
+        commit_notified(&mut notified, &pending);
+    } else {
+        eprintln!("[notify] 系统通知发送失败（不影响收件，本批保留重试机会）");
     }
 }
 

@@ -19,6 +19,41 @@ use std::path::Path;
 /// AI 单次可读、MD 不致膨胀；超过则改为输出本地文件路径
 const MD_EMBED_ATTACH_MAX: i64 = 64 * 1024;
 
+/// R14：附件名来自邮件 MIME 头（外部可控），直接拼进 `### ` 标题会让
+/// `[x](https://evil)` / `![img](...)` 变成可点击的注入链接——导出的
+/// .md 供 AI 与外部预览器读取，等于把伪造链接/指令带进下游。
+/// 行内文本转义 Markdown 元字符（front matter 已用 JSON 转义，无需此处重复）。
+/// 纯函数 + 单测钉死。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn escape_md_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|' => out.push('\\'),
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 最长连续反引号串长度：用于选 fenced code block 的分隔符
+/// （分隔符须严格长于内容中任何反引号串，否则提前闭合）
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn longest_backtick_run(s: &str) -> usize {
+    let mut max = 0;
+    let mut cur = 0;
+    for ch in s.chars() {
+        if ch == '`' {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    max
+}
+
 /// 导出 .md 的推荐文件名：与 .eml 同源清洗，仅扩展名不同
 pub fn suggested_filename(subject: &str, id: i64) -> String {
     match super::eml::suggested_filename(subject, id).strip_suffix(".eml") {
@@ -101,7 +136,7 @@ fn write_attachment_section(
 ) {
     md.push_str(&format!(
         "### {}（{}）\n\n",
-        a.filename,
+        escape_md_inline(&a.filename),
         crate::templates::fmt_size(a.size_orig)
     ));
     if a.detached {
@@ -112,13 +147,12 @@ fn write_attachment_section(
         && a.size_orig <= MD_EMBED_ATTACH_MAX
         && let Some((_, bytes)) = crate::mail::attachment_bytes(state, email_id, a.id)
     {
-        // 短文本：内容直接进代码块（AI 单次可读）；内容含 ``` 时用 4 反引号防破坏
+        // 短文本：内容直接进代码块；fence 长度取「内容最长连续反引号 + 1」
+        // 且不小于 3（GFM 闭合 fence 只需 ≥ 起始长度，固定 4 会被内容里的
+        // 5 连反引号提前闭合，附件内容逃逸成正文）。
         let content = String::from_utf8_lossy(&bytes);
-        let fence = if content.contains("```") {
-            "````"
-        } else {
-            "```"
-        };
+        let longest = longest_backtick_run(&content);
+        let fence = "`".repeat(longest.max(2) + 1);
         md.push_str(&format!("{fence}{lang}\n{content}\n{fence}\n\n"));
         return;
     }
@@ -221,8 +255,25 @@ pub fn html_to_md_text_into(html: &str, seed: String) -> String {
                         .split(|c: char| c.is_whitespace() || c == '>')
                         .next()
                         .unwrap_or("");
-                    b.on_tag(name, closing);
                     i += rel + 1;
+                    // R14：与 strip_html 同口径跳过 script/style/head/title 的
+                    // 内容。生产正文虽经氨净化，但历史/外部导入数据可能含
+                    // 未净化 HTML；脚本体/CSS 会原样进 MD 污染 AI 分析。
+                    // 闭标签本身不产生文本，直接跳过；开标签跳到对应闭标签后。
+                    if matches!(name, "script" | "style" | "head" | "title") {
+                        if !closing {
+                            let lower_rest = html[i..].to_ascii_lowercase();
+                            match lower_rest.find(&format!("</{name}")) {
+                                Some(close) => match html[i + close..].find('>') {
+                                    Some(gt) => i += close + gt + 1,
+                                    None => break,
+                                },
+                                None => break,
+                            }
+                        }
+                        continue;
+                    }
+                    b.on_tag(name, closing);
                 }
                 None => {
                     // 未闭合：余下按原文保留（畸形 HTML 不吞正文）

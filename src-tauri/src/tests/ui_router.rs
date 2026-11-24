@@ -10444,11 +10444,14 @@ fn settings_save_errors_render_an_error_banner() {
         &storage,
     ));
     assert!(html.contains(msg), "storage 模板必须渲染错误条：{html}");
-    // 四个失败分支都必须走 *_pane_error（含定义各 1 处）
+    // 三个失败分支都要回显：Busy/范围变更 Other 用 sync_form_error（带本次
+    // 表单值回显，R14），重新拉取用 sync_pane_error；各自含定义 1 处
     let src = include_str!("../ui/settings.rs");
+    let error_helpers = src.matches("sync_pane_error(").count()
+        + src.matches("sync_form_error(").count();
     assert!(
-        src.matches("sync_pane_error(").count() >= 4,
-        "范围变更 / 同步保存 / 重新拉取三个失败分支都要回显"
+        error_helpers >= 5,
+        "范围变更 / 同步保存 / 重新拉取三个失败分支都要回显（实得 {error_helpers}）"
     );
     assert!(
         src.matches("storage_pane_error(").count() >= 2,
@@ -11457,5 +11460,56 @@ fn r131_unicode_casefold_from_filter() {
         from_filter: "müller".into(), date_from: 0, date_to: 0, has_attach: false,
     }).unwrap();
     assert_eq!(total, 1, "Unicode 小写折叠须命中非 ASCII 姓名（rows={}）", rows.len());
+    cleanup(&dir);
+}
+
+/// R14：同步设置在「范围变更 + 收件进行中」被拒时，必须回显本次提交值。
+/// 旧实现从 state 重读旧值 → 用户改动被静默清空、脏基线按旧值重建、
+/// 切 tab 不再提示未保存。
+#[test]
+fn r14_sync_busy_preserves_submitted_values() {
+    let (state, dir) = temp_state("r14-sync-busy");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::FIRST_FETCH_DAYS, "30"),
+            (keys::SYNC_INTERVAL_MIN, "15"),
+            (keys::MAX_MAIL_MB, "50"),
+        ])
+        .unwrap();
+    {
+        let mut s = state.fetch_state.lock().unwrap();
+        s.running = true;
+        s.started_at = mail::now_epoch();
+    }
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/save",
+            &form(&[
+                ("sync_on_start", "false"),
+                ("sync_interval_min", "5"),
+                ("first_fetch_days", "90"),
+                ("max_mail_mb", "120"),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let html = body(&resp);
+    assert!(html.contains("收件进行中"), "应给出 Busy 提示：{html}");
+    // 本次提交值必须仍在表单里（radio checked / input value 由模板渲染）
+    assert!(
+        html.contains("value=\"5\"") || html.contains("value='5'"),
+        "定时器间隔应回显提交的 5：{html}"
+    );
+    assert!(
+        html.contains("value=\"120\"") || html.contains("value='120'"),
+        "单封上限应回显提交的 120：{html}"
+    );
+    // 库里仍是旧值（拒绝保存）
+    let d = defaults();
+    assert_eq!(state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(), Some("30"));
     cleanup(&dir);
 }

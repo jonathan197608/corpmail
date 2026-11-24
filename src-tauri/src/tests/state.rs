@@ -2711,3 +2711,25 @@ fn p125_two_migration_targets_are_both_cleaned() {
         "清扫须遍历全部记录（含旧版无后缀文件）"
     );
 }
+
+/// R14 P3：set_batch 回滚写盘失败时，不能留下「内存还原为 prev、磁盘却是
+/// snapshot 新值」的隐藏不一致——后续任何 set_batch 都会以旧镜像为基准
+/// 静默冲掉磁盘新值。修法须把镜像对齐到 snapshot 并明确报错。
+/// 回滚 IO 失败无法在单测稳定注入，用源码护栏钉死关键语句。
+#[test]
+fn r14_set_batch_rollback_failure_aligns_memory_to_disk() {
+    const SRC: &str = include_str!("../state.rs");
+    let at = SRC.find("pub fn set_batch(").expect("set_batch 存在");
+    let end = SRC[at..].find("\n    /// 库键写入段").map(|p| at + p).unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    let rb = body.find("if let Err(rb) = crate::conf::save").expect("回滚分支存在");
+    let branch = &body[rb..];
+    assert!(
+        branch.contains("for (k, v) in &snapshot"),
+        "回滚写盘失败后须把内存镜像对齐到磁盘已写入的 snapshot：{branch}"
+    );
+    assert!(
+        branch.contains("return Err(format!("),
+        "回滚失败必须明确上抛，不能只 eprintln 留痕：{branch}"
+    );
+}

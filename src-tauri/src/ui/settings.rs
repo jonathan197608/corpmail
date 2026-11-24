@@ -303,6 +303,39 @@ pub(super) fn sync_pane_error(state: &AppState, error: &str) -> Resp {
     )
 }
 
+/// R14：保存失败时把本次提交值回写进 ctx，避免「错误条显示了、用户改动
+/// 却被静默清空」。只覆盖同步 pane 的五个字段；radio/checkbox 的最终
+/// checked 由模板按这些值渲染。成功路径不调用。
+fn restore_sync_form(
+    ctx: &mut SettingsCtx,
+    on: bool,
+    allow_images: bool,
+    interval: &str,
+    days: &str,
+    max_mail: &str,
+) {
+    ctx.sync_on_start = on;
+    ctx.allow_remote_images = allow_images;
+    ctx.sync_interval_min = interval.to_string();
+    ctx.first_fetch_days = days.to_string();
+    ctx.max_mail_mb = max_mail.to_string();
+}
+
+/// 保存失败：在回显本次提交值的 ctx 上挂错误条（R14）
+fn sync_form_error(
+    state: &AppState,
+    error: &str,
+    on: bool,
+    allow_images: bool,
+    interval: &str,
+    days: &str,
+    max_mail: &str,
+) -> Resp {
+    let mut ctx = settings_ctx(state, "sync", false, error, None, None);
+    restore_sync_form(&mut ctx, on, allow_images, interval, days, max_mail);
+    render_html(&pane_template("sync"), &ctx)
+}
+
 pub(super) fn storage_pane_error(state: &AppState, error: &str) -> Resp {
     render_html(
         &pane_template("storage"),
@@ -591,14 +624,25 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
         return match state.reset_and_fetch(&pairs) {
             Err(ResetFetchError::Busy) => {
                 // 运行轮收尾会把游标写回，此刻清了也会被覆盖：拒绝保存本轮并
-                // 提示等待（其余参数随本次一并保存会误导"范围已生效"）
+                // 提示等待（其余参数随本次一并保存会误导"范围已生效"）。
+                // R14：回显本次提交值——旧实现从 state 重读旧值，用户改动被
+                // 静默清空且脏基线按旧值重建，切 tab 不再提示未保存。
                 let mut ctx = settings_ctx(state, "sync", false, "", None, None);
                 ctx.refetch_busy = true;
+                restore_sync_form(&mut ctx, on, allow_images, &interval, &days, &max_mail);
                 render_html(&pane_template("sync"), &ctx)
             }
             Err(ResetFetchError::Other(e)) => {
                 eprintln!("[settings] 范围变更保存失败：{e}");
-                sync_pane_error(state, &format!("保存失败：{e}"))
+                sync_form_error(
+                    state,
+                    &format!("保存失败：{e}"),
+                    on,
+                    allow_images,
+                    &interval,
+                    &days,
+                    &max_mail,
+                )
             }
             Ok(()) => sync_pane(state, true),
         };
@@ -615,7 +659,15 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
     ];
     if let Err(e) = state.set_batch(&pairs) {
         eprintln!("[settings] 收件同步保存失败：{e}");
-        return sync_pane_error(state, &format!("保存失败：{e}"));
+        return sync_form_error(
+            state,
+            &format!("保存失败：{e}"),
+            on,
+            allow_images,
+            &interval,
+            &days,
+            &max_mail,
+        );
     }
     sync_pane(state, true)
 }

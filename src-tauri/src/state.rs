@@ -2269,7 +2269,18 @@ impl AppState {
             }
             let rollback = cfg.clone();
             if let Err(rb) = crate::conf::save(&self.anchor_dir, &rollback) {
-                eprintln!("[state] 配置回滚失败（corpmail.toml 可能与库不一致，请人工检查）：{rb}");
+                // R14：回滚写盘失败时磁盘仍是第一次写入的新值（snapshot），
+                // 而内存已还原为 prev——三方不一致会让后续任何 set_batch
+                // 以旧镜像为基准再次写盘，静默冲掉用户看到的新值。
+                // 回滚失败无法恢复旧态，只能承认配置面已生效：把镜像改回
+                // 磁盘真实值，并明确告知调用方「配置已写入、库键失败」，
+                // 绝不留下「界面以为没改、重启却生效」的隐藏状态。
+                for (k, v) in &snapshot {
+                    cfg.insert(k.clone(), v.clone());
+                }
+                return Err(format!(
+                    "配置已写入但数据库写入失败且回滚失败（{e}；回滚：{rb}）。请检查 corpmail.toml 后重试"
+                ));
             }
             return Err(e);
         }
