@@ -477,3 +477,75 @@ fn p1124_save_manual_sanitizes_name() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 第十二轮 P1-1：contacts 非空（例如升级后先收到一封新邮件触发增量采集）
+/// 不得让历史回填永久跳过。
+#[test]
+fn p121_backfill_runs_even_with_existing_contacts() {
+    let (state, dir) = temp_state("p121-backfill-existing");
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs, created_at)
+                 VALUES ('in','inbox','received','old-boss@x.cn','老领导','demo@x.cn',1)",
+                [],
+            )
+            .unwrap();
+            save_manual(c, "manual@x.cn", "手动录入", 99).unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let mut conn = crate::db::open(&state.data_dir().join("corpmail.db")).unwrap();
+    backfill(&mut conn).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM contacts WHERE addr='old-boss@x.cn'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "已有联系人时历史邮件仍须回填");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 第十二轮 P1-1：回填中断后重启须从持久游标续跑，不重扫已完成批次。
+#[test]
+fn p121_backfill_resumes_from_persisted_cursor() {
+    let (state, dir) = temp_state("p121-backfill-resume");
+    state
+        .with_conn(|c| {
+            for (id, addr) in [(1, "first@x.cn"), (2, "second@x.cn"), (3, "third@x.cn")] {
+                c.execute(
+                    "INSERT INTO emails(id, direction, folder, status, from_addr, to_addrs, created_at)
+                     VALUES (?1,'in','inbox','received',?2,'',1)",
+                    rusqlite::params![id, addr],
+                )
+                .unwrap();
+            }
+            // 模拟上次跑到 id=1 后被强杀：游标已随该批提交
+            c.execute(
+                "INSERT INTO repair_marks(k,v) VALUES('contacts_backfill','1')",
+                [],
+            )
+            .unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    let mut conn = crate::db::open(&state.data_dir().join("corpmail.db")).unwrap();
+    backfill(&mut conn).unwrap();
+    for addr in ["second@x.cn", "third@x.cn"] {
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM contacts WHERE addr=?1", [addr], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "断点后的联系人 {addr} 须补齐");
+    }
+    let mark: String = conn
+        .query_row(
+            "SELECT v FROM repair_marks WHERE k='contacts_backfill'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mark, "3", "游标须推进到最大已处理 id");
+    let _ = std::fs::remove_dir_all(&dir);
+}

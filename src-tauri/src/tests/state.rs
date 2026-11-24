@@ -2691,3 +2691,23 @@ fn p81_set_batch_holds_config_lock_across_db_write_and_rollback() {
         "回滚不得改用独立取锁函数（会留并发覆盖窗口）"
     );
 }
+
+/// 第十二轮 P2-3：同一会话内两次迁移目标必须分别记录，启动逐个清扫，
+/// 旧实现的单文件覆盖写会让第一次的半成品目录永远残留。
+#[test]
+fn p125_two_migration_targets_are_both_cleaned() {
+    const SRC: &str = include_str!("../state.rs");
+    let at = SRC.find("fn record_migration_target(").expect("记录函数存在");
+    let end = SRC[at..].find("\n    }\n").map(|p| at + p).unwrap_or(SRC.len());
+    let body = &SRC[at..end];
+    assert!(
+        body.contains("format!(\"{MIGRATION_TARGET_FILE}."),
+        "目标记录须按路径 hash 分别落文件，不能覆盖写：{body}"
+    );
+    let at = SRC.find("fn cleanup_stale_migration_target(").expect("清扫函数存在");
+    let end = SRC[at..].find("\n    }\n").map(|p| at + p).unwrap_or(SRC.len());
+    assert!(
+        SRC[at..end].contains("for f in records"),
+        "清扫须遍历全部记录（含旧版无后缀文件）"
+    );
+}

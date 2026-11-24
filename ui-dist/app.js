@@ -1660,59 +1660,56 @@ function mbxAutosaveRequest(form, doc, htx, timeoutMs) {
                 handler: function (_elt, info) {
                     var xhr = info && info.xhr;
                     var ok = mbxAutosaveRespOk(xhr);
+                    var res = null;
                     if (ok) {
-                        var res = null;
                         try { res = JSON.parse(xhr.responseText); } catch (e) { res = null; }
-                        if (res && res.ok && res.draft_id > 0) {
-                            // 第十一轮 P2-6：服务端跳过的空/损坏附件必须让用户看见，
-                            // 否则 pickedPaths 清空后该附件静默消失。
-                            if (res.skipped > 0) {
-                                var ah = document.getElementById('autosave-hint');
-                                if (ah) ah.innerHTML = '<span class="autosave-err">'
-                                    + escapeHtml(String(res.skipped))
-                                    + ' 个空/损坏附件已跳过，请检查</span>';
-                            }
-                            var idEl = form.querySelector('input[name="draft_id"]');
-                            if (idEl && (!idEl.value || idEl.value === '0')) {
-                                idEl.value = String(res.draft_id);
-                            }
-                            // 复查五 P2-5：用服务端返回的完整附件 id 刷新 keep_ids，
-                            // 并清空已落库的待选文件——否则下一轮按旧列表裁剪会
-                            // 删掉刚入库的附件；源文件此时被移走则静默丢失。
-                            // 第十轮 P1-3：回填不能整体覆盖在途改动。用户在请求
-                            // 飞行中新增的待存附件 / 移除的已入库附件都要保留：
-                            // 只消费本次确实提交过的路径，只合并本次新入库的 id，
-                            // 并置 changed 让 finish 补发一次最终状态。
-                            if (Array.isArray(res.keep_ids)) {
-                                var parseList = function (s) {
-                                    try { var a = JSON.parse(s || '[]'); return Array.isArray(a) ? a : []; }
-                                    catch (e2) { return []; }
-                                };
-                                var submittedPaths = parseList(values.attach_paths);
-                                var submittedIds = parseList(values.keep_ids);
-                                var keepEl = form.querySelector('#keep-ids');
-                                var currentKeep = keepEl ? keepEl.value : values.keep_ids;
-                                var currentIds = parseList(currentKeep);
-                                var attachChanged =
-                                    JSON.stringify(pickedPaths.slice().sort()) !==
-                                    JSON.stringify(submittedPaths.slice().sort());
-                                var keepChanged =
-                                    JSON.stringify(currentIds) !== JSON.stringify(submittedIds);
-                                if (attachChanged || keepChanged) inflight.changed = true;
-                                // 保留在途新增；只移除本次已落库的路径
-                                pickedPaths = pickedPaths.filter(function (p) {
-                                    return submittedPaths.indexOf(p) < 0;
-                                });
-                                // 保留在途删除；只并入本次新入库的 id
-                                var merged = currentIds.concat(res.keep_ids.filter(function (aid) {
-                                    return submittedIds.indexOf(aid) < 0 && currentIds.indexOf(aid) < 0;
-                                }));
-                                if (keepEl) keepEl.value = JSON.stringify(merged);
-                                renderPicked(false);
-                            }
+                    }
+                    var skipped = 0;
+                    if (ok && res && res.ok && res.draft_id > 0) {
+                        // 第十二轮回归修复：不在 handler 里直接写 hint——trigger() 的
+                        // .then 会无条件写「已自动保存」覆盖掉提示。统一把 skipped
+                        // 交给 resolve 值，由消费端一处渲染（迁移 flush 路径同样受益）。
+                        skipped = Number(res.skipped) || 0;
+                        var idEl = form.querySelector('input[name="draft_id"]');
+                        if (idEl && (!idEl.value || idEl.value === '0')) {
+                            idEl.value = String(res.draft_id);
+                        }
+                        // 复查五 P2-5：用服务端返回的完整附件 id 刷新 keep_ids，
+                        // 并清空已落库的待选文件——否则下一轮按旧列表裁剪会
+                        // 删掉刚入库的附件；源文件此时被移走则静默丢失。
+                        // 第十轮 P1-3：回填不能整体覆盖在途改动。用户在请求
+                        // 飞行中新增的待存附件 / 移除的已入库附件都要保留：
+                        // 只消费本次确实提交过的路径，只合并本次新入库的 id，
+                        // 并置 changed 让 finish 补发一次最终状态。
+                        if (Array.isArray(res.keep_ids)) {
+                            var parseList = function (s) {
+                                try { var a = JSON.parse(s || '[]'); return Array.isArray(a) ? a : []; }
+                                catch (e2) { return []; }
+                            };
+                            var submittedPaths = parseList(values.attach_paths);
+                            var submittedIds = parseList(values.keep_ids);
+                            var keepEl = form.querySelector('#keep-ids');
+                            var currentKeep = keepEl ? keepEl.value : values.keep_ids;
+                            var currentIds = parseList(currentKeep);
+                            var attachChanged =
+                                JSON.stringify(pickedPaths.slice().sort()) !==
+                                JSON.stringify(submittedPaths.slice().sort());
+                            var keepChanged =
+                                JSON.stringify(currentIds) !== JSON.stringify(submittedIds);
+                            if (attachChanged || keepChanged) inflight.changed = true;
+                            // 保留在途新增；只移除本次已落库的路径
+                            pickedPaths = pickedPaths.filter(function (p) {
+                                return submittedPaths.indexOf(p) < 0;
+                            });
+                            // 保留在途删除；只并入本次新入库的 id
+                            var merged = currentIds.concat(res.keep_ids.filter(function (aid) {
+                                return submittedIds.indexOf(aid) < 0 && currentIds.indexOf(aid) < 0;
+                            }));
+                            if (keepEl) keepEl.value = JSON.stringify(merged);
+                            renderPicked(false);
                         }
                     }
-                    finish({ ok: ok, status: xhr ? xhr.status : 0 });
+                    finish({ ok: ok, status: xhr ? xhr.status : 0, skipped: skipped });
                 }
             });
             if (pending && typeof pending.catch === 'function') {
@@ -1774,6 +1771,15 @@ function mbxMigAfterFlush(flush, actions) {
             if (!r.ok) {
                 // 第十一轮 P1-2：失败必须可见——此前只 return，用户误以为在保存
                 hint.innerHTML = '<span class="autosave-err">自动保存失败，内容仍在编辑框，请手动存草稿</span>';
+                return;
+            }
+            // 第十二轮回归：skipped 提示由此处统一渲染。handler 内早先直接写
+            // hint 会被本 .then 的「已自动保存」覆盖，导致 R11 P2-6 在主路径
+            // （5s 防抖）100% 失效——空/损坏附件继续静默丢失。
+            if (r.skipped > 0) {
+                hint.innerHTML = '<span class="autosave-err">'
+                    + escapeHtml(String(r.skipped))
+                    + ' 个空/损坏附件已跳过，请检查</span>';
                 return;
             }
             hint.innerHTML = MBX_IC.check + ' 已自动保存 ' + escapeHtml(clock());

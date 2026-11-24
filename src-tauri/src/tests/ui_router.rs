@@ -11348,3 +11348,91 @@ fn p1125_settings_tabs_sync() {
         "tab 容器须用 replace 策略：后发请求中止在途，避免高亮与 pane 内容错位"
     );
 }
+
+/// 第十二轮 P2：与 autosave 同口径——手动「存草稿」携带未改动的旧定时滑入
+/// 60s 窗口时不得整单拒绝，否则最后一分钟正文编辑无法保存。
+#[test]
+fn p123_draft_save_accepts_unchanged_old_schedule_in_window() {
+    let (state, dir) = temp_state("p123-draft-near-window");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let near_str = mail::sched_local_value(mail::now_epoch() + 60);
+    let near = mail::sched_epoch_of(&near_str).unwrap();
+    assert!(near > mail::now_epoch() && near <= mail::now_epoch() + 60);
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "临近窗口草稿".into(),
+            body_text: "旧正文".into(),
+            in_reply_to: None,
+            scheduled_at: near,
+        },
+    )
+    .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "存草稿的新正文"),
+                ("scheduled_at", &near_str),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    assert_ne!(resp.status, 500, "未改动的旧定时不得拦下手动存草稿");
+    let (text, at): (String, i64) = state.with_conn(|c| {
+        c.query_row("SELECT body_text, scheduled_at FROM emails WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    });
+    assert_eq!(text, "存草稿的新正文", "最后一分钟编辑须落库");
+    assert_eq!(at, near, "旧定时保持不变");
+    cleanup(&dir);
+}
+
+/// 反向护栏：用户新设的近端定时仍须拒绝，不能借「旧定时例外」绕过 60s 门禁。
+#[test]
+fn p123_draft_save_still_rejects_new_near_schedule() {
+    let (state, dir) = temp_state("p123-draft-new-near");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let near_str = mail::sched_local_value(mail::now_epoch() + 30);
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "新设近端定时"),
+                ("scheduled_at", &near_str),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    // 新设近端时刻走 retry 回填，不得落库为定时草稿
+    let any_scheduled: i64 = state
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT COALESCE(MAX(scheduled_at),0) FROM emails WHERE folder='draft'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+    assert_eq!(any_scheduled, 0, "新设近端定时不得落库：status={}", resp.status);
+    cleanup(&dir);
+}

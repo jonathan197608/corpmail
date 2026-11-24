@@ -345,60 +345,57 @@ pub fn participants(
     (direct, visible)
 }
 
-/// 回填：contacts 为空且历史邮件存在时，从 emails 一次性提取。
+/// 历史联系人回填（v4 升级）：从 emails 提取收/发件人。
 ///
-/// 幂等：非空即跳过（首启执行一次；之后由收/发件增量采集维护）。
-/// 计数口径与增量一致：收件只计发件人、发件计 To/Cc/Bcc，单封去重、排除自己；
-/// 收件抄送名单仅入库不计数。
-pub fn backfill(conn: &mut Connection) -> rusqlite::Result<()> {
-    let count: i64 = conn.query_row("SELECT count(*) FROM contacts", [], |r| r.get(0))?;
-    if count > 0 {
-        return Ok(());
-    }
+/// 第十二轮 P1-1：旧实现以「contacts 表非空」作唯一幂等判据——升级后只要先
+/// 收到一封新邮件（增量采集已插入联系人），历史回填就永久跳过；回填中途崩溃
+/// 后重启也因表非空而不再续跑，通讯录永久残缺。改为复用 repair_chunked：
+/// 游标与每批数据同事务落 repair_marks，中断后下次启动从断点续跑；
+/// upsert/touch 本身幂等，重复扫不产生重复联系人。
+pub fn backfill(conn: &mut Connection) -> Result<(), String> {
     let self_l = self_addr_conn(conn);
-    // 审计 R52：分块读写（每批 500，独立事务）。首启大信箱时旧实现一次性把
-    // 全部邮件的收件人串读进内存再开一个大事务，启动既慢又占内存
-    let mut after = 0i64;
-    loop {
-        type BackfillRow = (i64, String, String, String, String, String, String, i64);
-        let rows: Vec<BackfillRow> = crate::db::collect_rows(
-            conn,
-            "SELECT id, direction, from_addr, COALESCE(from_name,''), to_addrs, \
-                 COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
-                 COALESCE(received_at, sent_at, created_at, 0) FROM emails \
-                 WHERE id > ?1 ORDER BY id LIMIT ?2",
-            &[&after, &crate::mail::REPAIR_CHUNK],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
-        )?;
-        let Some(last) = rows.last().map(|r| r.0) else {
-            break;
-        };
-        let tx = conn.transaction()?;
-        for (_, dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, at) in rows {
+    crate::mail::repair_chunked(
+        conn,
+        "contacts_backfill",
+        |conn, after| {
+            type BackfillRow = (i64, String, String, String, String, String, String, i64);
+            let rows: Vec<BackfillRow> = crate::db::collect_rows(
+                conn,
+                "SELECT id, direction, from_addr, COALESCE(from_name,''), to_addrs, \
+                     COALESCE(cc_addrs,''), COALESCE(bcc_addrs,''), \
+                     COALESCE(received_at, sent_at, created_at, 0) FROM emails \
+                     WHERE id > ?1 ORDER BY id LIMIT ?2",
+                &[&after, &crate::mail::REPAIR_CHUNK],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let scanned = rows.last().map(|r| r.0).unwrap_or(0);
+            Ok((rows, scanned))
+        },
+        |tx, (_, dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, at)| {
             let (direct, visible) = participants(
-                &dir, &from_addr, &from_name, &to_addrs, &cc_addrs, &bcc_addrs, &self_l,
+                dir, from_addr, from_name, to_addrs, cc_addrs, bcc_addrs, &self_l,
             );
             for (addr, name) in direct {
-                upsert_conn(&tx, &addr, &name, at)?;
+                upsert_conn(tx, &addr, &name, *at).map_err(|e| e.to_string())?;
             }
             for (addr, name) in visible {
-                touch_conn(&tx, &addr, &name, at)?;
+                touch_conn(tx, &addr, &name, *at).map_err(|e| e.to_string())?;
             }
-        }
-        tx.commit()?;
-        after = last;
-    }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 

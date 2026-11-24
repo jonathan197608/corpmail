@@ -1044,7 +1044,16 @@ impl AppState {
     /// 记录本次迁移目标（R16）。写失败只留痕——它只影响「强杀后能否自动清扫」，
     /// 不影响迁移本身
     fn record_migration_target(&self, dest: &Path) {
-        let f = self.anchor_dir.join(MIGRATION_TARGET_FILE);
+        // 第十二轮 P2-3：旧实现把目标单值覆盖写在同一文件里——若第一次迁移
+        // 中断且回滚失败、用户随即成功迁移到另一目录，第二个目标会覆盖第一个，
+        // 第一次的半成品目录永远无人清扫（可能 GB 级）。改为每目标独立记录：
+        // 路径 hash 做后缀，启动时逐个清扫。保留无后缀文件兼容旧版本记录。
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dest.hash(&mut h);
+        let f = self
+            .anchor_dir
+            .join(format!("{MIGRATION_TARGET_FILE}.{:016x}", h.finish()));
         if let Err(e) = std::fs::write(&f, dest.to_string_lossy().as_bytes()) {
             eprintln!("[state] 迁移目标记录写入失败（{}）：{e}", f.display());
         }
@@ -1058,12 +1067,30 @@ impl AppState {
     /// 三重保险，误删风险为零：① 只认自己写的目标记录；② 目录必须是当前数据目录
     /// 之外；③ 必须带 incomplete 中断标记（`recover` 见到 done 哨兵只清标记不删数据）。
     fn cleanup_stale_migration_target(&self) {
-        let f = self.anchor_dir.join(MIGRATION_TARGET_FILE);
-        let Ok(raw) = std::fs::read_to_string(&f) else {
+        // 兼容旧版单值记录 + 逐个处理本版追加式记录
+        let mut records: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.anchor_dir) {
+            for ent in rd.flatten() {
+                let name = ent.file_name();
+                let name = name.to_string_lossy();
+                if name == MIGRATION_TARGET_FILE
+                    || name.starts_with(&format!("{MIGRATION_TARGET_FILE}."))
+                {
+                    records.push(ent.path());
+                }
+            }
+        }
+        for f in records {
+            self.cleanup_one_migration_target(&f);
+        }
+    }
+
+    fn cleanup_one_migration_target(&self, f: &Path) {
+        let Ok(raw) = std::fs::read_to_string(f) else {
             return;
         };
         // 记录只用一次：无论能否清扫都先删，避免每次启动重复尝试
-        if let Err(e) = std::fs::remove_file(&f) {
+        if let Err(e) = std::fs::remove_file(f) {
             eprintln!("[state] 迁移目标记录清理失败（{}）：{e}", f.display());
         }
         let target = PathBuf::from(raw.trim());

@@ -117,3 +117,16 @@ fn normal_timeout_keeps_original_wording() {
     );
     std::thread::sleep(Duration::from_millis(250));
 }
+
+/// 第十二轮 P2：槽位被挂死线程占满时，文案必须告知需重启，
+/// 不能一律说「稍候再试」（用户重试无限次也不会恢复）。
+#[test]
+fn slot_exhaustion_hint_distinguishes_leaked_threads() {
+    assert_eq!(
+        slot_busy_message(3, 0),
+        "测试连接过于频繁（并发上限 3），请稍候再试"
+    );
+    let hint = slot_busy_message(3, 2);
+    assert!(hint.contains("重启应用"), "{hint}");
+    assert!(!hint.contains("稍候再试"), "挂死槽不能伪装成短暂限流：{hint}");
+}

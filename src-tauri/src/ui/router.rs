@@ -2665,8 +2665,11 @@ fn save_compose_form(
     // 因此 autosave 先回读库中当前定时一次，供三处共用。
     let now = mail::now_epoch();
     let sched_cleared = form.get("sched_cleared").map(|s| s == "1").unwrap_or(false);
+    // 第十二轮 P2：手动「存草稿」同样要识别「表单携带未改动的库中旧定时随时间
+    // 滑入 60s 窗口」——旧实现只在 preserve_sched（autosave）时回读，导致同一份
+    // 表单 autosave 成功、手动存草稿被拒且报「请重新选择」。
     let current_sched = match draft_id {
-        Some(id) if preserve_sched => state
+        Some(id) => state
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT scheduled_at FROM emails
@@ -2684,7 +2687,7 @@ fn save_compose_form(
     // 例外仅一处：autosave 携带的是**库中未改动的旧定时**，它随时间进入窗口，
     // 不是用户新意图；放行以保住正文编辑（复查五 P1-1）。
     if scheduled_at > 0 && scheduled_at <= now + 60 {
-        let unchanged_old = preserve_sched && scheduled_at > now && current_sched == Some(scheduled_at);
+        let unchanged_old = scheduled_at > now && current_sched == Some(scheduled_at);
         if !unchanged_old {
             return Err((
                 draft_id.unwrap_or(0),

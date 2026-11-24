@@ -6,7 +6,7 @@
 //! 防抖：前端按钮请求期禁用（§7），此处天然串行。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// 单通道测试结果
@@ -56,6 +56,20 @@ impl Drop for TestSlot {
     }
 }
 
+/// 超时被放弃的后台线程数（它们持有 TestSlot 直到自行终了）。
+/// 槽位耗尽时用它区分「真并发过多」（稍候可恢复）与「黑洞连接挂死」（只能重启），
+/// 避免第 12 轮审计指出的误导文案：旧提示一律说「稍候再试」，用户重试几十次
+/// 后仍锁死，只能盲猜要重启应用。
+static LEAKED_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+fn slot_busy_message(max: usize, leaked: usize) -> String {
+    if leaked > 0 {
+        format!("连接测试线程无响应（{leaked} 个未回收），请检查服务器地址与端口并重启应用后重试")
+    } else {
+        format!("测试连接过于频繁（并发上限 {max}），请稍候再试")
+    }
+}
+
 fn try_acquire(active: &AtomicUsize, max: usize) -> bool {
     active
         .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -73,9 +87,12 @@ fn with_timeout_limited(
     timeout: Duration,
 ) -> TestOutcome {
     if !try_acquire(&active, max) {
-        return TestOutcome::fail(0, format!("测试连接过于频繁（并发上限 {max}），请稍候再试"));
+        let leaked = LEAKED_SLOTS.load(Ordering::SeqCst);
+        return TestOutcome::fail(0, slot_busy_message(max, leaked));
     }
     let slot = TestSlot(active);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let thread_abandoned = Arc::clone(&abandoned);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // A7：后台闭包 panic 不能伪装成网络超时。旧实现 recv_timeout 的
@@ -101,17 +118,25 @@ fn with_timeout_limited(
         let _ = tx.send(outcome);
         // 显式释放：槽位生命周期与后台线程一致，而非与调用方一致
         drop(slot);
+        // 若调用方已因超时放弃，黑洞线程终于返回时把未回收计数还回去
+        if thread_abandoned.load(Ordering::SeqCst) {
+            LEAKED_SLOTS.fetch_sub(1, Ordering::SeqCst);
+        }
     });
     let started = Instant::now();
     match rx.recv_timeout(timeout) {
         Ok(outcome) => outcome,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => TestOutcome::fail(
-            started.elapsed().as_millis() as u64,
-            format!(
-                "连接超时（{} 秒无响应，请检查网络或服务器地址）",
-                timeout.as_secs()
-            ),
-        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            LEAKED_SLOTS.fetch_add(1, Ordering::SeqCst);
+            TestOutcome::fail(
+                started.elapsed().as_millis() as u64,
+                format!(
+                    "连接超时（{} 秒无响应，请检查网络或服务器地址）",
+                    timeout.as_secs()
+                ),
+            )
+        }
         // 后台线程未及 send 即终止（超出 catch_unwind 覆盖面的意外退出）：
         // 仍不得伪装成超时，报异常终止 + stderr 留痕（A7）
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
