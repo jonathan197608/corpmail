@@ -111,8 +111,12 @@ export const config = {
     )
   },
 
-  onComplete: function () {
-    import('./support/mock.mjs').then(({ stopMock }) => stopMock())
+  onComplete: async function () {
+    // 旧实现用 import().then() 且 onComplete 同步返回：wdio 不等 Promise，
+    // 动态 import 回调大概率在主进程退出前从未执行，mock python 进程持续
+    // 累积（每次 run.sh 三阶段各一次）。await 让清理真正落地。
+    const { stopMock } = await import('./support/mock.mjs')
+    stopMock()
     console.log(`\n[E2E] 截图与日志：${RUN_DIR}\n`)
   },
 }

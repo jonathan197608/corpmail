@@ -168,11 +168,14 @@ pub fn suggested_filename(subject: &str, id: i64) -> String {
         })
         .collect();
     let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
+    let named = if cleaned.is_empty() {
         format!("corpmail-{id}.eml")
     } else {
         format!("{cleaned}.eml")
-    }
+    };
+    // 主题来自邮件头（外部可控）：Windows 保留设备名（CON.eml 等）会让保存
+    // 对话框给非法建议名，另存无法完成；与附件落盘共用同一净化口径。
+    super::os_safe_name(&named, cfg!(windows))
 }
 
 /// 正文部分（有 HTML → multipart/alternative 双版本；否则纯文本）

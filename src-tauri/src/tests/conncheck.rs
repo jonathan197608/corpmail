@@ -130,3 +130,27 @@ fn slot_exhaustion_hint_distinguishes_leaked_threads() {
     assert!(hint.contains("重启应用"), "{hint}");
     assert!(!hint.contains("稍候再试"), "挂死槽不能伪装成短暂限流：{hint}");
 }
+
+/// 第十三轮 P2：超时认领与线程回收必须靠同一令牌的 swap 配对。
+/// 旧实现 store+add / load+sub 两步分离，交错后要么永久过计数，
+/// 要么 usize 下溢显示天文数字并误导用户重启应用。
+#[test]
+fn leaked_slot_claim_is_pairwise_under_both_orders() {
+    // 调用方先超时认领 → +1；线程后回收 → -1
+    let settled = AtomicBool::new(false);
+    let leaked = AtomicUsize::new(0);
+    claim_leaked_slot(&settled, &leaked, false);
+    assert_eq!(leaked.load(Ordering::SeqCst), 1);
+    claim_leaked_slot(&settled, &leaked, true);
+    assert_eq!(leaked.load(Ordering::SeqCst), 0);
+    // 线程先结束 → 不记账；调用方随后超时 → 也不记账（槽已释放）
+    let settled = AtomicBool::new(false);
+    let leaked = AtomicUsize::new(0);
+    claim_leaked_slot(&settled, &leaked, true);
+    assert_eq!(leaked.load(Ordering::SeqCst), 0);
+    claim_leaked_slot(&settled, &leaked, false);
+    assert_eq!(leaked.load(Ordering::SeqCst), 0);
+    // 重复回收不得下溢
+    claim_leaked_slot(&settled, &leaked, true);
+    assert_eq!(leaked.load(Ordering::SeqCst), 0);
+}

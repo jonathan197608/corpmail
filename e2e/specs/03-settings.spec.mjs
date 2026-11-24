@@ -1,5 +1,5 @@
 import { browser, $, $$, expect } from '@wdio/globals'
-import { goto, shot, waitBoot, openSplit, waitPaneVisible, waitMailRows } from '../support/helpers.mjs'
+import { goto, shot, waitBoot, openSplit, waitPaneVisible, waitMailRows, waitText } from '../support/helpers.mjs'
 
 // 03：设置页签 + 收件状态条 + 连接测试（E1–E5 / F1）
 // 数据目录迁移（A6）已移到 95-migration：迁移成功会冻结整个进程的写入（R2），
@@ -141,8 +141,21 @@ describe('03 设置与收件状态', () => {
 
   it('T2 设置表单固定宽度：六个 pane 同宽；.sfield 页标签/控件各对齐同线', async () => {
     const widths = []
+    const tabLabels = {
+      send: '发信', receive: '收信', sync: '收件同步',
+      storage: '存储管理', templates: '模板', about: '关于',
+    }
     for (const tab of ['send', 'receive', 'sync', 'storage', 'templates', 'about']) {
       await goto(`/settings/${tab}`)
+      // stale-DOM 守卫：ui:// 首帧可能仍是上一页的 #settings-pane，单靠
+      // waitForExist + waitPaneVisible 会在旧 pane 上度量 6 次，同宽断言恒真。
+      await browser.waitUntil(
+        async () => {
+          const on = await $('.settings-tabs .stab.on')
+          return (await on.isExisting()) && (await on.getText()) === tabLabels[tab]
+        },
+        { timeout: 20000, timeoutMsg: `设置 tab「${tab}」未激活（旧 DOM 残留）` },
+      )
       await $('#settings-pane').waitForExist({ timeout: 20000 })
       await waitPaneVisible()
       widths.push(

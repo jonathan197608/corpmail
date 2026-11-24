@@ -11436,3 +11436,26 @@ fn p123_draft_save_still_rejects_new_near_schedule() {
     assert_eq!(any_scheduled, 0, "新设近端定时不得落库：status={}", resp.status);
     cleanup(&dir);
 }
+
+/// 第十三轮 P2：高级筛选 from 的 Rust/SQLite 大小写折叠必须同口径——
+/// SQLite 内建 lower() 只折 ASCII，输入「müller」查不到「MÜLLER@example.com」。
+#[test]
+fn r131_unicode_casefold_from_filter() {
+    let (state, dir) = temp_state("r131-unicode-from");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state.with_conn(|c| {
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs, \
+                                subject, body_text, subject_tokens, body_tokens, created_at)\
+             VALUES ('in','inbox','received','MÜLLER@example.com','MÜLLER','','主题','正文','主题','正文',1)",
+            [],
+        ).unwrap();
+    });
+    let (rows, total) = mail::list(&state, &mail::ListQuery {
+        folder: "inbox".into(), page: 1, per: 10, sort: mail::SortKey::DateDesc,
+        unread_only: false, external_only: false, internal_domain: "chinatelecom.cn".into(),
+        from_filter: "müller".into(), date_from: 0, date_to: 0, has_attach: false,
+    }).unwrap();
+    assert_eq!(total, 1, "Unicode 小写折叠须命中非 ASCII 姓名（rows={}）", rows.len());
+    cleanup(&dir);
+}

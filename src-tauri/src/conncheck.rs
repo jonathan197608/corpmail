@@ -62,6 +62,22 @@ impl Drop for TestSlot {
 /// 后仍锁死，只能盲猜要重启应用。
 static LEAKED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 
+/// 超时放弃与线程回收对同一令牌做一次 swap：谁 swap 出 false 谁负责记账。
+/// 旧实现用「先 store(true) 再 fetch_add」/「先 load 再 fetch_sub」两次独立
+/// 原子操作，交错后要么永久过计数（线程先 load 到 false、调用方后 +1），
+/// 要么短暂下溢（调用方 store 后线程先 -1，usize 回绕成天文数字）。
+/// 语义：调用方超时且先认领 → +1（确实有挂死线程占槽）；后台线程后认领
+/// → -1（终于回收）。若后台线程先认领，说明它已正常结束，调用方不再记账。
+fn claim_leaked_slot(settled: &AtomicBool, leaked: &AtomicUsize, from_thread: bool) {
+    if settled.swap(true, Ordering::SeqCst) {
+        if from_thread {
+            let _ = leaked.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        }
+    } else if !from_thread {
+        leaked.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn slot_busy_message(max: usize, leaked: usize) -> String {
     if leaked > 0 {
         format!("连接测试线程无响应（{leaked} 个未回收），请检查服务器地址与端口并重启应用后重试")
@@ -91,8 +107,8 @@ fn with_timeout_limited(
         return TestOutcome::fail(0, slot_busy_message(max, leaked));
     }
     let slot = TestSlot(active);
-    let abandoned = Arc::new(AtomicBool::new(false));
-    let thread_abandoned = Arc::clone(&abandoned);
+    let settled = Arc::new(AtomicBool::new(false));
+    let thread_settled = Arc::clone(&settled);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // A7：后台闭包 panic 不能伪装成网络超时。旧实现 recv_timeout 的
@@ -119,16 +135,13 @@ fn with_timeout_limited(
         // 显式释放：槽位生命周期与后台线程一致，而非与调用方一致
         drop(slot);
         // 若调用方已因超时放弃，黑洞线程终于返回时把未回收计数还回去
-        if thread_abandoned.load(Ordering::SeqCst) {
-            LEAKED_SLOTS.fetch_sub(1, Ordering::SeqCst);
-        }
+        claim_leaked_slot(&thread_settled, &LEAKED_SLOTS, true);
     });
     let started = Instant::now();
     match rx.recv_timeout(timeout) {
         Ok(outcome) => outcome,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            abandoned.store(true, Ordering::SeqCst);
-            LEAKED_SLOTS.fetch_add(1, Ordering::SeqCst);
+            claim_leaked_slot(&settled, &LEAKED_SLOTS, false);
             TestOutcome::fail(
                 started.elapsed().as_millis() as u64,
                 format!(

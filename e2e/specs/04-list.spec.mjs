@@ -181,11 +181,12 @@ describe('04 列表筛选与批量操作', () => {
 
     await goto('/')
     await waitBoot()
-    await browser.waitUntil(
-      async () => (await $('.side .unread-chip').isExisting()) ||
-        (await $('#fetch-status').getText()).includes('0 封新'),
-      { timeoutMsg: '侧栏未读角标未出现（收件箱应有未读）' },
-    )
+    // 旧实现的 `#fetch-status` 含「0 封新」兜底与角标无关，wait 恒真且
+    // 后续只有截图无断言——角标渲染回归永远绿。改为只等角标本身，并断数值。
+    const chip = await $('.side .unread-chip')
+    await chip.waitForExist({ timeout: 20000 })
+    const chipText = await chip.getText()
+    expect(Number(chipText.trim())).toBeGreaterThan(0)
     await shot('侧栏-未读角标')
   })
 

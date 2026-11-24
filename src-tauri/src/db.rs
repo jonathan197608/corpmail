@@ -25,6 +25,14 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // 是显式固化该行为——防将来依赖环境差异。本应用无长读事务
     // （所有 with_conn 闭包均为短查询），autocheckpoint 不会被持续推迟
     conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    // SQLite 内建 lower() 只折 ASCII：Rust 侧 `to_lowercase()` 把「MÜLLER」
+    // 折成「müller」，而 lower('MÜLLER@x.cn') 仍是「mÜller@x.cn」，instr
+    // 永不为真——非 ASCII 姓名的高级筛选静默 0 命中。两侧统一用 Unicode 折叠。
+    conn.create_scalar_function("unicode_lower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8
+        | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let s = ctx.get::<String>(0)?;
+        Ok(s.to_lowercase())
+    })?;
     migrate(&mut conn)?;
     Ok(conn)
 }

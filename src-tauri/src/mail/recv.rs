@@ -778,8 +778,8 @@ fn header_fields(part: &mailparse::ParsedMail) -> HeaderFields {
             .to_string()
     };
     // From/To：addrparse 解析出地址与显示名
-    let (from_addr, from_name) = headers
-        .get_first_header("From")
+    let from_header = headers.get_first_header("From");
+    let (from_addr, from_name) = from_header
         .and_then(|h| mailparse::addrparse_header(h).ok())
         .and_then(|list| {
             list.extract_single_info().map(|i| {
@@ -790,6 +790,16 @@ fn header_fields(part: &mailparse::ParsedMail) -> HeaderFields {
             })
         })
         .unwrap_or_default();
+    // 显示名兜底：addrparse 对未编码 GBK 显示名退 Latin-1；主题路径已有的
+    // GB18030 重解码同样适用于 From 头（仅在疑似 mojibake 且解出 CJK 时采纳）。
+    let from_name = if looks_mojibake(&from_name) && !from_name.chars().any(is_cjk) {
+        from_header
+            .map(decode_header_value)
+            .filter(|v| v != &from_name)
+            .unwrap_or(from_name)
+    } else {
+        from_name
+    };
     // To/Cc：addrparse 展开组地址，取纯地址逗号拼接（联系人采集与展示共用）
     let addr_list = |key: &str| -> String {
         headers
@@ -832,6 +842,13 @@ fn decode_subject(headers: &mailparse::headers::Headers<'_>) -> String {
     let Some(h) = headers.get_first_header("Subject") else {
         return String::new();
     };
+    decode_header_value(h)
+}
+
+/// RFC2047/未编码 GBK 头的统一解码兜底（主题与 From 显示名共用）。
+/// 显示名旧实现直接取 `i.display_name`（addrparse 对原始 GBK 字节退 Latin-1），
+/// 污染联系人采集与列表展示；主题有兜底而显示名没有，属同构遗漏。
+fn decode_header_value(h: &mailparse::MailHeader<'_>) -> String {
     let value = h.get_value().trim().to_string();
     // Latin-1 兜底迹象：出口出现 U+0080..U+00FF（原始字节非 UTF-8）
     if !value.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')) {
@@ -1125,7 +1142,26 @@ fn fix_gbk_fallback(part: &mailparse::ParsedMail, decoded: &str) -> String {
 /// ② mojibake（UTF-8 被误标 latin1/1252，字符落 U+0080-00FF 区）；
 /// ③ 未声明/错声明的 GBK 字节兜底重解码。
 fn body_text_repaired(part: &mailparse::ParsedMail) -> String {
-    let decoded = part.get_body().unwrap_or_default();
+    let decoded = match part.get_body() {
+        Ok(s) => s,
+        Err(_) => {
+            // 传输编码损坏（截断 base64 / 非法 QP）时 mailparse 的 get_body 与
+            // get_body_raw 共用解码器、双双失败；旧实现 `unwrap_or_default()`
+            // 把正文静默变空串，游标已推进且重拉也不会变。用未解传输编码的
+            // 原始字节 lossy 保留，至少让用户看到内容并意识到异常。
+            eprintln!("[recv] 正文传输编码解码失败，保留原始字节");
+            let raw = match part.get_body_encoded() {
+                mailparse::body::Body::Base64(b) | mailparse::body::Body::QuotedPrintable(b) => {
+                    b.get_raw().to_vec()
+                }
+                mailparse::body::Body::SevenBit(b) | mailparse::body::Body::EightBit(b) => {
+                    b.get_raw().to_vec()
+                }
+                mailparse::body::Body::Binary(b) => b.get_raw().to_vec(),
+            };
+            return String::from_utf8_lossy(&raw).into_owned();
+        }
+    };
     if let Ok(raw) = part.get_body_raw()
         && let Ok(s) = std::str::from_utf8(&raw)
         && s.chars().any(|c| (c as u32) >= 0x80)
@@ -1177,6 +1213,63 @@ fn find_inline_part<'a>(
     None
 }
 
+/// RFC 2231 扩展参数的百分号解码（`charset'lang'pct-encoded`）。
+/// mailparse 的 `params` 在普通 `filename` 已存在时会**跳过** `filename*`
+/// 解码（lib.rs:1107 `filter(|k| !map.contains_key(k))`），而本项目 EML 导出、
+/// Gmail/Outlook 都采用「ASCII 回退名 + filename* 中文名」双写——收件侧因此
+/// 永远读到下划线占位名。这里从原始头自行解出扩展参数并优先采用。
+fn decode_ext_param(raw_header: &[u8], key: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(raw_header);
+    let lower = text.to_ascii_lowercase();
+    let needle = format!("{key}*=");
+    let at = lower.find(&needle)?;
+    let rest = text[at + needle.len()..].trim_start();
+    // 值到下一个分号为止；部分客户端给扩展参数加引号，容错去引号
+    let value = rest
+        .split([';', '\r', '\n'])
+        .next()?
+        .trim()
+        .trim_matches('"');
+    let mut seg = value.splitn(3, '\'');
+    let charset = seg.next()?.trim();
+    let _lang = seg.next()?;
+    let encoded = seg.next()?;
+    if charset.is_empty() || encoded.is_empty() {
+        return None;
+    }
+    let bytes = percent_decode(encoded.as_bytes());
+    let enc = encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    let (cow, _, _) = enc.decode(&bytes);
+    let name = cow.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%'
+            && i + 2 < input.len()
+            && let (Some(hi), Some(lo)) = (hex(input[i + 1]), hex(input[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
 /// 附件收集（§6.1：Content-Disposition attachment 或带 filename 的 part）
 fn collect_attachments(mail: &mailparse::ParsedMail) -> Vec<IncomingAttach> {
     let mut out = Vec::new();
@@ -1192,19 +1285,44 @@ fn walk_attachments(mail: &mailparse::ParsedMail, out: &mut Vec<IncomingAttach>)
     // 正文与文件都拿不到，整封只剩一个空壳（审计 P1-19）。
     let leaf = mail.subparts.is_empty();
     if cd.disposition == mailparse::DispositionType::Attachment || (named && leaf) {
-        let filename = cd
-            .params
-            .get("filename")
-            .or_else(|| mail.ctype.params.get("name"))
-            .cloned()
+        // 优先取 RFC 2231 扩展参数（中文名），回退 mailparse 已解码的普通参数。
+        // 双写形态下 mailparse 会丢掉 filename*，导致中文名永久变 ASCII 占位。
+        use mailparse::MailHeaderMap;
+        let headers = mail.get_headers();
+        let header_raw = |key: &str| -> &[u8] {
+            headers
+                .get_first_header(key)
+                .map(|h| h.get_value_raw())
+                .unwrap_or_default()
+        };
+        let filename = decode_ext_param(header_raw("Content-Disposition"), "filename")
+            .or_else(|| decode_ext_param(header_raw("Content-Type"), "name"))
+            .or_else(|| cd.params.get("filename").cloned())
+            .or_else(|| mail.ctype.params.get("name").cloned())
             .unwrap_or_else(|| "attachment".into());
-        if let Ok(data) = mail.get_body_raw() {
-            out.push(IncomingAttach {
-                filename,
-                mime: mail.ctype.mimetype.clone(),
-                data,
-            });
-        }
+        let data = match mail.get_body_raw() {
+            Ok(d) => d,
+            Err(_) => {
+                // 附件传输编码损坏时旧实现 `if let Ok` 直接跳过，用户完全
+                // 看不到「曾有附件」，EML 导出/另存/转发也一并漏掉。用未解
+                // 编码的原始字节占位，保证附件行存在且用户可见。
+                eprintln!("[recv] 附件 {filename} 传输编码解码失败，保留原始字节");
+                match mail.get_body_encoded() {
+                    mailparse::body::Body::Base64(b) | mailparse::body::Body::QuotedPrintable(b) => {
+                        b.get_raw().to_vec()
+                    }
+                    mailparse::body::Body::SevenBit(b) | mailparse::body::Body::EightBit(b) => {
+                        b.get_raw().to_vec()
+                    }
+                    mailparse::body::Body::Binary(b) => b.get_raw().to_vec(),
+                }
+            }
+        };
+        out.push(IncomingAttach {
+            filename,
+            mime: mail.ctype.mimetype.clone(),
+            data,
+        });
         return; // 附件 part 不再递归
     }
     for sub in &mail.subparts {

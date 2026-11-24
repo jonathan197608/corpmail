@@ -2257,3 +2257,38 @@ fn p103_standard_json_xml_mime_previews_as_text() {
     assert_eq!(preview_kind_of("application/ld+json", "data.jsonld"), "text");
     assert_eq!(preview_kind_of("text/html", "x.html"), "", "HTML 仍不可内嵌");
 }
+
+/// 第十三轮 P1-1：Windows canonicalize 返回 `\\?\d:\...`，盘符白名单必须
+/// 同时收 verbatim 与裸形态，否则「目录存在就拒绝、不存在就放行」。
+#[test]
+fn r131_windows_roots_cover_verbatim_drive_prefix() {
+    use std::ffi::OsString;
+    let roots = windows_roots(&|k| match k {
+        "USERPROFILE" => Some(OsString::from(r"C:\Users\e2e")),
+        "SystemRoot" => Some(OsString::from(r"C:\Windows")),
+        _ => None,
+    });
+    assert!(roots.iter().any(|r| r == r"d:"), "裸盘符根须保留：{roots:?}");
+    assert!(
+        roots.iter().any(|r| r == r"\\?\d:"),
+        "canonicalize 的 verbatim 盘符根须收录：{roots:?}"
+    );
+    // 两种形态都要能判进白名单
+    assert!(allowed(r"\\?\d:\out\report.csv", &roots, '\\'));
+    assert!(allowed(r"d:\out\new\report.csv", &roots, '\\'));
+}
+
+/// 第十三轮 P1-2：Windows 保留设备名（CON/PRN/NUL/COM1/LPT9）不得作另存名。
+#[test]
+fn r132_windows_reserved_device_names_are_sanitized() {
+    for name in ["CON.txt", "nul.pdf", "Com1.csv", "LPT9.xlsx", "AUX", "prn.log"] {
+        let fixed = os_safe_name(name, true);
+        assert_ne!(&fixed, name, "保留设备名须改写：{name}");
+        let base = fixed.split('.').next().unwrap_or("").to_ascii_uppercase();
+        assert!(!matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT9"),
+            "改写后仍保留：{name} → {fixed}");
+    }
+    // 正常文件名不受影响
+    assert_eq!(os_safe_name("报告.pdf", true), "报告.pdf");
+    assert_eq!(os_safe_name("CONFERENCE.txt", true), "CONFERENCE.txt");
+}

@@ -1601,8 +1601,8 @@ fn list_filter_sql(q: &ListQuery, alias: &str) -> (String, String) {
     // 高级检索（B1）：同样用"常量参数恒在"的写法——SQL 结构固定，绑定参数
     // 恒为 4 个；未启用时 :fromf='' / :dfrom=0 / :dto=0 / :attf=0 短路
     let adv_sql = format!(
-        " AND (:fromf = '' OR instr(lower({a}from_addr), :fromf) > 0
-                        OR instr(lower({a}from_name), :fromf) > 0)
+        " AND (:fromf = '' OR instr(unicode_lower({a}from_addr), :fromf) > 0
+                        OR instr(unicode_lower({a}from_name), :fromf) > 0)
           AND (:dfrom = 0 OR COALESCE({a}received_at, {a}sent_at, {a}created_at) >= :dfrom)
           AND (:dto = 0 OR COALESCE({a}received_at, {a}sent_at, {a}created_at) <= :dto)
           AND (:attf = 0 OR {a}attach_cnt > 0)"
@@ -2386,7 +2386,20 @@ fn os_safe_name(name: &str, windows: bool) -> String {
         .collect();
     let trimmed = mapped.trim_end_matches([' ', '.']);
     if trimmed.trim().is_empty() {
-        "attachment".to_string()
+        return "attachment".to_string();
+    }
+    // Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）不能作文件名，
+    // 即使带扩展名也会被 OS 拒绝。外部可控的 MIME filename 可能恰为 CON.txt，
+    // 「全部另存」会静默跳过；在基名后加下划线消除保留性。
+    let base = trimmed.split('.').next().unwrap_or("");
+    let base_upper = base.to_ascii_uppercase();
+    let reserved = matches!(base_upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base_upper.len() == 4
+            && (base_upper.starts_with("COM") || base_upper.starts_with("LPT"))
+            && base_upper.as_bytes()[3].is_ascii_digit()
+            && base_upper.as_bytes()[3] != b'0');
+    if reserved {
+        format!("{base}_{}", &trimmed[base.len()..])
     } else {
         trimmed.to_string()
     }
@@ -3422,10 +3435,15 @@ fn windows_roots(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<String
         .unwrap_or('C');
     for letter in 'A'..='Z' {
         if letter != system_drive {
-            // 盘符根收 "d:"（不带尾分隔符）——path_within_sep 匹配时自拼分隔符，
-            // 根里预置会造成 "d:\\" 双分隔符永不匹配
+            // 盘符根收两种形态：
+            // - "d:"：comparable_path 在目标父目录不存在时走 cut==0 分支，
+            //   返回未 canonicalize 的 `d:\out\new\x.txt`（无 verbatim 前缀）
+            // - "\\?\d:"：父目录已存在时 canonicalize 成功，Windows 返回
+            //   `\\?\d:\out\x.txt`（A14 只测了裸形态，生产必失败）
+            // 两种都要收，否则同一 D 盘「目录存在就拒绝、不存在就放行」。
             let low = letter.to_ascii_lowercase();
             roots.push(format!("{low}:"));
+            roots.push(format!(r"\\?\{low}:"));
         }
     }
     roots

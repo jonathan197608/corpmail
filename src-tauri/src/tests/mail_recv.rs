@@ -1251,3 +1251,32 @@ fn p101_incoming_commit_failure_cleans_written_attachments() {
         "收件 commit 失败路径也必须清理 written 附件"
     );
 }
+
+/// 第十三轮 P1-4：EML 导出/Gmail 的双写形态 `filename="____.txt";
+/// filename*=UTF-8''%E6%98%8E%E7%BB%86.txt` 必须还原中文名。
+#[test]
+fn r134_rfc2231_filename_star_wins_over_ascii_fallback() {
+    let raw = b"From: a@x.cn\r\nSubject: s\r\nContent-Type: application/octet-stream\r\n\
+                Content-Disposition: attachment; filename=\"____.txt\"; \
+                filename*=UTF-8''%E6%98%8E%E7%BB%86.txt\r\n\r\nDATA";
+    let mail = parse_incoming(1, 1, false, Some(1), raw).unwrap();
+    assert_eq!(mail.attachments.len(), 1);
+    assert_eq!(mail.attachments[0].filename, "明细.txt", "双写须优先扩展参数");
+}
+
+/// 第十三轮 P1-2/P1-3：传输编码损坏时正文/附件不得静默消失。
+#[test]
+fn r132_broken_transfer_encoding_keeps_body_and_attachment() {
+    let raw = b"From: a@x.cn\r\nSubject: s\r\n\
+                Content-Type: multipart/mixed; boundary=BOUND\r\n\r\n\
+                --BOUND\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                Content-Transfer-Encoding: base64\r\n\r\n5Lya6K6uQQ\r\n\
+                --BOUND\r\nContent-Type: application/octet-stream\r\n\
+                Content-Disposition: attachment; filename=\"bad.bin\"\r\n\
+                Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQKh!!!\r\n\
+                --BOUND--\r\n";
+    let mail = parse_incoming(1, 2, false, Some(1), raw).unwrap();
+    assert!(!mail.body_text.is_empty(), "损坏 base64 正文不得变空串");
+    assert_eq!(mail.attachments.len(), 1, "损坏 base64 附件不得静默丢弃");
+    assert_eq!(mail.attachments[0].filename, "bad.bin");
+}
