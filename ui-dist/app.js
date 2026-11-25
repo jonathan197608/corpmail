@@ -2158,13 +2158,17 @@ function mbxSnapshotForm(form) {
     // 当前筛选的检索态：检索场景禁用跨页全选（前后端口径一致）。
     // 第十一轮 P2-3：后端 has_search 涵盖 q/from/df/dt/att，前端此前只判 ba-q，
     // 导致高级筛选下仍显示可点入口、点了却被后端拒绝（并触发批量错误）。
-    function isSearch() {
-        return (val('ba-q') || '').trim() !== ''
-            || (val('ba-from') || '').trim() !== ''
-            || (val('ba-df') || '').trim() !== ''
-            || (val('ba-dt') || '').trim() !== ''
-            || val('ba-att') === '1';
+    // R18：抽成纯函数供 vm 真值表测试；旧静态 contains 护栏把 !== 改成 === 仍全绿。
+    // --- R18 isSearch core START ---
+    function mbxBatchIsSearch(get) {
+        return (get('ba-q') || '').trim() !== ''
+            || (get('ba-from') || '').trim() !== ''
+            || (get('ba-df') || '').trim() !== ''
+            || (get('ba-dt') || '').trim() !== ''
+            || get('ba-att') === '1';
     }
+    // --- R18 isSearch core END ---
+    function isSearch() { return mbxBatchIsSearch(val); }
 
     function bar() { return document.getElementById('batch-bar'); }
     function items() {

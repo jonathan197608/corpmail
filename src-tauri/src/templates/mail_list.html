@@ -81,7 +81,12 @@
             <input type="hidden" name="folder" value="{{ folder }}">
             {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
             {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
-                        {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+            {# R18 P1：改每页/排序同样不能丢高级筛选，否则命中集静默扩成全量 #}
+            {% if from_filter %}<input type="hidden" name="from" value="{{ from_filter }}">{% endif %}
+            {% if df %}<input type="hidden" name="df" value="{{ df }}">{% endif %}
+            {% if dt %}<input type="hidden" name="dt" value="{{ dt }}">{% endif %}
+            {% if has_attach %}<input type="hidden" name="att" value="1">{% endif %}
+            {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
             <label class="per-page" title="每页显示条数">
                 <select class="per-select" name="per" aria-label="每页显示条数" data-mbx-action="submit-form">
                     <option value="10" {% if per == 10 %}selected{% endif %}>每页 10 封</option>
@@ -120,6 +125,10 @@
                :attf 附件条件），搜索框丢 att 会让"只看有附件"子集在搜索后
                静默扩成全量，与 unread/external 口径不一致 #}
             {% if has_attach %}<input type="hidden" name="att" value="1">{% endif %}
+            {# R18 P1：from/df/dt 与 att 同口径——搜索提交后必须仍在同一筛选子集内 #}
+            {% if from_filter %}<input type="hidden" name="from" value="{{ from_filter }}">{% endif %}
+            {% if df %}<input type="hidden" name="df" value="{{ df }}">{% endif %}
+            {% if dt %}<input type="hidden" name="dt" value="{{ dt }}">{% endif %}
             {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
             {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         </form>

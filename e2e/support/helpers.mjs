@@ -152,9 +152,37 @@ export async function htmxAjax(method, url, values, target = '#toast') {
  * @param target 选择器，或已定位的元素（详情页有多个 ⋯ 时用后者取最后一个）
  */
 export async function openSplit(target) {
-  let toggle = typeof target === 'string' ? await $(target) : target
-  // 允许传 .split 容器：委托按 ev.target.closest('[data-split-toggle]') 判定，
-  // 事件必须落在按钮上——打在容器上会被当成「点击外部」而收起菜单
+  if (typeof target === 'string') {
+    // R18：列表会被后台收取/置顶刷新整片换入。旧实现先 `$(target)` 拿
+    // WebdriverIO 元素，再跨多次 execute 复用；刷新一来就 stale element。
+    // 选择器路径改成每次在页面内重新 querySelector，全程不持有旧引用。
+    for (let i = 0; i < 5; i += 1) {
+      const state = await browser.execute((sel) => {
+        let el = document.querySelector(sel)
+        if (!el) return 'missing'
+        // 允许传 .split 容器：委托按 closest('[data-split-toggle]') 判定，
+        // 事件必须落在按钮上——打在容器上会被当成「点击外部」而收起菜单
+        if (!el.matches('[data-split-toggle]')) {
+          el = el.querySelector('[data-split-toggle]')
+        }
+        if (!el) return 'missing'
+        const split = el.closest('.split')
+        const menu = split && split.querySelector('.split-menu')
+        if (menu && !menu.hidden) return 'open'
+        // dispatchEvent 而非 el.click()/wdio click：实测详情页 ⋯ 上后两者
+        // 不触发 app.js 的 document 委托（2026-11-09 探针）
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+        return 'clicked'
+      }, target)
+      if (state === 'open') return
+      await browser.pause(150)
+    }
+    throw new Error(`下拉菜单未展开：${target}`)
+  }
+
+  // 详情页可能同时有多个 ⋯，调用方传已定位元素；该页无列表片段刷新，
+  // 仍沿用元素路径（toggle 分支 hidden 取反，重试点到「展开」为止）。
+  let toggle = target
   const isToggle = await browser.execute(
     (el) => !!el.matches?.('[data-split-toggle]'),
     toggle,
@@ -167,10 +195,6 @@ export async function openSplit(target) {
       return !!menu && !menu.hidden
     }, toggle)
   if (await isOpen()) return
-  // 用 dispatchEvent(MouseEvent) 而不是 el.click()/wdio click：
-  // 实测详情页 ⋯ 按钮上两者都不触发 app.js 的 document 委托（菜单不展开），
-  // 而合成 MouseEvent 能正常冒泡到委托（2026-11-09 探针：before true →
-  // after false）。toggle 分支是 hidden 取反，重试点到「展开」为止。
   for (let i = 0; i < 3; i += 1) {
     await browser.execute((el) => {
       el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
@@ -178,9 +202,7 @@ export async function openSplit(target) {
     if (await isOpen()) return
     await browser.pause(150)
   }
-  throw new Error(
-    `下拉菜单未展开：${typeof target === 'string' ? target : '(element)'}`,
-  )
+  throw new Error('下拉菜单未展开：(element)')
 }
 
 /** 按可见文本点元素（菜单项没有稳定 class 时用；.tb-item/.split-menu a） */

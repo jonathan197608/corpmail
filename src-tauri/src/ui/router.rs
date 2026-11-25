@@ -2987,13 +2987,18 @@ fn email_resend(state: &AppState, req: &Req) -> Resp {
     let Some(id) = path_id(&req.path, "/emails/") else {
         return Resp::not_found();
     };
-    if mail::reopen_failed(state, id) {
-        Resp::hx_redirect(&format!("/compose?draft_id={id}"))
-    } else {
-        Resp::hx_redirect(&format!(
+    match mail::reopen_failed(state, id) {
+        Ok(true) => Resp::hx_redirect(&format!("/compose?draft_id={id}")),
+        Ok(false) => Resp::hx_redirect(&format!(
             "/emails/{id}?error={}",
             urlencode("仅发送失败的邮件可重发")
-        ))
+        )),
+        // R18 P2：写库失败必须与「状态不符」区分，否则用户被明确告知不能重发，
+        // 而真实原因是 BUSY / 磁盘满 / 库只读，重发意图静默丢失。
+        Err(err) => Resp::hx_redirect(&format!(
+            "/emails/{id}?error={}",
+            urlencode(&format!("重发失败：{err}"))
+        )),
     }
 }
 

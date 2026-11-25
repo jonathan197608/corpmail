@@ -547,7 +547,7 @@ fn reopen_failed_returns_to_draft() {
         )
         .unwrap();
     });
-    assert!(reopen_failed(&state, id), "failed 应可回草稿");
+    assert!(reopen_failed(&state, id).unwrap(), "failed 应可回草稿");
     let (status, folder, error): (String, String, Option<String>) = state.with_conn(|c| {
         c.query_row(
             "SELECT status, folder, error FROM emails WHERE id=?1",
@@ -558,7 +558,43 @@ fn reopen_failed_returns_to_draft() {
     });
     assert_eq!((status.as_str(), folder.as_str()), ("draft", "draft"));
     assert!(error.is_none(), "重开应清失败原因");
-    assert!(!reopen_failed(&state, id), "非 failed 不应可重开");
+    assert!(!reopen_failed(&state, id).unwrap(), "非 failed 不应可重开");
+    cleanup(&dir);
+}
+
+/// R18 P2：写库失败不能伪装成「状态不符」。用 BEFORE UPDATE 触发器稳定制造
+/// SQLITE_CONSTRAINT，无需权限注入；断言 Err 上抛且邮件原样保留。
+#[test]
+fn r18_reopen_failed_write_error_is_not_status_mismatch() {
+    let (state, dir) = temp_state("r18-reopen-write-error");
+    let id = queued_email(&state, "peer@x.cn");
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET status='failed', folder='sent', error='服务器拒收' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        c.execute(
+            "CREATE TRIGGER r18_reopen_abort BEFORE UPDATE ON emails \
+             WHEN NEW.status='draft' BEGIN SELECT RAISE(ABORT, 'forced write failure'); END",
+            [],
+        )
+        .unwrap();
+    });
+    let err = reopen_failed(&state, id).expect_err("写失败必须上抛，不能伪装成状态不符");
+    assert!(err.contains("forced write failure"), "错误须带真实原因：{err}");
+    state.with_conn(|c| {
+        c.execute("DROP TRIGGER r18_reopen_abort", []).unwrap();
+        let (status, error): (String, String) = c
+            .query_row(
+                "SELECT status, COALESCE(error,'') FROM emails WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed", "写失败不得改变状态");
+        assert_eq!(error, "服务器拒收", "写失败不得清掉失败原因");
+    });
     cleanup(&dir);
 }
 
@@ -707,7 +743,7 @@ fn interrupted_sending_recovers_to_failed() {
     });
     assert_eq!(status, "failed");
     assert!(error.contains("上次发送被中断"), "应写明中断原因：{error}");
-    assert!(reopen_failed(&state, id), "自愈后必须能重发");
+    assert!(reopen_failed(&state, id).unwrap(), "自愈后必须能重发");
     cleanup(&dir);
 }
 

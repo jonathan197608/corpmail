@@ -9,21 +9,23 @@
 use super::*;
 use crate::templates::TEMPLATES;
 
-/// 内联事件属性（CSP `script-src 'self'` 下全部会被拦）
+/// 内联事件属性名（CSP `script-src 'self'` 下全部会被拦）。
+/// R18：只存属性名，`=` 两侧允许空白；旧版存 `onclick=` 整串，
+/// `<button onclick = "x">` 这种 HTML 合法写法会漏检。
 const INLINE_HANDLERS: &[&str] = &[
-    "onclick=",
-    "onchange=",
-    "oninput=",
-    "onsubmit=",
-    "onload=",
-    "onerror=",
-    "onkeydown=",
-    "onkeyup=",
-    "onmouseover=",
-    "onfocus=",
-    "onblur=",
-    "onselect=",
-    "ondblclick=",
+    "onclick",
+    "onchange",
+    "oninput",
+    "onsubmit",
+    "onload",
+    "onerror",
+    "onkeydown",
+    "onkeyup",
+    "onmouseover",
+    "onfocus",
+    "onblur",
+    "onselect",
+    "ondblclick",
 ];
 
 /// 直接按字段造响应：`Resp::html` 是 router 模块私有的构造器，
@@ -104,19 +106,50 @@ fn inline_handler_in_markup(src: &str) -> Option<(String, usize)> {
         let mut from = 0;
         while let Some(off) = src[from..].find(name) {
             let i = from + off;
+            let after = &src[i + name.len()..];
+            // 必须是属性位置：名字前是空白/标签开头，名字后（跳过空白）紧跟 '='。
+            // 注释里「onclick = 说明」和 `data-note="onclick=x"` 都不算。
+            let attr_start = i == 0
+                || src[..i]
+                    .chars()
+                    .last()
+                    .map(|c| c.is_whitespace() || c == '<')
+                    .unwrap_or(false);
+            let attr_assign = after.trim_start().starts_with('=');
             let before = &src[..i];
             let in_tag = match (before.rfind('<'), before.rfind('>')) {
                 (Some(lt), Some(gt)) => lt > gt,
                 (Some(_), None) => true,
                 _ => false,
             };
-            if in_tag {
+            if attr_start && attr_assign && in_tag {
                 return Some((name.to_string(), i));
             }
             from = i + name.len();
         }
     }
     None
+}
+
+/// R18：空白写法与注释/属性值误报的两端断言。
+#[test]
+fn inline_handler_detection_allows_whitespace_but_not_comments() {
+    let spaced = r#"<button onclick = "doThing()">按钮</button>"#;
+    assert_eq!(
+        inline_handler_in_markup(spaced).map(|(name, _)| name),
+        Some("onclick".to_string()),
+        "合法 HTML 空白写法也必须被拦下"
+    );
+    let quoted = r#"<button data-note="onclick = 仅说明">按钮</button>"#;
+    assert!(
+        inline_handler_in_markup(quoted).is_none(),
+        "属性值里的同名字串不是事件属性"
+    );
+    let comment = "说明：onclick = 旧写法已被替换";
+    assert!(
+        inline_handler_in_markup(comment).is_none(),
+        "注释里的同名字串不是事件属性"
+    );
 }
 
 #[test]

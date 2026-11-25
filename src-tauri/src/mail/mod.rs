@@ -2724,17 +2724,13 @@ pub fn mark_unread(state: &AppState, id: i64) -> Result<bool, String> {
     })
 }
 
-/// 单行 CAS 更新：仅当恰好影响 1 行返回 true（0 行 = 条件不满足/重复提交，幂等）
-fn exec_one(conn: &rusqlite::Connection, sql: &str, id: i64) -> bool {
-    match conn.execute(sql, [id]) {
-        Ok(n) => n == 1,
-        Err(e) => {
-            // SQLITE_BUSY 等写失败不得伪装成「条件不满足」，否则 UI 显示成功
-            // 但库里没变（db::open 已给 10s busy_timeout，走到这里属真故障）
-            eprintln!("[mail] 单行更新失败（id={id}）：{e}");
-            false
-        }
-    }
+/// 单行 CAS 更新：仅当恰好影响 1 行返回 Ok(true)（0 行 = 条件不满足/重复提交，幂等）。
+/// R18：SQLITE_BUSY 等写错误以 Err 上抛，绝不伪装成「条件不满足」——
+/// 旧实现返回 false，重发入口会把写故障误报成「仅发送失败的邮件可重发」。
+fn exec_one(conn: &rusqlite::Connection, sql: &str, id: i64) -> Result<bool, String> {
+    conn.execute(sql, [id])
+        .map(|n| n == 1)
+        .map_err(|err| format!("单行更新失败（id={id}）：{err}"))
 }
 
 // ---------- 删除（§5.3 硬删：行 + FTS（触发器）+ 独立附件文件） ----------

@@ -114,6 +114,8 @@ test('R2：慢 text A 在途切到 Office B，最终面板不含 A 文本（跨�
     await new Promise((r) => setTimeout(r, 260)); // 等 A 的迟到响应
 
     assert.deepEqual(h.officeCalls, ['B.docx'], 'Office 分支应被调用一次');
+    // R18：resetCalls 以前只记录不断言，删掉 app.js 的 mbxOfficeReset 仍能全绿。
+    assert.equal(h.resetCalls.length, 2, 'A 与 B 两次打开都须复位 Office 代次');
     const allText = h.getTextNodes().join('\n');
     assert.ok(
         !allText.includes('A-TEXT-SHOULD-NOT-APPEAR'),
@@ -130,6 +132,7 @@ test('R2：正常 text 单附件渲染不受影响（无回归）', async () => 
     h.preview('/only/view', 'text', '唯一.txt');
     await new Promise((r) => setTimeout(r, 30));
     assert.ok(h.getTextNodes().some((t) => t.includes('ONLY-TEXT')), 'text 分支应正常渲染');
+    assert.equal(h.resetCalls.length, 1, 'text 分支也须走统一入口复位 Office 代次');
 });
 
 test('P3-1：慢 text 在途关闭预览，迟到响应不得写入隐藏面板', async () => {

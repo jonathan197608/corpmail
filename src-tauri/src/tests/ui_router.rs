@@ -11367,25 +11367,24 @@ fn p113_batch_error_keeps_list_fragment() {
 /// 第十一轮 P2-2：搜索与高级检索表单须保留 unread/external 筛选隐藏域。
 #[test]
 fn p1122_search_forms_keep_filter_context() {
-    const TPL: &str = include_str!("../templates/mail_list.html");
-    let search = TPL.find("<form class=\"search\"").expect("搜索表单存在");
-    let adv = TPL.find("<form class=\"adv-panel\"").expect("高级检索表单存在");
-    for (name, start, end) in [
-        ("search", search, adv),
-        ("adv-panel", adv, TPL.len()),
-    ] {
-        let frag = &TPL[start..end];
-        assert!(frag.contains("name=\"unread\""), "{name} 表单须保留 unread 筛选");
-        assert!(frag.contains("name=\"external\""), "{name} 表单须保留 external 筛选");
+    // R18：运行时读取——include_str! 在变异注入恢复同秒 mtime 时会缓存旧内容
+    let tpl_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/templates/mail_list.html");
+    let tpl = std::fs::read_to_string(&tpl_path).expect("模板可读");
+    let per = tpl.find("<form class=\"per-form\"").expect("每页表单存在");
+    let search = tpl.find("<form class=\"search\"").expect("搜索表单存在");
+    let adv = tpl.find("<form class=\"adv-panel\"").expect("高级检索表单存在");
+    // R18 P1：搜索和改每页/排序都必须保留全部筛选上下文，否则命中集扩成全量，
+    // 用户以为在子集里勾选/删除，批量操作落到看不见的行。
+    for (name, start, end) in [("per-form", per, search), ("search", search, adv)] {
+        let frag = &tpl[start..end];
+        for field in ["unread", "external", "from", "df", "dt", "att"] {
+            assert!(
+                frag.contains(&format!("name=\"{field}\"")),
+                "{name} 表单须保留 {field} 筛选（R18 P1）"
+            );
+        }
     }
-    // R16 P2：搜索框也须保留 att——后端 search() 复用 list_filter_sql
-    // （含 :attf 附件条件），旧实现只有高级面板有 att，搜索后"只看有附件"
-    // 静默扩成全量，与 unread/external 口径不一致。
-    let search_frag = &TPL[search..adv];
-    assert!(
-        search_frag.contains("name=\"att\""),
-        "搜索表单须保留 att 附件筛选，与高级面板同口径"
-    );
 }
 
 /// 第十一轮 P2-5：设置页 tab 容器须带 hx-sync 防快速连点乱序。

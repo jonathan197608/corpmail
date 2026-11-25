@@ -217,6 +217,7 @@ pub fn enqueue_draft(state: &AppState, id: i64) -> bool {
              WHERE id = ?1 AND status = 'draft'",
             id,
         )
+        .expect("测试入队不应写失败")
     })
 }
 
@@ -347,8 +348,10 @@ pub fn recover_interrupted_sends(conn: &rusqlite::Connection) -> usize {
 
 /// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）。
 /// `sent_at` 非空 = 已投递过，禁止把它退回草稿再发一次（重复投递）。
-pub fn reopen_failed(state: &AppState, id: i64) -> bool {
+pub fn reopen_failed(state: &AppState, id: i64) -> Result<bool, String> {
     state.with_conn(|conn| {
+        // R18 P2：exec_one 现在把 SQL 写错误以 Err 上抛，UI 不再把
+        // SQLITE_BUSY / 磁盘满误报成「仅发送失败的邮件可重发」。
         exec_one(
             conn,
             "UPDATE emails SET status = 'draft', folder = 'draft', error = NULL
