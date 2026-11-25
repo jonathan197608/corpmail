@@ -2771,6 +2771,41 @@ fn resend_failed_returns_to_compose_and_rejects_others() {
             .any(|(k, v)| k == "HX-Redirect" && v.starts_with("/emails/1?error=")),
         "非 failed 重发应被拒并提示"
     );
+    // R19：写库失败的原始 SQLite 细节不得回显到 URL/详情页，但仍要有明确提示。
+    state.with_conn(|c| {
+        c.execute("UPDATE emails SET status='failed', folder='sent' WHERE id=1", [])
+            .unwrap();
+        c.execute(
+            "CREATE TRIGGER r19_resend_abort BEFORE UPDATE ON emails \
+             WHEN NEW.status='draft' BEGIN SELECT RAISE(ABORT, 'SECRET_SQLITE_DETAIL'); END",
+            [],
+        )
+        .unwrap();
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/resend", b""),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let redirect = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.as_str())
+        .expect("写失败也应有重定向提示");
+    assert!(redirect.starts_with("/emails/1?error="), "{redirect}");
+    assert!(
+        !redirect.contains("SECRET_SQLITE_DETAIL") && !redirect.contains("单行更新失败"),
+        "内部 SQL 错误不得回显：{redirect}"
+    );
+    assert!(redirect.contains("error="), "必须保留可显示的失败提示");
+    state.with_conn(|c| {
+        c.execute("DROP TRIGGER r19_resend_abort", []).unwrap();
+    });
     cleanup(&dir);
 }
 

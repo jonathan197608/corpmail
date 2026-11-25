@@ -205,14 +205,27 @@ export async function openSplit(target) {
   throw new Error('下拉菜单未展开：(element)')
 }
 
-/** 按可见文本点元素（菜单项没有稳定 class 时用；.tb-item/.split-menu a） */
+/** 按文本点元素（菜单项/分页链接没有稳定 id 时用）。
+ *  R19：旧实现先 `$$` 拿 WDIO 元素再逐个 getText/click；批量 htmx 刷新
+ *  会重建这些菜单项，跨协议往返后元素即 stale。改为页面内重新查询 + 派发点击。
+ */
 export async function clickByText(selector, text) {
-  const els = await $$(selector)
-  for (const el of els) {
-    if ((await el.getText()).includes(text)) {
-      await el.click()
-      return
-    }
+  for (let i = 0; i < 5; i += 1) {
+    const hit = await browser.execute(
+      (sel, needle) => {
+        for (const el of document.querySelectorAll(sel)) {
+          if ((el.textContent || '').includes(needle)) {
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+            return true
+          }
+        }
+        return false
+      },
+      selector,
+      text,
+    )
+    if (hit) return
+    await browser.pause(150)
   }
   throw new Error(`找不到含「${text}」的元素：${selector}`)
 }

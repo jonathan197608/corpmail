@@ -2993,12 +2993,15 @@ fn email_resend(state: &AppState, req: &Req) -> Resp {
             "/emails/{id}?error={}",
             urlencode("仅发送失败的邮件可重发")
         )),
-        // R18 P2：写库失败必须与「状态不符」区分，否则用户被明确告知不能重发，
-        // 而真实原因是 BUSY / 磁盘满 / 库只读，重发意图静默丢失。
-        Err(err) => Resp::hx_redirect(&format!(
-            "/emails/{id}?error={}",
-            urlencode(&format!("重发失败：{err}"))
-        )),
+        // R18 P2：写库失败必须与「状态不符」区分；R19 收敛：原始 rusqlite
+        // 错误只写日志，不回显给 UI（与 email_undo_send 同口径）。
+        Err(err) => {
+            eprintln!("[resend] 重发回草稿写库失败（id={id}）：{err}");
+            Resp::hx_redirect(&format!(
+                "/emails/{id}?error={}",
+                urlencode("重发失败，请稍后重试")
+            ))
+        }
     }
 }
 

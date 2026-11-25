@@ -114,11 +114,20 @@ fn broken_fallback_at(
         std::process::id()
     );
     let mut backup = anchor.join(&base);
+    let mut free = !backup.exists();
     for seq in 1..max_candidates.max(1) {
-        if !backup.exists() {
+        if free {
             break;
         }
         backup = anchor.join(format!("{base}-{seq}"));
+        free = !backup.exists();
+    }
+    // R19：循环只检查了 base..base-(n-2)，末位候选未经 exists() 就 rename，
+    // 极端碰撞下会静默 REPLACE 已有备份（可能含唯一 data_dir 指针）。
+    if !free {
+        return Err(format!(
+            "配置文件格式异常且原文备份失败（候选 {base} 及 {max_candidates} 个后缀均被占用）：为避免覆盖已有备份，已停止启动。请清理锚点目录后重试"
+        ));
     }
     let kept = std::fs::rename(path, &backup).is_ok();
     eprintln!(

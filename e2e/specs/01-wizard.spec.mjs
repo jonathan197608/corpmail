@@ -83,9 +83,11 @@ describe('01 首启向导与首次收件', () => {
     // 改掉集团域名后 OA 指引应实时隐藏（app.js 监听输入，非集团域名不适用 OA 路径）
     await browser.waitUntil(
       async () => {
-        const hidden = await browser.execute(
-          () => ![...document.querySelectorAll('.setup-card .ct-guide')].some((g) => !g.hidden),
-        )
+        const hidden = await browser.execute(() => {
+          // R19：空集时 `![].some(...)` 恒真，指引整体移除会让断言永远绿。
+          const guides = [...document.querySelectorAll('.setup-card .ct-guide')]
+          return guides.length > 0 && guides.every((g) => g.hidden)
+        })
         return hidden
       },
       { timeout: 5000, timeoutMsg: '改自定义域名后 OA 指引未隐藏' },

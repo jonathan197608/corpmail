@@ -260,3 +260,38 @@ fn r17_corrupt_backups_never_overwrite_each_other() {
     assert_eq!(texts, vec!["bad toml #1 ===", "bad toml #2 ==="], "两份原文都在");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R19：候选名循环的末位也必须检查。旧实现只检查 base..base-(n-2)，
+/// 最后一个候选未经 exists() 就 rename，极端碰撞会覆盖已有备份。
+#[test]
+fn r19_last_backup_candidate_is_checked() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-r19-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let original = "data_dir_override = \"保留我\"\n坏 toml ===";
+    let path = dir.join(CONFIG_FILE);
+    std::fs::write(&path, original).unwrap();
+    let stamp = (1_700_000_001u64, 987_654_321u32);
+    let base = format!(
+        "{CONFIG_FILE}.broken-{}-{:09}-{}",
+        stamp.0,
+        stamp.1,
+        std::process::id()
+    );
+    std::fs::create_dir_all(dir.join(&base)).unwrap();
+    std::fs::create_dir_all(dir.join(format!("{base}-1"))).unwrap();
+
+    let err = broken_fallback_at(&dir, &path, "测试末位候选", stamp, 2)
+        .expect_err("所有候选被占用时必须报错，不能覆盖已有备份");
+    assert!(err.contains("均被占用"), "错误须说明候选耗尽：{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original,
+        "原文必须原样保留"
+    );
+    assert!(
+        dir.join(&base).is_dir(),
+        "第一个占位目录不得被替换"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
