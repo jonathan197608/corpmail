@@ -698,17 +698,31 @@ fn persist_fetch_cursor_advances_monotonically_and_resets_on_uidvalidity_change(
     push(&state, 1, 150, false).unwrap(); // 旧轮迟到写
     assert_eq!(read_uid(&state).as_deref(), Some("200"));
 
-    // 5) 空批（uid=0）：只采纳 uidvalidity，uid 保持上一值
+    // 5) R16 P1：uidvalidity 变化 + 空批(uid=0)——UID 空间重置，uid 必须归零。
+    // 旧实现在此只写 UV 不写 uid，旧 uid=200 残留 → 新邮箱 UID 从 1 开始时
+    // resolve_uids 走增量 201:* 滤掉全部新邮件，永久漏收。
     push(&state, 2, 0, false).unwrap();
     assert_eq!(read_uv(&state).as_deref(), Some("2"));
-    assert_eq!(read_uid(&state).as_deref(), Some("200"));
+    assert_eq!(
+        read_uid(&state).as_deref(),
+        Some("0"),
+        "UV 变化时 uid 必须无条件重置为 0（含空批），否则新 UID 空间永久漏收"
+    );
 
     // 6) uidvalidity 变化（UID 空间重置）：无条件采纳新空间，uid 允许变小
     push(&state, 3, 5, false).unwrap();
     assert_eq!(read_uv(&state).as_deref(), Some("3"));
     assert_eq!(read_uid(&state).as_deref(), Some("5"));
 
-    // 7) 收尾（sync=true）：补写 last_sync_at
+    // 7) R16 配套：同空间空批 uid=0 不得把已推进游标回退到 0
+    push(&state, 3, 0, false).unwrap();
+    assert_eq!(
+        read_uid(&state).as_deref(),
+        Some("5"),
+        "同 UV 空批不得回退游标（只有 UV 变化才无条件采纳）"
+    );
+
+    // 8) 收尾（sync=true）：补写 last_sync_at
     push(&state, 3, 5, true).unwrap();
     assert!(
         state

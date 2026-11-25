@@ -2981,7 +2981,12 @@ fn persist_fetch_cursor(
         .unwrap_or(0);
     crate::db::settings::set(&tx, uv_key, &uidvalidity.to_string())
         .map_err(|e| format!("uidvalidity 写入失败：{e}"))?;
-    if uid > 0 && (uidvalidity != cur_uv || uid > cur_uid) {
+    // R16 P1：uidvalidity 变化时 UID 空间重置，uid 必须无条件采纳（含 0）。
+    // 旧实现 `uid > 0 && (uv变化 || uid>cur)` 在「UV 变化 + 首拉窗口空批(uid=0)」
+    // 时只写新 UV、旧 uid 保留：此后新邮箱 UID 从 1 开始，resolve_uids 见 UV
+    // 相同且 last.uid>0 走增量 1001:* 并滤掉全部新 UID，永久漏收且无提示。
+    // 同空间空批(uid=0) 仍跳过，保持单调不回退。
+    if uidvalidity != cur_uv || (uid > 0 && uid > cur_uid) {
         crate::db::settings::set(&tx, uid_key, &uid.to_string())
             .map_err(|e| format!("uid 写入失败：{e}"))?;
     }

@@ -630,3 +630,27 @@ fn r15_group_syntax_does_not_leak_group_name_into_addr() {
     let addrs: Vec<&str> = got.iter().map(|(a, _)| a.as_str()).collect();
     assert_eq!(addrs, ["a@x.cn", "b@x.cn"], "组名不得进入地址列表：{addrs:?}");
 }
+
+/// R16 P2：联系人管理页搜索须与 suggest 同口径走 unicode_lower。
+/// 旧实现 SQLite LIKE 只折 ASCII，搜 MÜLLER 命中不到 müller@x.cn，
+/// 而撰写页联想（suggest）能命中——同一数据两个入口结论相反。
+#[test]
+fn r16_list_rows_search_unicode_case_fold() {
+    let (c, _dir) = r15_mem("r16-list-unicode");
+    upsert_conn(&c, "müller@x.cn", "穆勒", 1).unwrap();
+    upsert_conn(&c, "other@x.cn", "无关", 2).unwrap();
+    let rows = list_rows(&c, "MÜLLER", 10, ContactsSort::Recent).unwrap();
+    assert_eq!(
+        rows.first().map(|r| r.addr.as_str()),
+        Some("müller@x.cn"),
+        "联系人页 Unicode 大小写不敏感搜索须命中：{:?}",
+        rows.iter().map(|r| r.addr.as_str()).collect::<Vec<_>>()
+    );
+    // 与 suggest 同 seed 结论一致
+    let sug = suggest(&c, "MÜLLER", 10).unwrap();
+    assert_eq!(
+        sug.first().map(|p| p.addr.as_str()),
+        Some("müller@x.cn"),
+        "联系人页与联想入口结论必须一致"
+    );
+}

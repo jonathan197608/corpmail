@@ -3038,6 +3038,22 @@ fn detail_status_polling_targets_status_region_only() {
     ));
     assert!(done.contains("已发送"), "sent 片段显示终态");
     assert!(!done.contains("hx-get="), "终态不应再轮询：{done}");
+    // R16 P2：邮件被删除 → 旧实现 404 text 让 htmx 不 swap，状态区永远
+    // 每 2s 轮询、每次 responseError 弹 toast。须返回 200 终态片段（无
+    // hx-get）让轮询自然停止。
+    let gone = route(
+        &state,
+        &assets(),
+        &req("GET", "/emails/999/statusbar", b""),
+        &t,
+    );
+    assert_eq!(gone.status, 200, "删除邮件的状态区须 200 终态片段");
+    let gone_body = body(&gone);
+    assert!(gone_body.contains("已删除"), "须明示终态：{gone_body}");
+    assert!(
+        !gone_body.contains("hx-get="),
+        "终态片段不得再带轮询（否则 404 循环 toast）：{gone_body}"
+    );
     // 未配置账号：拒绝（不渲染空状态区）
     let (fresh, fresh_dir) = temp_state("r42-statusbar-empty");
     let resp = route(
@@ -3596,6 +3612,29 @@ fn protocol_rejects_foreign_origin() {
             &t,
         );
         assert_eq!(resp.status, 403, "{origin} 必须视为外部来源");
+    }
+    // R16 P2：本机进程在 ui.localhost:3000 提供页面，Origin 带端口。旧实现
+    // 只取 host（丢弃端口）误判为自身放行——same-site 忽略端口也不触发拒绝，
+    // 本机任意页面即可静默改配置/删联系人。必须按完整 authority 判定。
+    for origin in [
+        "http://ui.localhost:3000",
+        "http://tauri.localhost:8080",
+        "https://ui.localhost:4443",
+    ] {
+        let resp = route(
+            &state,
+            &assets(),
+            &req_hdr(
+                "POST",
+                "/settings/sync/save",
+                "",
+                Some(origin),
+                Some("same-site"),
+                true,
+            ),
+            &t,
+        );
+        assert_eq!(resp.status, 403, "{origin} 带端口必须视为外部来源");
     }
     cleanup(&dir);
 }
@@ -11339,6 +11378,14 @@ fn p1122_search_forms_keep_filter_context() {
         assert!(frag.contains("name=\"unread\""), "{name} 表单须保留 unread 筛选");
         assert!(frag.contains("name=\"external\""), "{name} 表单须保留 external 筛选");
     }
+    // R16 P2：搜索框也须保留 att——后端 search() 复用 list_filter_sql
+    // （含 :attf 附件条件），旧实现只有高级面板有 att，搜索后"只看有附件"
+    // 静默扩成全量，与 unread/external 口径不一致。
+    let search_frag = &TPL[search..adv];
+    assert!(
+        search_frag.contains("name=\"att\""),
+        "搜索表单须保留 att 附件筛选，与高级面板同口径"
+    );
 }
 
 /// 第十一轮 P2-5：设置页 tab 容器须带 hx-sync 防快速连点乱序。
@@ -11650,5 +11697,71 @@ fn r15_forward_skipped_uses_accumulate_not_assign() {
     assert!(
         !body.contains("detached_skipped = report.skipped_attachments"),
         "赋值会丢失复制阶段跳过数：{body}"
+    );
+}
+
+/// R16 P2：列表行「进入详情」链接须保留 per=1（每页条数），返回列表才不
+/// 静默回到默认 10 条。`list_ctx` 旧实现拿 PER_MIN(1) 判默认值，与 base/
+/// rebuild_list_query（PER_DEFAULT=10）口径分叉。
+#[test]
+fn r16_list_query_keeps_per_one_and_drops_default_ten() {
+    let (state, dir) = temp_state("r16-per-one");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                    subject_tokens, body_tokens, created_at)
+                 VALUES ('in','inbox','received','a@x.cn','demo@chinatelecom.cn','件',
+                         '件','体',1)",
+                [],
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let t = FakeTester { smtp_ok: true, imap_ok: true };
+    let rows = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/list/rows", "per=1", b""),
+        &t,
+    ));
+    assert!(
+        rows.contains("per=1"),
+        "per=1 须出现在详情链接查询串：{rows}"
+    );
+    let rows10 = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/list/rows", "per=10", b""),
+        &t,
+    ));
+    assert!(
+        !rows10.contains("per=10"),
+        "默认 10 条不应写进查询串：{rows10}"
+    );
+    cleanup(&dir);
+}
+
+/// R16 P2：静态资源编译期内嵌、模板无版本参数，24h 强缓存会让升级后
+/// 新 HTML 配旧 JS（安全修复不生效）。asset() 必须 no-store。
+#[test]
+fn r16_embedded_assets_not_cached_long_term() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/router.rs"
+    ))
+    .expect("源码可读");
+    let at = src.find("fn asset(mime: String, body: Vec<u8>)").expect("asset 存在");
+    let end = src[at..].find("\n    }\n").map(|p| at + p).unwrap_or(src.len());
+    let body = &src[at..end];
+    assert!(
+        body.contains("no-store"),
+        "内嵌静态资源不得长缓存：{body}"
+    );
+    assert!(
+        !body.contains("max-age=86400"),
+        "旧 24h 缓存必须移除：{body}"
     );
 }

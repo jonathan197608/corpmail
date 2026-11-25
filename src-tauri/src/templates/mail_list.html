@@ -116,6 +116,10 @@
                丢上下文，命中集与用户当前视图不一致（批量勾选也会作用到看不见的行） #}
             {% if unread_only %}<input type="hidden" name="unread" value="1">{% endif %}
             {% if external_only %}<input type="hidden" name="external" value="1">{% endif %}
+            {# R16 P2：att 也要保留——后端 search() 复用 list_filter_sql（含
+               :attf 附件条件），搜索框丢 att 会让"只看有附件"子集在搜索后
+               静默扩成全量，与 unread/external 口径不一致 #}
+            {% if has_attach %}<input type="hidden" name="att" value="1">{% endif %}
             {% if per != 10 %}<input type="hidden" name="per" value="{{ per }}">{% endif %}
             {% if sort != 'date_desc' %}<input type="hidden" name="sort" value="{{ sort }}">{% endif %}
         </form>

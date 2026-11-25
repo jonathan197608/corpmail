@@ -712,6 +712,11 @@ function mbxPreviewAttachment(url, kind, name) {
         const frame = document.createElement('iframe');
         frame.src = url;
         frame.title = name;
+        // R16 P2：与 Office 预览同口径——同源 PDF iframe 默认可触达
+        // window.__TAURI__，crafted PDF 的 JS/URI 动作是纵深防御缺口。
+        // sandbox 不给 allow-scripts（PDF 阅读器不需要脚本），并禁用 referrer。
+        frame.setAttribute('sandbox', '');
+        frame.setAttribute('referrerpolicy', 'no-referrer');
         body.appendChild(frame);
     } else if (kind === 'text') {
         // A5/R2：代次已在入口对全部 kind 递增。慢 text 请求完成后若用户

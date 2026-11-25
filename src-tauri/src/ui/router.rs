@@ -206,7 +206,11 @@ impl Resp {
         Self {
             status: 200,
             content_type: mime,
-            cache_control: "max-age=86400",
+            // R16 P2：app.js/app.css/office-preview.js 是编译期内嵌字节，
+            // 模板引用无版本参数。24h 强缓存让升级后新 HTML 配旧 JS 最长
+            // 陈旧一天（安全修复/选择器变更不生效）。本地加载无网络收益，
+            // 改 no-store 保证每次启动都取当前二进制内的资源。
+            cache_control: "no-store",
             body,
             extra_headers: Vec::new(),
         }
@@ -554,13 +558,19 @@ fn foreign_origin(req: &Req) -> bool {
     // 第九轮 P2-8：localhost/127.0.0.1 不是本应用来源——任何本机进程都能在
     // 这些主机上提供页面，其脚本可向本应用发跨源 POST（Origin 校验会放行）。
     // macOS 的 ui://localhost 无 Origin 或被判 null，已有单独放行，不受影响。
-    let host = o
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split([':', '/'])
-        .next()
-        .unwrap_or("");
-    !matches!(host, "ui.localhost" | "tauri.localhost")
+    // R16 P2：旧实现只取 host 丢弃端口——本机任意进程在 ui.localhost:3000
+    // 提供页面，其跨源 POST 的 Origin=http://ui.localhost:3000 被误判为自身
+    // 放行（.localhost 按 RFC6761 解析到 loopback），可静默改配置/删联系人。
+    // 改为比对完整 authority：仅自身 host 且无显式端口（或 80/443）才放行。
+    let scheme_end = o.find("://").map(|p| p + 3).unwrap_or(0);
+    let authority = o[scheme_end..].split('/').next().unwrap_or("");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let own_host = matches!(host, "ui.localhost" | "tauri.localhost");
+    let own_port = port.is_none() || matches!(port, Some("80") | Some("443"));
+    !(own_host && own_port)
 }
 
 /// 请求是否会产生持久化副作用（迁移冻结期据此返回 409）。
@@ -1031,7 +1041,11 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
         }
         list_query.push_str(&format!("q={}", urlencode(&q_input)));
     }
-    if per != PER_MIN {
+    // R16 P2：与 base(:978)、rebuild_list_query(:3760) 及模板
+    // `{% if per != 10 %}` 保持同一口径——per 的「默认值」是 PER_DEFAULT(10)，
+    // 不是 PER_MIN(1)。旧实现拿 PER_MIN 判，导致 per=1 往返详情丢失（返回
+    // 每页条数静默变回 10），per=10 又多余写进 URL。
+    if per != PER_DEFAULT {
         if !list_query.is_empty() {
             list_query.push('&');
         }
@@ -2949,7 +2963,15 @@ fn email_status_bar(state: &AppState, req: &Req) -> Resp {
     }
     match mail::get(state, id) {
         Some(email) => render_html("email_status.html", &StatusCtx { email }),
-        None => Resp::text(404, "邮件不存在或已删除"),
+        // R16 P2：邮件被删除时旧实现返回 404 text——htmx 不 swap 4xx，带
+        // `hx-trigger="every 2s"` 的状态区永远留在 DOM 无限轮询，每次 404
+        // 触发 responseError → 每 2 秒一条错误 toast。改为返回 200 的终态
+        // 片段（无 hx-get），与 sent/failed 终态同口径让轮询自然停止。
+        None => Resp::html(
+            "<div id=\"mail-status\" aria-live=\"polite\">\
+             <div class=\"md-status failed\">邮件已删除，发送状态不再更新。</div></div>"
+                .to_string(),
+        ),
     }
 }
 

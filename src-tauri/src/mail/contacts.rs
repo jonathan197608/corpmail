@@ -245,10 +245,14 @@ pub fn list_rows(
             .query_map([limit], contact_row)?
             .collect::<Result<Vec<_>, _>>();
     }
-    let pattern = format!("%{}%", escape_like(t));
+    // R16 P2：与 suggest(:144 unicode_lower) 同口径。SQLite 内建 LIKE 只折
+    // ASCII，联系人页搜 MÜLLER 命中不到 müller@x.cn，而撰写页联想能命中——
+    // 同一数据两个入口结论相反，用户以为联系人丢失。
+    let pattern = format!("%{}%", escape_like(&t.to_lowercase()));
     let mut stmt = conn.prepare(&format!(
         "SELECT addr, name, updated_at, hits FROM contacts \
-         WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
+         WHERE unicode_lower(addr) LIKE ?1 ESCAPE '\\' \
+            OR unicode_lower(name) LIKE ?1 ESCAPE '\\' \
          ORDER BY {order} LIMIT ?2"
     ))?;
     stmt.query_map(rusqlite::params![pattern, limit], contact_row)?
