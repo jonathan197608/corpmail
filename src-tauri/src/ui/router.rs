@@ -2686,8 +2686,29 @@ fn save_compose_form(
     // P1-4 统一过去时刻校验：新设的过去时刻不得落库（否则调度线程当轮即发出）。
     // 例外仅一处：autosave 携带的是**库中未改动的旧定时**，它随时间进入窗口，
     // 不是用户新意图；放行以保住正文编辑（复查五 P1-1）。
+    // R15 P1：在途 autosave 可能携「远期定时」旧值晚到（点发送前 5s 防抖已发
+    // 出的请求，隐藏域当时是 now+3600），而库里此刻是刚写入的撤销窗口 now+9。
+    // 旧实现只在 scheduled_at==0 时回读库值 → 远期旧值既命中不了 60s 拒绝
+    // （>now+60）也不是 0 值分支，被原样写库覆盖撤销窗口：邮件不再 9s 后
+    // 发出，而是远期静默自动发出且撤销 toast 早已消失。
+    // 修法：preserve_sched 且库中当前定时落在「可保留窗口」时，表单值与库值
+    // 不同的（无论 0 还是远期）一律以库值为准——autosave 不承担改期职责。
+    if preserve_sched
+        && !sched_cleared
+        && let Some(at) = current_sched
+        && at > 0
+        && at <= now + AUTOSAVE_PRESERVE_WINDOW
+        && scheduled_at != at
+    {
+        eprintln!(
+            "[compose] 在途旧表单定时值（{scheduled_at}）被库中发送窗口（{at}）覆盖"
+        );
+        scheduled_at = at;
+    }
     if scheduled_at > 0 && scheduled_at <= now + 60 {
-        let unchanged_old = scheduled_at > now && current_sched == Some(scheduled_at);
+        // 库中未改动的旧定时（含到点未派发的 <= now 值）随时间进入窗口不是新意图；
+        // 只有库中无此值、表单新设的临近时刻才拒绝。
+        let unchanged_old = current_sched == Some(scheduled_at);
         if !unchanged_old {
             return Err((
                 draft_id.unwrap_or(0),
@@ -2695,9 +2716,12 @@ fn save_compose_form(
             ));
         }
     } else if scheduled_at == 0 && preserve_sched && !sched_cleared {
-        // P2-1 / 复查四 P1-2：无清空标记的 0 值视为在途旧表单，仅回读撤销窗口
-        // 内的近端时刻；远期定时仍可被用户主动清空（复查四 P1-2 口径不变）。
-        if let Some(at) = current_sched.filter(|at| *at > now && *at <= now + AUTOSAVE_PRESERVE_WINDOW) {
+        // 到点未派发窗口（scheduled_at ∈ (0, now]）仍是用户未撤回的发送意图：
+        // 调度线程每 2s 扫一次，此刻清空会把待发邮件静默降级为普通草稿。
+        // 旧实现 filter(*at > now) 漏掉此窗口；改 > 0 覆盖到点未派发。
+        if let Some(at) = current_sched
+            .filter(|at| *at > 0 && *at <= now + AUTOSAVE_PRESERVE_WINDOW)
+        {
             scheduled_at = at;
         }
     }
@@ -2771,7 +2795,10 @@ fn save_compose_form(
         if !already {
             let report = mail::eml::build_eml_report(state, attach_eml_from)
                 .map_err(|e| (id, format!("转发邮件生成失败：{e}")))?;
-            detached_skipped = report.skipped_attachments;
+            // R15 P2：复制 + EML 重建两处 skipped 必须累加。旧实现用赋值，
+            // 同时带 forward_from 与 attach_eml_from 时丢失复制阶段的 skip 数，
+            // 提示的不可用附件数偏小，用户以为只丢 1 个实际丢了 2 个。
+            detached_skipped += report.skipped_attachments;
             mail::add_attachment_bytes(state, id, &name, "message/rfc822", &report.bytes)
                 .map_err(|e| (id, format!("转发邮件附加失败：{e}")))?;
         }

@@ -2292,3 +2292,57 @@ fn r132_windows_reserved_device_names_are_sanitized() {
     assert_eq!(os_safe_name("报告.pdf", true), "报告.pdf");
     assert_eq!(os_safe_name("CONFERENCE.txt", true), "CONFERENCE.txt");
 }
+
+// ---------- R15：附件源类型守卫 / 附件写盘不可穿越符号链接 ----------
+
+/// R15 P2：guard_attach_source 必须与 guard_save_dest 对称拒绝非普通文件
+/// （FIFO/设备）。这类文件的 fs::read 会永久阻塞 UI（无超时）。可被注入
+/// 的 IO 失败无法在单测稳定构造 FIFO，用源码护栏钉死该判定分支存在。
+#[test]
+fn r15_guard_attach_source_rejects_non_regular_file() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mail/mod.rs"))
+        .expect("源码可读");
+    let at = src.find("pub fn guard_attach_source(").expect("守卫存在");
+    let end = src[at..].find("\npub fn ").map(|p| at + p).unwrap_or(src.len());
+    let body = &src[at..end];
+    assert!(
+        body.contains("!md.is_file()"),
+        "guard_attach_source 必须拒绝 FIFO/设备（非普通文件）：{body}"
+    );
+    assert!(
+        body.contains("symlink_metadata"),
+        "类型判定必须走 symlink_metadata（不跟随链接）：{body}"
+    );
+}
+
+/// R15 P2：写盘碰撞检测必须把符号链接（含悬空链接）视为已占用。旧实现
+/// Path::exists() 跟随链接，悬空链接返回 false → fs::write 写穿到外部路径。
+/// 用源码护栏钉死判定口径，并正向验证 symlink_metadata 与 exists 的差异。
+#[test]
+fn r15_attachment_collision_treats_symlink_as_occupied() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mail/mod.rs"))
+        .expect("源码可读");
+    let at = src.find("fn insert_attachment(").expect("写盘函数存在");
+    let end = src[at..].find("\n/// ").map(|p| at + p).unwrap_or(src.len());
+    let body = &src[at..end];
+    assert!(
+        body.contains("candidate).symlink_metadata().is_err()"),
+        "碰撞检测须用 symlink_metadata（链接视为占用）：{body}"
+    );
+    assert!(
+        !body.contains("!ctx.root.join(&candidate).exists()"),
+        "旧实现 exists() 跟随悬空链接，必须移除：{body}"
+    );
+    // 正向：悬空链接的 exists() 为 false 而 symlink_metadata 可见（Unix）
+    #[cfg(unix)]
+    {
+        let base = std::env::temp_dir().join(format!("r15-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let link = base.join("dangling.gz");
+        std::os::unix::fs::symlink("/nonexistent/corpmail-r15", &link).unwrap();
+        assert!(!link.exists(), "前置：悬空链接 exists() 为 false");
+        assert!(link.symlink_metadata().is_ok(), "symlink_metadata 能看到链接");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+}

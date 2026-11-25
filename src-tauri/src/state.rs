@@ -1089,15 +1089,16 @@ impl AppState {
         let Ok(raw) = std::fs::read_to_string(f) else {
             return;
         };
-        // 记录只用一次：无论能否清扫都先删，避免每次启动重复尝试
-        if let Err(e) = std::fs::remove_file(f) {
-            eprintln!("[state] 迁移目标记录清理失败（{}）：{e}", f.display());
-        }
         let target = PathBuf::from(raw.trim());
         if target.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(f);
             return;
         }
-        // 绝不动当前正在使用的数据目录（迁移成功后的目标正是它）
+        // R15 P2：旧实现无条件先删记录再查目标。目标盘当时不可达（外置盘
+        // 未插/网络盘离线）时 canonicalize 失败、marker 读不到 → 直接 return，
+        // 但记录已被永久删除：盘再接上后 GB 级半成品既不被清扫也无任何提示。
+        // 改为确认目标可达且已了结（含"不是我们的目录"）后才删记录。
+        let reachable = std::fs::symlink_metadata(&target).is_ok();
         let cur = self.data_dir();
         let same = match (std::fs::canonicalize(&target), std::fs::canonicalize(&cur)) {
             (Ok(a), Ok(b)) => a == b,
@@ -1128,14 +1129,27 @@ impl AppState {
                     );
                 }
             }
+            if reachable {
+                let _ = std::fs::remove_file(f);
+            }
             return;
         }
         if !target.join(MIGRATION_MARKER).exists() {
-            return; // 无中断标记 = 不是我们的半成品，一个字节都不碰
+            // 无中断标记 = 不是我们的半成品，一个字节都不碰；但目标可达时
+            // 记录已了结（无需重试），删掉避免每次启动重复检查。
+            if reachable {
+                let _ = std::fs::remove_file(f);
+            }
+            return; // 目标不可达时保留记录，下次启动重试
         }
         match recover_incomplete_migration(&target) {
-            Ok(()) => eprintln!("[state] 已清理上次被中断的迁移残留：{}", target.display()),
-            Err(e) => eprintln!("[state] 清理上次迁移残留失败：{e}"),
+            Ok(()) => {
+                eprintln!("[state] 已清理上次被中断的迁移残留：{}", target.display());
+                if reachable {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
+            Err(e) => eprintln!("[state] 清理上次迁移残留失败（记录保留待重试）：{e}"),
         }
     }
 

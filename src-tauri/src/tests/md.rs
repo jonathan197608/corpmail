@@ -224,6 +224,10 @@ fn build_md_attachment_sections_embed_and_path() {
             .map_err(|e| e.to_string())
         })
         .unwrap();
+    // R15：file 存储需实体文件，否则 MD 会如实标注「附件文件缺失」
+    let p = dir.join("attachments/2026-11/99/1_截图.png.gz");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"fake-gz").unwrap();
     // 已清理：说明不可导出
     crate::mail::add_attachment_bytes(&state, id, "旧报告.pdf", "application/pdf", &[9]).unwrap();
     state
@@ -295,6 +299,11 @@ fn build_md_uses_relative_attachment_path_only() {
             )
         })
         .unwrap();
+
+    // R15：file 存储需实体文件，否则 MD 会如实标注「附件文件缺失」
+    let p = dir.join("attachments/2026-11/9/1_x.xlsx.gz");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"fake-gz").unwrap();
 
     let md = build_md(&state, email_id).unwrap();
     // 相对路径与文件名保留
@@ -370,4 +379,43 @@ fn r14_html_to_md_skips_script_style_head_title() {
     for noise in ["标题", "alert", "color:red"] {
         assert!(!got.contains(noise), "隐藏块内容不得进 MD：{got}");
     }
+}
+
+/// R15 P2：storage=file 但磁盘文件丢失时，MD 必须如实标注缺失，不得谎报
+/// 「本地文件（相对路径）」误导外发后的 AI 分析（EML 已有 skipped 报告）。
+#[test]
+fn r15_md_reports_missing_attachment_file() {
+    let (state, dir) = temp_state("r15-md-missing");
+    let email_id = state
+        .with_conn(|c| {
+            c.query_row(
+                "INSERT INTO emails (direction, folder, status, subject, from_addr, to_addrs,
+                                      subject_tokens, body_tokens, created_at, body_text, body_kind)
+                 VALUES ('in','inbox','received','缺失','a@x.cn','demo@chinatelecom.cn','','',0,'正文','plain')
+                 RETURNING id",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO attachments (email_id, filename, size_orig, size_gz, storage, file_path, sha256)
+                 VALUES (?1, '丢失的.csv', 100, 50, 'file', '2026-11/9/1_x.csv.gz', 'beef')",
+                [email_id],
+            )
+        })
+        .unwrap();
+    // 不创建实体文件
+    let md = build_md(&state, email_id).unwrap();
+    assert!(md.contains("附件文件缺失，无法导出"), "须明示缺失：{md}");
+    assert!(
+        !md.contains("本地文件（相对数据目录）：attachments/2026-11/9/1_x.csv.gz"),
+        "不得谎报文件存在：{md}"
+    );
+    // 相对路径仍保留供追溯，但不得是绝对路径
+    assert!(md.contains("attachments/2026-11/9/1_x.csv.gz"), "{md}");
+    assert!(!md.contains(&dir.display().to_string()), "{md}");
+    cleanup(&dir);
 }

@@ -2950,7 +2950,11 @@ fn insert_attachment(
         let mut rel = String::new();
         for seq in n..n.saturating_add(10_000) {
             let candidate = format!("{}/{}/{}_{}.gz", ctx.month, ctx.email_id, seq, filename);
-            if !ctx.root.join(&candidate).exists() {
+            // R15 P2：旧实现用 Path::exists() 判碰撞——它跟随符号链接，
+            // 悬空链接（指向不存在目标）返回 false → 被判可写 → fs::write
+            // 跟随链接写到白名单外的任意路径。改用 symlink_metadata：链接
+            // 一律视为已占用，跳到下一 seq。
+            if ctx.root.join(&candidate).symlink_metadata().is_err() {
                 rel = candidate;
                 break;
             }
@@ -2969,8 +2973,22 @@ fn insert_attachment(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|err| format!("创建附件目录失败：{err}"))?;
         }
-        std::fs::write(&dest, &gz).map_err(|err| format!("写入附件文件失败：{err}"))?;
-        written.push(dest);
+        // R15 P2：create_new 成功后立刻把 dest 记入 written——旧实现在
+        // fs::write 返回后才 push，磁盘满/IO 错误写到一半失败时已创建的残缺
+        // .gz 不在清理清单，留成孤儿靠 1 小时宽限期才回收。create_new（O_EXCL）
+        // 与上面的 symlink_metadata 判碰撞配对：并发/TOCTOU 下也不覆盖已有文件。
+        // 注意必须在 open 成功后 push——open 失败说明文件不是我创建的，不能删。
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|err| format!("创建附件文件失败：{err}"))?;
+            written.push(dest.clone());
+            file.write_all(&gz)
+                .map_err(|err| format!("写入附件文件失败：{err}"))?;
+        }
         ctx.tx
             .execute(
                 "INSERT INTO attachments(email_id, filename, mime, size_orig, size_gz,
@@ -3324,10 +3342,16 @@ pub fn guard_attach_source(raw: &str) -> Result<(), String> {
         return Err(format!("附件路径必须是绝对路径：{raw}"));
     }
     // 符号链接指向白名单外文件同样要拒绝（metadata 跟随、这里用 symlink_metadata）
-    if let Ok(md) = std::fs::symlink_metadata(p)
-        && md.file_type().is_symlink()
-    {
-        return Err(format!("附件不能是符号链接：{raw}"));
+    // R15 P2：与 guard_save_dest 对称补普通文件类型校验——FIFO/设备文件在
+    // symlink_metadata 下既非链接也非普通文件，旧实现放过后 add_attachments
+    // 的 std::fs::read(p) 打开 FIFO 读端会永久阻塞（无超时），整个 UI 卡死。
+    if let Ok(md) = std::fs::symlink_metadata(p) {
+        if md.file_type().is_symlink() {
+            return Err(format!("附件不能是符号链接：{raw}"));
+        }
+        if !md.is_file() {
+            return Err(format!("附件不是普通文件：{raw}"));
+        }
     }
     if !save_dest_allowed(p) {
         return Err(format!(

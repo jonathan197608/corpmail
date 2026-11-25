@@ -2733,3 +2733,45 @@ fn r14_set_batch_rollback_failure_aligns_memory_to_disk() {
         "回滚失败必须明确上抛，不能只 eprintln 留痕：{branch}"
     );
 }
+
+/// R15 P2：迁移目标盘当下不可达（外置盘未插/网络盘离线）时，启动清扫
+/// 不得先删目标记录——旧实现删完记录才发现 canonicalize/marker 都读不到，
+/// 盘再接上后 GB 级半成品永久残留且无提示。记录须保留到下次启动重试。
+#[test]
+fn r15_unreachable_migration_target_keeps_record_for_retry() {
+    let base = temp_dir("r15-mig-unreachable");
+    let anchor = base.join("anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    drop(AppState::open(&anchor));
+
+    let orphan = base.join("orphan");
+    std::fs::create_dir_all(orphan.join("attachments")).unwrap();
+    std::fs::write(orphan.join(MIGRATION_MARKER), b"incomplete").unwrap();
+    std::fs::write(orphan.join("corpmail.db"), b"half-written").unwrap();
+    let record = anchor.join(MIGRATION_TARGET_FILE);
+    std::fs::write(&record, orphan.to_string_lossy().as_bytes()).unwrap();
+
+    // 模拟盘不可达：把目标目录改名（记录里的路径不存在）
+    let parked = base.join("orphan-parked");
+    std::fs::rename(&orphan, &parked).unwrap();
+
+    let _state = AppState::open(&anchor);
+    assert!(
+        record.exists(),
+        "目标不可达时记录必须保留，下次启动重试"
+    );
+    assert!(
+        parked.join("corpmail.db").exists(),
+        "不可达的半成品不得被误动"
+    );
+
+    // 盘重新接上：恢复路径后再启动一次，须完成清扫并删记录
+    std::fs::rename(&parked, &orphan).unwrap();
+    let _state2 = AppState::open(&anchor);
+    assert!(
+        !orphan.join("corpmail.db").exists(),
+        "盘恢复后须清扫半成品"
+    );
+    assert!(!record.exists(), "清扫完成后记录才可删除");
+    let _ = std::fs::remove_dir_all(&base);
+}

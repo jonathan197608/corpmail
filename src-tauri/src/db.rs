@@ -38,7 +38,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// schema 版本（结构性变更时 +1 并在 MIGRATIONS 追加增量）
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// 增量迁移表：`MIGRATIONS[n]` = 从版本 n+1 升到 n+2 的 DDL
 /// （只允许不可回退的加列/建索引/建表）
@@ -94,6 +94,7 @@ fn apply_step(tx: &Connection, from: i64) -> rusqlite::Result<()> {
         10 => migrate_v11(tx),
         11 => migrate_v12(tx),
         12 => migrate_v13(tx),
+        13 => migrate_v14(tx),
         _ => Ok(()),
     }
 }
@@ -258,6 +259,33 @@ fn migrate_v13(tx: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// v13 → v14：联系人「手动改名」锁定标记。1 = 姓名由用户在联系人页手动
+/// 新增/编辑，自动采集（收/发件 From/To 显示名）与 backfill 都不得覆盖——
+/// 旧实现无条件用邮件头显示名覆盖，用户手改的备注/姓名静默丢失。
+fn migrate_v14(tx: &Connection) -> rusqlite::Result<()> {
+    // 从 v11 以下升级的库可能尚未建 contacts（v4 增量），先幂等建表——
+    // 旧实现直接 PRAGMA table_info(contacts) 会报 "no such table"。
+    migrate_v4(tx)?;
+    if !contacts_has_column(tx, "manual_name")? {
+        tx.execute_batch(
+            "ALTER TABLE contacts ADD COLUMN manual_name INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+fn contacts_has_column(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let mut stmt = tx.prepare("PRAGMA table_info(contacts)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let col: String = row.get(1)?;
+        if col == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// v5 → v6：密送（BCC）。仅站内存档用（自己发出的邮件记住密送了谁，

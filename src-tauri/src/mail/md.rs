@@ -13,7 +13,6 @@
 //! - 纯文本邮件原样导出；超大占位邮件按占位说明导出（提示未下载）
 
 use crate::state::AppState;
-use std::path::Path;
 
 /// 导出 .md 时可直接内嵌的附件大小上限（字节）：短文本附件直接进正文代码块，
 /// AI 单次可读、MD 不致膨胀；超过则改为输出本地文件路径
@@ -171,10 +170,29 @@ fn write_attachment_section(
         })
         .ok();
     match location.as_ref().map(|(s, p)| (s.as_str(), p.as_str())) {
-        Some(("file", p)) if !p.is_empty() => md.push_str(&format!(
-            "本地文件（相对数据目录）：{}（gzip 压缩存储）\n\n",
-            Path::new("attachments").join(p).display()
-        )),
+        Some(("file", p)) if !p.is_empty() => {
+            // R15 P2：旧实现无论文件是否存在都输出「本地文件（相对数据目录）：
+            // attachments/...」，但 storage=file 且磁盘文件丢失/损坏时这句是
+            // 假的——导出的 .md 常被外发给 AI 分析，下游按路径找不到文件且
+            // 无从判断是路径失效还是附件根本没导出。EML 已用 skipped_attachments
+            // 明示，MD 至少要在内容里如实标注缺失。
+            let rel = p.replace('\\', "/");
+            let exists = state
+                .data_dir()
+                .join("attachments")
+                .join(p)
+                .symlink_metadata()
+                .is_ok();
+            if exists {
+                md.push_str(&format!(
+                    "本地文件（相对数据目录）：attachments/{rel}（gzip 压缩存储）\n\n"
+                ));
+            } else {
+                md.push_str(&format!(
+                    "附件文件缺失，无法导出（原相对路径：attachments/{rel}）\n\n"
+                ));
+            }
+        }
         _ => md.push_str(&format!(
             "附件内容存于本地数据库（无独立文件，{}）\n\n",
             crate::templates::fmt_size(a.size_orig)

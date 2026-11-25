@@ -4,6 +4,15 @@ use super::*;
 use crate::state::AppState;
 use std::path::PathBuf;
 
+/// R15 测试用：独立连接 + 独立临时库（避免 AppState 的全局锁/线程干扰）
+fn r15_mem(tag: &str) -> (Connection, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("corpmail-r15-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = crate::db::open(&dir.join("corpmail.db")).unwrap();
+    (conn, dir)
+}
+
 fn temp_state(tag: &str) -> (AppState, PathBuf) {
     let dir = std::env::temp_dir().join(format!("corpmail-contacts-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -548,4 +557,76 @@ fn p121_backfill_resumes_from_persisted_cursor() {
         .unwrap();
     assert_eq!(mark, "3", "游标须推进到最大已处理 id");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- R15：联系人手动改名保护 / 长度 / 排序 / Unicode ----------
+
+#[test]
+fn r15_manual_name_survives_auto_collect_and_backfill() {
+    let (c, _dir) = r15_mem("r15-manual");
+    let now = 1_700_000_000i64;
+    save_manual(&c, "boss@x.cn", "王总（财务）", now).unwrap();
+    // 自动采集（收/发件）不得覆盖手改姓名
+    upsert_conn(&c, "boss@x.cn", "王大力", now + 10).unwrap();
+    touch_conn(&c, "boss@x.cn", "王大力", now + 20).unwrap();
+    let name: String = c
+        .query_row("SELECT name FROM contacts WHERE addr='boss@x.cn'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name, "王总（财务）", "手动姓名须防自动采集覆盖：{name}");
+    let manual: i64 = c
+        .query_row("SELECT manual_name FROM contacts WHERE addr='boss@x.cn'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(manual, 1, "手动标记须落库");
+    // backfill 重扫同样不覆盖
+    let (c2, _dir2) = r15_mem("backfill");
+    save_manual(&c2, "peer@x.cn", "老张", now).unwrap();
+    upsert_conn(&c2, "peer@x.cn", "张三", now).unwrap();
+    let name2: String = c2
+        .query_row("SELECT name FROM contacts WHERE addr='peer@x.cn'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name2, "老张", "采集不得覆盖手动姓名：{name2}");
+}
+
+#[test]
+fn r15_auto_collect_name_truncated_to_60_chars() {
+    let (c, _dir) = r15_mem("r15-trunc");
+    upsert_conn(&c, "long@x.cn", &"张".repeat(200), 1).unwrap();
+    let name: String = c
+        .query_row("SELECT name FROM contacts WHERE addr='long@x.cn'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name.chars().count(), 60, "自动采集姓名须截断到 60 字符");
+    // UTF-8 边界：多字节字符不得被切断
+    assert!(name.chars().all(|ch| ch == '张'), "截断不得产生非法字符");
+}
+
+#[test]
+fn r15_name_sort_keeps_unnamed_contacts() {
+    let (c, _dir) = r15_mem("r15-sort");
+    upsert_conn(&c, "named@x.cn", "张三", 1).unwrap();
+    upsert_conn(&c, "unnamed@x.cn", "", 2).unwrap();
+    let rows = list_rows(&c, "", 10, ContactsSort::Name).unwrap();
+    assert_eq!(rows.len(), 2, "按姓名排序不得隐藏未命名联系人");
+    assert_eq!(rows[0].addr, "named@x.cn", "有姓名的排前");
+    assert_eq!(rows[1].addr, "unnamed@x.cn", "未命名沉底");
+}
+
+#[test]
+fn r15_suggest_unicode_case_fold() {
+    let (c, _dir) = r15_mem("r15-suggest");
+    upsert_conn(&c, "müller@x.cn", "穆勒", 1).unwrap();
+    upsert_conn(&c, "other@x.cn", "müller 同事", 2).unwrap();
+    let got = suggest(&c, "MÜLLER", 8).unwrap();
+    assert_eq!(
+        got.first().map(|p| p.addr.as_str()),
+        Some("müller@x.cn"),
+        "Unicode 大小写不敏感精确地址须排首位（{:?}）",
+        got.iter().map(|p| p.addr.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn r15_group_syntax_does_not_leak_group_name_into_addr() {
+    let got = parse_addr_list("Team: a@x.cn, b@x.cn;");
+    let addrs: Vec<&str> = got.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(addrs, ["a@x.cn", "b@x.cn"], "组名不得进入地址列表：{addrs:?}");
 }

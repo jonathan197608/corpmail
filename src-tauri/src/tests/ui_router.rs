@@ -7524,11 +7524,10 @@ fn contacts_page_sort_orders_and_preserves() {
         html.find("c2@x.cn").unwrap(),
     );
     assert!(n2 < n0 && n0 < n1, "sort=name 应按姓名升序（UTF-8 字节序）");
-    // 姓名排序排除未命名联系人（无可排姓名的行不显示）
-    assert!(
-        !html.contains("c3@x.cn"),
-        "sort=name 不应显示未命名联系人：{html}"
-    );
+    // R15：未命名联系人在 sort=name 下也保留（沉底），不得整批隐藏——
+    // 旧实现 WHERE name<>'' 让纯地址采集的联系人"凭空消失"。
+    let c3 = html.find("c3@x.cn").unwrap();
+    assert!(c3 > n2, "未命名联系人应保留但排在有名之后：{html}");
     // sort=addr：地址升序，且未命名联系人在此视图保留
     let html = body(&route(
         &state,
@@ -11512,4 +11511,144 @@ fn r14_sync_busy_preserves_submitted_values() {
     let d = defaults();
     assert_eq!(state.get_or(keys::FIRST_FETCH_DAYS, &d).as_deref(), Some("30"));
     cleanup(&dir);
+}
+
+/// R15 P1：点发送后，一条在途 autosave（快照里是远期定时 now+3600）晚到，
+/// 不得覆盖刚写入的撤销窗口 now+9。旧实现把远期值原样写库，邮件改为远期
+/// 静默自动发出、撤销 toast 早已消失，用户完全失去撤销机会。
+#[test]
+fn r15_stale_autosave_far_schedule_cannot_override_undo_window() {
+    let (state, dir) = temp_state("r15-stale-far-sched");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let undo = mail::now_epoch() + UNDO_SEND_SECS;
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "撤销窗口".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: undo,
+        },
+    )
+    .unwrap();
+    let far_str = mail::sched_local_value(mail::now_epoch() + 3600);
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "在途旧表单的新正文"),
+                ("scheduled_at", &far_str),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let (at, text): (i64, String) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT scheduled_at, body_text FROM emails WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!(at, undo, "撤销窗口不得被在途远期旧值覆盖（实际 {at}）");
+    assert_eq!(text, "在途旧表单的新正文", "正文仍须保存");
+    cleanup(&dir);
+}
+
+/// R15 P2：定时到点但调度线程尚未派发（scheduled_at ∈ (0, now]）时到达的
+/// autosave，不得把待发邮件静默清回普通草稿（用户会看到"发送仍在进行"但
+/// 发件箱永远没有这封）。显式 sched_cleared=1 仍可清空。
+#[test]
+fn r15_autosave_preserves_due_but_undispatched_schedule() {
+    let (state, dir) = temp_state("r15-due-undispatched");
+    state
+        .set_batch(&[(keys::ACCOUNT_PREFIX, "demo"), (keys::DISPLAY_NAME, "张伟")])
+        .unwrap();
+    let due = mail::now_epoch() - 2;
+    let id = mail::save_draft(
+        &state,
+        &mail::DraftInput {
+            id: None,
+            from_addr: "demo@chinatelecom.cn".into(),
+            from_name: "张伟".into(),
+            to_addrs: "peer@x.cn".into(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: "到点未派发".into(),
+            body_text: "正文".into(),
+            in_reply_to: None,
+            scheduled_at: 0,
+        },
+    )
+    .unwrap();
+    state
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE emails SET scheduled_at=?2 WHERE id=?1",
+                rusqlite::params![id, due],
+            )
+        })
+        .unwrap();
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", "peer@x.cn"),
+                ("body_text", "编辑但不清定时"),
+                ("scheduled_at", ""),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let at: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(at, due, "到点未派发的定时不得被空值 autosave 清回 0");
+    cleanup(&dir);
+}
+
+/// R15 P2：转发复制 skipped 与 EML 重建 skipped 必须累加（+=），旧实现用
+/// 赋值会丢失复制阶段的跳过数，用户看到的不可用附件数偏小。
+#[test]
+fn r15_forward_skipped_uses_accumulate_not_assign() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/router.rs"
+    ))
+    .expect("源码可读");
+    let at = src
+        .find("let mut detached_skipped = 0usize;")
+        .expect("累加变量存在");
+    let end = src[at..].find("let mut skipped = 0usize;").map(|p| at + p).unwrap_or(src.len());
+    let body = &src[at..end];
+    assert!(
+        body.contains("detached_skipped += report.skipped_attachments;"),
+        "EML 重建 skipped 必须累加到复制 skipped：{body}"
+    );
+    assert!(
+        body.contains("detached_skipped += copy_skipped"),
+        "复制 skipped 必须先累加：{body}"
+    );
+    assert!(
+        !body.contains("detached_skipped = report.skipped_attachments"),
+        "赋值会丢失复制阶段跳过数：{body}"
+    );
 }

@@ -32,6 +32,20 @@ pub fn parse_addr_list(raw: &str) -> Vec<(String, String)> {
         if part.is_empty() {
             continue;
         }
+        // R15 P2：邮件组语法 `Team: a@x.cn, b@x.cn;` 的首 token 含组名前缀，
+        // 旧实现只判 contains('@') 就把 "Team: a@x.cn" 当完整地址返回 ——
+        // addr_plausible 会因空白挡它入库，但撰写页 addr_chips 显示畸形 chip、
+        // merge_addrs（回复全部）拼出 `Team: a@x.cn <...>` 畸形 To 头被 SMTP 拒。
+        // 冒号前是无空白的组名时剥掉前缀（地址本地部分不允许裸冒号）。
+        let part = if let Some((group, rest)) = part.split_once(':')
+            && !group.contains(char::is_whitespace)
+            && !group.is_empty()
+            && rest.contains('@')
+        {
+            rest.trim()
+        } else {
+            part
+        };
         if let (Some(lt), Some(gt)) = (part.rfind('<'), part.rfind('>'))
             && lt < gt
         {
@@ -66,8 +80,15 @@ fn addr_plausible(addr: &str) -> bool {
 /// 联系人姓名清洗：控制字符折叠为单个空格（连续 CR/LF 不产生连续空位），
 /// 头尾控制不产空白——恶意邮件头的 CR/LF 不应进入建议列表与联系人页。
 /// 复用 crate 级 collapse_control（与系统通知正文同一口径）。
+/// R15 P2：长度上限下沉到此处（60 字符，按 char 边界截断），与手动保存
+/// 路由层校验同口径——旧实现只对手动路径限 60，自动采集（收/发件显示名）
+/// 可把数百字符的超长姓名直接入库，撑破联系人页/联想列表布局。
 fn name_safe(name: &str) -> String {
-    super::collapse_control(name)
+    let collapsed = super::collapse_control(name);
+    if collapsed.chars().count() <= 60 {
+        return collapsed;
+    }
+    collapsed.chars().take(60).collect()
 }
 
 /// 写入/合并一条联系人（事务内或独立连接均可）。
@@ -84,7 +105,10 @@ pub fn upsert_conn(conn: &Connection, addr: &str, name: &str, at: i64) -> rusqli
     conn.execute(
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
          ON CONFLICT(addr) DO UPDATE SET
-             name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END,
+             name = CASE
+                 WHEN contacts.manual_name = 1 THEN contacts.name
+                 WHEN excluded.name <> '' THEN excluded.name
+                 ELSE contacts.name END,
              updated_at = MAX(contacts.updated_at, excluded.updated_at),
              hits = contacts.hits + 1",
         rusqlite::params![addr, name, at],
@@ -113,21 +137,26 @@ pub fn suggest(conn: &Connection, q: &str, limit: usize) -> rusqlite::Result<Vec
         })?;
         return rows.collect();
     }
-    let pattern = format!("%{}%", escape_like(q));
-    let prefix = format!("{}%", escape_like(q));
-    let exact = q.to_ascii_lowercase();
+    // R15 P2：Unicode 大小写折叠。旧实现用 to_ascii_lowercase + SQLite lower()
+    // 都只折 ASCII，`MÜLLER` 查不到 `müller@x.cn`（WHERE 的 LIKE 也只折
+    // ASCII，排序改了也没用）——与已修的高级筛选 from 口径不一致。
+    // db::open 已注册 unicode_lower；WHERE 与排序两边都改才能真命中。
+    let exact = q.to_lowercase();
+    let upattern = format!("%{}%", escape_like(&q.to_lowercase()));
+    let uprefix = format!("{}%", escape_like(&q.to_lowercase()));
     let mut stmt = conn.prepare(
         "SELECT addr, name FROM contacts
-         WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'
+         WHERE unicode_lower(addr) LIKE ?1 ESCAPE '\\'
+            OR unicode_lower(name) LIKE ?1 ESCAPE '\\'
          ORDER BY CASE
-                    WHEN lower(addr) = ?2 THEN 0
-                    WHEN addr LIKE ?3 ESCAPE '\\' THEN 1
+                    WHEN unicode_lower(addr) = ?2 THEN 0
+                    WHEN unicode_lower(addr) LIKE ?3 ESCAPE '\\' THEN 1
                     ELSE 2
                   END,
                   updated_at DESC, hits DESC
          LIMIT ?4",
     )?;
-    let rows = stmt.query_map(rusqlite::params![pattern, exact, prefix, limit], |r| {
+    let rows = stmt.query_map(rusqlite::params![upattern, exact, uprefix, limit], |r| {
         Ok(Contact {
             addr: r.get(0)?,
             name: r.get(1)?,
@@ -188,7 +217,7 @@ impl ContactsSort {
         match self {
             Self::Recent => "updated_at DESC, hits DESC",
             Self::Hits => "hits DESC, updated_at DESC",
-            Self::Name => "name ASC, addr ASC",
+            Self::Name => "(name = '') ASC, name ASC, addr ASC",
             Self::Addr => "addr ASC",
         }
     }
@@ -204,29 +233,23 @@ pub fn list_rows(
 ) -> rusqlite::Result<Vec<ContactRow>> {
     let limit = limit as i64;
     let order = sort.order_by();
-    // 按姓名排序时排除未命名联系人：它们没有可排的姓名，不应占用列表位置
-    // （其他排序仍保留全部联系人，避免“联系人凭空消失”）
-    let name_only = sort == ContactsSort::Name;
+    // R15 P2：按姓名排序时旧实现 WHERE name <> '' 把所有只从纯地址采集的
+    // 联系人整批隐藏（total/分页同步缩水），切回"最近联系"又冒出来，用户
+    // 以为联系人丢了。改为保留全部、用排序键 (name='') 让未命名沉底。
     let t = q.trim();
     if t.is_empty() {
-        let filter = if name_only { "WHERE name <> ''" } else { "" };
         let mut stmt = conn.prepare(&format!(
-            "SELECT addr, name, updated_at, hits FROM contacts \
-             {filter} ORDER BY {order} LIMIT ?1"
+            "SELECT addr, name, updated_at, hits FROM contacts ORDER BY {order} LIMIT ?1"
         ))?;
         return stmt
             .query_map([limit], contact_row)?
             .collect::<Result<Vec<_>, _>>();
     }
     let pattern = format!("%{}%", escape_like(t));
-    let filter = if name_only {
-        "WHERE (addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\') AND name <> ''"
-    } else {
-        "WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'"
-    };
     let mut stmt = conn.prepare(&format!(
         "SELECT addr, name, updated_at, hits FROM contacts \
-         {filter} ORDER BY {order} LIMIT ?2"
+         WHERE addr LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' \
+         ORDER BY {order} LIMIT ?2"
     ))?;
     stmt.query_map(rusqlite::params![pattern, limit], contact_row)?
         .collect::<Result<Vec<_>, _>>()
@@ -260,7 +283,10 @@ pub fn touch_conn(conn: &Connection, addr: &str, name: &str, at: i64) -> rusqlit
     conn.execute(
         "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 0)
          ON CONFLICT(addr) DO UPDATE SET
-             name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END,
+             name = CASE
+                 WHEN contacts.manual_name = 1 THEN contacts.name
+                 WHEN excluded.name <> '' THEN excluded.name
+                 ELSE contacts.name END,
              updated_at = MAX(contacts.updated_at, excluded.updated_at)",
         rusqlite::params![addr, name, at],
     )?;
@@ -523,9 +549,12 @@ pub fn save_manual(conn: &Connection, addr: &str, name: &str, now: i64) -> rusql
     let name = name_safe(name.trim());
     // 编辑已有联系人只改姓名，不刷新 updated_at——「最近联系」是邮件往来的
     // 时间戳，改个名字不应让它变成"今天联系过"
+    // R15 P1：手动保存打上 manual_name=1 锁定标记，后续 upsert/touch/backfill
+    // 都不得再用邮件显示名覆盖（用户备注/改名是权威数据源）。
     conn.execute(
-        "INSERT INTO contacts(addr, name, updated_at, hits) VALUES (?1, ?2, ?3, 1)
-         ON CONFLICT(addr) DO UPDATE SET name = excluded.name",
+        "INSERT INTO contacts(addr, name, updated_at, hits, manual_name)
+         VALUES (?1, ?2, ?3, 1, 1)
+         ON CONFLICT(addr) DO UPDATE SET name = excluded.name, manual_name = 1",
         rusqlite::params![addr.trim(), name, now],
     )?;
     Ok(())
