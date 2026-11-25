@@ -85,11 +85,41 @@ fn broken_fallback(
     path: &Path,
     reason: &str,
 ) -> Result<BTreeMap<String, String>, String> {
+    // R17 P2：秒级 stamp 在同一秒内二次损坏时会覆盖上一份备份（Unix rename /
+    // Windows MoveFileExW 均静默 REPLACE_EXISTING），可能抹掉唯一含有效
+    // data_dir 指针的副本。加纳秒 + pid，且目标已存在时递增序号。
+    // 纳秒补零到 9 位：`prune_broken_backups` 按文件名字典序保留最近 3 份，
+    // 变长纳秒会把 ...-999-... 错排到 ...-1000-... 之后。
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let backup = anchor.join(format!("{CONFIG_FILE}.broken-{stamp}"));
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    broken_fallback_at(anchor, path, reason, stamp, 1001)
+}
+
+/// 与 `broken_fallback` 同逻辑，但时间戳与候选数由调用方给定。
+/// 测试用固定 stamp + `max_candidates=1` 预占唯一候选名制造 rename 失败（C16）；
+/// 生产始终走当前时间与 base + 1000 个后缀。
+fn broken_fallback_at(
+    anchor: &Path,
+    path: &Path,
+    reason: &str,
+    stamp: (u64, u32),
+    max_candidates: u32,
+) -> Result<BTreeMap<String, String>, String> {
+    let base = format!(
+        "{CONFIG_FILE}.broken-{}-{:09}-{}",
+        stamp.0,
+        stamp.1,
+        std::process::id()
+    );
+    let mut backup = anchor.join(&base);
+    for seq in 1..max_candidates.max(1) {
+        if !backup.exists() {
+            break;
+        }
+        backup = anchor.join(format!("{base}-{seq}"));
+    }
     let kept = std::fs::rename(path, &backup).is_ok();
     eprintln!(
         "[conf] 配置文件解析失败（{reason}）；{}",
@@ -119,6 +149,13 @@ fn prune_broken_backups(anchor: &Path, keep: usize) {
         .filter_map(Result::ok)
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.starts_with(&prefix))
+        // 目录同名时只是 rename 失败留下的占位（测试预占 / 手工创建），
+        // remove_file 对目录必失败并刷错误日志；清理阶段只认普通文件。
+        .filter(|n| {
+            std::fs::symlink_metadata(anchor.join(n))
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        })
         .collect();
     if names.len() <= keep {
         return;
@@ -145,17 +182,22 @@ pub fn save(anchor: &Path, cfg: &BTreeMap<String, String>) -> Result<(), String>
     // tmp 带 pid：并发写或多进程残留时不会互相覆盖；rename 前 sync_all 保证
     // 掉电时不留空文件（审计 P2-5 / P1-48）
     let tmp = anchor.join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()));
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("配置临时文件创建失败：{e}"))?;
-    f.write_all(text.as_bytes())
-        .map_err(|e| format!("配置写入失败：{e}"))?;
-    f.sync_all().map_err(|e| format!("配置刷盘失败：{e}"))?;
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        // rename 失败（目标被占用等）：清掉临时残片，下次重试从干净状态开始
+    // R17 P2：旧实现只在 rename 失败时清理 tmp——write_all/sync_all 失败
+    // （磁盘满/配额超）时残片留在锚点目录，PID 变化后无人回收、持续累积。
+    // 统一走闭包：任何一步失败都清掉本次 tmp 再上抛。
+    let outcome = (|| -> Result<(), String> {
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("配置临时文件创建失败：{e}"))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| format!("配置写入失败：{e}"))?;
+        f.sync_all().map_err(|e| format!("配置刷盘失败：{e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &path).map_err(|e| format!("配置落盘失败：{e}"))
+    })();
+    if outcome.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("配置落盘失败：{e}"));
     }
-    Ok(())
+    outcome
 }
 
 #[cfg(test)]

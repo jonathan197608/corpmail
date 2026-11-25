@@ -85,17 +85,21 @@ fn corrupt_config_without_backup_fails_loudly_and_keeps_original() {
     let path = dir.join(CONFIG_FILE);
     std::fs::write(&path, &original).unwrap();
 
-    // 预建未来几秒的 broken-* 目录：rename(文件 → 已存在目录) 必失败，
-    // 覆盖测试跨秒边界，不依赖文件系统权限
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    for d in 0..5 {
-        std::fs::create_dir_all(dir.join(format!("{CONFIG_FILE}.broken-{}", now + d))).unwrap();
-    }
+    // R17：备份名改为「秒-纳秒(9 位)-pid」后，无法再靠预建秒级目录撞名。
+    // 用可注入时间戳的测试缝锁定精确候选名，再预建成目录：rename(文件 →
+    // 已存在目录) 在 Unix/Windows 都失败，跨平台且不依赖权限。
+    let stamp = (1_700_000_000u64, 123_456_789u32);
+    let backup = format!(
+        "{CONFIG_FILE}.broken-{}-{:09}-{}",
+        stamp.0,
+        stamp.1,
+        std::process::id()
+    );
+    std::fs::create_dir_all(dir.join(&backup)).unwrap();
 
-    let err = super::load(&dir).expect_err("备份失败时必须明确报错，不能静默按未配置启动");
+    // max_candidates=1：唯一候选已被目录占用，无后缀可退，rename 必失败
+    let err = broken_fallback_at(&dir, &path, "测试预占备份名", stamp, 1)
+        .expect_err("备份失败时必须明确报错，不能静默按未配置启动");
     assert!(err.contains("备份失败"), "错误应说明真实原因：{err}");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -128,6 +132,25 @@ fn save_uses_pid_scoped_tmp_and_does_not_touch_legacy_stub() {
     assert_eq!(
         load(&dir).get(keys::DISPLAY_NAME).map(String::as_str),
         Some("张三")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R17 P2：save 的任何失败路径都不能留下 pid tmp。把目标配置路径预建成目录，
+/// 让 rename 稳定失败（Unix/Windows 同口径），断言 tmp 已被统一清理。
+#[test]
+fn r17_save_failure_removes_pid_scoped_tmp() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-r17-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(CONFIG_FILE)).unwrap();
+    let mut cfg = BTreeMap::new();
+    cfg.insert(keys::DISPLAY_NAME.to_string(), "张三".to_string());
+    let err = save(&dir, &cfg).expect_err("目标路径是目录时 rename 必须失败");
+    assert!(err.contains("配置落盘失败"), "错误应指向落盘阶段：{err}");
+    assert!(
+        !dir.join(format!("{CONFIG_FILE}.{}.tmp", std::process::id()))
+            .exists(),
+        "任何失败路径都不得残留 tmp（旧实现 write/sync 失败时仍残留）"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -206,4 +229,34 @@ fn set_readonly(path: &Path, on: bool) {
     {
         let _ = (path, on);
     }
+}
+
+/// R17 P2：配置损坏备份名必须唯一——旧实现用秒级 stamp，同一秒内二次
+/// 损坏会静默覆盖上一份备份（可能含唯一有效的 data_dir 指针）。
+#[test]
+fn r17_corrupt_backups_never_overwrite_each_other() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-r17-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in 1..=2 {
+        std::fs::write(dir.join(CONFIG_FILE), format!("bad toml #{n} ===")).unwrap();
+        assert!(load(&dir).is_empty(), "第 {n} 次损坏应降级为未配置");
+    }
+    let backups: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("corpmail.toml.broken-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 2, "两次损坏须留两份备份（旧实现秒级同名覆盖只剩 1 份）");
+    let mut texts: Vec<_> = backups
+        .iter()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, vec!["bad toml #1 ===", "bad toml #2 ==="], "两份原文都在");
+    let _ = std::fs::remove_dir_all(&dir);
 }

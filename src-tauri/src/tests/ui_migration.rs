@@ -331,10 +331,18 @@ fn migration_modal_has_stall_watchdog() {
     let progress = APP_JS
         .find("add('migration-progress'")
         .expect("progress 监听存在");
+    // R17 P1：旧断言用无右边界切片 + contains，而 `mbxMigLastEvent = Date.now();`
+    // 在 error/启动/继续等待等 4 处出现——删掉 progress 监听里的复位语句，
+    // 测试仍被后面的同名语句满足（假绿）。收窄到 progress 监听器体并计数。
     let rest = &APP_JS[progress..];
-    assert!(
-        rest.contains("mbxMigLastEvent = Date.now();"),
-        "每个事件都要重置看门狗计时"
+    let end = rest
+        .find("add('migration-done'")
+        .expect("done 监听存在（progress 右边界）");
+    let body = &rest[..end];
+    assert_eq!(
+        body.matches("mbxMigLastEvent = Date.now();").count(),
+        1,
+        "progress 监听器必须自己复位看门狗计时，不能靠其他监听器的同名语句蒙混"
     );
     // 后端兜底：panic 不走 Err 分支，必须 catch_unwind 后 emit migration-error
     assert!(

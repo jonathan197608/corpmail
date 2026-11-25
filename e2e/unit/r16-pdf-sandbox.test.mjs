@@ -22,11 +22,12 @@ test('R16 PDF 预览 iframe 带 sandbox 与 no-referrer', () => {
     /setAttribute\(\s*['"]sandbox['"]\s*,/,
     'PDF iframe 必须设置 sandbox（不得同源裸 iframe）'
   );
-  assert.match(
-    branch,
-    /referrerpolicy/,
-    'PDF iframe 必须设置 referrerpolicy=no-referrer'
+  // R17 修正：旧断言只匹配属性名，改成 unsafe-url 仍假绿——须验字面量取值
+  const refAttr = branch.match(
+    /setAttribute\(\s*['"]referrerpolicy['"]\s*,\s*['"]([^'"]*)['"]\s*\)/
   );
+  assert.ok(refAttr, 'referrerpolicy 设置必须是字面量以便审计');
+  assert.equal(refAttr[1], 'no-referrer', 'PDF iframe referrerpolicy 必须是 no-referrer');
   const setAttr = branch.match(/setAttribute\(\s*['"]sandbox['"]\s*,\s*['"]([^'"]*)['"]\s*\)/);
   assert.ok(setAttr, 'sandbox 设置必须是字面量以便审计');
   assert.ok(

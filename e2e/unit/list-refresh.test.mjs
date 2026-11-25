@@ -185,3 +185,14 @@ test('app.js 批量状态机确实调用抽出的纯函数（不是各写一份�
         'selectedCount/apply 必须调用 B10 core 纯函数，否则测试覆盖的是镜像副本'
     );
 });
+
+// R17 P2：批量操作 htmx.ajax 无 .catch —— 传输层失败（onerror/timeout，
+// 不到服务端故不触发全局 responseError）时 unhandledRejection + 界面无反应。
+test('R17 批量操作 htmx.ajax 带 reject 兜底', () => {
+    const at = APP_JS.indexOf("htmx.ajax('POST', '/emails/batch'");
+    assert.ok(at >= 0, '批量提交点存在');
+    const end = APP_JS.indexOf('};', at);
+    const branch = APP_JS.slice(at, end > at ? end : at + 400);
+    assert.match(branch, /\.catch\(/, '批量提交必须捕获 reject（网络层失败兜底）');
+    assert.match(branch, /mbxToast/, '失败须 toast 告知用户');
+});

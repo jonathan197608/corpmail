@@ -1200,8 +1200,17 @@ function mbxInitContacts() {
             state.timer = setTimeout(() => mbxContactQuery(inp, state), 200);
         });
         inp.addEventListener('keydown', ev => mbxContactKey(inp, state, ev));
-        inp.addEventListener('blur', () => setTimeout(() => { box.hidden = true; }, 150));
-        inp.addEventListener('focus', () => { if (state.items.length) box.hidden = false; });
+        // R17 P2：blur 后 150ms 内重新 focus（点回输入框用方向键选人）时，
+        // 旧定时器仍会到期隐藏建议框，mbxContactKey 首行见 hidden 直接 return，
+        // 键盘选人失效。focus/新 blur 都先清掉在途 blurTimer。
+        inp.addEventListener('blur', () => {
+            clearTimeout(state.blurTimer);
+            state.blurTimer = setTimeout(() => { box.hidden = true; }, 150);
+        });
+        inp.addEventListener('focus', () => {
+            clearTimeout(state.blurTimer);
+            if (state.items.length) box.hidden = false;
+        });
     });
 }
 
@@ -2237,9 +2246,16 @@ function mbxSnapshotForm(form) {
         // 批量删除确认：页面内模态（原 window.confirm 在 macOS WKWebView
         // 不弹窗恒返 false，批量删除会静默失效）
         var submit = function () {
+            // R17 P2：与 mbxRefreshList/Side 同口径——传输层失败（onerror/
+            // timeout，不到服务端、不触发全局 responseError）时 Promise reject
+            // 无 catch 会成 unhandledRejection，界面「点了没反应」、勾选不变。
             htmx.ajax('POST', '/emails/batch', {
                 target: '#list-area', swap: 'outerHTML',
                 values: Object.fromEntries(params.entries())
+            }).catch(function () {
+                if (typeof mbxToast === 'function') {
+                    mbxToast('批量操作失败，请稍后重试', 'err', 6000);
+                }
             });
         };
         if (confirmMsg) {
@@ -2502,6 +2518,7 @@ document.addEventListener('click', function (ev) {
 // --- P8 shortcut core END ---
 
 // ---------- 撰写页：离开前未保存确认 ----------
+// --- R17 compose leave core START ---
 // 编辑过但未保存/发送时，点链接离开弹页面内确认模态（Tauri 的 macOS WKWebView
 // 不支持 window.confirm，故用 mbxConfirmLeave）。edited 标记由输入事件置位，
 // 自动保存/存草稿成功后清零（已落库不再提示）。
@@ -2550,11 +2567,24 @@ document.addEventListener('click', function (ev) {
         }
     });
 
-    // 发送/存草稿按钮 → 已保存意图，放行后续导航
-    document.addEventListener('click', function (ev) {
-        var b = ev.target && ev.target.closest ? ev.target.closest('button[hx-post="/compose/send"], button[type="submit"]') : null;
-        if (b) leaving = true;
-    }, true);
+    // R17 P1：与设置页同口径——leaving 只在请求**真正发出**时置位。
+    // 旧实现在 click 阶段置位，但撰写页 configRequest 有两条 preventDefault
+    // 路径（收件人为空/空正文确认框点「返回修改」），请求根本没发、beforeRequest
+    // 未触达，leaving 卡死 → beforeunload 直接放行，未保存正文静默丢失。
+    document.body.addEventListener('htmx:beforeRequest', function (ev) {
+        var d = ev.detail || {};
+        // 按请求路径判定（不依赖 elt 是 form 还是 button：存草稿走 form submit、
+        // 发送走 button hx-post），只有 /compose/send 与 /compose/draft 是
+        // 「已保存意图」；autosave/fetch 等其他请求不得置位。
+        var path = String((d.pathInfo && d.pathInfo.requestPath) || d.path || '');
+        if (path.indexOf('/compose/send') >= 0 || path.indexOf('/compose/draft') >= 0) {
+            leaving = true;
+        }
+    });
+    // 请求发出但失败（网络错误/4xx/5xx）或 HTML5 校验拦截 → 复位，
+    // 让 beforeunload 重新按 isDirty 提醒（设置页 R14 同款）
+    document.body.addEventListener('htmx:responseError', function () { leaving = false; });
+    document.addEventListener('invalid', function () { leaving = false; }, true);
 
     // 链接离开 → 自定义模态确认（确认后跳转，避免二次拦截）
     document.addEventListener('click', function (ev) {
@@ -2583,6 +2613,7 @@ document.addEventListener('click', function (ev) {
         }
     });
 })();
+// --- R17 compose leave core END ---
 
 // ---------- 设置页：离开前未保存确认 ----------
 // 覆盖：切换 tab（hx-get 替换 #settings-pane）、点侧栏/其他链接离开、刷新/关闭。
