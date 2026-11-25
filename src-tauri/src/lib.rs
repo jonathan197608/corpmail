@@ -518,7 +518,8 @@ fn spawn_fetch_scheduler<R: tauri::Runtime>(handle: tauri::AppHandle<R>) {
                 .state::<state::AppState>()
                 .get(state::keys::SYNC_INTERVAL_MIN)
                 .flatten()
-                .and_then(|v| v.parse::<u64>().ok())
+                // R20 P2：与写端 settings.rs 同钳制，手改 DB 超大值不得让定时收件停摆
+                .and_then(|v| v.parse::<u64>().ok().map(state::clamp_sync_interval_min))
                 .unwrap_or(30)
         };
         loop {

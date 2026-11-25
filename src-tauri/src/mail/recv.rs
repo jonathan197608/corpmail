@@ -11,7 +11,7 @@
 use super::{
     AppState, AttachCtx, attach_root_of, e, inline_limit_conn, insert_attachment, is_cjk,
     looks_mojibake, mark_read, month_dir_conn, now_epoch, safe_filename, sanitize_html, strip_html,
-    sync_attach_stats, thread_key_of, tokenize, zoned_of,
+    sync_attach_stats, thread_key_of, tokenize,
 };
 use crate::net::TlsMode;
 use rusqlite::OptionalExtension;
@@ -742,16 +742,29 @@ impl MailFetcher for RealFetcher {
     }
 }
 
-/// IMAP SINCE 日期（"DD-Mon-YYYY"，epoch 换算）
+/// IMAP SINCE 日期（"DD-Mon-YYYY"）：生产入口，时钟取当前 epoch。
 fn imap_since(days: i64) -> String {
-    let cutoff = now_epoch() - days.clamp(1, 365) * 86_400;
-    let Some(z) = zoned_of(cutoff) else {
+    imap_since_at(days, now_epoch())
+}
+
+/// R20 P2：可注入时钟的纯实现。
+///
+/// 旧实现用 zoned_of（客户端本地时区，且 1h 缓存）把 cutoff 换算成本地日期，
+/// 再交给 IMAP 服务器按**服务器时区**解释 SINCE——跨时区用户（如客户在东八区、
+/// 服务器在 UTC）边界当天的新邮件会被服务器判为早于 SINCE 而永久漏拉。
+/// 改用 UTC 日期且额外回退 1 天作安全边界：最多多拉一天（由 UID 游标去重），
+/// 但不会漏信。注入时钟便于固定 epoch 单测，不依赖机器时区或 TZ 缓存。
+fn imap_since_at(days: i64, now: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let cutoff = now - days.clamp(1, 365) * 86_400 - 86_400;
+    let Some(ts) = jiff::Timestamp::from_second(cutoff).ok() else {
         return "01-Jan-2020".into();
     };
-    let month = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ][(z.month() as usize - 1).min(11)];
-    format!("{:02}-{month}-{}", z.day() as u32, z.year())
+    let utc = ts.to_zoned(jiff::tz::TimeZone::UTC);
+    let month = MONTHS[(utc.month() as usize - 1).min(11)];
+    format!("{:02}-{month}-{}", utc.day() as u32, utc.year())
 }
 
 /// 头部字段抽取（parse_incoming 与 placeholder_mail 共用）：
@@ -849,13 +862,19 @@ fn decode_subject(headers: &mailparse::headers::Headers<'_>) -> String {
 /// 显示名旧实现直接取 `i.display_name`（addrparse 对原始 GBK 字节退 Latin-1），
 /// 污染联系人采集与列表展示；主题有兜底而显示名没有，属同构遗漏。
 fn decode_header_value(h: &mailparse::MailHeader<'_>) -> String {
+    let raw = h.get_value_raw();
+    // R20 P2：相邻 encoded-word 的 UTF-8 字节可能跨词切分（网关 75 列折行），
+    // mailparse 逐词解码会各自产出 U+FFFD。先按字节合并同 charset 相邻词一次解码，
+    // 成功即采纳；混合普通文本/不同 charset 时不合并，保持原有兜底逻辑。
+    if let Some(joined) = decode_adjacent_encoded_words(raw) {
+        return joined;
+    }
     let value = h.get_value().trim().to_string();
     // Latin-1 兜底迹象：出口出现 U+0080..U+00FF（原始字节非 UTF-8）
     if !value.chars().any(|c| matches!(c, '\u{80}'..='\u{ff}')) {
         return value;
     }
     // 原始字节本是合法 UTF-8 → 非 GBK 情形（如 RFC6532 直接 UTF-8），不猜
-    let raw = h.get_value_raw();
     if std::str::from_utf8(raw).is_ok() {
         return value;
     }
@@ -866,6 +885,103 @@ fn decode_header_value(h: &mailparse::MailHeader<'_>) -> String {
     } else {
         value
     }
+}
+
+/// R20 P2：合并 RFC2047 §6.2 相邻 encoded-word 的原始字节后一次解码。
+///
+/// 仅当整个头值由 2+ 个「同 charset、同 B/Q 编码、之间只有空白」的
+/// encoded-word 构成时采纳；任何普通文本、charset 不一致、解码失败都返回 None，
+/// 交回原有 GB18030/Latin-1 兜底。只在原始 ASCII 字节上操作（base64/Q payload
+/// 本身是 ASCII），不对已解码的 String 做二次处理。
+fn decode_adjacent_encoded_words(raw: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut charset: Option<String> = None;
+    let mut encoding: Option<String> = None;
+    let mut payload: Vec<u8> = Vec::new();
+    let mut words = 0usize;
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        if !rest.starts_with("=?") {
+            return None;
+        }
+        let after = &rest[2..];
+        let q1 = after.find('?')?;
+        let cs = &after[..q1];
+        if cs.is_empty() {
+            return None;
+        }
+        let after2 = &after[q1 + 1..];
+        let enc_len = after2.find('?')?;
+        let enc = &after2[..enc_len];
+        if !enc.eq_ignore_ascii_case("B") && !enc.eq_ignore_ascii_case("Q") {
+            return None;
+        }
+        let payload_encoded = &after2[enc_len + 1..];
+        let end = payload_encoded.find("?=")?;
+        let part = &payload_encoded[..end];
+        let cs_lower = cs.to_ascii_lowercase();
+        let enc_upper = enc.to_ascii_uppercase();
+        match &charset {
+            None => charset = Some(cs_lower),
+            Some(existing) if existing == &cs_lower => {}
+            _ => return None,
+        }
+        match &encoding {
+            None => encoding = Some(enc_upper.clone()),
+            Some(existing) if existing == &enc_upper => {}
+            _ => return None,
+        }
+        let bytes = if enc_upper == "B" {
+            base64::engine::general_purpose::STANDARD.decode(part).ok()?
+        } else {
+            // Q 编码：=XX 是十六进制字节，_ 是空格，其余原样
+            let p = part.as_bytes();
+            let mut out = Vec::with_capacity(p.len());
+            let mut i = 0;
+            while i < p.len() {
+                if p[i] == b'_' {
+                    out.push(b' ');
+                    i += 1;
+                } else if p[i] == b'=' {
+                    if i + 2 >= p.len() {
+                        return None;
+                    }
+                    let hex = |b: u8| -> Option<u8> {
+                        match b {
+                            b'0'..=b'9' => Some(b - b'0'),
+                            b'A'..=b'F' => Some(b - b'A' + 10),
+                            b'a'..=b'f' => Some(b - b'a' + 10),
+                            _ => None,
+                        }
+                    };
+                    out.push((hex(p[i + 1])? << 4) | hex(p[i + 2])?);
+                    i += 3;
+                } else {
+                    out.push(p[i]);
+                    i += 1;
+                }
+            }
+            out
+        };
+        payload.extend_from_slice(&bytes);
+        words += 1;
+        rest = payload_encoded[end + 2..].trim();
+    }
+    if words < 2 {
+        return None;
+    }
+    let cs = charset?;
+    let enc = encoding_rs::Encoding::for_label(cs.as_bytes())?;
+    let (cow, _, had_errors) = enc.decode(&payload);
+    if had_errors {
+        return None;
+    }
+    let decoded = cow.trim().to_string();
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// 超大邮件的占位形态：只有信头派生字段 + 一段说明正文，附件与正文均不下载。

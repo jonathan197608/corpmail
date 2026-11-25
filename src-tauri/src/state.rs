@@ -2830,6 +2830,28 @@ fn first_fetch_days_from_raw(raw: &str) -> i64 {
     raw.trim().parse::<i64>().unwrap_or(30).clamp(0, 365)
 }
 
+/// 收件间隔上限（分钟，7 天）：超过此值的间隔会让调度线程实质停摆
+pub const SYNC_INTERVAL_MAX_MIN: u64 = 10_080;
+/// inline 附件上限区间（MB）：0 等于全走独立文件，2048 以上单库体积失控
+pub const INLINE_ATTACH_MIN_MB: u64 = 1;
+pub const INLINE_ATTACH_MAX_MB: u64 = 2048;
+
+/// 收件间隔钳制（分钟）：0 = 仅手动原样保留，上限 7 天。
+/// 写端（ui/settings.rs）与读端（lib.rs 调度线程）必须同调——手改 DB
+/// 或旧版遗留的超大值若只在写端被钳，读端会 sleep 一个天文数字，
+/// 定时收件从此静默停摆且只有重启才恢复。
+pub fn clamp_sync_interval_min(v: u64) -> u64 {
+    v.min(SYNC_INTERVAL_MAX_MIN)
+}
+
+/// inline 附件上限的**读端**钳制（MB）：仅钳上界 2048。
+/// 0 是历史合法的「全走独立文件」语义（存量库/测试用它避免造大文件），
+/// 读端必须原样保留；写端 ui/settings.rs 另用 INLINE_ATTACH_MIN_MB 禁止
+/// 用户在表单里新设 0。两端上界同源，杜绝手改 DB 超大值撑爆单库。
+pub fn clamp_inline_attach_mb(v: u64) -> u64 {
+    v.min(INLINE_ATTACH_MAX_MB)
+}
+
 /// 单封收件上限（字节）：解析失败/未配置取默认 50MB；超出区间钳制到 1..=200MB
 /// （设置页与收件线程同源，防手改配置把上限推成天文数字或 0）
 pub fn max_mail_bytes_from(raw: &str) -> u64 {

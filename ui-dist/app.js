@@ -2765,6 +2765,28 @@ document.addEventListener('click', function (e) {
 // 避免一页挂 N 个。
 var MBX_TPL_SEQ = 0;
 
+// --- R20 tpl lifecycle core START ---
+// R20 P2：模板 pane 切走/保存后整片 swap，旧字段节点连同 wangEditor 实例一起
+// 被摘除，但实例内部的 DOM 监听/定时器不会自动释放——反复切 tab 会累积
+// 泄漏。注册表记录每个已初始化字段，pane 换入前统一 destroy（与撰写页
+// mbxBuildEditor 同口径）；新 pane 的 afterSwap 再重新惰性建。
+var MBX_TPL_REGISTRY = [];
+function mbxTplDestroyAll() {
+    for (var i = 0; i < MBX_TPL_REGISTRY.length; i++) {
+        var f = MBX_TPL_REGISTRY[i];
+        if (f && f.__tplSt && f.__tplSt.ed) {
+            try { f.__tplSt.ed.destroy(); } catch (e) { /* 已销毁则忽略 */ }
+            f.__tplSt.ed = null;
+        }
+    }
+    MBX_TPL_REGISTRY.length = 0;
+}
+document.body.addEventListener('htmx:beforeSwap', function (ev) {
+    var t = ev.detail && ev.detail.target;
+    if (t && t.id === 'settings-pane') mbxTplDestroyAll();
+});
+// --- R20 tpl lifecycle core END ---
+
 // HTML → 纯文本：块级元素与 <br> 转换行，去标签留文本
 function mbxHtmlToText(html) {
     var d = document.createElement('div');
@@ -2912,6 +2934,9 @@ function mbxTplInitField(field) {
         srcBtn: field.querySelector('[data-tpl-src-toggle]'),
         upgradeBtn: field.querySelector('[data-tpl-upgrade]')
     };
+    // R20 P2：登记字段，pane 换入前据此销毁编辑器实例
+    field.__tplSt = st;
+    MBX_TPL_REGISTRY.push(field);
     if (!st.plainBox || !st.htmlField || !st.ta || !st.bar || !st.area) return;
     if (st.srcBtn) st.srcBtn.addEventListener('click', function () { mbxTplToggleSrc(st); });
     if (st.upgradeBtn) st.upgradeBtn.addEventListener('click', function () { mbxTplUpgrade(st); });

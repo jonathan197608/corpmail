@@ -916,6 +916,66 @@ fn fetch_refuses_new_round_at_hang_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// R20 P2：收件间隔与 inline 上限的写端/读端共用同一钳制纯函数。
+/// 真值表钉死边界值；源码护栏钉死两个读端确实调用（运行期读源码，避免
+/// include_str! 在变异注入期间编译期缓存造成假绿）。
+#[test]
+fn r20_shared_config_clamps_are_called_on_both_read_paths() {
+    assert_eq!(clamp_sync_interval_min(0), 0, "0 = 仅手动，不能被钳成 1");
+    assert_eq!(clamp_sync_interval_min(30), 30);
+    assert_eq!(clamp_sync_interval_min(10_080), 10_080);
+    assert_eq!(clamp_sync_interval_min(100_000), 10_080, "手改超大值必须钳到 7 天");
+
+    assert_eq!(clamp_inline_attach_mb(1), 1);
+    assert_eq!(clamp_inline_attach_mb(20), 20);
+    assert_eq!(clamp_inline_attach_mb(2048), 2048);
+    assert_eq!(clamp_inline_attach_mb(0), 0, "0 = 全走独立文件，读端须保留历史语义");
+    assert_eq!(clamp_inline_attach_mb(u64::MAX), 2048, "天文数字钳到 2048");
+
+    let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("lib.rs 可读");
+    let at = lib
+        .find("let read_interval =")
+        .expect("调度线程读端存在");
+    let end = lib[at..].find("loop {").expect("读端闭包右边界");
+    let body = &lib[at..at + end];
+    assert!(
+        body.contains("clamp_sync_interval_min"),
+        "调度线程读端必须调用共享钳制，不能裸 parse（手改 DB 超大值会让定时收件停摆）"
+    );
+
+    let mail = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mail/mod.rs"))
+        .expect("mail/mod.rs 可读");
+    let at = mail
+        .find("fn inline_limit_conn")
+        .expect("inline 上限读端存在");
+    let end = mail[at..].find("// ---------- 附件两级存储").expect("读端右边界");
+    let body = &mail[at..at + end];
+    assert!(
+        body.contains("clamp_inline_attach_mb"),
+        "inline 上限读端必须调用共享钳制，不能裸 parse（超大值会把所有附件塞进 inline BLOB）"
+    );
+
+    let settings = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/settings.rs"
+    ))
+    .expect("settings.rs 可读");
+    let at = settings
+        .find("let inline = match form")
+        .expect("inline 写端存在");
+    let end = settings[at..].find("let clean =").expect("写端右边界");
+    let body = &settings[at..at + end];
+    assert!(
+        body.contains("INLINE_ATTACH_MAX_MB"),
+        "写端上界必须引用与读端同源的常量，不能各写一个 2048"
+    );
+    assert!(
+        body.contains("INLINE_ATTACH_MIN_MB"),
+        "写端须保留下界 1（禁止用户新设 0），读端的 0 兼容不能反向放宽表单"
+    );
+}
+
 /// 单封收件上限：解析失败/缺省取 50MB，越界钳制到 1..=200MB（0 会让所有邮件成占位）
 #[test]
 fn max_mail_bytes_clamps_to_reasonable_range() {

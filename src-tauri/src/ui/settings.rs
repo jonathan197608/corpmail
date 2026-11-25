@@ -14,11 +14,6 @@ use crate::state::{self, AppState, MigrateOutcome, ResetFetchError, defaults, fu
 use serde::Serialize;
 use std::collections::HashMap;
 
-/// 附件走 inline BLOB 的上限区间（MB）：下限 1（0 等于全走独立文件，
-/// 徒增文件数），上限 2048（再大单库体积失控，且远超邮件服务商单封上限）
-const INLINE_ATTACH_MIN_MB: u32 = 1;
-const INLINE_ATTACH_MAX_MB: u32 = 2048;
-
 /// 设置页（六 tab 全量上下文：整页与 pane 片段共用一份）
 #[derive(Serialize)]
 pub(super) struct SettingsCtx {
@@ -575,8 +570,9 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
     };
     let interval = match form.get("sync_interval_min") {
         // 上限 7 天：调度线程按间隔 sleep，巨值会让定时收件永久失效（重启才恢复）
-        Some(v) => match v.trim().parse::<u32>() {
-            Ok(n) => n.min(10_080).to_string(),
+        Some(v) => match v.trim().parse::<u64>() {
+            // R20 P2：读端同钳制在 state::clamp_sync_interval_min，防手改 DB 超大值绕过写端
+            Ok(n) => state::clamp_sync_interval_min(n).to_string(),
             Err(_) => cur(keys::SYNC_INTERVAL_MIN),
         },
         None => cur(keys::SYNC_INTERVAL_MIN),
@@ -727,10 +723,12 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
     // （旧实现只校验"是数字"，填 40 亿会让所有附件都走 inline BLOB，撑爆单库）
     let inline = match form
         .get("inline_attach_max_mb")
-        .map(|v| v.trim().parse::<u32>())
+        .map(|v| v.trim().parse::<u64>())
     {
+        // R20 P2：上界与读端同源（state::INLINE_ATTACH_MAX_MB）；下界 1 只在
+        // 写端禁止用户新设 0（读端保留 0 的历史「全走独立文件」语义）
         Some(Ok(v)) => v
-            .clamp(INLINE_ATTACH_MIN_MB, INLINE_ATTACH_MAX_MB)
+            .clamp(state::INLINE_ATTACH_MIN_MB, state::INLINE_ATTACH_MAX_MB)
             .to_string(),
         _ => cur(keys::INLINE_ATTACH_MAX_MB),
     };

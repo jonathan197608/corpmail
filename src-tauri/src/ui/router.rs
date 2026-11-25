@@ -2839,7 +2839,9 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
     }
     let form = parse_form(&req.body);
     let ctx_qs = form_list_query(&form);
-    let mut just_sent = None;
+    // R20 P2：Ok(false)/Err 与定时分支全部提前 return，走到末尾的只有成功
+    // 确认路径（just_sent = Some(id)）；用 let 而非 mut 避免 clippy unused_assignments
+    let just_sent;
     // 定时发送（M4-2）：scheduled_at 非空且晚于当前 → 不入队。
     // 校验前置（保存前）：过时刻拒绝并回撰写页，避免"存下过去时刻的定时 →
     // 调度线程当轮立即发出"的竞态
@@ -2896,7 +2898,10 @@ fn compose_send(state: &AppState, req: &Req) -> Resp {
             // 仍跳列表（无 just_sent），邮件永久停在 draft，用户却以为已发送。
             match mail::schedule_send_in(state, id, UNDO_SEND_SECS) {
                 Ok(true) => just_sent = Some(id),
-                Ok(false) => eprintln!("[compose] 撤销窗口未设置：草稿已入队或被并发发送（id={id}）"),
+                // R20 P2：CAS miss 表示另一路已把草稿入队/发出。旧实现只 eprintln，
+                // 界面照常跳列表且无 just_sent——用户既看不到撤销入口，也不知道
+                // 邮件其实已在发送流程中。回详情页给固定文案，与 undo_send 同口径。
+                Ok(false) => return send_cas_miss_redirect(id),
                 Err(err) => {
                     eprintln!("[compose] 撤销窗口写入失败：{err}");
                     return compose_retry_redirect(
@@ -3018,6 +3023,15 @@ fn redirect_compose(draft_id: i64, error: &str) -> Resp {
 /// 刚敲的收件人/主题/正文整段消失（htmx 走 HX-Redirect 整页导航，DOM 里的
 /// 值不会自动保留）。正文按 8KB 截断（UTF-8 安全边界）：超长邮件仍会丢尾巴，
 /// 但一段都不给才是真丢。
+/// R20 P2：发送确认 CAS miss（另一路已入队/发出）→ 回详情页固定文案提示。
+/// 文案不得带原始状态或 SQLite 错误（与 email_undo_send 同口径）。
+fn send_cas_miss_redirect(id: i64) -> Resp {
+    Resp::hx_redirect(&format!(
+        "/emails/{id}?error={}",
+        urlencode("发送已开始，请在发件箱确认（本次未能设置撤销窗口）")
+    ))
+}
+
 fn compose_retry_redirect(
     draft_id: i64,
     error: &str,

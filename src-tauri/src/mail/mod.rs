@@ -2820,7 +2820,8 @@ fn inline_limit_conn(conn: &rusqlite::Connection) -> u64 {
     .optional()
     .ok()
     .flatten()
-    .and_then(|v| v.parse::<u64>().ok())
+    // R20 P2：与写端 settings.rs 同钳制，手改 DB 超大值不得把所有附件塞进 inline BLOB
+    .and_then(|v| v.parse::<u64>().ok().map(crate::state::clamp_inline_attach_mb))
     .unwrap_or(20)
     .saturating_mul(1024 * 1024)
 }

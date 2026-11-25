@@ -11778,6 +11778,53 @@ fn r16_list_query_keeps_per_one_and_drops_default_ten() {
     cleanup(&dir);
 }
 
+/// R20 P2：发送确认 CAS miss（另一路已入队/发出）必须给用户固定文案回显，
+/// 不能静默跳列表（用户不知道邮件已在发送流程中）。CAS miss 需真实并发，
+/// 单测无法稳定注入，故用「纯函数行为 + 调用点源码护栏」两段钉死。
+#[test]
+fn r20_compose_send_cas_miss_shows_fixed_feedback() {
+    let resp = send_cas_miss_redirect(42);
+    let redirect = resp
+        .extra_headers
+        .iter()
+        .find(|(k, _)| k == "HX-Redirect")
+        .map(|(_, v)| v.as_str())
+        .expect("必须回详情页提示");
+    assert!(redirect.starts_with("/emails/42?error="), "回跳路径：{redirect}");
+    let qs = redirect.split_once('?').map(|(_, v)| v).unwrap_or("");
+    let decoded: Vec<(String, String)> = form_urlencoded::parse(qs.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let error = decoded
+        .iter()
+        .find(|(k, _)| k == "error")
+        .map(|(_, v)| v.as_str())
+        .expect("必须带 error 文案");
+    assert!(
+        error.contains("发送已开始"),
+        "必须明确告知邮件已在发送流程中：{error}"
+    );
+    assert!(
+        !redirect.contains("SQLITE") && !redirect.contains("BUSY"),
+        "内部错误只记日志，不得回显：{redirect}"
+    );
+
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/router.rs"
+    ))
+    .expect("源码可读");
+    let at = src
+        .find("match mail::schedule_send_in(state, id, UNDO_SEND_SECS)")
+        .expect("撤销窗口 CAS 调用点存在");
+    let end = src[at..].find("\n            }\n").expect("match 右边界");
+    let body = &src[at..at + end];
+    assert!(
+        body.contains("Ok(false) => return send_cas_miss_redirect(id)"),
+        "CAS miss 分支必须回显固定文案，不能只 eprintln：{body}"
+    );
+}
+
 /// R16 P2：静态资源编译期内嵌、模板无版本参数，24h 强缓存会让升级后
 /// 新 HTML 配旧 JS（安全修复不生效）。asset() 必须 no-store。
 #[test]

@@ -108,6 +108,42 @@ fn decode_subject_falls_back_to_gbk_for_raw_header() {
     );
 }
 
+/// R20 P2：相邻 encoded-word 的 UTF-8 字节跨词切分（网关 75 列折行），
+/// mailparse 逐词解码各产生 U+FFFD；必须合并字节一次解码还原中文。
+#[test]
+fn decode_subject_joins_adjacent_encoded_words_split_multibyte() {
+    // "中文" UTF-8 = E4 B8 | AD E6 96 87，切在两个 B 编码词中
+    let raw = b"Subject: =?UTF-8?B?5Lg=?= =?UTF-8?B?reaWhw==?=\r\n\r\n".to_vec();
+    let parsed = mailparse::parse_mail(&raw).unwrap();
+    assert_eq!(
+        header_fields(&parsed).subject,
+        "中文",
+        "跨词切分的 UTF-8 必须合并解码，不能是两个 U+FFFD"
+    );
+    // 未切分的标准相邻词也须正常（回归：合并逻辑不能破坏常规情形）
+    let raw2 = b"Subject: =?UTF-8?B?5Lit?= =?UTF-8?B?5paH?=\r\n\r\n".to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw2).unwrap()).subject,
+        "中文"
+    );
+    // 相邻词之间夹普通文本时不合并：文本必须保留
+    let raw3 = b"Subject: =?UTF-8?B?5Lg=?= hi =?UTF-8?B?reaWhw==?=\r\n\r\n".to_vec();
+    let out3 = header_fields(&mailparse::parse_mail(&raw3).unwrap()).subject;
+    assert!(out3.contains("hi"), "夹普通文本不得整体吞掉：{out3}");
+    // Q 编码跨字节切分同样覆盖
+    let raw4 = b"Subject: =?UTF-8?Q?=E4=B8?= =?UTF-8?Q?=AD=E6=96=87?=\r\n\r\n".to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw4).unwrap()).subject,
+        "中文"
+    );
+    // 单 encoded-word 走原路径（words<2 时不触发合并）
+    let raw5 = b"Subject: =?UTF-8?B?5Lit5paH?=\r\n\r\n".to_vec();
+    assert_eq!(
+        header_fields(&mailparse::parse_mail(&raw5).unwrap()).subject,
+        "中文"
+    );
+}
+
 /// 存量主题 GBK 乱码修复：库内 latin1-mojibake（每字节一 U+00xx 字符）应还原，
 /// 且 subject_tokens 同步重算（FTS 检索一致）；西文 latin1 主题不误改
 #[test]
@@ -376,6 +412,25 @@ fn imap_since_produces_imap_date_format() {
     assert_eq!(parts[0].len(), 2);
     assert_eq!(parts[1].len(), 3, "月份缩写三字母：{s}");
     assert_eq!(parts[2].len(), 4, "年份四位：{s}");
+}
+
+/// R20 P2：SINCE 用 UTC + 回退 1 天安全边界，固定 epoch 可测、不依赖机器时区。
+/// 2026-11-25T00:30:00Z（UTC 已跨日，东八区仍是 08:30 同日）；
+/// 7 天 cutoff = 11-18 00:30Z，再回退 1 天 → SINCE 11-17。
+#[test]
+fn r20_imap_since_uses_utc_with_safety_margin() {
+    // 2026-11-25T00:30:00Z 的 epoch
+    let now = 1_795_566_600;
+    assert_eq!(imap_since_at(7, now), "17-Nov-2026");
+    assert_eq!(imap_since_at(1, now), "23-Nov-2026", "1 天窗口也回退 1 天");
+    assert_eq!(imap_since_at(365, now), "24-Nov-2025");
+    // 边界月份/年份翻转
+    let jan1 = 1_767_225_600; // 2026-01-01T00:00:00Z
+    assert_eq!(imap_since_at(1, jan1), "30-Dec-2025");
+    // clamp：0/负数按 1 天算（调用方 first_days<=0 走 ALL，不走 SINCE）
+    assert_eq!(imap_since_at(0, now), imap_since_at(1, now));
+    assert_eq!(imap_since_at(-5, now), imap_since_at(1, now));
+    assert_eq!(imap_since_at(1000, now), imap_since_at(365, now));
 }
 
 #[test]
