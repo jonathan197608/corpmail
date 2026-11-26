@@ -7,8 +7,8 @@
 ```
 store-assets/
 ├── msix/
-│   ├── AppxManifest.xml     # 商店包清单（Identity.Name=corpmail 已定稿；Publisher 为占位）
-│   ├── assets/              # 全套商店图标（像素风，最近邻放大无损）
+│   ├── AppxManifest.xml     # 商店包清单（Identity.Name=JonathanHuang.corpmail + Publisher CN 均已定稿）
+│   ├── assets/              # 全套商店图标（蓝底白色信封，脚本 gen-icons.py 生成）
 │   └── （out/ 构建产物，不入库）
 ├── listing/
 │   └── store-listing.md     # Partner Center 逐字段对照表（中英双语）
@@ -38,14 +38,23 @@ store-assets/
 
 | 文件 | 场景 |
 |---|---|
-| `01-main-inbox.png` | 收件箱（6 封真实感种子：未读点/附件夹/近期时间） |
-| `02-detail-attachments.png` | 邮件详情 + 附件区 |
-| `03-compose.png` | 撰写（含已填示例内容） |
-| `04-search.png` | 全文检索高亮命中 |
-| `05-storage.png` | 存储管理（占用/清理策略） |
+| `01-main-inbox.png` | 收件箱（3 封种子：未读点、附件标记、侧栏计数） |
+| `02-detail-attachments.png` | 邮件详情 + 附件区（置顶/转发/回复/删除顶栏） |
+| `03-compose.png` | 撰写页（收件人/抄送/主题/正文/附件 + 模板下拉 + 定时发送） |
+| `04-search.png` | 中文关键词检索，命中词高亮 |
+| `05-storage.png` | 设置·存储管理（六 tab：发信/收信/收件同步/存储管理/模板/关于） |
 
-截图由 `.temp/smoke-html`（`cargo test dump_smoke_html -- --ignored` 导出）在
-1920×1080 视口下渲染获得，与发行物同源同 CSS。
+截图取自当前版本的三阶段 E2E 实机渲染（`e2e/run.sh` 产物），从 2880×1802 的
+HiDPI 截图缩放到 1920×1080，与发行代码同源。E2E 跑完后可按下列命令再生成：
+
+```bash
+SRC=e2e/artifacts/<运行ID>
+magick "$SRC/002-列表-取消未读过滤.png"       -resize 1920x -gravity north -crop 1920x1080+0+0 +repage store-assets/screenshots/01-main-inbox.png
+magick "$SRC/001-读信-正文与附件.png"         -resize 1920x -gravity north -crop 1920x1080+0+0 +repage store-assets/screenshots/02-detail-attachments.png
+magick "$SRC/002-撰写-初始态含模板下拉.png"   -resize 1920x -gravity north -crop 1920x1080+0+0 +repage store-assets/screenshots/03-compose.png
+magick "$SRC/003-检索-中文关键词命中.png"     -resize 1920x -gravity north -crop 1920x1080+0+0 +repage store-assets/screenshots/04-search.png
+magick "$SRC/004-设置-存储管理.png"           -resize 1920x -gravity north -crop 1920x1080+0+0 +repage store-assets/screenshots/05-storage.png
+```
 
 ## 构建流程（Windows 机上）
 

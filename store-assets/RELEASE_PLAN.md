@@ -1,7 +1,10 @@
 # CorpMail · Microsoft Store 上架方案
 
-> 版本：v1.2（2026-10-30）｜目标版本 0.3.0｜保留名 JonathanHuang.corpmail
+> 版本：v1.3（2026-11-26）｜目标版本 0.3.0｜保留名 JonathanHuang.corpmail
 > 本文档为执行总纲：阶段、步骤、责任分工、提交物与回退策略。
+> v1.3 修订：商店截图 5 张全部换为当前版本 E2E 实机渲染（原图为 2026-10-29
+> 旧 UI，设置页 4 tab / mailbox.toml，与 0.3.0 不符）；listing 隐私描述对齐
+> `PRIVACY.zh-CN.md`（远程图片默认关闭、凭据降级）、图标描述改为蓝白信封。
 > v1.2 修订：打包改用 WinApp CLI（免装 Windows SDK，只出未签名包）；
 > WACK 预检移除（非必要，商店认证自带检测），tag 收尾改为商店提交后。
 
@@ -10,7 +13,7 @@
 ## 一、总体路线
 
 ```
-[阶段 0] 资产定稿（本次会话完成）
+[阶段 0] 资产定稿（已完成，见第七节状态清单）
     ↓
 [阶段 1] 构建商店包（Windows 机，你执行）
     ↓
@@ -120,11 +123,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build-msix.ps1
 | AppxManifest（Identity/Publisher/语言 zh-CN/虚拟化禁用） | ✅ 定稿 |
 | 商店图标 6 规格（44/50/150/310/620 + Wide） | ✅ |
 | listing 中英双语 + 认证备注英文 | ✅ |
-| 隐私声明（zh-CN 主用 + en-US 备用） | ✅ 本次推根目录公开路径 |
-| 截图 5 张 1920×1080 | ✅ |
+| 隐私声明（zh-CN 主用 + en-US 备用） | ✅ 仓库根目录公开路径，listing 描述已对齐 |
+| 截图 5 张 1920×1080 | ✅ 2026-11-26 换为当前版本 E2E 实机渲染（原 2026-10-29 旧 UI 已弃用） |
 | build-msix.ps1（PowerShell 原生，WinApp CLI 打包） | ✅ |
 | 版本 0.3.0 全链统一 | ✅ |
 | identifier/数据目录 com.corpmail.desktop | ✅ 本版统一（无存量用户，无需迁移） |
 | 品牌（productName=CorpMail；窗口标题/托盘菜单中文名「企业邮箱客户端」） | ✅ 本版统一 |
-| 公开隐私文档路径（仓库根） | ✅ 本次修复（原 docs/ 整体在 .gitignore，链接会 404） |
+| 公开隐私文档路径（仓库根） | ✅ 已修复（原 docs/ 整体在 .gitignore，链接会 404） |
 | GitHub 仓库迁移至 corpmail（原 mailbox 仓库停用为历史归档） | ✅ 已迁移（商店隐私链接等全链指向新仓库） |

@@ -39,7 +39,7 @@ CorpMail 是一款为办公场景打造的本地优先邮箱客户端：收发�
 【为什么选择 CorpMail】
 
 ■ 隐私优先，数据不出本机
-全部邮件保存在本机数据库，不经过任何第三方服务器；账号密码存入 Windows 凭据管理器，数据库不留明文。我们不运营任何服务器，也不收集任何数据。
+全部邮件保存在本机数据库，不经过任何第三方服务器；账号密码优先存入 Windows 凭据管理器（系统凭据服务不可用时降级为本机加密文件 + 独立密钥），数据库不留明文。我们不运营任何服务器，也不收集任何数据。
 
 ■ 标准协议直连自有邮箱
 发信走 SMTP、收信走 IMAP，直连你自己公司的邮件服务器。无需在应用内注册新账号，首次启动填入现有邮箱即可使用。
@@ -53,8 +53,8 @@ CorpMail 是一款为办公场景打造的本地优先邮箱客户端：收发�
 ■ 精致流畅的桌面体验
 原生窗口 + 轻量界面，启动即用；收取新邮件、发送、清理全部后台执行不打断浏览；撰写、回复、草稿、附件一应俱全。
 
-■ 像素风图标 · 一眼可辨
-全新像素风设计语言，蓝白撞色，清爽有记忆点。
+■ 简洁图标 · 一眼可辨
+蓝白配色的信封标识，界面清爽、辨识度高。
 
 【适合谁用】
 
@@ -64,16 +64,18 @@ CorpMail 是一款为办公场景打造的本地优先邮箱客户端：收发�
 
 【功能一览】
 
-· 收件（IMAP）：手动 / 定时自动收取，未读标记，已读状态回写服务器
-· 发件（SMTP）：异步发送队列，失败可一键重新编辑发送
-· 撰写与回复：草稿自动留存，多附件添加、在线预览（图片 / PDF / 文本）、另存为
+· 收件（IMAP）：手动 / 定时自动收取，未读标记，已读状态回写服务器，会话视图
+· 发件（SMTP）：异步发送队列，失败可一键重新编辑发送，发送后短时间内可撤销
+· 撰写与回复：草稿自动留存，多附件添加、在线预览（图片 / PDF / Office / 文本）、另存为
+· 邮件管理：置顶、批量操作、跨页全选、高级筛选、EML/Markdown 导出
 · 全文检索：中文分词 + 相关度排序 + 关键词高亮
-· 存储管理：数据目录可迁移，自动清理策略可调，存储占用一目了然
+· 存储管理：数据目录可后台迁移，自动清理策略可调，存储占用一目了然
+· 隐私开关：正文远程图片默认阻止，按需开启
 · 单实例运行：重复启动自动聚焦已有窗口
 
 【隐私与安全】
 
-CorpMail 不内置统计分析、不联网上报任何信息；唯一网络行为是与你配置的邮件服务器通信。密码仅存于 Windows 凭据管理器，数据库中不落明文。
+CorpMail 不内置统计分析、不联网上报任何信息。网络请求仅发往你配置的 IMAP/SMTP 服务器；正文远程图片默认阻止，仅在「设置 → 收件同步 → 加载邮件中的远程图片」开启后才由应用代理加载。密码优先存于 Windows 凭据管理器，不可用时降级为本机加密存储，数据库中不落明文。
 
 【支持】
 
@@ -88,7 +90,7 @@ CorpMail is a local-first email client for business mailboxes: send and receive 
 【Why CorpMail】
 
 ■ Privacy first — everything stays local
-All mail is stored in a local database and never passes through any third-party server. Account passwords live in Windows Credential Manager, never in plaintext. We run no servers and collect nothing.
+All mail is stored in a local database and never passes through any third-party server. Account passwords live in Windows Credential Manager (falling back to an encrypted local file with a separate key when the system credential service is unavailable), never in plaintext. We run no servers and collect nothing.
 
 ■ Standard protocols, your own mailbox
 Send via SMTP, receive via IMAP — direct connections to your company's mail servers. No new account needed inside the app; just configure your existing mailbox on first launch.
@@ -102,8 +104,8 @@ Attachments are gzip-compressed and tiered by size; sent mail and large attachme
 ■ A fast, polished desktop experience
 Native window, instant start. Fetching, sending and cleaning all run in the background without interrupting browsing. Compose, reply, drafts and attachments included.
 
-■ Pixel-art icon, instantly recognizable
-A crisp blue-and-white pixel design language.
+■ Clean icon, instantly recognizable
+A crisp blue-and-white envelope identity on a clean interface.
 
 【Who it's for】
 
@@ -113,16 +115,18 @@ A crisp blue-and-white pixel design language.
 
 【Feature list】
 
-· Receive (IMAP): manual / scheduled fetch, unread flags, read-state sync back to server
-· Send (SMTP): asynchronous queue with one-click edit-and-resend on failure
-· Compose & reply: auto-saved drafts, multi-attachment add, inline preview (images / PDF / text), save-as
+· Receive (IMAP): manual / scheduled fetch, unread flags, read-state sync back to server, conversation view
+· Send (SMTP): asynchronous queue with one-click edit-and-resend, short undo window after sending
+· Compose & reply: auto-saved drafts, multi-attachment add, inline preview (images / PDF / Office / text), save-as
+· Mail management: pin to top, batch actions, cross-page select all, advanced filters, EML/Markdown export
 · Search: tokenized FTS with relevance ranking and highlighting
-· Storage: movable data directory, tunable auto-clean policies, size at a glance
+· Storage: background-movable data directory, tunable auto-clean policies, size at a glance
+· Privacy switch: remote images in message bodies blocked by default, opt-in to load
 · Single instance: relaunching focuses the existing window
 
 【Privacy & security】
 
-CorpMail embeds no analytics and phones nothing home; its only network activity is talking to the mail servers you configure. Passwords are stored exclusively in Windows Credential Manager.
+CorpMail embeds no analytics and phones nothing home. Network requests go only to the IMAP/SMTP servers you configure; remote images in message bodies are blocked by default and are loaded through the app only after you enable "Load remote images" in Settings → Sync. Passwords are stored in Windows Credential Manager, with an encrypted local fallback when unavailable.
 
 【Support】
 
@@ -137,9 +141,13 @@ Issues & source code (MIT): https://github.com/jonathan197608/corpmail
 ## 5. 此版本的新增功能（What's new，两者通用模板）
 
 ```
-v0.3.0
-· Microsoft Store 首发版本
-· 收发一体（SMTP/IMAP）、草稿与附件、中文全文检索、存储管理
+v0.3.0 — Microsoft Store 首发版本
+· 收发一体：SMTP 发信 / IMAP 收信、异步发送队列、失败可重发
+· 撰写与草稿：自动保存、多附件、模板插入、定时发送、富文本
+· 中文全文检索：分词索引、相关度排序、命中高亮
+· 本地存档：数据目录可迁移（后台执行）、自动清理策略、存储占用可视
+· 附件：预览、另存、压缩归档、导出 EML/Markdown
+· 隐私：远程图片默认阻止、凭据系统级存储、无遥测
 ```
 
 ## 6. 类别（Category）
