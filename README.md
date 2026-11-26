@@ -35,17 +35,29 @@ CorpMail（中文名「企业邮箱客户端」）是一款面向中国电信企
 ### 从源码构建
 
 要求：Rust stable、macOS/Linux（交叉编译 Windows 产物需 mingw-w64）或 Windows 原生。
+运行时 crate `tauri` 为 2.12.5（见 Cargo.lock）；命令行 `tauri-cli` 独立发版，
+当前为 2.12.4，两者版本号不同步属正常：
 
 ```bash
-# macOS 交叉编译 Windows NSIS 安装器
-# 运行时 crate `tauri` 为 2.12.5（见 Cargo.lock）；命令行 `tauri-cli` 独立发版，
-# 当前最高为 2.12.4，两者版本号不同步属正常。
 cargo install tauri-cli --version 2.12.4
+```
+
+交叉编译 Windows NSIS 安装器：
+
+```bash
+# macOS 宿主：必须用打包脚本，不能直接跑 cargo tauri build。
+# 脚本前置两件必需事：patched makensis 的 PATH 注入、WebView2 Bootstrapper
+# 打包缓存预置。缺前者 libiconv 在 "wchar_t" 通道对 C0/CJK/BOM 返回 EILSEQ，
+# 标准 makensis 处理任意脚本即 bad_alloc 崩溃（中文语言文件另报 Bad text encoding）；
+# 缺后者 bundler 会联网拉取 fwlink，内网拦截 go.microsoft.com 时打包失败。
+scripts/build-windows.sh
+
+# Linux / Windows 宿主：系统 nsis 即可（Linux 上 apt install nsis），无上述前置
 cargo tauri build --target x86_64-pc-windows-gnu \
   --config '{"bundle":{"targets":["nsis"]}}'
 ```
 
-> macOS 宿主构建 NSIS 需自建 patched makensis：macOS 的 libiconv 在 "wchar_t" 转换通道上对 C0 控制符/CJK/BOM 返回 EILSEQ，标准版 makensis 处理任意脚本即 bad_alloc 崩溃（中文语言文件还会额外报 "Bad text encoding"）。用 `scripts/build-patched-nsis.sh` 从 NSIS 3.13 源码构建补丁版；Linux/Windows 宿主无此问题，`apt install nsis` 即可。
+> macOS 的 patched NSIS 工具链若尚未构建，先跑 `scripts/build-patched-nsis.sh`（从 NSIS 3.13 源码构建，约 1 分钟）；`build-windows.sh` 检测缺失会硬失败并给出该指引，不会静默回退到必崩的系统 makensis。
 
 商店 MSIX 包由 `scripts/build-msix.ps1`（WinApp CLI）在 Windows 机上构建，详见 `store-assets/`。
 
