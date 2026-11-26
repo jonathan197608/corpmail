@@ -13,14 +13,16 @@
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub" id="mail-count">共 {{ total }} 封</span></h1>
         {% if items %}
-        {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）；
-           发件箱/草稿箱按钮精简（2026-11-09）：只保留「全选」与「跨页选择全部」，
-           删除/批量操作/清空选择仅收件箱与全部视图渲染 #}
+        {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）。
+           收件箱保留完整批量组；草稿箱提供批量删除与清空选择；发件箱只保留
+           「全选」与「跨页选择全部」（已发送邮件的状态动作无意义）。 #}
         <div class="mbx-inline" id="batch-bar">
             <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">全选</label>
             <span class="ba-count" id="ba-count"></span>
-            {% if folder != 'sent' and folder != 'draft' %}
+            {% if folder != 'sent' %}
             <button type="button" class="btn small danger" data-batch="delete">{{ ic.icon('trash') }} 删除</button>
+            {% endif %}
+            {% if folder == 'inbox' %}
             <div class="split ba-more">
                 <button type="button" class="btn small" data-split-toggle aria-label="更多批量操作">批量操作⋯</button>
                 <div class="split-menu" hidden>
@@ -32,9 +34,12 @@
                     <button type="button" data-batch="unstar">{{ ic.icon('star') }} 取消置顶</button>
                 </div>
             </div>
+            {% endif %}
+            {% if folder != 'sent' %}
             <button type="button" class="btn small" id="ba-clear">清空选择</button>
-            {% else %}
-            {# 发件/草稿箱：无批量动作与 ⋯ 下拉，但跨页「选择全部 N 封」仍需常驻
+            {% endif %}
+            {% if folder != 'inbox' %}
+            {# 发件/草稿箱：跨页「选择全部 N 封」为常驻按钮
                （js 选中后填充文案并显隐，与下拉内入口共用同一 id/逻辑） #}
             <a href="#" id="ba-select-all" class="btn small" hidden></a>
             {% endif %}

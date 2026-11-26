@@ -1032,8 +1032,8 @@ document.body.addEventListener('mbx:starDone', function (ev) {
     btn.classList.toggle('on', starred);
     btn.setAttribute('aria-pressed', starred ? 'true' : 'false');
     btn.title = starred ? '取消置顶（恢复按时间排序）' : '置顶显示（列表排在最前）';
-    // 详情页按钮带文字（列表页按钮仅星形图标）、两形态统一一套文案
-    if (btn.textContent.indexOf('星') >= 0) {
+    // 详情页按钮带「置顶/已置顶」文字（列表页走上方刷新分支，不进这里）
+    if (btn.textContent.indexOf('置顶') >= 0) {
         btn.innerHTML = starred ? MBX_IC.starFill + ' 已置顶' : MBX_IC.star + ' 置顶';
     } else {
         btn.innerHTML = MBX_IC.starFill;
@@ -2272,7 +2272,8 @@ function mbxSnapshotForm(form) {
     function confirmText(action) {
         var n = selectedCount();
         if (action === 'delete') {
-            return '确定删除选中的 ' + n + ' 封邮件？删除后无法恢复（含附件），草稿也会一并删除。';
+            var noun = val('ba-folder') === 'draft' ? '封草稿' : '封邮件';
+            return '确定删除选中的 ' + n + ' ' + noun + '？删除后无法恢复（含附件）。';
         }
         return null;
     }

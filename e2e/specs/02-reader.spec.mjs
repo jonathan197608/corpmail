@@ -114,6 +114,30 @@ describe('02 读信与检索', () => {
     await shot('读信-顶栏动作区')
   })
 
+  it('详情页置顶翻转：文字与 aria-pressed 同步（与列表页同口径）', async () => {
+    let btn = await $('.tb-actions .star-btn')
+    expect(await btn.isExisting()).toBe(true)
+    expect(await btn.getAttribute('aria-pressed')).toBe('false')
+    await btn.click()
+    await browser.waitUntil(
+      async () => (await $('.tb-actions .star-btn').getAttribute('aria-pressed')) === 'true',
+      { timeoutMsg: '详情页置顶后 aria-pressed 未翻转' },
+    )
+    btn = await $('.tb-actions .star-btn')
+    expect(await btn.getText()).toContain('已置顶')
+    // 详情页 star 按钮 hx-trigger 带 throttle:500ms；翻转就地更新不自重绘，
+    // 测试必须跨过节流窗口，否则第二次点击被 htmx 吞掉（看起来像没响应）
+    await browser.pause(600)
+    await btn.click()
+    await browser.waitUntil(
+      async () => (await $('.tb-actions .star-btn').getAttribute('aria-pressed')) === 'false',
+      { timeoutMsg: '详情页取消置顶后 aria-pressed 未翻转' },
+    )
+    btn = await $('.tb-actions .star-btn')
+    expect(await btn.getText()).toContain('置顶')
+    expect(await btn.getText()).not.toContain('已置顶')
+  })
+
   it('T5 会话视图直达 URL：/threads/{id} 渲染该主题归组的往来卡片', async () => {
     // 会话视图入口在详情页（mode=thread）；深链 /threads/{id} 是独立路由
     // （router.rs thread_detail_page）——结构从未被 spec 直达覆盖。

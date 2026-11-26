@@ -210,6 +210,30 @@ describe('04 列表筛选与批量操作', () => {
     await shot('列表-取消置顶')
   })
 
+  it('B10b 行内置顶/取消置顶：与详情页同一入口', async () => {
+    await goto('/')
+    await waitBoot()
+    await waitMailRows()
+    expect((await $$('.mail-row.starred')).length).toBe(0)
+    let btn = await (await $$('.mail-row'))[0].$('.star-btn')
+    expect(await btn.isExisting()).toBe(true)
+    expect(await btn.getAttribute('aria-pressed')).toBe('false')
+    await btn.click()
+    await browser.waitUntil(
+      async () => (await $$('.mail-row.starred')).length === 1,
+      { timeoutMsg: '行内置顶后未出现置顶行' },
+    )
+    btn = await (await $$('.mail-row.starred'))[0].$('.star-btn')
+    expect(await btn.getAttribute('aria-pressed')).toBe('true')
+    expect(await btn.getText()).toContain('已置顶')
+    await shot('列表-行内置顶')
+    await btn.click()
+    await browser.waitUntil(
+      async () => (await $$('.mail-row.starred')).length === 0,
+      { timeoutMsg: '行内取消置顶未生效' },
+    )
+  })
+
   it('B15 批量标已读/标未读 + 清空选择（批量操作⋯ 菜单）', async () => {
     await goto('/')
     await waitBoot()
@@ -330,6 +354,7 @@ describe('04 列表筛选与批量操作', () => {
     await waitMailRows() // T4/R6：等列表行挂载再取 before 基线
     const before = (await $$('.mail-row')).length
     const rows = await $$('.mail-row')
+    expect(await rows.at(-1).$('.row-del').isExisting()).toBe(true) // 行内删除入口常驻
     await rows.at(-1).$('.mbx-item').click() // 删最后一行：保住 05 依赖的「会议纪要」
     await $('button[data-batch="delete"]').click()
     // 2026-11：hx-confirm 改页面内模态（window.confirm 在 WKWebView 恒 false）

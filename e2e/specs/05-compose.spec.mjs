@@ -137,6 +137,44 @@ describe('05 撰写与发送', () => {
     await shot('草稿箱-新草稿')
   })
 
+  it('D3b 草稿箱行内删除：删临时草稿，D3 的草稿保留', async () => {
+    await goto('/compose')
+    await $(COMPOSE.to).setValue('row-delete@corpmail.test')
+    await $(COMPOSE.subject).setValue('E2E 行内删除草稿')
+    await $(COMPOSE.body).setValue('行内删除验证正文。')
+    await $('button[type="submit"]').click()
+    await browser.waitUntil(
+      async () => (await browser.getUrl()).includes('saved=1'),
+      { timeoutMsg: '临时草稿未保存' },
+    )
+
+    await goto('/?folder=draft')
+    await waitBoot()
+    await waitText('.mail-list', 'E2E 行内删除草稿')
+    const before = (await $$('.mail-row')).length
+    let target = null
+    for (const row of await $$('.mail-row')) {
+      if ((await row.getText()).includes('E2E 行内删除草稿')) {
+        target = row
+        break
+      }
+    }
+    expect(target).toBeDefined()
+    await (await target.$('.row-del')).click()
+    expect(await confirmModalText()).toContain('草稿')
+    await acceptConfirm()
+    await browser.waitUntil(
+      async () => !(await $('.mail-list').getText()).includes('E2E 行内删除草稿'),
+      { timeout: 20000, timeoutMsg: '行内删除后草稿仍在列表' },
+    )
+    await browser.waitUntil(
+      async () => (await $$('.mail-row')).length === before - 1,
+      { timeout: 20000, timeoutMsg: '行内删除后草稿行数未减少' },
+    )
+    await waitText('.mail-list', 'E2E 自动保存草稿')
+    await shot('草稿箱-行内删除')
+  })
+
   it('D4 立即发送：outbox 落盘（To/主题正确）+ 发件箱出现该邮件', async () => {
     const before = sentMails().length
     await goto('/compose')

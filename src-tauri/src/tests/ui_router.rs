@@ -490,9 +490,9 @@ fn thread_entry_on_detail_page_only_when_multiple() {
     cleanup(&dir);
 }
 
-/// 发件箱/草稿箱（2026-11-09 需求）：①列表行「对方」显示收件人而非自己；
-/// ②批量按钮组只保留「全选」（删除/批量操作/清空选择不渲染）；
-/// ③顶栏 ⋯ 下拉（含「收取新邮件」）不渲染；收件箱视图不受影响
+/// 发件箱/草稿箱：①列表行「对方」显示收件人而非自己；
+/// ②发件箱批量按钮只保留「全选」，草稿箱提供批量删除 + 清空选择；
+/// ③顶栏 ⋯ 下拉（含「收取新邮件」）不渲染；收件箱/草稿箱行内置顶与删除常驻
 #[test]
 fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     let (state, dir) = temp_state("toolbar-sent-draft");
@@ -503,14 +503,16 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         .with_conn(|c| {
             c.execute_batch(
                 "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
-                                    subject, body_text, subject_tokens, body_tokens, created_at, sent_at)
+                                    subject, body_text, subject_tokens, body_tokens, created_at, sent_at, starred)
                  VALUES ('out','sent','sent','demo@chinatelecom.cn','张伟','peer@x.cn',
-                         '季度汇报','已发送正文','季度 汇报','正文',1,1),
+                         '季度汇报','已发送正文','季度 汇报','正文',1,1,0),
                         ('out','draft','draft','demo@chinatelecom.cn','张伟',
                          '李四 <lisi@x.cn>, wangwu@x.cn, zhao@x.cn, qian@x.cn',
-                         '未完草稿','草稿正文','未完 草稿','正文',2,NULL),
+                         '未完草稿','草稿正文','未完 草稿','正文',2,NULL,0),
+                        ('out','draft','draft','demo@chinatelecom.cn','张伟','starred@x.cn',
+                         '已置顶草稿','置顶正文','已 置顶 草稿','正文',2,NULL,1),
                         ('in','inbox','received','boss@x.cn','部门领导','demo@chinatelecom.cn',
-                         '月度激励清单','收件正文','月度 激励 清单','正文',3,NULL)",
+                         '月度激励清单','收件正文','月度 激励 清单','正文',3,NULL,0)",
             )
             .unwrap();
             Ok::<(), String>(())
@@ -544,6 +546,10 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         "发件箱不应渲染删除/清空选择按钮：{html}"
     );
     assert!(
+        !html.contains("row-act"),
+        "发件箱不应渲染行内置顶/删除按钮：{html}"
+    );
+    assert!(
         !html.contains("收取新邮件") && !html.contains("tb-more-btn"),
         "发件箱不应渲染 ⋯ 下拉（含收取新邮件）：{html}"
     );
@@ -565,6 +571,16 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         !html.contains("收取新邮件"),
         "草稿箱不应渲染收取新邮件：{html}"
     );
+    assert!(
+        html.contains("data-batch=\"delete\"")
+            && html.contains("清空选择")
+            && html.contains("row-del")
+            && html.contains("确定删除这封草稿？")
+            && html.contains("row-act star-btn btn small")
+            && html.contains("已置顶")
+            && html.contains("取消置顶"),
+        "草稿箱应渲染批量删除与行内置顶/删除：{html}"
+    );
     // 收件箱：按钮组与 ⋯ 下拉保持原样
     let html = body(&route(
         &state,
@@ -576,14 +592,67 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         },
     ));
     assert!(
-        html.contains("data-batch=\"delete\"") && html.contains("清空选择"),
-        "收件箱应保留完整批量按钮组：{html}"
+        html.contains("data-batch=\"delete\"")
+            && html.contains("清空选择")
+            && html.contains("row-del")
+            && html.contains("确定删除这封邮件？")
+            && html.contains("row-act star-btn btn small"),
+        "收件箱应保留完整批量按钮组与行内置顶/删除：{html}"
     );
     assert!(
         html.contains("收取新邮件") && html.contains("tb-more-btn"),
         "收件箱应保留 ⋯ 下拉与收取入口：{html}"
     );
     cleanup(&dir);
+}
+
+/// 行内操作（置顶/删除）必须落在链接外（否则点按钮会顺带打开详情），
+/// 删除必须保留页面内确认、置顶必须复用详情页同一端点。
+/// 运行时读源码，避免变异测试同秒 mtime 触发 include_str! 陈旧缓存。
+#[test]
+fn row_actions_are_outside_link_and_reuse_detail_endpoints() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/templates/mail_list_rows.html"
+    ))
+    .expect("行模板可读");
+    let link_close = src.find("</a>").expect("行链接闭合标签存在");
+    let star_btn = src.find("class=\"row-act star-btn").expect("行内置顶按钮存在");
+    let del_btn = src.find("class=\"row-act row-del").expect("行内删除按钮存在");
+    assert!(
+        star_btn > link_close && del_btn > link_close,
+        "行内操作按钮必须放在行链接闭合标签之后：{src}"
+    );
+    let star = &src[star_btn..star_btn + src[star_btn..].find('>').expect("置顶按钮闭合")];
+    assert!(
+        star.contains("hx-post=\"/emails/{{ m.id }}/star")
+            && star.contains("data-mail-id=\"{{ m.id }}\""),
+        "行内置顶应复用详情页同一端点与事件标记：{star}"
+    );
+    let del = &src[del_btn..del_btn + src[del_btn..].find('>').expect("删除按钮闭合")];
+    assert!(
+        del.contains("hx-post=\"/emails/{{ m.id }}/delete"),
+        "行内删除应走已有硬删端点：{del}"
+    );
+    assert!(
+        del.contains("hx-confirm="),
+        "行内删除必须带页面内确认（WKWebView 无原生 confirm）：{del}"
+    );
+}
+
+/// 详情页置顶翻转后必须保留「置顶/已置顶」文字：旧判据找「星」在改名后
+/// 恒 false，按钮会退化成纯图标（与列表页口径不一致）。运行时读源码。
+#[test]
+fn detail_star_toggle_keeps_visible_label() {
+    let js = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ui-dist/app.js"
+    ))
+    .expect("app.js 可读");
+    assert!(
+        js.contains("btn.textContent.indexOf('置顶') >= 0"),
+        "置顶翻转应识别「置顶」文案，不能沿用已废弃的「星」判据"
+    );
 }
 
 #[test]
@@ -2282,15 +2351,14 @@ fn star_endpoint_toggles_and_pins_to_top() {
         "星标邮件应置顶：{}",
         top
     );
-    // 行内星标按钮已移除（2026-11-04 设计变更）：星标行以 starred class
-    // （金色脊线）表达，按钮仅存于详情页
+    // 星标行同时以 starred class（金色脊线）与行内「已置顶」按钮表达
     assert!(
         h.contains("mail-row starred"),
         "星标行应以 starred class（金脊线）标记"
     );
     assert!(
-        !h.contains("class=\"star-btn on\""),
-        "列表行不应再有星标按钮"
+        h.contains("row-act star-btn btn small on") && h.contains("已置顶"),
+        "星标行应保留与详情页同口径的已置顶按钮"
     );
     // 详情页：按钮显示已星标态
     let detail = body(&route(
@@ -8109,7 +8177,7 @@ fn list_per_page_select_and_persist() {
     // 默认（无 per）：10 条/页、第 1 页显示 "1 / 3"
     let html = body(&route(&state, &assets(), &req("GET", "/", b""), &t));
     assert!(html.contains("1 / 3"), "25 封默认 10/页 = 3 页");
-    assert_eq!(html.matches("data-mail-id").count(), 10, "默认每页 10 行");
+    assert_eq!(html.matches("<div class=\"mail-row").count(), 10, "默认每页 10 行");
     // 选择器存在且 selected=10
     assert!(html.contains("per-select"), "顶栏应有每页选择器");
     assert!(html.contains("<option value=\"10\" selected"));
@@ -8140,7 +8208,7 @@ fn list_per_page_select_and_persist() {
         &t,
     ));
     assert_eq!(
-        html.matches("data-mail-id").count(),
+        html.matches("<div class=\"mail-row").count(),
         25,
         "per 钳到 100 后 25 封一页"
     );
@@ -8152,7 +8220,7 @@ fn list_per_page_select_and_persist() {
         &t,
     ));
     assert_eq!(
-        html.matches("data-mail-id").count(),
+        html.matches("<div class=\"mail-row").count(),
         25,
         "非法 per 应回退 settings(100)"
     );
@@ -8170,10 +8238,10 @@ fn list_per_page_select_and_persist() {
     cleanup(&dir);
 }
 
-/// 列表行不再渲染星标按钮（2026-11-04 设计变更）：星标行以金色脊线 class
-/// 表达（.mail-row.starred），行内无 star-btn；批量工具栏 star/unstar 仍在
+/// 星标行同时以金色脊线 class（.mail-row.starred）与行内「已置顶」按钮表达；
+/// 批量工具栏 star/unstar 仍在
 #[test]
-fn list_rows_show_starred_as_spine_not_button() {
+fn list_rows_show_starred_as_spine_and_button() {
     let (state, dir) = temp_state("star-spine");
     state
         .set_batch(&[
@@ -8202,8 +8270,8 @@ fn list_rows_show_starred_as_spine_not_button() {
         "星标行应有 starred class（金脊线钩子）：{html}"
     );
     assert!(
-        !html.contains("class=\"star-btn on\""),
-        "列表行不应再有星标按钮"
+        html.contains("row-act star-btn btn small on") && html.contains("已置顶"),
+        "星标行应保留与详情页同口径的已置顶按钮：{html}"
     );
     assert!(
         html.contains("data-batch=\"unstar\""),
@@ -8555,7 +8623,7 @@ fn advanced_search_filters_and_persists() {
         &t,
     ));
     assert_eq!(
-        html.matches("data-mail-id=").count(),
+        html.matches("<div class=\"mail-row").count(),
         2,
         "非法日期应忽略：{html}"
     );
