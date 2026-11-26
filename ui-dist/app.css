@@ -3045,6 +3045,20 @@ form.setup-card .setup-actions {
     gap: 10px;
 }
 
+/* 会话卡片包装：置顶按钮在链接外，定位到右上角，不覆盖卡片点击区域 */
+.thread-mail-wrap {
+    position: relative;
+}
+.thread-mail-wrap .thread-star {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    z-index: 1;
+}
+.thread-mail-wrap .tm-time {
+    margin-right: 76px;
+}
+
 .thread-mail {
     display: block;
     padding: 12px 16px;

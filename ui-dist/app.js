@@ -342,12 +342,33 @@ let mbxMigLastEvent = 0;
 let mbxMigPhase = '';
 // 阈值常量与看门狗实现见下方 C19 watchdog core（可被 Node vm 单独执行做行为测试）
 
+/// 页面内确认的 Promise 包装（WKWebView 无原生 confirm）：迁移后果最重
+/// （冻结全库写入 + 完成后自动重启），选完目录后必须先确认再发起。
+function mbxConfirmAsync(message, okLabel) {
+    return new Promise(function (resolve) {
+        mbxConfirmLeave(
+            message,
+            function () { resolve(true); },
+            okLabel || '确认迁移',
+            '取消',
+            function () { resolve(false); } // 取消必须 resolve，不能悬空 Promise
+        );
+    });
+}
+
 async function mbxMoveDataDir() {
     if (mbxMoveBusy) return;
     mbxMoveBusy = true;
     try {
         const dir = await window.__TAURI__.dialog.open({ directory: true });
         if (!dir) return;
+        const oldDir = (document.querySelector('.dir-path') || {}).textContent || '';
+        const ok = await mbxConfirmAsync(
+            '将把数据库与附件从\n' + oldDir + '\n迁移到\n' + dir
+                + '\n\n迁移期间无法读写邮件，完成后应用会自动重启。确认继续？',
+            '确认迁移'
+        );
+        if (!ok) return;
         // A10：先强制把撰写页内容落进旧库。冻结位在下面这个 POST 的协议线程里
         // 置位，此后 /compose/autosave 全被 409；迁移完成 1.5s 自动退出，
         // 没落库的内容会随进程消失。flush 失败一律取消迁移，不静默放行。
@@ -430,6 +451,7 @@ function mbxMigOpen() {
             + '<div class="migrate-detail" id="migrate-detail">准备迁移…</div>'
             + '<div class="migrate-actions">'
             + '<button type="button" class="btn" data-mbx-action="migration-keep-waiting" hidden>继续等待</button>'
+            + '<button type="button" class="btn" data-mbx-action="migration-retry" hidden>重新选择目录并重试</button>'
             + '<button type="button" class="btn" data-mbx-action="migration-close" hidden>返回</button>'
             + '</div>'
             + '</div>';
@@ -541,16 +563,21 @@ function mbxMigHideActions() {
     var mask = document.getElementById('migrate-mask');
     var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
     if (keep) keep.hidden = true;
+    var retry = mask && mask.querySelector('[data-mbx-action="migration-retry"]');
+    if (retry) retry.hidden = true;
     var back = mask && mask.querySelector('[data-mbx-action="migration-close"]');
     if (back) back.hidden = true;
 }
 
-// 失败态：显示错误 + 「返回」按钮（隐藏模式，用户可关回到存储页）
+// 失败态：显示错误 + 「重新选择目录并重试」「返回」按钮（隐藏模式，用户可
+// 就地重试或关回存储页）。重试按钮只在失败态露出，确认/进行中一律收起。
 function mbxMigShowError(msg) {
     mbxMigHideActions();
     var mask = document.getElementById('migrate-mask');
     var d = document.getElementById('migrate-detail');
     if (d) d.textContent = msg || '迁移失败，请重试';
+    var retry = mask && mask.querySelector('[data-mbx-action="migration-retry"]');
+    if (retry) retry.hidden = false;
     var btn = mask && mask.querySelector('[data-mbx-action="migration-close"]');
     if (btn) btn.hidden = false;
 }
@@ -584,13 +611,9 @@ async function mbxMigListen() {
         mbxMigLastEvent = Date.now();
         var p = e.payload || {};
         mbxMigPhase = p.phase || '';
-        // 阶段推进说明快照已过：两个动作按钮都收起，避免误点重启计时或关掉
-        // 正在跑的迁移遮罩（确认态的「继续等待」「返回」此时都已失效）
-        var mask = document.getElementById('migrate-mask');
-        var keep = mask && mask.querySelector('[data-mbx-action="migration-keep-waiting"]');
-        if (keep) keep.hidden = true;
-        var back = mask && mask.querySelector('[data-mbx-action="migration-close"]');
-        if (back) back.hidden = true;
+        // 阶段推进说明快照已过：所有动作按钮收起（含失败态的「重试」），
+        // 避免误点重启计时或关掉正在跑的迁移遮罩
+        mbxMigHideActions();
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
     await add('migration-done', function (e) {
@@ -811,6 +834,13 @@ document.addEventListener('click', function (ev) {
         case 'move-data-dir': mbxMoveDataDir(); break;
         case 'migration-close': mbxMigCloseModal(); break;
         case 'migration-keep-waiting': mbxMigKeepWaiting(); break;
+        case 'migration-retry':
+            // 失败态就地重试：先关遮罩解绑监听/释放焦点，再走原始入口
+            // 重新选目录。不直接复用上次目录——失败可能正是目标不可写，
+            // 且看门狗超时场景后台线程仍在跑（文案已提示），需重新决策。
+            mbxMigCloseModal();
+            mbxMoveDataDir();
+            break;
         case 'pick-setup-dir': mbxPickSetupDir(el); break;
         case 'toggle-hidden': {
             // 开关按钮：翻转自身 .on，并把对应 hidden input 写成 on/off 值
@@ -1027,7 +1057,11 @@ document.body.addEventListener('mbx:starDone', function (ev) {
         mbxRefreshList();
         return;
     }
-    var btn = document.querySelector('.star-btn[data-mail-id]');
+    // 会话页有多枚置顶按钮：按事件携带的 id 精确匹配，旧实现取第一个
+    // .star-btn 会导致点第二封翻转第一封（详情页只一枚，行为不变）。
+    var id = ev.detail && ev.detail.id;
+    var btn = id ? document.querySelector('.star-btn[data-mail-id="' + id + '"]')
+                 : document.querySelector('.star-btn[data-mail-id]');
     if (!btn) return;
     btn.classList.toggle('on', starred);
     btn.setAttribute('aria-pressed', starred ? 'true' : 'false');

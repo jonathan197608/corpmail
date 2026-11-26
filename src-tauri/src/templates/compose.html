@@ -106,6 +106,11 @@
                                   data-kind="{{ a.preview_kind }}" data-name="{{ a.filename }}"
                                   title="点击预览（图片/PDF/文本可直接查看，其他格式将提示）">{{ a.filename }}</span>
                             <span class="att-size">{{ a.size_orig | fmt_size }}</span>
+                            {# 已入库附件就地另存：与详情页附件行同端点（attachment_save），
+                               旧实现只有预览与移除，要另存得先离开撰写页进草稿详情。 #}
+                            <button type="button" class="btn small"
+                                    data-mbx-action="save-attachment" data-id="{{ draft_id }}" data-aid="{{ a.id }}" data-name="{{ a.save_name }}"
+                                    title="解压另存到本机（后缀按附件名/MIME 自动推断）">另存为</button>
                             <button type="button" class="btn small"
                                     data-mbx-action="remove-kept" data-id="{{ a.id }}"
                                     {% if a.mime == 'message/rfc822' %}data-eml-remove="1"{% endif %}>移除</button>

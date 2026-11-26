@@ -1433,7 +1433,7 @@ fn email_star(state: &AppState, req: &Req) -> Resp {
     match mail::toggle_star(state, id) {
         Ok(Some(starred)) => Resp::html(String::new()).with_event_detail(
             "mbx:starDone",
-            &serde_json::json!({ "starred": starred }).to_string(),
+            &serde_json::json!({ "starred": starred, "id": id }).to_string(),
         ),
         Ok(None) => Resp::not_found(),
         // P3-2：写失败不再吞成 404（不 emit 成功事件、由 responseError toast）

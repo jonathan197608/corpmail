@@ -553,12 +553,20 @@ pub(super) fn settings_account_save(state: &AppState, req: &Req) -> Resp {
     send_pane(state, true, "")
 }
 
-/// 设置·收件同步 tab：保存（参数在 M4 收件实施时生效）
-pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
-    let form = parse_form(&req.body);
+/// 收件同步 pane 的五个表单字段解析结果。save 与 refetch 必须共用同一套
+/// 解析与钳制：refetch 按钮声明 hx-include="closest form"，提交的是整表，
+/// 旧实现只读 first_fetch_days，用户同表改好的间隔/上限/开关会被静默丢弃。
+struct SyncFormValues {
+    on: bool,
+    allow_images: bool,
+    interval: String,
+    days: String,
+    max_mail: String,
+}
+
+fn parse_sync_form(state: &AppState, form: &HashMap<String, String>) -> SyncFormValues {
     let d = defaults();
     let cur = |k: &str| state.get_or(k, &d).unwrap_or_default();
-
     let on = match form.get("sync_on_start") {
         Some(v) => v == "true",
         None => cur(keys::SYNC_ON_START) == "true",
@@ -589,6 +597,27 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
             .to_string(),
         _ => cur(keys::MAX_MAIL_MB),
     };
+    SyncFormValues {
+        on,
+        allow_images,
+        interval,
+        days,
+        max_mail,
+    }
+}
+
+/// 设置·收件同步 tab：保存（参数在 M4 收件实施时生效）
+pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
+    let form = parse_form(&req.body);
+    let SyncFormValues {
+        on,
+        allow_images,
+        interval,
+        days,
+        max_mail,
+    } = parse_sync_form(state, &form);
+    let d = defaults();
+    let cur = |k: &str| state.get_or(k, &d).unwrap_or_default();
     // 范围变化检测（2026-11-03 Bug 修复）：扩大/缩小首拉范围后，收件箱增量
     // 游标仍指向旧范围的最大 UID——resolve_uids 兜底分支 filter(u > last.uid)
     // 会把新范围内低 UID 的历史邮件全部滤掉，表现为"改了范围收件箱不更新、
@@ -640,7 +669,13 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
                     &max_mail,
                 )
             }
-            Ok(()) => sync_pane(state, true),
+            Ok(()) => {
+                // 改范围触发全量重拉时给出去向提示：旧实现只返回「已保存」，
+                // 用户不知道双箱游标已清、重拉已在后台开跑，容易再点一次重拉。
+                let mut ctx = settings_ctx(state, "sync", true, "", None, None);
+                ctx.refetch_notice = true;
+                render_html(&pane_template("sync"), &ctx)
+            }
         };
     }
     let pairs = vec![
@@ -674,13 +709,19 @@ pub(super) fn settings_sync_save(state: &AppState, req: &Req) -> Resp {
 /// 解决"改首拉范围后历史不补拉"的缺口。
 pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
     let form = parse_form(&req.body);
-    let d = defaults();
-    let days = match form.get("first_fetch_days") {
-        Some(v) if matches!(v.as_str(), "7" | "30" | "90" | "0") => v.clone(),
-        _ => state.get_or(keys::FIRST_FETCH_DAYS, &d).unwrap_or_default(),
-    };
+    let SyncFormValues {
+        on,
+        allow_images,
+        interval,
+        days,
+        max_mail,
+    } = parse_sync_form(state, &form);
     let pairs = [
+        (keys::SYNC_ON_START, if on { "true" } else { "false" }),
+        (keys::ALLOW_REMOTE_IMAGES, if allow_images { "1" } else { "0" }),
+        (keys::SYNC_INTERVAL_MIN, interval.as_str()),
         (keys::FIRST_FETCH_DAYS, days.as_str()),
+        (keys::MAX_MAIL_MB, max_mail.as_str()),
         // 清空游标 → 走首拉分支（无游标 = 首次拉取），按新范围 UID SEARCH ALL / SINCE。
         // 双箱都清（2026-11-03 修复：此前漏清发件箱游标，重拉对发件箱不完整）；
         // 首拉阶段化标志一并清，重新进入「先发件箱后收件箱」串行模式

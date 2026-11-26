@@ -216,6 +216,22 @@ describe('05 撰写与发送', () => {
     await waitText('.mail-list', 'E2E 发送链路验证')
     await shot('发送-发件箱落位')
 
+    // 发件箱入口补齐（原在 04 验证，但阶段一发件箱为空、不渲染 batch-bar，
+    // 挪到本用例：发送后才有真实邮件行）。行内置顶在链接外、无行内删除；
+    // 批量组三视图统一，但标已读/未读后端限定 inbox，发件箱不渲染。
+    expect(await (await $('.mail-row .star-btn')).isExisting()).toBe(true)
+    expect(await (await $('.mail-row .row-del')).isExisting()).toBe(false)
+    expect(await $('#batch-bar [data-batch="delete"]').isExisting()).toBe(true)
+    expect(await $('#ba-clear').isExisting()).toBe(true)
+    expect(await $('#ba-select-all').isExisting()).toBe(true)
+    const batchActions = await browser.execute(() =>
+      Array.from(document.querySelectorAll('#batch-bar [data-batch]')).map((b) => b.getAttribute('data-batch')))
+    expect(batchActions).toContain('star')
+    expect(batchActions).toContain('unstar')
+    expect(batchActions).not.toContain('read')
+    expect(batchActions).not.toContain('unread')
+    await shot('发送-发件箱补齐入口')
+
     // T5（2026-11-16）：90-failure 覆盖 failed 终态；正常链路的 sent 徽标在
     // 此前从未直接断言（仅靠 outbox 落位间接证明）。进详情页断 .md-status.sent
     const sentRow = await $('.mail-row')

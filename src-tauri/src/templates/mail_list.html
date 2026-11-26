@@ -13,31 +13,29 @@
     <div class="topbar">
         <h1>{{ folder_label }} <span class="sub" id="mail-count">共 {{ total }} 封</span></h1>
         {% if items %}
-        {# 批量操作（批次五）：并入顶栏与筛选/搜索同一行（原独立一行已合并）。
-           收件箱保留完整批量组；草稿箱提供批量删除与清空选择；发件箱只保留
-           「全选」与「跨页选择全部」（已发送邮件的状态动作无意义）。 #}
+        {# 批量操作：三个视图统一渲染删除 / ⋯（置顶、取消置顶）/ 清空选择。
+           后端 delete/star/unstar 对任意 folder 生效（mail/mod.rs:1766-1800），
+           曾按 folder 裁剪导致发件箱勾选后无任何可执行动作、草稿箱无批量置顶。
+           仅「标已读/未读」限定 inbox——后端 SQL 带 folder='inbox'，其他视图
+           渲染即为 noop，故仍按 folder 条件渲染。 #}
         <div class="mbx-inline" id="batch-bar">
             <label class="mbx-check mbx-all"><input type="checkbox" id="batch-all" aria-label="全选本页">全选</label>
             <span class="ba-count" id="ba-count"></span>
-            {% if folder != 'sent' %}
             <button type="button" class="btn small danger" data-batch="delete">{{ ic.icon('trash') }} 删除</button>
-            {% endif %}
-            {% if folder == 'inbox' %}
             <div class="split ba-more">
                 <button type="button" class="btn small" data-split-toggle aria-label="更多批量操作">批量操作⋯</button>
                 <div class="split-menu" hidden>
                     {# 跨页全选入口放菜单内：选中后文案较长，留在行内会把顶栏挤换行 #}
-                    <a href="#" id="ba-select-all" hidden></a>
+                    {% if folder == 'inbox' %}<a href="#" id="ba-select-all" hidden></a>{% endif %}
+                    {% if folder == 'inbox' %}
                     <button type="button" data-batch="read">标已读</button>
                     <button type="button" data-batch="unread">标未读</button>
+                    {% endif %}
                     <button type="button" data-batch="star">{{ ic.icon('star-fill') }} 置顶</button>
                     <button type="button" data-batch="unstar">{{ ic.icon('star') }} 取消置顶</button>
                 </div>
             </div>
-            {% endif %}
-            {% if folder != 'sent' %}
             <button type="button" class="btn small" id="ba-clear">清空选择</button>
-            {% endif %}
             {% if folder != 'inbox' %}
             {# 发件/草稿箱：跨页「选择全部 N 封」为常驻按钮
                （js 选中后填充文案并显隐，与下拉内入口共用同一 id/逻辑） #}
@@ -113,13 +111,14 @@
             <span>{{ ic.icon('search') }}</span>
             <input type="search" name="q" placeholder="搜索邮件…" value="{{ q }}">
             {# 高级检索（B1）：展开面板（发件人/日期区间/仅附件）；sliders 图标配"高级"文案（贴合筛选语义）。
-               全文搜索启用（q 非空）时高级筛选无意义，隐藏入口，改为「清除」搜索 #}
-            {% if q %}
-            <a class="adv-toggle" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索关键词">清除</a>
-            {% else %}
+               搜索词与高级筛选可叠加：后端 search() 复用 list_filter_sql（mail/mod.rs:2108），
+               adv-panel 也带 q 隐藏域。旧实现在 q 非空时把入口换成「清除」，
+               导致「搜索后再按发件人/日期/附件收窄」的能力不可达。 #}
             <button type="button" id="adv-toggle"
                     class="adv-toggle {% if from_filter or df or dt or has_attach %}on{% endif %}"
                     title="高级检索：发件人、日期区间、附件" aria-label="高级检索">{{ ic.icon('filter') }} 高级</button>
+            {% if q %}
+            <a class="adv-toggle" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索关键词">清除</a>
             {% endif %}
             <input type="hidden" name="folder" value="{{ folder }}">
             {# 第十一轮 P2-2：搜索/高级检索须保留未读与外部筛选，否则一提交就

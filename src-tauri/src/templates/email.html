@@ -35,9 +35,16 @@
                 {% elif email.folder == 'sent' %}
                 <a class="btn primary" href="/compose?edit_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
                    title="载入该邮件内容到撰写页，修改后重新发送">{{ ic.icon('draft') }} 重新编辑</a>
+                {# 转发与「作为附件转发」对已发送邮件同样有意义：后端 /compose?forward_from|
+                   attach_eml 只校验邮件存在，不校验 direction（router.rs:2389-2469）。
+                   回复/标未读不放行——前者是「回复自己」语义不成立，后者后端限 inbox。 #}
+                <a class="btn" href="/compose?forward_from={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}">{{ ic.icon('forward') }} 转发</a>
                 <div class="split">
                     <button type="button" class="btn" data-split-toggle aria-label="更多操作">⋯</button>
                     <div class="split-menu" hidden>
+                        <a href="/compose?attach_eml={{ email.id }}{% if list_query %}&{{ list_query }}{% endif %}"
+                           title="把整封邮件打包为 .eml 附件发送（保留原始结构）">{{ ic.icon('paperclip') }} 作为附件转发</a>
+                        <div class="btn-sep"></div>
                         <button type="button" data-mbx-action="export-eml" data-id="{{ email.id }}" data-name="{{ export_name }}">{{ ic.icon('download') }} 导出 .eml</button>
                         <button type="button" data-mbx-action="export-md" data-id="{{ email.id }}" data-name="{{ export_md_name }}"
                                 title="导出为 Markdown 文件（结构化元数据 + 正文，方便交给 AI 分析处理）">{{ ic.icon('file') }} 导出 MD</button>

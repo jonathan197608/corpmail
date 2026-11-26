@@ -17,6 +17,7 @@
            每封卡片可点进单封详情页看完整正文与附件（HTML 原貌）。 #}
         <div class="thread-list">
             {% for m in detail.items %}
+            <div class="thread-mail-wrap">
             <a class="thread-mail card" href="/emails/{{ m.id }}">
                 <div class="tm-head">
                     <span class="tm-who">{{ m.from_display }}</span>
@@ -27,6 +28,15 @@
                 <div class="tm-subject">{% if m.subject_html %}{{ m.subject_html | safe }}{% else %}（无主题）{% endif %}</div>
                 <div class="tm-body">{{ m.body_preview }}</div>
             </a>
+            {# 行内置顶：按钮放在卡片链接外（点击不会误开详情），复用 /star 端点。
+               删除不放行——会话卡片删除需同步刷新整组，详情页已有删除入口。 #}
+            <button type="button" class="row-act star-btn btn small thread-star {% if m.starred %}on{% endif %}"
+                    data-mail-id="{{ m.id }}"
+                    hx-post="/emails/{{ m.id }}/star"
+                    hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
+                    aria-pressed="{{ 'true' if m.starred else 'false' }}"
+                    title="{% if m.starred %}取消置顶{% else %}置顶{% endif %}">{% if m.starred %}{{ ic.icon('star-fill') }} 已置顶{% else %}{{ ic.icon('star') }} 置顶{% endif %}</button>
+            </div>
             {% else %}
             <div class="card empty-state">
                 <div class="empty-art"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-12.3 7.6L4 21l1-4.2A8.5 8.5 0 1 1 21 11.5z"/><path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01"/></svg></div>

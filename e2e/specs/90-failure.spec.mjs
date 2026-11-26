@@ -135,6 +135,14 @@ describe('90 失败链路', () => {
     }, occupied)
     expect(armed).toBe('clicked')
 
+    // 入口修复：选完目录后先弹页面内确认（源/目标路径 + 冻结与重启提示），
+    // 确认后才真正 POST 迁移。这里模拟用户点「确认迁移」。
+    await browser.waitUntil(
+      async () => await $('#mbx-leave-confirm [data-leave-ok]').isExisting(),
+      { timeout: 5000, timeoutMsg: '迁移前置确认框未出现' },
+    )
+    await $('#mbx-leave-confirm [data-leave-ok]').click()
+
     try {
       // 启动校验失败 → 后端回完整 pane → 前端渲染错误并关闭模态
       await browser.waitUntil(async () => {

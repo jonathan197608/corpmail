@@ -468,8 +468,20 @@ fn migration_snapshot_stall_asks_user_before_failing() {
     let pbody2 = &APP_JS[progress..];
     let pbody2 = &pbody2[..pbody2.find("add('migration-done'").expect("done 监听存在")];
     assert!(
-        pbody2.contains("keep.hidden = true"),
-        "收到新进度事件必须收起「继续等待」按钮"
+        pbody2.contains("mbxMigHideActions();"),
+        "收到新进度事件必须统一收起所有动作按钮（含重试与继续等待）"
+    );
+    // 统一收起函数必须真的覆盖三枚按钮，否则改写成空函数时上面断言仍绿
+    let hide = APP_JS
+        .find("function mbxMigHideActions()")
+        .expect("统一收起函数存在");
+    let hide = &APP_JS[hide..];
+    let hide = &hide[..hide.find("\n}\n").expect("函数结束")];
+    assert!(
+        hide.contains("migration-keep-waiting")
+            && hide.contains("migration-retry")
+            && hide.contains("migration-close"),
+        "收起函数必须覆盖继续等待/重试/返回三枚按钮：{hide}"
     );
 }
 

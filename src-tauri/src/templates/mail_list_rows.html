@@ -33,8 +33,9 @@
                     <div class="mr-preview">{% if m.body_preview %}{{ m.body_preview }}{% else %}<span class="mr-no-body">（无正文）</span>{% endif %}</div>
                 </div>
             </a>
-            {% if folder == 'inbox' or folder == 'draft' %}
-            {# 行内操作与详情页同口径：置顶翻转 + 单封删除，均在链接外（不会误开详情）。
+            {# 行内操作与详情页同口径：置顶翻转对所有文件夹渲染（详情页亦无 folder
+               条件，发件箱邮件可被置顶，列表必须能就地取消）；删除仅收件箱/草稿箱，
+               发件箱删除走批量入口，避免误删已发送邮件。均在链接外，不会误开详情。
                置顶由 mbx:starDone 事件统一刷新列表片段；删除 hx-confirm 走页面内模态。 #}
             <button type="button" class="row-act star-btn btn small {% if m.starred %}on{% endif %}"
                     data-mail-id="{{ m.id }}"
@@ -43,6 +44,7 @@
                     aria-pressed="{{ 'true' if m.starred else 'false' }}"
                     title="{% if m.starred %}取消置顶（恢复按时间排序）{% else %}置顶显示（列表排在最前）{% endif %}"
                     aria-label="{% if m.starred %}取消置顶{% else %}置顶{% endif %}">{% if m.starred %}{{ ic.icon('star-fill') }} 已置顶{% else %}{{ ic.icon('star') }} 置顶{% endif %}</button>
+            {% if folder == 'inbox' or folder == 'draft' %}
             <button type="button" class="row-act row-del btn small danger"
                     hx-post="/emails/{{ m.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
                     hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"

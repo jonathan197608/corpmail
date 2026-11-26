@@ -491,7 +491,8 @@ fn thread_entry_on_detail_page_only_when_multiple() {
 }
 
 /// 发件箱/草稿箱：①列表行「对方」显示收件人而非自己；
-/// ②发件箱批量按钮只保留「全选」，草稿箱提供批量删除 + 清空选择；
+/// ②三个视图批量操作统一（删除 / ⋯ 置顶取消置顶 / 清空选择 / 跨页全选），
+///   仅「标已读/未读」限 inbox（后端 SQL 带 folder='inbox'）；
 /// ③顶栏 ⋯ 下拉（含「收取新邮件」）不渲染；收件箱/草稿箱行内置顶与删除常驻
 #[test]
 fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
@@ -542,12 +543,24 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         "发件箱应保留「跨页选择全部」入口：{html}"
     );
     assert!(
-        !html.contains("data-batch=\"delete\"") && !html.contains("清空选择"),
-        "发件箱不应渲染删除/清空选择按钮：{html}"
+        html.contains("data-batch=\"delete\"")
+            && html.contains("data-batch=\"star\"")
+            && html.contains("data-batch=\"unstar\"")
+            && html.contains("清空选择")
+            && html.contains("批量操作⋯"),
+        "发件箱应渲染完整批量操作（此前勾选后无任何可执行动作）：{html}"
     );
     assert!(
-        !html.contains("row-act"),
-        "发件箱不应渲染行内置顶/删除按钮：{html}"
+        !html.contains("data-batch=\"read\"") && !html.contains("data-batch=\"unread\""),
+        "发件箱不应渲染只读语义的标已读/未读（后端 SQL 限 inbox）：{html}"
+    );
+    assert!(
+        html.contains("row-act star-btn btn small"),
+        "发件箱应渲染行内置顶（详情页可置顶，列表须能就地取消）：{html}"
+    );
+    assert!(
+        !html.contains("row-del"),
+        "发件箱不应渲染行内删除（走批量入口）：{html}"
     );
     assert!(
         !html.contains("收取新邮件") && !html.contains("tb-more-btn"),
@@ -573,13 +586,15 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     );
     assert!(
         html.contains("data-batch=\"delete\"")
+            && html.contains("data-batch=\"star\"")
+            && html.contains("data-batch=\"unstar\"")
             && html.contains("清空选择")
             && html.contains("row-del")
             && html.contains("确定删除这封草稿？")
             && html.contains("row-act star-btn btn small")
             && html.contains("已置顶")
             && html.contains("取消置顶"),
-        "草稿箱应渲染批量删除与行内置顶/删除：{html}"
+        "草稿箱应渲染批量删除/置顶与行内置顶/删除：{html}"
     );
     // 收件箱：按钮组与 ⋯ 下拉保持原样
     let html = body(&route(
@@ -4130,6 +4145,58 @@ fn settings_sync_refetch_resets_cursor_and_keeps_range() {
     cleanup(&dir);
 }
 
+/// 重新拉取按钮的 hx-include="closest form" 提交整张表单：同表未保存的
+/// 间隔/上限/开关必须一并落库，旧实现只读 first_fetch_days 导致静默丢改动。
+#[test]
+fn sync_refetch_persists_whole_form() {
+    let (state, dir) = temp_state("sync-refetch-form");
+    state
+        .set_batch(&[
+            (keys::ACCOUNT_PREFIX, "demo"),
+            (keys::FIRST_FETCH_DAYS, "90"),
+            (keys::SYNC_INTERVAL_MIN, "5"),
+            (keys::MAX_MAIL_MB, "10"),
+            (keys::SYNC_ON_START, "false"),
+            (keys::ALLOW_REMOTE_IMAGES, "0"),
+        ])
+        .unwrap();
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/settings/sync/refetch",
+            &form(&[
+                ("sync_on_start", "true"),
+                ("allow_remote_images", "1"),
+                ("sync_interval_min", "30"),
+                ("first_fetch_days", "7"),
+                ("max_mail_mb", "80"),
+            ]),
+        ),
+        &FakeTester {
+            smtp_ok: true,
+            imap_ok: true,
+        },
+    );
+    let d = defaults();
+    let got = |k: &str| state.get_or(k, &d).unwrap_or_default();
+    assert_eq!(got(keys::SYNC_ON_START), "true", "重新拉取须保存启动收取改动");
+    assert_eq!(
+        got(keys::ALLOW_REMOTE_IMAGES),
+        "1",
+        "重新拉取须保存远程图片开关改动"
+    );
+    assert_eq!(got(keys::SYNC_INTERVAL_MIN), "30", "重新拉取须保存间隔改动");
+    assert_eq!(got(keys::MAX_MAIL_MB), "80", "重新拉取须保存单封上限改动");
+    assert_eq!(got(keys::FIRST_FETCH_DAYS), "7", "重新拉取须采纳所选范围");
+    assert!(
+        body(&resp).contains("触发重新拉取"),
+        "pane 应提示已触发重拉"
+    );
+    cleanup(&dir);
+}
+
 #[test]
 fn sync_refetch_rejected_while_fetch_running() {
     // C5：收件进行中点「重新拉取」必须拒绝——运行轮每批把游标写回，
@@ -6594,15 +6661,19 @@ fn detail_actions_render_at_top_with_reply_all() {
         !html.contains("reply_all_to") && !html.contains("reply_to="),
         "非收件方向不应有回复入口：{html}"
     );
-    // M9 发件箱：重新编辑（载入撰写页重发），不显示转发
+    // 发件箱：重新编辑 + 转发/作为附件转发（后端只校验邮件存在，不校验 direction）
     assert!(
         html.contains("/compose?edit_from=2"),
         "发件箱应有重新编辑入口：{html}"
     );
     assert!(html.contains("重新编辑"), "发件箱按钮文案应为重新编辑");
     assert!(
-        !html.contains("forward_from=2"),
-        "发件箱不应有转发入口：{html}"
+        html.contains("/compose?forward_from=2") && html.contains("/compose?attach_eml=2"),
+        "已发送邮件应可转发与作为附件转发：{html}"
+    );
+    assert!(
+        !html.contains("/compose?reply_to=2"),
+        "已发送邮件不应有回复自己的入口：{html}"
     );
     // M9 草稿箱：编辑草稿，不显示转发
     state
@@ -7129,7 +7200,7 @@ fn sync_save_range_change_resets_both_cursors() {
         ])
         .unwrap();
     // 范围 30 → 90：四游标清零
-    let _ = route(
+    let resp = route(
         &state,
         &assets(),
         &req(
@@ -7146,6 +7217,13 @@ fn sync_save_range_change_resets_both_cursors() {
             smtp_ok: true,
             imap_ok: true,
         },
+    );
+    // 改范围会触发全量重拉，须给出提示（旧实现只显示「已保存」，
+    // 用户不知道重拉已在后台开跑，容易再点一次重拉）
+    assert!(
+        body(&resp).contains("已按所选范围触发重新拉取"),
+        "范围变更保存后应提示已触发重拉：{}",
+        body(&resp)
     );
     let d = defaults();
     for k in [
@@ -7752,6 +7830,18 @@ fn compose_schedule_send_flow() {
     assert!(
         html.contains(mail::time_full(at).as_str()),
         "定时时刻完整展示"
+    );
+    // 远期定时（1 小时后，超出 10s 撤销窗口）也要能取消：后端
+    // cancel_scheduled_send 对任意 scheduled_at>0 的草稿有效，UI 不得只在
+    // 窗口内给按钮。旧实现只给一句「清空时间后点发送」文案（那是立即发出）。
+    assert!(
+        html.contains("取消定时")
+            && html.contains(r#"hx-post="/emails/1/undo-send""#),
+        "远期定时草稿应有取消定时按钮：{html}"
+    );
+    assert!(
+        !html.contains("撤销发送"),
+        "超出 10s 窗口不应显示「即将发送/撤销发送」：{html}"
     );
     // 草稿箱列表行 ⏰ 徽标
     let html = body(&route(
@@ -11490,6 +11580,36 @@ fn p1122_search_forms_keep_filter_context() {
     }
 }
 
+/// 搜索词与高级筛选可叠加：搜索态须同时保留「高级」入口与「清除」链接。
+/// 旧实现在 q 非空时把高级按钮换成清除，后端 search() 明明复用 list_filter_sql，
+/// 导致「搜索后再按发件人/日期/附件收窄」不可达。
+/// 运行时读源码，避免变异测试同秒 mtime 触发 include_str! 陈旧缓存。
+#[test]
+fn search_view_keeps_advanced_filter_toggle() {
+    let tpl = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates/mail_list.html"),
+    )
+    .expect("模板可读");
+    let search = tpl.find("<form class=\"search\"").expect("搜索表单存在");
+    let adv = tpl.find("<form class=\"adv-panel\"").expect("高级检索表单存在");
+    let frag = &tpl[search..adv];
+    assert!(
+        frag.contains(r#"id="adv-toggle""#),
+        "搜索表单须常驻高级检索入口（不得被 q 条件整块替换）：{frag}"
+    );
+    assert!(
+        frag.contains("清除"),
+        "搜索态仍须保留清除关键词链接：{frag}"
+    );
+    let adv_frag = &tpl[adv..];
+    let adv_end = adv_frag.find("</form>").expect("高级检索表单闭合");
+    assert!(
+        adv_frag[..adv_end].contains(r#"name="q""#),
+        "高级检索表单内部须保留 q 隐藏域，才能与搜索叠加：{}",
+        &adv_frag[..adv_end]
+    );
+}
+
 /// 第十一轮 P2-5：设置页 tab 容器须带 hx-sync 防快速连点乱序。
 #[test]
 fn p1125_settings_tabs_sync() {
@@ -11913,4 +12033,110 @@ fn r16_embedded_assets_not_cached_long_term() {
         !body.contains("max-age=86400"),
         "旧 24h 缓存必须移除：{body}"
     );
+}
+
+// ---------- 页面入口补齐（批次 B/C）----------
+
+fn tpl_src(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/templates")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("模板 {name} 可读: {e}"))
+}
+
+fn js_src() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-dist/app.js"),
+    )
+    .expect("app.js 可读")
+}
+
+#[test]
+fn entry_fix_fetch_status_error_has_retry() {
+    let t = tpl_src("fetch_status.html");
+    let err_at = t.find("{% if error %}").expect("错误分支存在");
+    let frag = &t[err_at..];
+    assert!(
+        frag.contains(r#"hx-get="/emails/fetch""#) && frag.contains("重试"),
+        "收取错误态须有就地重试按钮：{frag}"
+    );
+}
+
+#[test]
+fn entry_fix_sync_tab_has_immediate_fetch() {
+    let t = tpl_src("settings_pane_sync.html");
+    assert!(
+        t.contains(r#"hx-get="/emails/fetch""#),
+        "同步 tab 须有立即收取入口：{t}"
+    );
+}
+
+#[test]
+fn entry_fix_thread_has_star_button_outside_link() {
+    let t = tpl_src("thread.html");
+    let link_close = t.find("</a>").expect("卡片链接闭合");
+    let btn = t.find("thread-star").expect("会话置顶按钮存在");
+    assert!(btn > link_close, "置顶按钮必须在卡片链接外：{t}");
+    assert!(
+        t[btn..].contains(r#"hx-post="/emails/{{ m.id }}/star""#),
+        "会话置顶须复用 /star 端点"
+    );
+}
+
+#[test]
+fn entry_fix_star_done_event_carries_id() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/router.rs"
+    ))
+    .expect("router 可读");
+    let at = src.find("fn email_star(").expect("email_star 存在");
+    let frag = &src[at..];
+    assert!(
+        frag.contains(r#""starred": starred, "id": id"#),
+        "starDone 事件须携带 id，会话页多按钮才能精确翻转：{frag}"
+    );
+    let js = js_src();
+    let at = js.find("document.body.addEventListener('mbx:starDone'").expect("前端监听存在");
+    assert!(
+        js[at..].contains("ev.detail.id") || js[at..].contains("detail && detail.id"),
+        "前端须按 id 精确匹配置顶按钮"
+    );
+}
+
+#[test]
+fn entry_fix_compose_kept_attachment_has_save() {
+    let t = tpl_src("compose.html");
+    let kept = t.find("att-row kept").expect("已保存附件行存在");
+    let frag = &t[kept..kept + 1600.min(t.len() - kept)];
+    assert!(
+        frag.contains(r#"data-mbx-action="save-attachment""#),
+        "撰写页已存附件须有另存为入口：{frag}"
+    );
+}
+
+#[test]
+fn entry_fix_migration_has_confirm_and_retry() {
+    let js = js_src();
+    // 选目录后、发起 POST 前必须有确认（mbxConfirmAsync 出现在 mbxMoveDataDir 内）
+    let at = js.find("async function mbxMoveDataDir()").expect("迁移函数存在");
+    let end = js[at..].find("\n}\n").map(|p| at + p).unwrap_or(js.len());
+    let frag = &js[at..end];
+    let confirm_at = frag.find("mbxConfirmAsync(").expect("迁移须有确认");
+    let post_at = frag.find("fetch('/settings/storage/move'").expect("迁移 POST 存在");
+    assert!(
+        confirm_at < post_at,
+        "确认必须在发起迁移 POST 之前：{frag}"
+    );
+    // 失败态须有就地重试按钮，且失败态函数会显示它
+    let retry_at = js.find(r#"data-mbx-action="migration-retry""#).expect("重试按钮存在");
+    let err_at = js.find("function mbxMigShowError(").expect("失败态函数存在");
+    let err_end = js[err_at..].find("\n}\n").map(|p| err_at + p).unwrap_or(js.len());
+    assert!(
+        js[err_at..err_end].contains("migration-retry"),
+        "失败态须显示就地重试按钮"
+    );
+    let _ = retry_at;
 }

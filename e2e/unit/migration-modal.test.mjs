@@ -76,6 +76,9 @@ function fakeDom() {
     return {
         document: {
             getElementById: (id) => byId[id] || null,
+            // 迁移前置确认会读 .dir-path 取当前目录做文案；桩缺此方法会在
+            // 确认前抛 TypeError，造成「确认没弹但 POST 也没发」的假绿
+            querySelector: () => null,
             createElement: (tag) => mk(tag),
             activeElement: null,
             body,
@@ -93,7 +96,11 @@ function harness({ fetchImpl } = {}) {
     const toasts = [];
     // H4：焦点陷阱释放计数——mbxModalOpen 返回的 release 被调用几次
     let releaseCalls = 0;
-    let confirmLeave = (msg, onLeave, ok, cancel, onCancel) => { if (onCancel) onCancel(); };
+    // 默认自动确认：本 harness 的四条 A4 用例聚焦确认之后的 409 / 异常 /
+    // background / 空响应分支；迁移前置确认本身由下面的独立用例验证。
+    let confirmLeave = (msg, onLeave, ok, cancel, onCancel) => {
+        if (onLeave) onLeave();
+    };
     // 锚点外的前置函数：桩化（聚焦 A4 本身的行为，不重复测 flush 链路）
     const confirmLeaves = [];
     const ctx = vm.createContext({
@@ -131,8 +138,11 @@ function harness({ fetchImpl } = {}) {
     });
     const timeouts = [];
     // mbxConfirmLeave 在锚点外：替换为可断言的桩（A10 用真实取消语义驱动）
-    ctx.mbxConfirmLeave = (msg, onLeave, ok, cancel, onCancel) =>
-        confirmLeave(msg, onLeave, ok, cancel, onCancel);
+    let confirmCalls = 0;
+    ctx.mbxConfirmLeave = (msg, onLeave, ok, cancel, onCancel) => {
+        confirmCalls++;
+        return confirmLeave(msg, onLeave, ok, cancel, onCancel);
+    };
     ctx.mbxMigCloseModal = null;
     vm.runInContext(core(), ctx);
     // window.__TAURI__ 引用同一个对象（core 源码经 window 前缀访问）
@@ -143,6 +153,7 @@ function harness({ fetchImpl } = {}) {
         setNow: (v) => { now = v; },
         dom: dom.__dom,
         releaseCalls: () => releaseCalls,
+        confirmCalls: () => confirmCalls,
         run: () => ctx.mbxMoveDataDir(),
         runPrecheck: (ev) => ctx.mbxComposePrecheck(ev),
         runConfirmReset: (ev) => ctx.mbxComposeConfirmReset(ev),
@@ -153,6 +164,32 @@ function harness({ fetchImpl } = {}) {
         intervalCount: () => intervals.filter((i) => i.fn).length,
     };
 }
+
+test('入口修复：迁移前置确认取消不发起移动，确认后才发起', async () => {
+    let calls = 0;
+    const okResp = async () => {
+        calls++;
+        return {
+            ok: true, status: 200,
+            headers: { get: (k) => (k === 'X-CorpMail-Migration' ? 'background' : null) },
+            text: async () => '',
+        };
+    };
+    const cancelled = harness({ fetchImpl: okResp });
+    cancelled.setConfirmLeave((msg, onLeave, ok, cancel, onCancel) => {
+        if (onCancel) onCancel();
+    });
+    await cancelled.run();
+    assert.equal(cancelled.confirmCalls(), 1, '选完目录后必须弹出前置确认');
+    assert.equal(calls, 0, '取消前置确认后不得发起迁移 POST');
+    assert.equal(vm.runInContext('mbxMigWatchdog', cancelled.ctx), null, '取消后不应留看门狗');
+
+    const confirmed = harness({ fetchImpl: okResp });
+    await confirmed.run();
+    assert.equal(confirmed.confirmCalls(), 1, '确认路径也必须弹出前置确认');
+    assert.equal(calls, 1, '确认后必须发起迁移 POST');
+    assert.ok(vm.runInContext('mbxMigUnlisten', confirmed.ctx), '确认后应进入后台监听');
+});
 
 test('A4：409 启动失败停看门狗/解绑监听/释放焦点陷阱，30 分钟后无「继续等待」', async () => {
     const h = harness({

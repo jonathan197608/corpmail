@@ -19,8 +19,15 @@
                 hx-trigger="click throttle:500ms" hx-disabled-elt="this">撤销发送</button>
     </div>
     {% else %}
-    <div class="md-status sending">{{ ic.icon('clock') }} 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。</div>
-    <div class="sched-tip">要修改或取消定时：编辑草稿调整时间，或清空时间后点「发送」立即发出。</div>
+    {# 远期定时同样可取消：后端 cancel_scheduled_send 只要求 status=draft 且
+       scheduled_at>0（mail/send.rs:246-256），不限 10s 窗口。此前只有文案
+       诱导用户去编辑页清空时间，而「清空后点发送」是立即发出而非取消定时。 #}
+    <div class="md-status sending">{{ ic.icon('clock') }} 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。
+        <button type="button" class="btn small"
+                hx-post="/emails/{{ email.id }}/undo-send"
+                hx-trigger="click throttle:500ms" hx-disabled-elt="this">取消定时</button>
+    </div>
+    <div class="sched-tip">取消定时后草稿保留，可编辑调整时间再重新定时。</div>
     {% endif %}
     {% endif %}
     {% if email.status == 'queued' %}

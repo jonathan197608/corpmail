@@ -62,11 +62,24 @@ describe('02 读信与检索', () => {
     await waitText('.mail-list', '季度报表')
     expect((await $$('.mail-row')).length).toBe(1)
     await shot('检索-中文关键词命中')
+    // 搜索态仍可叠加高级筛选：旧实现把「高级」按钮换成「清除」，
+    // 后端 search() 明明支持与 from/df/dt/att 组合，入口被藏死。
+    expect(await (await $('#adv-toggle')).isExisting()).toBe(true)
+    expect(await (await $('a.adv-toggle')).isExisting()).toBe(true)
+    await $('#adv-toggle').click()
+    expect(
+      await browser.execute(() => !document.getElementById('adv-panel').hidden),
+    ).toBe(true)
+    expect(
+      await browser.execute(() => document.querySelector('#adv-panel input[name="q"]')?.value),
+    ).toBe('季度')
+    await shot('检索-叠加高级筛选')
+    await $('#adv-toggle').click() // 收起面板，保住下一条用例的清除链接可见
   })
 
   it('清空检索恢复全量列表', async () => {
-    // 2026-11-09 改版：q 非空时搜索框右侧是「清除」链接（.adv-toggle 复用自
-    // 高级检索入口位），原 search-clear × 已随图标 SVG 化移除
+    // q 非空时搜索框右侧同时有「高级」按钮与「清除」链接；
+    // 清除用 a.adv-toggle 定位（高级按钮是 button#adv-toggle）
     await $('a.adv-toggle').click()
     await waitBoot()
     await browser.waitUntil(async () => (await $$('.mail-row')).length >= 3, {
