@@ -890,25 +890,34 @@ fn dispatch_due_scheduled_picks_only_due_drafts() {
 /// 用源码形态断言挡住"拆开事务/去掉条件"的回归。
 #[test]
 fn dispatch_enqueue_is_transactional_with_sched_condition() {
-    const SEND_SRC: &str = include_str!("../mail/send.rs");
-    let start = SEND_SRC
+    // 运行时读取：include_str! 编译期缓存，变异验证恢复后可能读到陈旧的变异版
+    let src_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mail/send.rs");
+    let src = std::fs::read_to_string(src_path).expect("读取 send.rs");
+    let start = src
         .find("pub fn dispatch_due_scheduled")
         .expect("dispatch 函数存在");
     // 截到下一个文档注释边界：函数体内可能有顶格 `}`，`find("\n}\n")` 会误截
-    let end = SEND_SRC[start..]
+    let end = src[start..]
         .find("\n/// ")
         .map(|p| start + p)
-        .unwrap_or(SEND_SRC.len());
-    let body = &SEND_SRC[start..end];
+        .unwrap_or(src.len());
+    let body = &src[start..end];
     assert!(body.contains("with_conn(|conn|"), "SELECT+UPDATE 须在同一 with_conn 闭包");
     assert!(body.contains("conn.transaction()"), "须在同一事务内");
     let upd = body
         .find("UPDATE emails SET status = 'queued'")
         .expect("存在到点入队 UPDATE");
-    let tail = &body[upd..];
+    // 断言只看 UPDATE 的 SQL 字符串字面量内部：宽窗口 `body[upd..]` 会被
+    // 函数尾部同名注释顶替，删掉真条件再补注释仍绿。截到字面量闭合引号，
+    // 注释里的 "scheduled_at ..." 一律不算。
+    let lit_end = body[upd..]
+        .find('"')
+        .map(|p| upd + p)
+        .expect("UPDATE SQL 字面量闭合引号");
+    let sql = &body[upd..lit_end];
     assert!(
-        tail.contains("scheduled_at > 0") && tail.contains("scheduled_at <= ?2"),
-        "入队 UPDATE 必须复核 scheduled_at 到点，防撤销 TOCTOU"
+        sql.contains("scheduled_at > 0") && sql.contains("scheduled_at <= ?2"),
+        "入队 UPDATE 的 SQL 字面量必须复核 scheduled_at 到点，注释不算：{sql}"
     );
     // 不得再调用旧的 enqueue_draft（它只判 status，是 TOCTOU 根因）。
     // 只看非注释行，避免注释里提到函数形态就误伤

@@ -47,8 +47,14 @@ test('radio 组各选中值产生不同快照（基线旧实现恒为同一空�
 });
 
 test('设置页脏判定 IIFE 确实使用 core 快照（不是镜像副本）', () => {
-    assert.ok(
-        APP_JS.includes('var snapshot = mbxSnapshotForm;'),
-        'snapshot 必须直接引用 core 函数，否则测试覆盖的是镜像副本'
+    // 旧护栏只查全文件 contains：把赋值挪进无关 IIFE、设置页改用镜像快照
+    // 仍绿。收窄到 P7 core END 之后紧邻的 IIFE 头部。
+    const coreEnd = APP_JS.indexOf('// --- P7 settings snapshot core END ---');
+    assert.ok(coreEnd >= 0, 'P7 core 锚点存在');
+    const iifeHead = APP_JS.slice(coreEnd, coreEnd + 240);
+    assert.match(
+        iifeHead,
+        /\(function \(\) \{[\s\S]{0,160}var snapshot = mbxSnapshotForm;/,
+        'snapshot 必须由紧随 P7 core 的设置页 IIFE 直接引用 core 函数'
     );
 });

@@ -295,3 +295,36 @@ fn r19_last_backup_candidate_is_checked() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R22 P3：同秒同纳秒同 PID 的第 10+ 份备份，字典序 `-10 < -2` 会把更新的
+/// 备份裁掉。按「前缀 + 数值后缀」排序后必须保留数值最大的三份。
+#[test]
+fn prune_broken_backups_orders_suffix_numerically() {
+    let dir = std::env::temp_dir().join(format!("mbx-conf-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = format!(
+        "{CONFIG_FILE}.broken-1700000000-000000001-{}",
+        std::process::id()
+    );
+    let mut names = vec![base.clone()];
+    for i in 1..12 {
+        names.push(format!("{base}-{i}"));
+    }
+    for n in &names {
+        std::fs::write(dir.join(n), b"backup").unwrap();
+    }
+    prune_broken_backups(&dir, 3);
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![format!("{base}-10"), format!("{base}-11"), format!("{base}-9")],
+        "须按数值后缀保留最新三份（字典序排列后的期望）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

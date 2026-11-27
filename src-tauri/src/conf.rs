@@ -169,7 +169,25 @@ fn prune_broken_backups(anchor: &Path, keep: usize) {
     if names.len() <= keep {
         return;
     }
-    names.sort(); // 时间戳等宽数字串：字典序即时间序
+    // R22 P3：时间戳等宽前缀字典序即时间序，但同秒同纳秒同 PID 的第 10 份
+    // 备份后缀 `-10` 字典序小于 `-2`——旧 `names.sort()` 会裁掉更新的那份，
+    // 留下旧备份。按「去掉可选 -seq 的前缀 + seq 数值」排序，跨备份仍按时间戳。
+    names.sort_by_key(|n| {
+        let rest = n.strip_prefix(&prefix).unwrap_or(n);
+        let mut parts = rest.rsplitn(2, '-');
+        let last = parts.next().unwrap_or("");
+        let head = parts.next();
+        // base 形如 <sec>-<nano9>-<pid>（含 2 个 '-'）；只有再多一段纯数字
+        // 才是碰撞后缀，避免把 PID 误当 seq 而打乱跨备份的时间序。
+        let seq = head.filter(|h| h.matches('-').count() >= 2).and_then(|_| {
+            (!last.is_empty() && last.chars().all(|c| c.is_ascii_digit()))
+                .then(|| last.parse::<u32>().unwrap_or(0))
+        });
+        match seq {
+            Some(seq) => (head.unwrap_or("").to_string(), seq),
+            None => (rest.to_string(), 0),
+        }
+    });
     for name in &names[..names.len() - keep] {
         if let Err(e) = std::fs::remove_file(anchor.join(name)) {
             eprintln!("[conf] 旧备份清理失败（{name}）：{e}");

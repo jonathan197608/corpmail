@@ -93,6 +93,15 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel, onCancel) {
         // （mbxModalOpen 对已 inert 的节点不 push bg，新模态的 release
         // 覆盖不到它们），后续模态一关，.app 等页面容器就永久不可点
         if (typeof old.__mbxRelease === 'function') old.__mbxRelease();
+        // R22 P2：单槽替换必须补偿旧模态的取消回调。迁移确认的 onCancel 负责
+        // resolve(false)——若确认挂起期间被另一次 mbxConfirmLeave 顶掉而不调，
+        // Promise 永不 settle → mbxMoveDataDir 的 finally 不执行 → mbxMoveBusy
+        // 永久 true，迁移入口静默失效。先取出并置空防重入，再执行回调。
+        if (typeof old.__mbxOnCancel === 'function') {
+            var oldCancel = old.__mbxOnCancel;
+            old.__mbxOnCancel = null;
+            oldCancel();
+        }
         old.remove();
     }
     var mask = document.createElement('div');
@@ -113,6 +122,9 @@ function mbxConfirmLeave(message, onLeave, okLabel, cancelLabel, onCancel) {
     // A17：release 挂到 mask 上，二次进入 / 外部清理可凭 __mbxRelease 释放
     var release = mbxModalOpen(mask);
     mask.__mbxRelease = release;
+    // R22 P2：暴露给下一次 mbxConfirmLeave 的「单槽替换」补偿（onCancel 可能
+    // 为 undefined，替换处按 typeof 判定即可）
+    mask.__mbxOnCancel = onCancel;
     function close(cancelled) {
         release();
         if (mask.parentNode) mask.remove();
@@ -534,7 +546,7 @@ function mbxMigStartWatchdog() {
             mbxMigPromptStall();
         } else {
             mbxMigShowError('长时间无进展，可能目标目录不可写或网络盘已断开。\n\n'
-                + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。');
+                + '可点「返回」关闭本窗口后重试；后台迁移不会因此中止，若稍后成功应用会自动重启。', true);
         }
     }, 1000);
 }
@@ -575,7 +587,10 @@ function mbxMigHideActions() {
 
 // 失败态：显示错误 + 「重新选择目录并重试」「返回」按钮（隐藏模式，用户可
 // 就地重试或关回存储页）。重试按钮只在失败态露出，确认/进行中一律收起。
-function mbxMigShowError(msg) {
+// bgStillRunning=true（看门狗超时）：后台迁移并未中止，重试必然撞后端
+// migration_in_progress() 的 409——此态只留「返回」出口，不露「重试」。
+// 后端 migration-error 终态不传该参，仍保留就地重试。
+function mbxMigShowError(msg, bgStillRunning) {
     // P1-1（R21）：进入失败终态即解绑监听 + 停看门狗 + 释放焦点陷阱。
     // 此前 error 分支与看门狗 fail 只停表不摘监听，后台残留 progress 到达时
     // 会调 mbxMigHideActions() 把三枚按钮全收起，看门狗已停 → 无出口可点。
@@ -586,7 +601,7 @@ function mbxMigShowError(msg) {
     var d = document.getElementById('migrate-detail');
     if (d) d.textContent = msg || '迁移失败，请重试';
     var retry = mask && mask.querySelector('[data-mbx-action="migration-retry"]');
-    if (retry) retry.hidden = false;
+    if (retry) retry.hidden = !!bgStillRunning;
     var btn = mask && mask.querySelector('[data-mbx-action="migration-close"]');
     if (btn) btn.hidden = false;
 }
@@ -1955,8 +1970,19 @@ function mbxSchedLocalMin(nowMs) {
         if (!elt.matches('#sched-send-btn')) return;
         var p = picker();
         if (p) p.min = mbxSchedLocalMin(Date.now());
+        // R22 P2：这两条分支一旦 preventDefault，本次请求已取消，而 C14
+        // precheck 的确认回调可能已置位标志（550ms 重触发仍会被这里拦下）——
+        // 不清除就会在用户真正选好时刻后静默跳过空正文/空主题确认，直接投递。
+        // 注意：有值且校验通过时绝不清除，C14 确认后的重触发须正常放行。
+        var clearConfirms = function () {
+            if (elt.dataset) {
+                delete elt.dataset.mbxBodyOk;
+                delete elt.dataset.mbxSubjOk;
+            }
+        };
         if (!p || !p.value) {
             ev.preventDefault();
+            clearConfirms();
             var h = hidden();
             if (h) h.value = '';
             note('请先选择定时发送时刻（或点击「发送」立即发送）');
@@ -1965,6 +1991,7 @@ function mbxSchedLocalMin(nowMs) {
         var err = mbxSchedValidationError(p.value, Date.now());
         if (err) {
             ev.preventDefault();
+            clearConfirms();
             note(err);
         }
     });
@@ -1982,6 +2009,10 @@ function mbxSchedLocalMin(nowMs) {
 // --- C14 compose confirm core START ---
 // 具名函数便于 e2e/unit/compose-confirm.test.mjs 用 Node vm 直接驱动这段状态机。
 function mbxComposePrecheck(ev) {
+    // R22 P2：前序 capture 监听器（sched capture）已 preventDefault——本次
+    // 请求已被取消，不能再弹空正文/空主题确认并置位标志：置位后 550ms 重触发
+    // 仍会被 sched capture 拦下，用户选好时刻后两个确认被静默跳过直接投递。
+    if (ev.defaultPrevented) return;
     var detail = ev.detail || {};
     var elt = detail.elt;
     if (!elt || !elt.matches || !elt.matches('button[hx-post="/compose/send"]')) return;
@@ -2913,11 +2944,7 @@ function mbxTplBuild(st) {
     }
     st.ed.on('change', function () {
         if (st.mode !== 'rich') return;
-        var h = st.ed.getHtml();
-        // wangEditor 空内容输出 <p><br></p>：归一为空串，否则这段"空段落"
-        // 会被当有效 HTML 入库，产生空壳模板
-        if (!mbxHtmlToText(h)) h = '';
-        st.ta.value = h;
+        st.ta.value = mbxTplNormalizeHtml(st.ed.getHtml());
         // 编辑器不产生表单 input 事件：补发一次，设置页的"保存"按钮才会由灰转亮
         st.ta.dispatchEvent(new Event('input', { bubbles: true }));
     });
@@ -2928,10 +2955,20 @@ function mbxTplBuild(st) {
 }
 
 // --- R10 tpl dirty core START ---
+// R22 P3：富文本 HTML 写回 textarea 的统一归一。wangEditor 空内容输出
+// <p><br></p>：去标签/实体/空白后为空则写空串，否则这段"空段落"会被当
+// 有效 HTML 入库，产生空壳模板。change 路径与「富→源」切换共用。
+// 与 DOM 无关（不依赖 mbxHtmlToText），便于 Node vm 原样驱动本段 core。
+function mbxTplNormalizeHtml(h) {
+    var text = (h || '').replace(/<[^>]*>/g, '').replace(/&nbsp;/gi, '')
+        .replace(/\s+/g, '');
+    return text ? h : '';
+}
+
 function mbxTplToggleSrc(st) {
     if (st.mode === 'rich') {
         // 富文本 → 源码：编辑器内容写回 textarea 展示
-        st.ta.value = st.ed ? st.ed.getHtml() : '';
+        st.ta.value = st.ed ? mbxTplNormalizeHtml(st.ed.getHtml()) : '';
         // 第十轮 P3-1：与编辑器 change / 单向升级路径对称——程序写 textarea
         // 也必须派发可冒泡 input，否则设置页脏判定/基线不刷新。
         st.ta.dispatchEvent(new Event('input', { bubbles: true }));

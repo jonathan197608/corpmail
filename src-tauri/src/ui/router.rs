@@ -7,9 +7,9 @@
 //! - 向导保存成功以 `HX-Redirect` 响应头驱动整页跳转（htmx 约定）
 
 use super::settings::{
-    settings_account_save, settings_account_test, settings_backup_delete, settings_ctx,
-    settings_page, settings_pane_fragment, settings_storage_clean, settings_storage_move,
-    settings_storage_save, settings_sync_refetch, settings_sync_save,
+    TplFormEcho, settings_account_save, settings_account_test, settings_backup_delete,
+    settings_ctx, settings_page, settings_pane_fragment, settings_storage_clean,
+    settings_storage_move, settings_storage_save, settings_sync_refetch, settings_sync_save,
 };
 use crate::conncheck::TestOutcome;
 use crate::mail::{self, AttachView, EmailSummary, html_escape};
@@ -285,6 +285,10 @@ struct MainCtx {
     per: i64,
     /// 分页链接前缀（含 folder/unread/external/q/per 参数；模板拼 page=N）
     page_base: String,
+    /// R22 P1：「清除搜索关键词」链接——只删 q，保留 folder/unread/external/
+    /// per/sort/from/df/dt/att/page，与 app.js 的 adv-clear 同口径；否则清除
+    /// 后命中集静默扩成全量，后续全选批量操作会作用到被筛掉的行
+    clear_q_href: String,
     /// 当前检索词（空 = 普通列表；回显搜索框 + 空态文案区分）
     q: String,
     /// 排序键（A2；模板回显下拉，非默认值才进 URL）
@@ -397,6 +401,9 @@ struct ComposeCtx {
     sched_local: String,
     /// 刚撤销发送（A1）：显示「已撤销，可继续编辑」提示
     undone: bool,
+    /// R22 P3：来自远期定时的「取消定时」——功能同样是清 scheduled_at 留草稿，
+    /// 但文案须说取消定时，不能误称「已撤销发送」（那封邮件从未进入撤销窗口）
+    sched_canceled: bool,
     /// 邮件模板（B2）：正文上方「插入模板」下拉的数据源
     templates: Vec<mail::templates::Template>,
     /// 作为附件转发（B6）：源邮件 id（0 = 非此模式）；首次保存时把源邮件
@@ -791,10 +798,23 @@ fn template_save(state: &AppState, req: &Req) -> Resp {
         Ok(_) => (true, String::new()),
         Err(e) => (false, e),
     };
-    render_html(
-        "settings_pane_templates.html",
-        &settings_ctx(state, "templates", saved, &error, None, None),
-    )
+    let mut ctx = settings_ctx(state, "templates", saved, &error, None, None);
+    // R22 P2：失败分支回显本次提交值。旧实现从库中重建 pane，刚填的名称与
+    // 正在编辑的正文（富文本形态还要重建编辑器）全部消失。
+    if !error.is_empty() {
+        ctx.tpl_form = Some(TplFormEcho {
+            id: id.unwrap_or(0),
+            name,
+            body_text,
+            body_html,
+            body_mode: if body_mode == "html" {
+                "html".to_string()
+            } else {
+                "plain".to_string()
+            },
+        });
+    }
+    render_html("settings_pane_templates.html", &ctx)
 }
 
 /// 邮件模板删除（B2，POST /templates/delete）：幂等，删除后回 pane 片段
@@ -1087,6 +1107,16 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
         }
         list_query.push_str(&format!("page={page}"));
     }
+    // R22 P1：清除搜索词只删 q 段，其余筛选/排序/分页原样保留。list_query 已含
+    // 全部口径且与 page_base 同源，避免两处拼接漂移（page 可能越界，list_ctx
+    // 会按 total 收敛重查，与直接点分页一致）。
+    let clear_q_href = {
+        let kept: Vec<&str> = list_query
+            .split('&')
+            .filter(|p| !p.is_empty() && !p.starts_with("q="))
+            .collect();
+        format!("/?{}", kept.join("&"))
+    };
     MainCtx {
         frame: frame_ctx(state, &folder),
         folder: folder.clone(),
@@ -1101,6 +1131,7 @@ fn list_ctx(state: &AppState, req: &Req) -> MainCtx {
         total,
         per,
         page_base,
+        clear_q_href,
         q: q_input,
         sort: sort.as_str().to_string(),
         from_filter,
@@ -1291,7 +1322,14 @@ fn email_undo_send(state: &AppState, req: &Req) -> Resp {
         return Resp::not_found();
     };
     match mail::cancel_scheduled_send(state, id) {
-        Ok(true) => Resp::hx_redirect(&format!("/compose?draft_id={id}&undone=1")),
+        Ok(true) => {
+            let suffix = if req.query_param("cancel_only").as_deref() == Some("1") {
+                "&sched_canceled=1"
+            } else {
+                ""
+            };
+            Resp::hx_redirect(&format!("/compose?draft_id={id}&undone=1{suffix}"))
+        }
         Ok(false) => {
             let msg = urlencode("发送已开始，撤销窗口已过（可在发件箱确认）");
             Resp::hx_redirect(&format!("/emails/{id}?error={msg}"))
@@ -1461,7 +1499,10 @@ fn mark_read_and_sync_seen(state: &AppState, id: i64) -> Result<(), String> {
     match mail::ensure_seen_recheck(state, id) {
         Ok(true) => state.notify_seen(),
         Ok(false) => {}
-        Err(e) => eprintln!("[ui] 已读回写意向重建失败：{e}"),
+        // R22 P1：写故障必须与 mail::mark_read 同口径上抛。旧实现只记日志，
+        // 用户看到「打开成功 + sideRefresh」，但 seen_pending 未重建且无补偿
+        // 路径（worker 只处理 seen_pending=1），服务器 \Seen 永久失同步。
+        Err(e) => return Err(e),
     }
     state.poke_tray(); // 本地未读数变化：刷托盘角标（M4-1；调度线程兑底兑漏）
     Ok(())
@@ -1696,8 +1737,11 @@ struct ContactView {
     avatar: String,
     time_label: String,
     hits: i64,
-    /// 编辑链接的地址参数（已百分号编码；模板直接拼 query）
+    /// 编辑链接的地址参数（已百分号编码；兼容旧引用）
     edit_qs: String,
+    /// R22 P3：完整改名链接——沿用 contact_page_base 同源前缀，保留
+    /// 搜索词/每页条数/排序/当前页，避免改名后回到第 1 页找不到刚改的条目
+    edit_href: String,
 }
 
 /// 联系人页当前列表状态（搜索/分页/排序；URL 态与 POST 保存/删除带回共用）：
@@ -1716,6 +1760,32 @@ fn contacts_ctx_with(
     error: &str,
 ) -> ContactsCtx {
     contacts_ctx_full(state, opts, "", notice, error)
+}
+
+/// R22 P2：保存失败时回显本次提交值。旧实现错误分支走 contacts_ctx_with
+/// （edit_addr/edit_name 恒空），编辑态退化成新增态：用户按记忆重敲地址极易
+/// 生成拼写不同的新联系人，与改名前那条并存。地址已在库中则保留只读与
+/// 「保存修改」按钮；不在库中按新增态回显（校验失败的新增）。
+fn contacts_form_error(
+    state: &AppState,
+    opts: &ContactListOpts<'_>,
+    addr: &str,
+    name: &str,
+    notice: &str,
+    error: &str,
+) -> ContactsCtx {
+    let mut ctx = contacts_ctx_with(state, opts, notice, error);
+    ctx.edit_addr = addr.to_string();
+    ctx.edit_name = name.to_string();
+    ctx.editing = state
+        .with_conn(|conn| {
+            conn.query_row("SELECT 1 FROM contacts WHERE addr = ?1", [addr], |_| Ok(()))
+                .optional()
+        })
+        .ok()
+        .flatten()
+        .is_some();
+    ctx
 }
 
 /// 联系人分页解析：per 与 mail list 同口径（URL/表单 per 优先，缺省用 settings，
@@ -1798,6 +1868,11 @@ fn contacts_ctx_full(
                 "—".into()
             },
             edit_qs: urlencode(&r.addr),
+            edit_href: format!(
+                "{}&page={page}&edit={}",
+                contact_page_base(opts.q, per, sort.key()),
+                urlencode(&r.addr)
+            ),
             hits: r.hits,
         })
         .collect::<Vec<_>>();
@@ -1900,7 +1975,11 @@ fn contacts_save(state: &AppState, req: &Req) -> Resp {
         page,
         sort: sort.trim(),
     };
-    let ctx = contacts_ctx_with(state, &opts, &notice, &error);
+    let ctx = if error.is_empty() {
+        contacts_ctx_with(state, &opts, &notice, &error)
+    } else {
+        contacts_form_error(state, &opts, &addr_raw, &name, &notice, &error)
+    };
     render_html("contacts_area.html", &ctx)
 }
 
@@ -2351,6 +2430,10 @@ fn compose_page(state: &AppState, req: &Req) -> Resp {
         forward_attach_cnt: 0,
         sched_local: String::new(),
         undone: req.query_param("undone").map(|v| v == "1").unwrap_or(false),
+        sched_canceled: req
+            .query_param("sched_canceled")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         templates: mail::templates::list(state),
         attach_eml_from: 0,
         attach_eml_name: String::new(),
@@ -2601,7 +2684,13 @@ fn compose_autosave(state: &AppState, req: &Req) -> Resp {
         || ["attach_eml_from", "forward_from"]
             .iter()
             .any(|f| form_i64(&form, f).unwrap_or(0) > 0);
+    // R22 P2：定时变更也是语义字段。只有定时时刻的草稿清空时间（其余字段全空）
+    // 旧判定短路回 ok:true 不落库，前端却提示已保存——定时仍在库里到点投递；
+    // 只改时刻（to/subject/body 全空）同样必须落库，否则新时刻根本没保存。
+    let has_sched_change = form.get("sched_cleared").map(|v| v == "1").unwrap_or(false)
+        || !body_empty("scheduled_at");
     let trivial = !has_attach
+        && !has_sched_change
         && [
             "to_addrs",
             "cc_addrs",

@@ -2737,7 +2737,10 @@ fn exec_one(conn: &rusqlite::Connection, sql: &str, id: i64) -> Result<bool, Str
 
 pub fn delete(state: &AppState, id: i64) -> Result<bool, String> {
     let root = attach_root(state);
-    state.with_conn(|conn| {
+    // R22 P3：with_conn 闭包内只留 DB 操作。逐个 remove_file 与 prune_empty_dirs
+    // 的整棵 attachments 递归 readdir 挪到锁外——外置盘/深目录时不再占着全局
+    // store 锁阻塞收件入库、发送 worker 与列表查询（与 clean.rs 提交后删文件同构）。
+    let (deleted, files) = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         // 收集独立文件相对路径（行删除前；外键级联会随 emails 删除附件行）
         let mut stmt = tx
@@ -2753,14 +2756,15 @@ pub fn delete(state: &AppState, id: i64) -> Result<bool, String> {
             .execute("DELETE FROM emails WHERE id = ?1", [id])
             .map_err(e)?;
         tx.commit().map_err(e)?;
-        if n == 1 {
-            for rel in &files {
-                let _ = std::fs::remove_file(root.join(rel));
-            }
-            prune_empty_dirs(&root);
+        Ok::<_, String>((n == 1, files))
+    })?;
+    if deleted {
+        for rel in &files {
+            let _ = std::fs::remove_file(root.join(rel));
         }
-        Ok(n == 1)
-    })
+        prune_empty_dirs(&root);
+    }
+    Ok(deleted)
 }
 
 /// 真实目录判定（`symlink_metadata` 不跟随链接）：目录且非软链（复查 N3）。

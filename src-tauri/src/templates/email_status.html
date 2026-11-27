@@ -24,7 +24,7 @@
        诱导用户去编辑页清空时间，而「清空后点发送」是立即发出而非取消定时。 #}
     <div class="md-status sending">{{ ic.icon('clock') }} 已定时：<b>{{ email.scheduled_full }}</b> 自动发送。
         <button type="button" class="btn small"
-                hx-post="/emails/{{ email.id }}/undo-send"
+                hx-post="/emails/{{ email.id }}/undo-send?cancel_only=1"
                 hx-trigger="click throttle:500ms" hx-disabled-elt="this">取消定时</button>
     </div>
     <div class="sched-tip">取消定时后草稿保留，可编辑调整时间再重新定时。</div>

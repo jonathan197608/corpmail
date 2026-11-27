@@ -232,23 +232,32 @@ describe('04 列表筛选与批量操作', () => {
   it('B15 批量标已读/标未读 + 清空选择（批量操作⋯ 菜单）', async () => {
     await goto('/')
     await waitBoot()
+    // 0 行时「未读数 === 0」和「未读数 === 总行数」恒真，先等行渲染并钉死非空
+    await waitMailRows()
+    const rowCount = (await $$('.mail-row')).length
+    expect(rowCount).toBeGreaterThan(0)
+
+    expect((await $$('.mail-row')).length).toBeGreaterThan(0)
     await $('#batch-all').click()
     await clickBatchMenu('标已读')
     await browser.waitUntil(
       async () => (await $$('.mail-row.unread')).length === 0,
       { timeoutMsg: '批量标已读后仍有未读行' },
     )
+    expect((await $$('.mail-row.unread')).length).toBe(0) // 标未读增量的基线
     await shot('列表-批量标已读')
 
+    expect((await $$('.mail-row')).length).toBeGreaterThan(0)
     await $('#batch-all').click()
     await clickBatchMenu('标未读')
     await browser.waitUntil(
-      async () => (await $$('.mail-row.unread')).length === (await $$('.mail-row')).length,
-      { timeoutMsg: '批量标未读未生效' },
+      async () => (await $$('.mail-row.unread')).length === rowCount,
+      { timeoutMsg: '批量标未读后未读数须从 0 增到全量行数' },
     )
     await shot('列表-批量标未读')
 
     // 清空选择：先全选让计数有值，再点「清空选择」→ 计数归零、全选盒取消勾选
+    expect((await $$('.mail-row')).length).toBeGreaterThan(0)
     await $('#batch-all').click()
     const before = await browser.execute(
       () => document.getElementById('ba-count')?.textContent?.trim() ?? '',

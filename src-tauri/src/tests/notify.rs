@@ -151,6 +151,33 @@ fn r14_notify_commits_only_after_show_success() {
         between.contains("is_ok()") && between.contains("if shown"),
         "必须按 .show() 结果分支，失败不提交：{between}"
     );
+
+    // 仅「commit 在 .show() 之后」+「between 含 is_ok()/if shown」不足以挡住
+    // 把 commit 挪出成功块（留空壳 if shown 仍绿）。按花括号计数定位
+    // `if shown {` 的配对闭合括号，钉死 commit 真正落在成功分支块内。
+    let branch = body.find("if shown {").expect("成功分支存在");
+    let open = branch + "if shown".len(); // 指向 `{` 前的空格，让计数从 0 开始
+    let mut depth = 0i32;
+    let mut close = None;
+    for (off, ch) in body[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + off);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.expect("if shown 成功分支块须闭合");
+    assert!(
+        commit > open && commit < close,
+        "commit_notified 必须位于 if shown 成功块内：{body}"
+    );
+
     assert!(
         !body[..commit].contains("select_pending(&mut"),
         "筛选阶段不得消费去重集合"

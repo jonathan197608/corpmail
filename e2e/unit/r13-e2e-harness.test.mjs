@@ -15,10 +15,15 @@ test('onComplete 必须 await mock 清理，不能动态 import().then() 后同�
     const at = src.indexOf('onComplete:');
     assert.ok(at >= 0, 'onComplete 钩子存在');
     const body = src.slice(at, src.indexOf('\n  },', at));
-    assert.match(body, /async function/, '钩子须 async，wdio 才会等 Promise');
-    assert.match(body, /await import\('\.\/support\/mock\.mjs'\)/, '须 await 动态导入');
-    assert.match(body, /stopMock\(\)/, '须显式调用 stopMock');
-    assert.doesNotMatch(body, /\.then\(\(\{ stopMock \}\) => stopMock\(\)\)/, '旧 fire-and-forget 形态必须消失');
+    // 先剥注释行：旧护栏只认字符序列，注释掉真实代码仍能绿。
+    const code = body.split('\n').filter((l) => !l.trimStart().startsWith('//')).join('\n');
+    assert.match(code, /async function/, '钩子须 async，wdio 才会等 Promise');
+    assert.match(
+      code,
+      /const \{ stopMock \} = await import\('\.\/support\/mock\.mjs'\)[ \t]*\r?\n[ \t]*stopMock\(\);?/,
+      '须 await 动态导入后紧跟 stopMock();（wdio 才会等待清理落地）',
+    );
+    assert.doesNotMatch(code, /\.then\s*\(/, '不得用 .then() 回调形态（无论回调怎么写，同步返回都不会被等待）');
 });
 
 test('B9 侧栏未读角标断言不得含「0 封新」恒真兜底', () => {

@@ -118,7 +118,7 @@
                     class="adv-toggle {% if from_filter or df or dt or has_attach %}on{% endif %}"
                     title="高级检索：发件人、日期区间、附件" aria-label="高级检索">{{ ic.icon('filter') }} 高级</button>
             {% if q %}
-            <a class="adv-toggle" href="{% if folder == 'inbox' %}/{% else %}/?folder={{ folder }}{% endif %}" title="清除搜索关键词">清除</a>
+            <a class="adv-toggle" href="{{ clear_q_href }}" title="清除搜索关键词（保留当前筛选与排序）">清除</a>
             {% endif %}
             <input type="hidden" name="folder" value="{{ folder }}">
             {# 第十一轮 P2-2：搜索/高级检索须保留未读与外部筛选，否则一提交就

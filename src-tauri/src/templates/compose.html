@@ -14,7 +14,7 @@
         </div>
 
         <div class="card compose-card">
-            {% if undone %}<div class="compose-note ok">{{ ic.icon('undo') }} 已撤销发送，可继续编辑或重新发送</div>{% endif %}
+            {% if sched_canceled %}<div class="compose-note ok">{{ ic.icon('clock') }} 已取消定时发送，草稿已保留；可重新设定时间或立即发送</div>{% elif undone %}<div class="compose-note ok">{{ ic.icon('undo') }} 已撤销发送，可继续编辑或重新发送</div>{% endif %}
             {% if saved %}<div class="compose-note ok">{{ ic.icon('check') }} 草稿已保存</div>{% endif %}
             {% if skipped %}<div class="compose-note">已跳过 {{ skipped }} 个不可用附件（空文件或已被清理）</div>{% endif %}
             {% if error %}<div class="compose-note err">{{ error }}</div>{% endif %}

@@ -14,6 +14,16 @@ use crate::state::{self, AppState, MigrateOutcome, ResetFetchError, defaults, fu
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// R22 P2：模板保存失败时回显本次提交的表单值（新增 id=0，编辑 id=t.id）
+#[derive(Serialize)]
+pub(super) struct TplFormEcho {
+    pub(super) id: i64,
+    pub(super) name: String,
+    pub(super) body_text: String,
+    pub(super) body_html: String,
+    pub(super) body_mode: String,
+}
+
 /// 设置页（六 tab 全量上下文：整页与 pane 片段共用一份）
 #[derive(Serialize)]
 pub(super) struct SettingsCtx {
@@ -84,6 +94,8 @@ pub(super) struct SettingsCtx {
     backup_view: Option<BackupDeleteView>,
     // 模板 tab（B2）：邮件模板列表（其他 tab 为空）
     templates: Vec<crate::mail::templates::Template>,
+    /// R22 P2：模板保存失败时本次提交的表单值（成功/普通渲染为 None）
+    pub(super) tpl_form: Option<TplFormEcho>,
     // 关于 tab
     app_version: String,
 }
@@ -270,6 +282,7 @@ pub(super) fn settings_ctx(
         } else {
             Vec::new()
         },
+        tpl_form: None,
         app_version: env!("CARGO_PKG_VERSION").into(),
     }
 }
@@ -322,11 +335,22 @@ fn sync_form_error(
     render_html(&pane_template("sync"), &ctx)
 }
 
-pub(super) fn storage_pane_error(state: &AppState, error: &str) -> Resp {
-    render_html(
-        &pane_template("storage"),
-        &settings_ctx(state, "storage", false, error, None, None),
-    )
+pub(super) fn storage_pane_error(
+    state: &AppState,
+    error: &str,
+    inline: &str,
+    clean: &str,
+    keep_inbox: &str,
+    keep_sent: &str,
+) -> Resp {
+    let mut ctx = settings_ctx(state, "storage", false, error, None, None);
+    // R22 P2：与 sync_form_error 同口径——错误条出现时仍回显本次提交值。
+    // 旧实现从 state 重读，用户改的限额/保留天数被静默清空且脏基线按旧值重建。
+    ctx.inline_max = inline.to_string();
+    ctx.clean_days = clean.to_string();
+    ctx.keep_inbox = keep_inbox.to_string();
+    ctx.keep_sent = keep_sent.to_string();
+    render_html(&pane_template("storage"), &ctx)
 }
 
 /// 设置·发信页「测试连接」/ 收信页「测试收信」：双通道打 ConnTester
@@ -792,7 +816,14 @@ pub(super) fn settings_storage_save(state: &AppState, req: &Req) -> Resp {
     ];
     if let Err(e) = state.set_batch(&pairs) {
         eprintln!("[settings] 存储策略保存失败：{e}");
-        return storage_pane_error(state, &format!("保存失败：{e}"));
+        return storage_pane_error(
+            state,
+            &format!("保存失败：{e}"),
+            &inline,
+            &clean,
+            &keep_inbox,
+            &keep_sent,
+        );
     }
     // 新策略落地即同步执行一轮清理（个人邮箱规模毫秒级）：改短保留时长
     // 立即可见效果，无需等每日定时器或手动点「立即清理」（2026-11-03 需求：

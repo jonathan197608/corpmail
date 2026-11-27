@@ -144,7 +144,7 @@
                     {% if migration_running %}title="数据迁移进行中，请稍候…"{% elif migration_pending %}title="数据已迁移，请重启应用后再操作"{% else %}title="当前没有可释放的空间"{% endif %}{% else %}title="按上方策略立即执行清理"{% endif %}
                     hx-post="/settings/storage/clean"
                     hx-target="#settings-pane" hx-swap="outerHTML"
-                    hx-confirm="立即执行清理？超期的附件文件与过期邮件将被删除，草稿不受影响。"
+                    hx-confirm="立即执行清理？按上方预估的全部项目执行：超期附件、过期邮件与孤儿文件将被删除，草稿不受影响。"
                     hx-disabled-elt="this">立即清理</button>
         </div>
     </div>

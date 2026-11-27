@@ -9,30 +9,33 @@
         {% if saved %}<span class="test-result ok">{{ ic.icon('check') }} 已保存</span>{% endif %}
         {% if error %}<div class="tpl-error">{{ error }}</div>{% endif %}
 
+        {# R22 P2：保存失败时 tpl_form.id=0 携带本次提交值，避免错误条出现却清空表单 #}
         <form class="tpl-form" hx-post="/templates/save" hx-target="#settings-pane" hx-swap="outerHTML">
             <div class="sfield">
                 <label for="sf-tpl-name">名称{{ ic.tip('最多 60 字，用于下拉选择') }}</label>
-                <input type="text" name="name" id="sf-tpl-name" maxlength="60" required placeholder="如：收到请回复">
+                <input type="text" name="name" id="sf-tpl-name" maxlength="60" required placeholder="如：收到请回复"
+                       value="{% if tpl_form and tpl_form.id == 0 %}{{ tpl_form.name }}{% endif %}">
             </div>
             <div class="sfield" data-tpl-field>
                 <label for="sf-tpl-body">内容{{ ic.tip('默认按纯文本编辑；点「切换为富文本」后只能用富文本，不能再改回纯文本') }}</label>
-                <input type="hidden" name="body_mode" value="plain" data-tpl-mode>
-                <div class="tpl-plain-head" data-tpl-plain-head>
+                <input type="hidden" name="body_mode" data-tpl-mode
+                       value="{% if tpl_form and tpl_form.id == 0 %}{{ tpl_form.body_mode }}{% else %}plain{% endif %}">
+                <div class="tpl-plain-head" data-tpl-plain-head{% if tpl_form and tpl_form.id == 0 and tpl_form.body_mode == 'html' %} hidden{% endif %}>
                     <button type="button" class="btn small" data-tpl-upgrade
                             title="把当前纯文本转为富文本（不可再降级）">切换为富文本 ›</button>
                 </div>
-                <div data-tpl-plain>
-                    <textarea name="body_text" id="sf-tpl-body" rows="3" placeholder="如：收到，我这边核对后回复您。"></textarea>
+                <div data-tpl-plain{% if tpl_form and tpl_form.id == 0 and tpl_form.body_mode == 'html' %} hidden{% endif %}>
+                    <textarea name="body_text" id="sf-tpl-body" rows="3" placeholder="如：收到，我这边核对后回复您。">{% if tpl_form and tpl_form.id == 0 %}{{ tpl_form.body_text }}{% endif %}</textarea>
                 </div>
                 {# 富文本编辑（与撰写页同款 wangEditor），可切「HTML 源码」直接写源码；
                    与邮件正文一样仅单向升级，HTML 不可降级回纯文本 #}
-                <div class="tpl-editor" data-tpl-html-field hidden>
+                <div class="tpl-editor" data-tpl-html-field{% if not tpl_form or tpl_form.id != 0 or tpl_form.body_mode != 'html' %} hidden{% endif %}>
                     <div class="tpl-ed-actions">
                         <button type="button" class="btn small" data-tpl-src-toggle>{{ ic.icon('keyboard') }} HTML 源码</button>
                     </div>
                     <div class="tpl-ed-toolbar" data-tpl-tb></div>
                     <div class="tpl-ed-area" data-tpl-area></div>
-                    <textarea name="body_html" rows="4" data-tpl-html hidden></textarea>
+                    <textarea name="body_html" rows="4" data-tpl-html hidden>{% if tpl_form and tpl_form.id == 0 %}{{ tpl_form.body_html }}{% endif %}</textarea>
                 </div>
             </div>
             <button class="btn primary" type="submit">新增模板</button>
@@ -52,33 +55,36 @@
                         hx-trigger="click throttle:500ms" hx-disabled-elt="this"
                         hx-confirm="删除模板「{{ t.name }}」？删除后不可恢复。">删除</button>
             </div>
-            <details class="tpl-edit">
+            {# R22 P2：tpl_form.id == t.id 时本次编辑失败，展开该条并回显提交值 #}
+            <details class="tpl-edit"{% if tpl_form and tpl_form.id == t.id %} open{% endif %}>
                 <summary>编辑</summary>
                 <form hx-post="/templates/save" hx-target="#settings-pane" hx-swap="outerHTML">
                     <input type="hidden" name="id" value="{{ t.id }}">
                     <div class="sfield">
                         <label for="sf-tpl-name-{{ t.id }}">名称</label>
-                        <input type="text" name="name" id="sf-tpl-name-{{ t.id }}" value="{{ t.name }}" maxlength="60" required>
+                        <input type="text" name="name" id="sf-tpl-name-{{ t.id }}" maxlength="60" required
+                               value="{% if tpl_form and tpl_form.id == t.id %}{{ tpl_form.name }}{% else %}{{ t.name }}{% endif %}">
                     </div>
                     <div class="sfield" data-tpl-field>
                         <label for="sf-tpl-body-{{ t.id }}">内容</label>
                         {# 存量模板有 body_html 则直接 html 模式（不可降级）；否则 plain 可升级 #}
-                        <input type="hidden" name="body_mode" value="{% if t.body_html %}html{% else %}plain{% endif %}" data-tpl-mode>
-                        <div class="tpl-plain-head" data-tpl-plain-head {% if t.body_html %}hidden{% endif %}>
+                        <input type="hidden" name="body_mode" data-tpl-mode
+                               value="{% if tpl_form and tpl_form.id == t.id %}{{ tpl_form.body_mode }}{% elif t.body_html %}html{% else %}plain{% endif %}">
+                        <div class="tpl-plain-head" data-tpl-plain-head {% if tpl_form and tpl_form.id == t.id %}{% if tpl_form.body_mode == 'html' %}hidden{% endif %}{% elif t.body_html %}hidden{% endif %}>
                             <button type="button" class="btn small" data-tpl-upgrade
                                     title="把当前纯文本转为富文本（不可再降级）">切换为富文本 ›</button>
                         </div>
-                        <div data-tpl-plain {% if t.body_html %}hidden{% endif %}>
-                            <textarea name="body_text" id="sf-tpl-body-{{ t.id }}" rows="3">{{ t.body_text }}</textarea>
+                        <div data-tpl-plain {% if tpl_form and tpl_form.id == t.id %}{% if tpl_form.body_mode == 'html' %}hidden{% endif %}{% elif t.body_html %}hidden{% endif %}>
+                            <textarea name="body_text" id="sf-tpl-body-{{ t.id }}" rows="3">{% if tpl_form and tpl_form.id == t.id %}{{ tpl_form.body_text }}{% else %}{{ t.body_text }}{% endif %}</textarea>
                         </div>
-                        <div class="tpl-editor" data-tpl-html-field {% if not t.body_html %}hidden{% endif %}>
+                        <div class="tpl-editor" data-tpl-html-field {% if tpl_form and tpl_form.id == t.id %}{% if tpl_form.body_mode != 'html' %}hidden{% endif %}{% elif not t.body_html %}hidden{% endif %}>
                             <div class="tpl-ed-actions">
                                 <button type="button" class="btn small" data-tpl-src-toggle>{{ ic.icon('keyboard') }} HTML 源码</button>
                             </div>
                             <div class="tpl-ed-toolbar" data-tpl-tb></div>
                             <div class="tpl-ed-area" data-tpl-area></div>
                             <textarea name="body_html" rows="4" data-tpl-html
-                                      hidden>{{ t.body_html }}</textarea>
+                                      hidden>{% if tpl_form and tpl_form.id == t.id %}{{ tpl_form.body_html }}{% else %}{{ t.body_html }}{% endif %}</textarea>
                         </div>
                     </div>
                     <button class="btn small primary" type="submit">保存修改</button>

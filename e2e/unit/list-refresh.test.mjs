@@ -179,20 +179,46 @@ test('跨页全选：计数 total-exclude、提交 select_all + exclude_ids（�
 });
 
 test('app.js 批量状态机确实调用抽出的纯函数（不是各写一份）', () => {
-    assert.ok(
-        APP_JS.includes('return mbxBatchSelectedCount(stateBox);') &&
-            APP_JS.includes('mbxBatchSelectionParams(stateBox, params);'),
-        'selectedCount/apply 必须调用 B10 core 纯函数，否则测试覆盖的是镜像副本'
+    // 旧护栏只查两串在文件中的共现：把调用挪进永不被调用的 helper 仍绿。
+    // 收窄到真实的 selectedCount / apply 函数体区间。
+    const sc = APP_JS.indexOf('function selectedCount()');
+    const render = APP_JS.indexOf('function render()', sc);
+    assert.ok(sc >= 0 && render > sc, 'selectedCount/render 定义存在');
+    assert.match(
+        APP_JS.slice(sc, render),
+        /return\s+mbxBatchSelectedCount\(stateBox\);/,
+        '计数必须来自 B10 core'
+    );
+    const apply = APP_JS.indexOf('function apply(action, confirmMsg)');
+    const submit = APP_JS.indexOf('var submit = function ()', apply);
+    assert.ok(apply >= 0 && submit > apply, 'apply/submit 定义存在');
+    assert.match(
+        APP_JS.slice(apply, submit),
+        /mbxBatchSelectionParams\(stateBox, params\);/,
+        '提交参数必须来自 B10 core'
     );
 });
 
 // R17 P2：批量操作 htmx.ajax 无 .catch —— 传输层失败（onerror/timeout，
 // 不到服务端故不触发全局 responseError）时 unhandledRejection + 界面无反应。
-test('R17 批量操作 htmx.ajax 带 reject 兜底', () => {
+test('R17 批量操作 reject 时 catch 回调内确实 toast（行为验证）', async () => {
     const at = APP_JS.indexOf("htmx.ajax('POST', '/emails/batch'");
     assert.ok(at >= 0, '批量提交点存在');
-    const end = APP_JS.indexOf('};', at);
-    const branch = APP_JS.slice(at, end > at ? end : at + 400);
-    assert.match(branch, /\.catch\(/, '批量提交必须捕获 reject（网络层失败兜底）');
-    assert.match(branch, /mbxToast/, '失败须 toast 告知用户');
+    // 截到 submit 闭包结束，原样执行 htmx.ajax(...).catch(...) 表达式
+    const endMark = '\n        };\n        if (confirmMsg)';
+    const end = APP_JS.indexOf(endMark, at);
+    assert.ok(end > at, 'submit 闭包边界存在');
+    const code = APP_JS.slice(at, end);
+    const toasts = [];
+    const ctx = vm.createContext({
+        htmx: { ajax: () => Promise.reject(new Error('network down')) },
+        params: { entries: () => [] },
+        mbxToast: (msg, kind) => toasts.push([msg, kind]),
+    });
+    vm.runInContext(code, ctx);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(
+        toasts.some(([msg, kind]) => String(msg).includes('失败') && kind === 'err'),
+        `传输层 reject 必须 toast 失败文案：${JSON.stringify(toasts)}`
+    );
 });

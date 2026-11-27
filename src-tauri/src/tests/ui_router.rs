@@ -7822,7 +7822,7 @@ fn compose_schedule_send_flow() {
     // 窗口内给按钮。旧实现只给一句「清空时间后点发送」文案（那是立即发出）。
     assert!(
         html.contains("取消定时")
-            && html.contains(r#"hx-post="/emails/1/undo-send""#),
+            && html.contains(r#"hx-post="/emails/1/undo-send?cancel_only=1""#),
         "远期定时草稿应有取消定时按钮：{html}"
     );
     assert!(
@@ -8841,15 +8841,22 @@ fn template_body_mode_single_field_semantics() {
         &req("GET", "/settings/templates", b""),
         &t,
     ));
+    let mode_inputs: Vec<&str> = html
+        .match_indices("name=\"body_mode\"")
+        .map(|(p, _)| {
+            let end = html[p..].find('>').map(|e| p + e).unwrap_or(html.len());
+            &html[p..end]
+        })
+        .collect();
     assert!(
-        html.contains("name=\"body_mode\" value=\"html\""),
-        "存量 html 模板编辑应回 html 模式：{html}"
+        mode_inputs.iter().any(|s| s.contains("value=\"html\"")),
+        "存量 html 模板编辑应回 html 模式：{mode_inputs:?}"
     );
     assert!(html.contains("切换为富文本"), "应保留单向升级入口");
     assert!(!html.contains("转为纯文本"), "不应再有降级入口");
     assert!(
-        html.contains("name=\"body_mode\" value=\"plain\""),
-        "新增表单应初始 plain：{html}"
+        html.contains("name=\"body_mode\"") && html.contains("value=\"plain\""),
+        "新增表单应初始 plain（属性顺序不固定）：{html}"
     );
     // plain 模式保存：body_html 清空（表单值被忽略）
     let resp = route(
@@ -12160,4 +12167,360 @@ fn entry_fix_migration_has_confirm_and_retry() {
         "失败态须显示就地重试按钮"
     );
     let _ = retry_at;
+}
+
+// ---------- R22 审计回归 ----------
+
+#[test]
+fn r22_clear_search_keeps_all_filter_context() {
+    let (state, dir) = temp_state("r22-clear-q");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/",
+            "folder=inbox&unread=1&from=%E5%BC%A0&q=%E5%AD%A3%E5%BA%A6&per=20&sort=date_asc",
+            b"",
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    let line = html
+        .lines()
+        .find(|l| l.contains("title=\"清除搜索关键词"))
+        .expect("搜索态须渲染清除链接");
+    for expected in ["unread=1", "from=", "per=20", "sort=date_asc"] {
+        assert!(line.contains(expected), "清除链接须保留 {expected}：{line}");
+    }
+    assert!(!line.contains("q="), "清除链接不得再带搜索词：{line}");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_contact_save_error_echoes_submitted_form() {
+    let (state, dir) = temp_state("r22-contact-echo");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester { smtp_ok: true, imap_ok: true };
+    // 新增态：无效地址 → 本次输入仍回显
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("POST", "/contacts/save", &form(&[("addr", "bad-address"), ("name", "待改名")])),
+        &t,
+    ));
+    assert!(html.contains("value=\"bad-address\""), "失败须回显地址：{html}");
+    assert!(html.contains("value=\"待改名\""), "失败须回显姓名：{html}");
+
+    // 编辑态：姓名超长被拒 → 仍保持只读地址与「保存修改」
+    let addr = "echo.peer@example.com";
+    let _ = route(
+        &state,
+        &assets(),
+        &req("POST", "/contacts/save", &form(&[("addr", addr), ("name", "原姓名")])),
+        &t,
+    );
+    let long = "名".repeat(61);
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("POST", "/contacts/save", &form(&[("addr", addr), ("name", &long)])),
+        &t,
+    ));
+    assert!(html.contains("姓名最多 60 个字符"), "错误条须存在：{html}");
+    assert!(html.contains("readonly"), "编辑态失败不得退化为新增态：{html}");
+    assert!(html.contains("保存修改"), "按钮仍是保存修改：{html}");
+    assert!(html.contains(&long), "超长输入须原样回显：{html}");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_template_save_error_echoes_submitted_form() {
+    let (state, dir) = temp_state("r22-tpl-echo");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req("POST", "/templates/save", &form(&[("name", "回显测试"), ("body_text", "")])),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    assert!(html.contains("模板内容不能为空"), "错误条须存在：{html}");
+    assert!(html.contains("value=\"回显测试\""), "名称须回显：{html}");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_template_edit_error_keeps_edit_form_open() {
+    let (state, dir) = temp_state("r22-tpl-edit-echo");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester { smtp_ok: true, imap_ok: true };
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/templates/save", &form(&[("name", "已有模板"), ("body_text", "原文")])),
+        &t,
+    );
+    let id = state.with_conn(|c| {
+        c.query_row("SELECT MAX(id) FROM templates", [], |r| r.get::<_, i64>(0)).unwrap()
+    });
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/templates/save",
+            &form(&[
+                ("id", &id.to_string()),
+                ("name", "改名回显"),
+                ("body_text", ""),
+            ]),
+        ),
+        &t,
+    ));
+    assert!(html.contains("模板内容不能为空"), "错误条须存在：{html}");
+    assert!(html.contains("value=\"改名回显\""), "编辑表单须回显本次名称：{html}");
+    assert!(
+        html.contains("class=\"tpl-edit\" open"),
+        "失败后该模板的编辑区须保持展开，否则用户找不到回显内容"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_autosave_sched_cleared_is_not_trivial() {
+    let (state, dir) = temp_state("r22-sched-clear");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let future = mail::sched_local_value(mail::now_epoch() + 3600);
+    let draft_req = req(
+        "POST",
+        "/compose/draft",
+        &form(&[
+            ("to_addrs", "peer@example.com"),
+            ("subject", "远期定时"),
+            ("body_text", "正文"),
+            ("body_mode", "plain"),
+            ("scheduled_at", future.as_str()),
+            ("keep_ids", "[]"),
+            ("attach_paths", "[]"),
+        ]),
+    );
+    let resp = route(&state, &assets(), &draft_req, &FakeTester { smtp_ok: true, imap_ok: true });
+    assert_eq!(resp.status, 200);
+    let (id, at): (i64, i64) = state.with_conn(|c| {
+        c.query_row(
+            "SELECT id, scheduled_at FROM emails WHERE status='draft' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert!(at > 0, "前置条件：草稿带定时时刻");
+    // 其余字段全空 + sched_cleared=1：旧 trivial 判定短路回 ok:true 不落库
+    let resp = route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/autosave",
+            &form(&[
+                ("draft_id", &id.to_string()),
+                ("to_addrs", ""),
+                ("subject", ""),
+                ("body_text", ""),
+                ("body_html", ""),
+                ("sched_cleared", "1"),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    let json: serde_json::Value = serde_json::from_str(&body(&resp)).expect("autosave 回 JSON");
+    assert!(json["draft_id"].as_i64().unwrap_or(0) > 0, "清空定时必须落库：{json}");
+    let after: i64 = state.with_conn(|c| {
+        c.query_row("SELECT scheduled_at FROM emails WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(after, 0, "定时时刻须被清空，否则到点仍投递");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_cancel_scheduled_uses_its_own_copy() {
+    let (state, dir) = temp_state("r22-cancel-copy");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let future = mail::sched_local_value(mail::now_epoch() + 3600);
+    let t = FakeTester { smtp_ok: true, imap_ok: true };
+    route(
+        &state,
+        &assets(),
+        &req(
+            "POST",
+            "/compose/draft",
+            &form(&[
+                ("to_addrs", "peer@example.com"),
+            ("subject", "取消定时"),
+            ("body_text", "正文"),
+            ("body_mode", "plain"),
+            ("scheduled_at", future.as_str()),
+                ("keep_ids", "[]"),
+                ("attach_paths", "[]"),
+            ]),
+        ),
+        &t,
+    );
+    let id = state.with_conn(|c| {
+        c.query_row("SELECT MAX(id) FROM emails", [], |r| r.get::<_, i64>(0)).unwrap()
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req_q("POST", &format!("/emails/{id}/undo-send"), "cancel_only=1", b""),
+        &t,
+    );
+    assert!(
+        resp.extra_headers.iter().any(|(k, v)| k == "HX-Redirect"
+            && v == &format!("/compose?draft_id={id}&undone=1&sched_canceled=1")),
+        "取消定时须带自己的文案标记：{:?}", resp.extra_headers
+    );
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/compose", &format!("draft_id={id}&undone=1&sched_canceled=1"), b""),
+        &t,
+    ));
+    assert!(html.contains("已取消定时发送"), "文案须说取消定时：{html}");
+    assert!(!html.contains("已撤销发送，可继续编辑"), "不得误称撤销发送：{html}");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_contact_edit_link_keeps_search_context() {
+    let (state, dir) = temp_state("r22-contact-link");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let t = FakeTester { smtp_ok: true, imap_ok: true };
+    route(
+        &state,
+        &assets(),
+        &req("POST", "/contacts/save", &form(&[("addr", "zhang@example.com"), ("name", "张三")])),
+        &t,
+    );
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q("GET", "/contacts", "q=%E5%BC%A0&per=20&page=2&sort=name", b""),
+        &t,
+    ));
+    let lines: Vec<&str> = html.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| l.contains("ct-edit-link"))
+        .expect("改名入口存在");
+    let line = lines[idx..(idx + 2).min(lines.len())].join(" ");
+    // 仅一条联系人且 per=20 → pages=1，越界 page=2 按既定口径收敛到 1
+    for expected in ["q=", "per=20", "page=1", "sort=name", "edit="] {
+        assert!(line.contains(expected), "改名链接须保留 {expected}：{line}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_clean_confirm_covers_orphan_files() {
+    let tpl = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates/settings_pane_storage.html"),
+    )
+    .expect("模板可读");
+    let marker = "hx-confirm=\"立即执行清理";
+    let at = tpl.find(marker).expect("清理确认存在") + marker.len();
+    let end = tpl[at..].find('"').map(|p| at + p).unwrap_or(tpl.len());
+    let confirm = &tpl[at..end];
+    assert!(confirm.contains("孤儿文件"), "确认范围须含孤儿文件：{confirm}");
+    assert!(confirm.contains("过期邮件"), "确认范围须含过期邮件：{confirm}");
+}
+
+#[test]
+fn r22_seen_recheck_write_failure_returns_500() {
+    let (state, dir) = temp_state("r22-seen-recheck-fail");
+    state.with_conn(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER r22_fail_seen BEFORE UPDATE OF seen_pending ON emails
+             WHEN NEW.seen_pending = 1
+             BEGIN SELECT RAISE(ABORT, 'forced seen_pending failure'); END;",
+        )
+        .unwrap();
+        // 已读但回写意向被清空：再次打开详情必须重建 seen_pending
+        c.execute(
+            "INSERT INTO emails(direction, folder, status, from_addr, to_addrs, subject,
+                                body_text, subject_tokens, body_tokens, unread, seen_pending,
+                                remote_uid, created_at, received_at)
+             VALUES ('in', 'inbox', 'received', 'a@x.cn', 'me@example.com', '主题', '正文',
+                     '主题', '正文', 0, 0, 100, 1, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    let resp = route(
+        &state,
+        &assets(),
+        &req("POST", "/emails/1/read", b""),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    );
+    assert_eq!(resp.status, 500, "seen_pending 重建写失败必须上抛，不能假装打开成功");
+    assert!(
+        !resp.extra_headers.iter().any(|(k, v)| k == "HX-Trigger" && v.contains("mbx:sideRefresh")),
+        "失败时不得派发侧栏刷新成功信号"
+    );
+    let pending: i64 = state.with_conn(|c| {
+        c.query_row("SELECT seen_pending FROM emails WHERE id = 1", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(pending, 0, "写失败后标志仍未落库，需留给下次重试");
+    cleanup(&dir);
+}
+
+#[test]
+fn r22_storage_error_restores_submitted_values() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/settings.rs"),
+    )
+    .expect("settings.rs 可读");
+    let at = src.find("pub(super) fn storage_pane_error(").expect("失败分支存在");
+    let end = src[at..]
+        .find("\n}\n")
+        .map(|p| at + p)
+        .unwrap_or(src.len());
+    let code: String = src[at..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for field in [
+        "ctx.inline_max = inline",
+        "ctx.clean_days = clean",
+        "ctx.keep_inbox = keep_inbox",
+        "ctx.keep_sent = keep_sent",
+    ] {
+        assert!(code.contains(field), "存储保存失败须回显 {field}：{code}");
+    }
+}
+
+#[test]
+fn r22_delete_file_io_outside_store_lock() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mail/mod.rs"),
+    )
+    .expect("mail/mod.rs 可读");
+    let at = src.find("pub fn delete(").expect("删除函数存在");
+    let end = src[at..]
+        .find("\n}\n")
+        .map(|p| at + p)
+        .unwrap_or(src.len());
+    let body = &src[at..end];
+    let close = body.find("})?;").expect("with_conn 闭包结束点");
+    let io = body.find("remove_file(").expect("附件文件删除点");
+    let prune = body.find("prune_empty_dirs(").expect("目录回收点");
+    assert!(
+        io > close && prune > close,
+        "文件删除与目录递归必须在全局 store 锁外：{body}"
+    );
 }
