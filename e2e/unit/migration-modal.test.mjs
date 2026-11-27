@@ -64,12 +64,14 @@ function fakeDom() {
     // 原桩 querySelector 恒 null → hideActions/showError 的按钮操作是 no-op。
     const buttons = {
         keep: mk('button-keep-waiting'),
+        retry: mk('button-migration-retry'), // R21：失败态「重新选择目录并重试」也须可观测
         close: mk('button-close'),
         card: mk('div-migrate-card'),
     };
     mask.querySelector = (sel) => {
         if (sel === '.migrate-card') return buttons.card;
         if (sel.includes('migration-keep-waiting')) return buttons.keep;
+        if (sel.includes('migration-retry')) return buttons.retry;
         if (sel.includes('migration-close')) return buttons.close;
         return null;
     };
@@ -93,6 +95,7 @@ function harness({ fetchImpl } = {}) {
     const intervals = [];
     let now = 0;
     const unlistenCalls = [];
+    const listeners = {};
     const toasts = [];
     // H4：焦点陷阱释放计数——mbxModalOpen 返回的 release 被调用几次
     let releaseCalls = 0;
@@ -116,7 +119,13 @@ function harness({ fetchImpl } = {}) {
         CustomEvent: class { constructor(t, o) { this.type = t; this.detail = o && o.detail; } },
         __TAURI__: {
             dialog: { open: async () => '/tmp/dest' },
-            event: { listen: async (name, fn) => { return () => unlistenCalls.push(name); } },
+            // 保存处理器供测试注入迟到事件（P1-1：error 后的 progress 不得收起出口）
+            event: {
+                listen: async (name, fn) => {
+                    (listeners[name] = listeners[name] || []).push(fn);
+                    return () => unlistenCalls.push(name);
+                },
+            },
         },
         URLSearchParams: class { constructor() {} toString() { return ''; } },
         fetch: fetchImpl || (async () => ({ ok: true, status: 200, headers: { get: () => null }, text: async () => '' })),
@@ -162,6 +171,9 @@ function harness({ fetchImpl } = {}) {
             for (const it of intervals) if (it.fn) for (let i = 0; i < n; i++) it.fn();
         },
         intervalCount: () => intervals.filter((i) => i.fn).length,
+        fire: (name, payload) => {
+            for (const fn of listeners[name] || []) fn({ payload });
+        },
     };
 }
 
@@ -267,6 +279,36 @@ test('A4：200 空响应（pane 应用失败）第三分支同样 abort（复查
         h.dom.detail.textContent.includes('迁移结果无法显示'),
         `应显示「迁移结果无法显示」（实际：${h.dom.detail.textContent}）`,
     );
+});
+
+test('P1-1：error 后迟到的 progress 不得收起「重试/返回」出口（R21）', async () => {
+    const h = harness({
+        fetchImpl: async () => ({
+            ok: true, status: 200,
+            headers: { get: (k) => (k === 'X-CorpMail-Migration' ? 'background' : null) },
+            text: async () => '',
+        }),
+    });
+    await h.run();
+    // 后台迁移进行中：确认态按钮全收起
+    assert.equal(h.dom.buttons.retry.hidden, true, '进行中不得露出重试');
+    // 终态失败：露出重试/返回
+    h.fire('migration-error', '目标目录不可写');
+    assert.equal(h.dom.buttons.retry.hidden, false, '失败态必须露出「重新选择目录并重试」');
+    assert.equal(h.dom.buttons.close.hidden, false, '失败态必须露出「返回」');
+    assert.ok(h.dom.detail.textContent.includes('目标目录不可写'), '失败文案已显示');
+    // 关键回归：看门狗超时但后台仍在跑时，迟到 progress 会到达前端。
+    // 旧实现无条件 mbxMigHideActions() 把三枚按钮全收起，用户被锁死。
+    h.fire('migration-progress', { phase: 'attachments', detail: '仍在复制附件' });
+    assert.equal(h.dom.buttons.retry.hidden, false, '迟到 progress 不得收起重试按钮');
+    assert.equal(h.dom.buttons.close.hidden, false, '迟到 progress 不得收起返回按钮');
+    assert.ok(
+        h.dom.detail.textContent.includes('目标目录不可写')
+            && !h.dom.detail.textContent.includes('仍在复制附件'),
+        '失败文案不得被迟到的进度覆盖（实际：' + h.dom.detail.textContent + '）',
+    );
+    assert.equal(vm.runInContext('mbxMigFailed', h.ctx), true, '失败终态标志已置位');
+    assert.equal(vm.runInContext('mbxMigWatchdog', h.ctx), null, '失败态看门狗已停');
 });
 
 test('A4：二次 mbxMigOpen 复位上次失败态（复查 R5）', async () => {

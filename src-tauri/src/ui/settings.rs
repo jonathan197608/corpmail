@@ -289,15 +289,6 @@ pub(super) fn sync_pane(state: &AppState, saved: bool) -> Resp {
     )
 }
 
-/// C8：保存失败必须回显原因。旧实现四个失败分支都返回「与点击前逐字节相同」
-/// 的正常 pane，用户误以为策略已生效；sync 模板此前连错误条都没有。
-pub(super) fn sync_pane_error(state: &AppState, error: &str) -> Resp {
-    render_html(
-        &pane_template("sync"),
-        &settings_ctx(state, "sync", false, error, None, None),
-    )
-}
-
 /// R14：保存失败时把本次提交值回写进 ctx，避免「错误条显示了、用户改动
 /// 却被静默清空」。只覆盖同步 pane 的五个字段；radio/checkbox 的最终
 /// checked 由模板按这些值渲染。成功路径不调用。
@@ -738,13 +729,24 @@ pub(super) fn settings_sync_refetch(state: &AppState, req: &Req) -> Resp {
     // 且无任何反馈——等待当前收取完成后重试即可
     match state.reset_and_fetch(&pairs) {
         Err(ResetFetchError::Busy) => {
+            // P2-1（R21）：与 save 路径 R14 同口径——回显本次提交值，否则
+            // 用户键入的间隔/范围被静默清空，切 tab 不再提示未保存。
             let mut ctx = settings_ctx(state, "sync", false, "", None, None);
             ctx.refetch_busy = true;
+            restore_sync_form(&mut ctx, on, allow_images, &interval, &days, &max_mail);
             render_html(&pane_template("sync"), &ctx)
         }
         Err(ResetFetchError::Other(e)) => {
             eprintln!("[settings] 重新拉取启动失败：{e}");
-            sync_pane_error(state, &format!("重新拉取失败：{e}"))
+            sync_form_error(
+                state,
+                &format!("重新拉取失败：{e}"),
+                on,
+                allow_images,
+                &interval,
+                &days,
+                &max_mail,
+            )
         }
         Ok(()) => {
             let mut ctx = settings_ctx(state, "sync", false, "", None, None);

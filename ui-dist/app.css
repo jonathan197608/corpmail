@@ -2957,16 +2957,6 @@ form.setup-card .setup-actions {
     text-decoration: none;
 }
 
-/* 列表行内操作（收件箱/草稿箱）：置顶与删除，与详情页同口径；按钮在链接外 */
-.mail-row .row-act {
-    align-self: center;
-    flex: 0 0 auto;
-    height: 30px;
-    padding: 0 8px;
-    gap: 4px;
-    font-size: 12px;
-    white-space: nowrap;
-}
 /* 批量操作组（批次五）：并入列表顶栏单行，不再独占一行。
    本页全选 + 已选计数 + 删除 + 批量⋯ + 取消；按钮 34px 与顶栏其他控件齐高 */
 .mbx-inline {

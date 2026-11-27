@@ -325,25 +325,30 @@ pub fn dispatch_due_scheduled(state: &AppState) -> usize {
 /// 不能一律判失败（否则已投递的邮件会变成可重发 → 用户重发即重复投递）：
 /// - `sent_at` 已写（SMTP 已成功接收，本地状态没来得及落定）→ 补成 `sent`；
 /// - `sent_at` 为空（发送途中被杀，服务器是否收到未知）→ 置 `failed` 让用户决定重发。
-pub fn recover_interrupted_sends(conn: &rusqlite::Connection) -> usize {
+pub fn recover_interrupted_sends(conn: &rusqlite::Connection) -> Result<usize, String> {
+    // P2-3（R21）：写故障必须上抛。旧实现两条 UPDATE 用 unwrap_or(0) 把
+    // SQLITE_BUSY / 外置盘未就绪 / 只读库吞成「0 行已处理」，启动只打印
+    // recovered > 0 的日志，失败路径完全静默。该行既不被启动残留扫描
+    // （只查 queued）也不被 reopen_failed（只收 failed）接手 → 永久停在
+    // sending，用户无入口重发或删除。
     let delivered = conn
         .execute(
             "UPDATE emails SET status = 'sent', folder = 'sent', error = ''
              WHERE status = 'sending' AND sent_at IS NOT NULL",
             [],
         )
-        .unwrap_or(0);
+        .map_err(|e| format!("崩溃恢复：已投递邮件补记失败：{e}"))?;
     let unknown = conn
         .execute(
             "UPDATE emails SET status = 'failed', error = '上次发送被中断（应用异常退出），请重发'
              WHERE status = 'sending' AND sent_at IS NULL",
             [],
         )
-        .unwrap_or(0);
+        .map_err(|e| format!("崩溃恢复：中断邮件复位失败：{e}"))?;
     if delivered > 0 {
         eprintln!("[send] 崩溃恢复：{delivered} 封已投递邮件补记为已发送");
     }
-    delivered + unknown
+    Ok(delivered + unknown)
 }
 
 /// failed → draft 回编辑（§9 /emails/{id}/resend 重发入口；仅 failed 可转）。

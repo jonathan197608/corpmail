@@ -555,12 +555,8 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
         "发件箱不应渲染只读语义的标已读/未读（后端 SQL 限 inbox）：{html}"
     );
     assert!(
-        html.contains("row-act star-btn btn small"),
-        "发件箱应渲染行内置顶（详情页可置顶，列表须能就地取消）：{html}"
-    );
-    assert!(
-        !html.contains("row-del"),
-        "发件箱不应渲染行内删除（走批量入口）：{html}"
+        !html.contains("row-act") && !html.contains("row-del"),
+        "发件箱列表行不应渲染置顶/删除按钮（统一在详情页与批量栏）：{html}"
     );
     assert!(
         !html.contains("收取新邮件") && !html.contains("tb-more-btn"),
@@ -587,14 +583,10 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     assert!(
         html.contains("data-batch=\"delete\"")
             && html.contains("data-batch=\"star\"")
-            && html.contains("data-batch=\"unstar\"")
             && html.contains("清空选择")
-            && html.contains("row-del")
-            && html.contains("确定删除这封草稿？")
-            && html.contains("row-act star-btn btn small")
-            && html.contains("已置顶")
-            && html.contains("取消置顶"),
-        "草稿箱应渲染批量删除/置顶与行内置顶/删除：{html}"
+            && !html.contains("row-act")
+            && !html.contains("row-del"),
+        "草稿箱应渲染批量删除/置顶，列表行不应有置顶/删除按钮：{html}"
     );
     // 收件箱：按钮组与 ⋯ 下拉保持原样
     let html = body(&route(
@@ -609,10 +601,9 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     assert!(
         html.contains("data-batch=\"delete\"")
             && html.contains("清空选择")
-            && html.contains("row-del")
-            && html.contains("确定删除这封邮件？")
-            && html.contains("row-act star-btn btn small"),
-        "收件箱应保留完整批量按钮组与行内置顶/删除：{html}"
+            && !html.contains("row-act")
+            && !html.contains("row-del"),
+        "收件箱应保留完整批量按钮组，列表行不应有置顶/删除按钮：{html}"
     );
     assert!(
         html.contains("收取新邮件") && html.contains("tb-more-btn"),
@@ -621,37 +612,22 @@ fn sent_draft_rows_show_recipient_and_toolbar_minimized() {
     cleanup(&dir);
 }
 
-/// 行内操作（置顶/删除）必须落在链接外（否则点按钮会顺带打开详情），
-/// 删除必须保留页面内确认、置顶必须复用详情页同一端点。
-/// 运行时读源码，避免变异测试同秒 mtime 触发 include_str! 陈旧缓存。
+/// 2026-11-27 需求：三个邮件列表行右侧不再渲染任何操作按钮，
+/// 置顶/删除统一在详情页与顶部批量栏。运行时读源码，防止变异期陈旧缓存。
 #[test]
-fn row_actions_are_outside_link_and_reuse_detail_endpoints() {
+fn list_rows_have_no_inline_action_buttons() {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/templates/mail_list_rows.html"
     ))
     .expect("行模板可读");
-    let link_close = src.find("</a>").expect("行链接闭合标签存在");
-    let star_btn = src.find("class=\"row-act star-btn").expect("行内置顶按钮存在");
-    let del_btn = src.find("class=\"row-act row-del").expect("行内删除按钮存在");
     assert!(
-        star_btn > link_close && del_btn > link_close,
-        "行内操作按钮必须放在行链接闭合标签之后：{src}"
-    );
-    let star = &src[star_btn..star_btn + src[star_btn..].find('>').expect("置顶按钮闭合")];
-    assert!(
-        star.contains("hx-post=\"/emails/{{ m.id }}/star")
-            && star.contains("data-mail-id=\"{{ m.id }}\""),
-        "行内置顶应复用详情页同一端点与事件标记：{star}"
-    );
-    let del = &src[del_btn..del_btn + src[del_btn..].find('>').expect("删除按钮闭合")];
-    assert!(
-        del.contains("hx-post=\"/emails/{{ m.id }}/delete"),
-        "行内删除应走已有硬删端点：{del}"
+        !src.contains("row-act") && !src.contains("row-del"),
+        "列表行不应再渲染置顶/删除按钮：{src}"
     );
     assert!(
-        del.contains("hx-confirm="),
-        "行内删除必须带页面内确认（WKWebView 无原生 confirm）：{del}"
+        src.contains("class=\"mail-row") && src.contains("class=\"mr-link\""),
+        "行主体（复选框 + 内容链接）须保留"
     );
 }
 
@@ -2366,14 +2342,14 @@ fn star_endpoint_toggles_and_pins_to_top() {
         "星标邮件应置顶：{}",
         top
     );
-    // 星标行同时以 starred class（金色脊线）与行内「已置顶」按钮表达
+    // 星标行以 starred class（金色脊线）表达；行内按钮已移除（2026-11-27）
     assert!(
         h.contains("mail-row starred"),
         "星标行应以 starred class（金脊线）标记"
     );
     assert!(
-        h.contains("row-act star-btn btn small on") && h.contains("已置顶"),
-        "星标行应保留与详情页同口径的已置顶按钮"
+        !h.contains("row-act") && !h.contains("row-del"),
+        "列表行不应再渲染置顶/删除按钮：{h}"
     );
     // 详情页：按钮显示已星标态
     let detail = body(&route(
@@ -4235,6 +4211,16 @@ fn sync_refetch_rejected_while_fetch_running() {
     let html = body(&resp);
     assert!(html.contains("收件进行中"), "进行中应拒绝并给出明确提示");
     assert!(!html.contains("触发重新拉取"), "不得同时出现成功触发提示");
+    // P2-1（R21）：拒绝路径须回显本次提交的范围（0=全部），而非 state 里的旧值 90。
+    // 否则用户改动被静默清空，切 tab 也不再提示未保存。
+    assert!(
+        html.contains(r#"data-first-fetch-initial="0""#),
+        "Busy 分支须回显本次提交的 first_fetch_days=0：{html}"
+    );
+    assert!(
+        !html.contains(r#"data-first-fetch-initial="90""#),
+        "Busy 分支不得回退显示 state 旧值 90：{html}"
+    );
     assert_eq!(
         state.get_or(keys::LAST_UID, &d).as_deref(),
         Some("9503"),
@@ -8360,8 +8346,8 @@ fn list_rows_show_starred_as_spine_and_button() {
         "星标行应有 starred class（金脊线钩子）：{html}"
     );
     assert!(
-        html.contains("row-act star-btn btn small on") && html.contains("已置顶"),
-        "星标行应保留与详情页同口径的已置顶按钮：{html}"
+        !html.contains("row-act") && !html.contains("row-del"),
+        "列表行不应再渲染置顶/删除按钮：{html}"
     );
     assert!(
         html.contains("data-batch=\"unstar\""),
@@ -10675,13 +10661,16 @@ fn settings_save_errors_render_an_error_banner() {
         &storage,
     ));
     assert!(html.contains(msg), "storage 模板必须渲染错误条：{html}");
-    // 三个失败分支都要回显：Busy/范围变更 Other 用 sync_form_error（带本次
-    // 表单值回显，R14），重新拉取用 sync_pane_error；各自含定义 1 处
-    let src = include_str!("../ui/settings.rs");
-    let error_helpers = src.matches("sync_pane_error(").count()
-        + src.matches("sync_form_error(").count();
+    // 三个失败分支都要回显本次提交值：统一走 sync_form_error（含定义 1 处，
+    // 调用 3 处）。运行时读源码，避免变异验证时 include_str! 缓存导致假绿。
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ui/settings.rs"
+    ))
+    .expect("settings.rs 可读");
+    let error_helpers = src.matches("sync_form_error(").count();
     assert!(
-        error_helpers >= 5,
+        error_helpers >= 4,
         "范围变更 / 同步保存 / 重新拉取三个失败分支都要回显（实得 {error_helpers}）"
     );
     assert!(
@@ -12076,7 +12065,10 @@ fn entry_fix_sync_tab_has_immediate_fetch() {
 #[test]
 fn entry_fix_thread_has_star_button_outside_link() {
     let t = tpl_src("thread.html");
-    let link_close = t.find("</a>").expect("卡片链接闭合");
+    // 旧断言取模板第一个 </a>（:9 的返回链接），按钮即使被移进卡片链接内
+    // 也恒真。改为定位卡片链接自身的 </a>。
+    let card_at = t.find(r#"class="thread-mail card""#).expect("卡片链接存在");
+    let link_close = card_at + t[card_at..].find("</a>").expect("卡片链接闭合");
     let btn = t.find("thread-star").expect("会话置顶按钮存在");
     assert!(btn > link_close, "置顶按钮必须在卡片链接外：{t}");
     assert!(
@@ -12100,9 +12092,38 @@ fn entry_fix_star_done_event_carries_id() {
     );
     let js = js_src();
     let at = js.find("document.body.addEventListener('mbx:starDone'").expect("前端监听存在");
+    let frag = &js[at..];
+    let end = frag.find("\n});").unwrap_or(frag.len());
+    let frag = &frag[..end];
     assert!(
-        js[at..].contains("ev.detail.id") || js[at..].contains("detail && detail.id"),
-        "前端须按 id 精确匹配置顶按钮"
+        frag.contains(r#".star-btn[data-mail-id="' + id + '"]"#),
+        "前端须按 id 精确匹配置顶按钮（旧实现取第一个按钮会翻错）：{frag}"
+    );
+    // P1-2：按 id 翻转按钮的同时必须同步同卡片头星标，否则「按钮已置顶、
+    // 卡片无星」。静态护栏钉死 wrapper 定位与 .tm-star 插入/移除两侧都在。
+    assert!(
+        frag.contains("closest('.thread-mail-wrap')")
+            && frag.contains(".tm-star")
+            && frag.contains("appendChild"),
+        "starDone 须同步会话卡片头星标：{frag}"
+    );
+}
+
+#[test]
+fn entry_fix_migration_failure_keeps_exit_buttons() {
+    let js = js_src();
+    let at = js.find("function mbxMigShowError(").expect("失败态函数存在");
+    let end = js[at..].find("\n}").map(|p| at + p).unwrap_or(js.len());
+    let frag = &js[at..end];
+    assert!(
+        frag.contains("mbxMigAbort()") && frag.contains("mbxMigFailed = true"),
+        "失败态必须解绑监听并置终态，防止迟到 progress 收起出口：{frag}"
+    );
+    let p_at = js.find("await add('migration-progress'").expect("进度监听存在");
+    let p_end = js[p_at..].find("\n    });").map(|p| p_at + p).unwrap_or(js.len());
+    assert!(
+        js[p_at..p_end].contains("if (mbxMigFailed) return;"),
+        "迟到 progress 必须在收起按钮前被终态拦下"
     );
 }
 

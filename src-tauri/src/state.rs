@@ -960,19 +960,18 @@ impl AppState {
                 copied.load(std::sync::atomic::Ordering::SeqCst),
                 None,
             );
-            let (prev, save_res) = {
-                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-                let prev = cfg.get(keys::DATA_DIR).cloned();
-                cfg.insert(
-                    keys::DATA_DIR.to_string(),
-                    dest_path.to_string_lossy().into_owned(),
-                );
-                let snapshot = cfg.clone();
-                (prev, crate::conf::save(&self.anchor_dir, &snapshot))
-            };
-            save_res.map_err(|e| {
-                // 配置写失败：镜像恢复指针（镜像必须反映文件内容）
-                let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            // P2-2（R21）：保存 + 回滚全程持同一把 config 锁（与 point_data_dir、
+            // set_batch 同口径）。旧实现在 save 失败后释放锁再重加锁回滚镜像，
+            // 窗口内并发 set_batch 会让磁盘/镜像分叉。
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = cfg.get(keys::DATA_DIR).cloned();
+            cfg.insert(
+                keys::DATA_DIR.to_string(),
+                dest_path.to_string_lossy().into_owned(),
+            );
+            let snapshot = cfg.clone();
+            crate::conf::save(&self.anchor_dir, &snapshot).map_err(|e| {
+                // 配置写失败：同锁内镜像恢复指针（镜像必须反映文件内容）
                 match prev {
                     Some(v) => {
                         cfg.insert(keys::DATA_DIR.to_string(), v);
@@ -1177,7 +1176,12 @@ impl AppState {
         }
         // 指针先行：写失败则删掉刚建的新库文件回滚（此时尚未换连接，旧库仍在用）
         if let Err(e) = self.point_data_dir(&dest_path) {
-            let _ = std::fs::remove_file(dest_path.join("corpmail.db"));
+            // P3-1（R21）：db::open 以 WAL 模式建库会同时生成 -wal/-shm。
+            // 只删主库会让 validate_data_dir 误判目录可用（它只看 db/attachments），
+            // 下次重试建库可能恢复上一轮 WAL 脏页。三件套一起清。
+            for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+                let _ = std::fs::remove_file(dest_path.join(f));
+            }
             return Err(e);
         }
         self.swap_store(new_conn, &dest_path);
@@ -1312,18 +1316,18 @@ impl AppState {
     /// 数据目录指针写入 corpmail.toml（直切/采纳共用）：失败时恢复内存镜像
     /// （镜像必须反映文件内容）并返回错误，不动目标目录
     fn point_data_dir(&self, dest_path: &Path) -> Result<(), String> {
-        let (prev, save_res) = {
-            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = cfg.get(keys::DATA_DIR).cloned();
-            cfg.insert(
-                keys::DATA_DIR.to_string(),
-                dest_path.to_string_lossy().into_owned(),
-            );
-            let snapshot = cfg.clone();
-            (prev, crate::conf::save(&self.anchor_dir, &snapshot))
-        };
-        if let Err(e) = save_res {
-            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        // P2-2（R21）：与 set_batch 同口径——保存 + 失败回滚全程持同一把 config 锁。
+        // 旧实现 save 失败后先释放锁、再重新加锁只回滚内存镜像；窗口内并发
+        // set_batch 把「新目录 + 对方改动」写盘后，A 只回滚镜像 → 磁盘/镜像分叉，
+        // 下次 set_batch 以镜像为基准全量写盘把指针覆盖回旧值。
+        let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = cfg.get(keys::DATA_DIR).cloned();
+        cfg.insert(
+            keys::DATA_DIR.to_string(),
+            dest_path.to_string_lossy().into_owned(),
+        );
+        let snapshot = cfg.clone();
+        if let Err(e) = crate::conf::save(&self.anchor_dir, &snapshot) {
             match prev {
                 Some(v) => {
                     cfg.insert(keys::DATA_DIR.to_string(), v);
@@ -1964,9 +1968,14 @@ impl AppState {
         // 启动补发只查 queued、reopen_failed 只收 failed、详情页 2s 轮询永不停止。
         // 按 sent_at 分开处理：已写投递时间 → 补成 sent（不能诱导重发）；
         // 未写 → 复位 failed 并写明原因，把「是否重发」的决策交回用户
-        let recovered = crate::mail::recover_interrupted_sends(&conn);
-        if recovered > 0 {
-            eprintln!("[send] 启动自愈：{recovered} 封中断的 sending 邮件已按投递事实复位");
+        // P2-3（R21）：写错误不再吞成 0——留痕后由管理员/用户处置，避免
+        // 邮件永久卡 sending 且无任何提示（下次启动会再试一次）。
+        match crate::mail::recover_interrupted_sends(&conn) {
+            Ok(recovered) if recovered > 0 => eprintln!(
+                "[send] 启动自愈：{recovered} 封中断的 sending 邮件已按投递事实复位"
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("[send] {e}；请检查数据目录可写性并重启应用"),
         }
         // 崩溃恢复 2/2：残留 queued 补发（按 id 升序）
         let stale: Vec<i64> = conn

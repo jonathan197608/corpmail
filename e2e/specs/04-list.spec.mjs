@@ -193,10 +193,14 @@ describe('04 列表筛选与批量操作', () => {
   it('B10 批量置顶/取消：全选 → 批量操作⋯ 菜单 star/unstar', async () => {
     await goto('/')
     await waitBoot()
+    await waitMailRows()
+    const rowsBefore = (await $$('.mail-row')).length
+    expect(rowsBefore).toBeGreaterThan(0) // 0 行时下方等值断言恒真（R21 假绿）
     await $('#batch-all').click()
     await clickBatchMenu('置顶')
     await browser.waitUntil(
-      async () => (await $$('.mail-row.starred')).length === (await $$('.mail-row')).length,
+      async () => (await $$('.mail-row')).length > 0
+        && (await $$('.mail-row.starred')).length === (await $$('.mail-row')).length,
       { timeoutMsg: '批量置顶后未全部标金排前' },
     )
     await shot('列表-批量置顶')
@@ -210,28 +214,19 @@ describe('04 列表筛选与批量操作', () => {
     await shot('列表-取消置顶')
   })
 
-  it('B10b 行内置顶/取消置顶：与详情页同一入口', async () => {
+  it('B10b 列表行右侧无操作按钮：置顶/删除统一在详情页与批量栏', async () => {
     await goto('/')
     await waitBoot()
     await waitMailRows()
-    expect((await $$('.mail-row.starred')).length).toBe(0)
-    let btn = await (await $$('.mail-row'))[0].$('.star-btn')
-    expect(await btn.isExisting()).toBe(true)
-    expect(await btn.getAttribute('aria-pressed')).toBe('false')
-    await btn.click()
-    await browser.waitUntil(
-      async () => (await $$('.mail-row.starred')).length === 1,
-      { timeoutMsg: '行内置顶后未出现置顶行' },
-    )
-    btn = await (await $$('.mail-row.starred'))[0].$('.star-btn')
-    expect(await btn.getAttribute('aria-pressed')).toBe('true')
-    expect(await btn.getText()).toContain('已置顶')
-    await shot('列表-行内置顶')
-    await btn.click()
-    await browser.waitUntil(
-      async () => (await $$('.mail-row.starred')).length === 0,
-      { timeoutMsg: '行内取消置顶未生效' },
-    )
+    expect((await $$('.mail-row')).length).toBeGreaterThan(0)
+    const flags = await browser.execute(() =>
+      Array.from(document.querySelectorAll('.mail-row')).map((row) => ({
+        star: !!row.querySelector('.star-btn'),
+        del: !!row.querySelector('.row-del'),
+      })))
+    expect(flags.length).toBeGreaterThan(0)
+    expect(flags.every((f) => !f.star && !f.del)).toBe(true)
+    await shot('列表-行内无按钮')
   })
 
   it('B15 批量标已读/标未读 + 清空选择（批量操作⋯ 菜单）', async () => {
@@ -354,7 +349,8 @@ describe('04 列表筛选与批量操作', () => {
     await waitMailRows() // T4/R6：等列表行挂载再取 before 基线
     const before = (await $$('.mail-row')).length
     const rows = await $$('.mail-row')
-    expect(await rows.at(-1).$('.row-del').isExisting()).toBe(true) // 行内删除入口常驻
+    // 2026-11-27：列表行右侧按钮已移除，删除统一走顶部批量栏
+    expect(await (await rows.at(-1).$('.row-del')).isExisting()).toBe(false)
     await rows.at(-1).$('.mbx-item').click() // 删最后一行：保住 05 依赖的「会议纪要」
     await $('button[data-batch="delete"]').click()
     // 2026-11：hx-confirm 改页面内模态（window.confirm 在 WKWebView 恒 false）

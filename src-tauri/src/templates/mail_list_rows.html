@@ -4,10 +4,10 @@
     <div class="mail-list" id="mail-list" data-total="{{ total }}">
     {% if items %}
         {% for m in items %}
-        {# 行 = div（复选框区）+ a（内容区链接）+ 操作按钮（置顶/删除，均在链接外）。
-            复选框与按钮天然各管各的默认行为，无需任何 click 拦截（2026-11-03 实测）。
-            置顶态另以左侧脊线色区分：金=置顶行、蓝=未读行（置顶与未读同存取金，
-            未读另有蓝点+加粗表达）；行内按钮与详情页共用 /star 与 /delete 端点 #}
+        {# 行 = div（复选框区）+ a（内容区链接）。置顶/删除操作统一在详情页与
+            顶部批量栏，行内不再渲染按钮（2026-11-27 需求）。置顶态以左侧脊线色
+            区分：金=置顶行、蓝=未读行（置顶与未读同存取金，未读另有蓝点+加粗表达）。
+            复选框在链接外，点选不误开详情（2026-11-03 实测）。 #}
         <div class="mail-row {% if m.starred %}starred{% endif %} {% if m.unread %}unread{% endif %} {% if m.status == 'draft' %}is-draft{% endif %}"
              data-mail-id="{{ m.id }}" data-mail-unread="{{ 1 if m.unread else 0 }}"
              {% if m.starred %}title="已置顶（列表排在最前）"{% endif %}>
@@ -33,25 +33,6 @@
                     <div class="mr-preview">{% if m.body_preview %}{{ m.body_preview }}{% else %}<span class="mr-no-body">（无正文）</span>{% endif %}</div>
                 </div>
             </a>
-            {# 行内操作与详情页同口径：置顶翻转对所有文件夹渲染（详情页亦无 folder
-               条件，发件箱邮件可被置顶，列表必须能就地取消）；删除仅收件箱/草稿箱，
-               发件箱删除走批量入口，避免误删已发送邮件。均在链接外，不会误开详情。
-               置顶由 mbx:starDone 事件统一刷新列表片段；删除 hx-confirm 走页面内模态。 #}
-            <button type="button" class="row-act star-btn btn small {% if m.starred %}on{% endif %}"
-                    data-mail-id="{{ m.id }}"
-                    hx-post="/emails/{{ m.id }}/star"
-                    hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
-                    aria-pressed="{{ 'true' if m.starred else 'false' }}"
-                    title="{% if m.starred %}取消置顶（恢复按时间排序）{% else %}置顶显示（列表排在最前）{% endif %}"
-                    aria-label="{% if m.starred %}取消置顶{% else %}置顶{% endif %}">{% if m.starred %}{{ ic.icon('star-fill') }} 已置顶{% else %}{{ ic.icon('star') }} 置顶{% endif %}</button>
-            {% if folder == 'inbox' or folder == 'draft' %}
-            <button type="button" class="row-act row-del btn small danger"
-                    hx-post="/emails/{{ m.id }}/delete{% if list_query %}?{{ list_query }}{% endif %}"
-                    hx-trigger="click throttle:500ms" hx-swap="none" hx-disabled-elt="this"
-                    hx-confirm="{% if folder == 'draft' %}确定删除这封草稿？{% else %}确定删除这封邮件？{% endif %}删除后无法恢复（含附件）。"
-                    aria-label="{% if folder == 'draft' %}删除草稿{% else %}删除邮件{% endif %}"
-                    title="{% if folder == 'draft' %}删除这封草稿（含附件，无法恢复）{% else %}删除这封邮件（含附件，无法恢复）{% endif %}">{{ ic.icon('trash') }} 删除</button>
-            {% endif %}
         </div>
         {% endfor %}
         {% if pages > 1 %}

@@ -2849,3 +2849,88 @@ fn r15_unreachable_migration_target_keeps_record_for_retry() {
     assert!(!record.exists(), "清扫完成后记录才可删除");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// P3-1（R21）：首启直切回滚须清 corpmail.db 三件套（含 -wal/-shm）。
+/// 只删主库会让 validate_data_dir 误判目录可用，重试建库可能恢复上一轮 WAL 脏页。
+#[test]
+fn switch_data_dir_first_run_rollback_clears_wal_and_shm() {
+    let anchor = temp_dir("switch-rollback-wal");
+    let state = AppState::open_with_anchor(&anchor, &anchor);
+    assert!(state.store_is_empty(), "新库应为空");
+    let target = std::env::temp_dir().join(format!("mbx-switch-wal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    // 让 conf::save 必失败：原子保存的 tmp 路径被同名目录占位
+    std::fs::create_dir_all(anchor.join(format!(
+        "{}.{}.tmp",
+        crate::conf::CONFIG_FILE,
+        std::process::id()
+    )))
+    .unwrap();
+
+    let err = state
+        .switch_data_dir_first_run(target.to_str().unwrap())
+        .unwrap_err();
+    assert!(err.contains("配置文件写入失败"), "应停在指针写入：{err}");
+    for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+        assert!(!target.join(f).exists(), "回滚须清除 {f}，否则重试恢复脏页");
+    }
+    let _ = std::fs::remove_dir_all(&target);
+    let _ = std::fs::remove_dir_all(&anchor);
+}
+
+/// P2-2（R21）静态护栏：配置指针写入失败后，镜像回滚必须在同一把 config 锁内完成。
+/// 旧实现 save 后释放锁、再重新加锁回滚，窗口内并发 set_batch 会让磁盘/镜像分叉。
+#[test]
+fn config_pointer_rollback_holds_same_lock() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/state.rs"
+    ))
+    .expect("state.rs 可读");
+    // point_data_dir：从加锁到 conf::save 的 map_err 回滚之间不得再出现 config.lock()
+    let at = src
+        .find("fn point_data_dir(&self, dest_path: &Path)")
+        .expect("point_data_dir 存在");
+    let func = &src[at..];
+    let end = func.find("\n    }\n").expect("函数边界");
+    let func = &func[..end];
+    let lock_at = func
+        .find("self.config.lock()")
+        .expect("point_data_dir 须持 config 锁");
+    let save_at = func.find("crate::conf::save").expect("须写配置");
+    let between = &func[lock_at + "self.config.lock()".len()..save_at];
+    assert!(
+        !between.contains("config.lock()"),
+        "加锁与 save 之间不得重复加锁（破坏同锁回滚）：{between}"
+    );
+    // 回滚分支内（save 之后）也不得重新加锁——镜像回滚与 save 同锁
+    let after_save = &func[save_at..];
+    assert!(
+        !after_save.contains("self.config.lock()"),
+        "save 失败回滚不得重新加锁（须沿用持锁的 cfg guard）：{after_save}"
+    );
+}
+
+/// P3-1（R21）静态护栏：回滚块必须显式清三件套，防止变异回退成只删主库
+/// （运行时断言可能被 SQLite 正常关闭时的自动 checkpoint 掩盖，故此护栏必需）。
+#[test]
+fn switch_first_run_rollback_lists_three_db_files() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/state.rs"
+    ))
+    .expect("state.rs 可读");
+    let at = src
+        .find("pub fn switch_data_dir_first_run(")
+        .expect("函数存在");
+    let func = &src[at..];
+    let rb = func
+        .find("if let Err(e) = self.point_data_dir(&dest_path)")
+        .expect("回滚分支存在");
+    let rollback = &func[rb..];
+    let end = rollback.find("self.swap_store").expect("swap_store 边界");
+    let rollback = &rollback[..end];
+    for f in ["corpmail.db", "corpmail.db-wal", "corpmail.db-shm"] {
+        assert!(rollback.contains(f), "回滚块须显式清除 {f}：{rollback}");
+    }
+}

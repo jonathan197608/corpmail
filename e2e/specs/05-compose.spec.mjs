@@ -137,7 +137,7 @@ describe('05 撰写与发送', () => {
     await shot('草稿箱-新草稿')
   })
 
-  it('D3b 草稿箱行内删除：删临时草稿，D3 的草稿保留', async () => {
+  it('D3b 草稿箱批量删除：勾选临时草稿删掉，D3 的草稿保留', async () => {
     await goto('/compose')
     await $(COMPOSE.to).setValue('row-delete@corpmail.test')
     await $(COMPOSE.subject).setValue('E2E 行内删除草稿')
@@ -160,19 +160,22 @@ describe('05 撰写与发送', () => {
       }
     }
     expect(target).toBeDefined()
-    await (await target.$('.row-del')).click()
+    // 2026-11-27：列表行右侧按钮移除，删除走顶部批量栏
+    expect(await (await target.$('.row-del')).isExisting()).toBe(false)
+    await (await target.$('.mbx-item')).click()
+    await $('button[data-batch="delete"]').click()
     expect(await confirmModalText()).toContain('草稿')
     await acceptConfirm()
     await browser.waitUntil(
       async () => !(await $('.mail-list').getText()).includes('E2E 行内删除草稿'),
-      { timeout: 20000, timeoutMsg: '行内删除后草稿仍在列表' },
+      { timeout: 20000, timeoutMsg: '批量删除后草稿仍在列表' },
     )
     await browser.waitUntil(
       async () => (await $$('.mail-row')).length === before - 1,
-      { timeout: 20000, timeoutMsg: '行内删除后草稿行数未减少' },
+      { timeout: 20000, timeoutMsg: '批量删除后草稿行数未减少' },
     )
     await waitText('.mail-list', 'E2E 自动保存草稿')
-    await shot('草稿箱-行内删除')
+    await shot('草稿箱-批量删除')
   })
 
   it('D4 立即发送：outbox 落盘（To/主题正确）+ 发件箱出现该邮件', async () => {
@@ -217,9 +220,10 @@ describe('05 撰写与发送', () => {
     await shot('发送-发件箱落位')
 
     // 发件箱入口补齐（原在 04 验证，但阶段一发件箱为空、不渲染 batch-bar，
-    // 挪到本用例：发送后才有真实邮件行）。行内置顶在链接外、无行内删除；
-    // 批量组三视图统一，但标已读/未读后端限定 inbox，发件箱不渲染。
-    expect(await (await $('.mail-row .star-btn')).isExisting()).toBe(true)
+    // 挪到本用例：发送后才有真实邮件行）。2026-11-27 起列表行右侧按钮全移除，
+    // 置顶/删除统一在详情页与顶部批量栏；批量组三视图统一，但标已读/未读
+    // 后端限定 inbox，发件箱不渲染。
+    expect(await (await $('.mail-row .star-btn')).isExisting()).toBe(false)
     expect(await (await $('.mail-row .row-del')).isExisting()).toBe(false)
     expect(await $('#batch-bar [data-batch="delete"]').isExisting()).toBe(true)
     expect(await $('#ba-clear').isExisting()).toBe(true)

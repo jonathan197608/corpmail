@@ -340,6 +340,9 @@ let mbxMigWatchdog = null;
 let mbxMigLastEvent = 0;
 // 最近一次进度事件的阶段：看门狗按阶段取不同阈值（快照期阻塞、无事件可发）
 let mbxMigPhase = '';
+// P1-1（R21）：失败终态。看门狗超时但后台仍在跑时，迟到的 migration-progress
+// 不得再收起「重试/返回」出口，也不得用「正在迁移…」覆盖失败文案。
+let mbxMigFailed = false;
 // 阈值常量与看门狗实现见下方 C19 watchdog core（可被 Node vm 单独执行做行为测试）
 
 /// 页面内确认的 Promise 包装（WKWebView 无原生 confirm）：迁移后果最重
@@ -463,6 +466,7 @@ function mbxMigOpen() {
     if (bar) bar.style.width = '0%';
     var detail = document.getElementById('migrate-detail');
     if (detail) detail.textContent = '准备迁移…';
+    mbxMigFailed = false;
     mbxMigHideActions();
     mask.hidden = false;
     mask.__mbxRelease = mbxModalOpen(mask, mask.querySelector('.migrate-card'));
@@ -572,6 +576,11 @@ function mbxMigHideActions() {
 // 失败态：显示错误 + 「重新选择目录并重试」「返回」按钮（隐藏模式，用户可
 // 就地重试或关回存储页）。重试按钮只在失败态露出，确认/进行中一律收起。
 function mbxMigShowError(msg) {
+    // P1-1（R21）：进入失败终态即解绑监听 + 停看门狗 + 释放焦点陷阱。
+    // 此前 error 分支与看门狗 fail 只停表不摘监听，后台残留 progress 到达时
+    // 会调 mbxMigHideActions() 把三枚按钮全收起，看门狗已停 → 无出口可点。
+    mbxMigAbort();
+    mbxMigFailed = true;
     mbxMigHideActions();
     var mask = document.getElementById('migrate-mask');
     var d = document.getElementById('migrate-detail');
@@ -608,11 +617,14 @@ async function mbxMigListen() {
         }).then(function (f) { unlist.push(f); });
     };
     await add('migration-progress', function (e) {
+        // P1-1（R21）：失败终态后到达的迟到 progress 一律忽略——不能收起
+        // 「重试/返回」出口，也不能把失败文案覆盖成「正在迁移…」。
+        if (mbxMigFailed) return;
         mbxMigLastEvent = Date.now();
         var p = e.payload || {};
         mbxMigPhase = p.phase || '';
-        // 阶段推进说明快照已过：所有动作按钮收起（含失败态的「重试」），
-        // 避免误点重启计时或关掉正在跑的迁移遮罩
+        // 阶段推进说明快照已过：所有动作按钮收起（确认态按钮此时已失效），
+        // 避免误点重启计时或关掉正在跑的迁移遮罩。失败终态已在上方拦掉。
         mbxMigHideActions();
         mbxMigSet(mbxMigPhasePct(p), p.detail || '正在迁移…');
     });
@@ -1071,6 +1083,22 @@ document.body.addEventListener('mbx:starDone', function (ev) {
         btn.innerHTML = starred ? MBX_IC.starFill + ' 已置顶' : MBX_IC.star + ' 置顶';
     } else {
         btn.innerHTML = MBX_IC.starFill;
+    }
+    // P1-2（R21）：会话页卡片头星标由模板按 m.starred 服务端渲染，hx-swap=none
+    // 只翻按钮态，不同步徽标会出现「按钮已置顶、卡片无星」。按同一 wrapper
+    // 的 .tm-head 就地插入/移除 .tm-star（详情页无 wrapper，天然跳过）。
+    var wrap = btn.closest ? btn.closest('.thread-mail-wrap') : null;
+    if (wrap && typeof wrap.querySelector === 'function') {
+        var head = wrap.querySelector('.tm-head');
+        var badge = wrap.querySelector('.tm-star');
+        if (starred && !badge && head) {
+            badge = document.createElement('span');
+            badge.className = 'tm-star';
+            badge.innerHTML = MBX_IC.starFill;
+            head.appendChild(badge);
+        } else if (!starred && badge && typeof badge.remove === 'function') {
+            badge.remove();
+        }
     }
 });
 

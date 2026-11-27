@@ -732,7 +732,7 @@ fn interrupted_sending_recovers_to_failed() {
         c.execute("UPDATE emails SET status='sending' WHERE id=?1", [id])
             .unwrap();
     });
-    assert_eq!(state.with_conn(|c| recover_interrupted_sends(c)), 1);
+    assert_eq!(state.with_conn(|c| recover_interrupted_sends(c)).unwrap(), 1);
     let (status, error): (String, String) = state.with_conn(|c| {
         c.query_row(
             "SELECT status, COALESCE(error,'') FROM emails WHERE id=?1",
@@ -744,6 +744,43 @@ fn interrupted_sending_recovers_to_failed() {
     assert_eq!(status, "failed");
     assert!(error.contains("上次发送被中断"), "应写明中断原因：{error}");
     assert!(reopen_failed(&state, id).unwrap(), "自愈后必须能重发");
+    cleanup(&dir);
+}
+
+/// P2-3（R21）：sent_at 已写 = SMTP 已投递，补成 sent 而非 failed 诱导重发；
+/// 同时覆盖写故障分支必须 Err 而非吞成 0（邮件永久卡 sending）。
+#[test]
+fn interrupted_sending_delivered_branch_and_write_error() {
+    let (state, dir) = temp_state("m3-recover-delivered");
+    let id = queued_email(&state, "peer@x.cn");
+    state.with_conn(|c| {
+        c.execute(
+            "UPDATE emails SET status='sending', sent_at=1 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    });
+    assert_eq!(state.with_conn(|c| recover_interrupted_sends(c)).unwrap(), 1);
+    let status: String = state.with_conn(|c| {
+        c.query_row("SELECT status FROM emails WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(status, "sent", "已投递邮件须补成 sent，禁止诱导重复投递");
+    assert!(
+        !reopen_failed(&state, id).unwrap(),
+        "已投递邮件不得退回草稿重发"
+    );
+
+    // 写故障：DROP 表后 UPDATE 失败，必须上抛 Err（旧实现 unwrap_or(0) 静默）
+    state.with_conn(|c| {
+        c.execute("DROP TABLE emails", []).unwrap();
+    });
+    let res = state.with_conn(|c| recover_interrupted_sends(c));
+    assert!(res.is_err(), "写故障必须上抛 Err，不得吞成 0：{res:?}");
+    assert!(
+        res.unwrap_err().contains("崩溃恢复"),
+        "错误须可定位到崩溃恢复阶段"
+    );
     cleanup(&dir);
 }
 
