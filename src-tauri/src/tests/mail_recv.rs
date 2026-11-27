@@ -1300,10 +1300,27 @@ fn p101_incoming_commit_failure_cleans_written_attachments() {
         .map(|p| at + p)
         .unwrap_or(SRC.len());
     let body = &SRC[at..end];
+    // R23 P2：旧断言从首个 tx.commit() 截到函数尾，宽窗口里同时含 commit 失败
+    // inspect_err 与末段 Err(err) 两条路径的 remove_file——删掉 inspect_err 里那条
+    // 仍绿。收窄到 commit 的 inspect_err 子块内断言，并补两条路径 count==2。
     let commit = body.find("tx.commit()").expect("收件须在事务内提交");
+    let map_err = body[commit..]
+        .find(".map_err(e)?;")
+        .map(|p| commit + p)
+        .expect("commit 后须有 map_err 上抛");
+    let inspect_block = &body[commit..map_err];
     assert!(
-        body[commit..].contains("remove_file(f)"),
+        inspect_block.contains("inspect_err"),
+        "commit 失败须走 inspect_err 清理，不能只靠 ? 绕过"
+    );
+    assert!(
+        inspect_block.contains("remove_file(f)"),
         "收件 commit 失败路径也必须清理 written 附件"
+    );
+    assert_eq!(
+        body.matches("remove_file(f)").count(),
+        2,
+        "写入失败与提交失败两条路径都要清理附件"
     );
 }
 

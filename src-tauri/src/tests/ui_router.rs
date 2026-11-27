@@ -12524,3 +12524,129 @@ fn r22_delete_file_io_outside_store_lock() {
         "文件删除与目录递归必须在全局 store 锁外：{body}"
     );
 }
+
+// ---------- R23 审计回归 ----------
+
+#[test]
+fn r23_empty_state_clear_search_keeps_filter_context() {
+    // 空态「清除搜索」与顶栏「清除」同源：只去 q，保留 unread/from/per/sort。
+    // 构造无命中的搜索，断言空态链接来自 clear_q_href 而非硬编码 /?folder=。
+    let (state, dir) = temp_state("r23-empty-clear-q");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/",
+            "folder=inbox&unread=1&from=%E5%BC%A0&q=%E4%B8%8D%E5%AD%98%E5%9C%A8&per=20&sort=date_asc",
+            b"",
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    let line = html
+        .lines()
+        .find(|l| l.contains("清除搜索</a>"))
+        .expect("空态须渲染清除搜索按钮（区别于顶栏「清除」）");
+    for expected in ["unread=1", "from=", "per=20", "sort=date_asc"] {
+        assert!(line.contains(expected), "空态清除链接须保留 {expected}：{line}");
+    }
+    assert!(!line.contains("q="), "空态清除链接不得再带搜索词：{line}");
+    // 模板不得残留旧硬编码写法（两处清除入口同口径）
+    let tpl = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates/mail_list_rows.html"),
+    )
+    .expect("行片段模板可读");
+    assert!(
+        !tpl.contains("{% if folder == 'inbox' %}/{% else %}"),
+        "空态清除不得再走硬编码 /?folder= 写法"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn r23_thread_card_link_carries_list_context() {
+    let (state, dir) = temp_state("r23-thread-ctx");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    // 入库两封同 thread_key 邮件组成会话
+    state
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO emails(direction, folder, status, from_addr, from_name, to_addrs,
+                                    subject, body_text, subject_tokens, body_tokens, unread,
+                                    created_at, received_at, thread_key)
+                 VALUES ('in','inbox','received','boss@x.cn','领导','demo@chinatelecom.cn',
+                         '会议通知','正文','会议 通知','正文',1,1,1,'会议通知'),
+                        ('out','sent','sent','demo@chinatelecom.cn','张伟','boss@x.cn',
+                         'Re: 会议通知','回复','会议 通知','回复',0,2,2,'会议通知')",
+            )
+            .unwrap();
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/threads/1",
+            "unread=1&page=3&sort=date_asc",
+            b"",
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    let card = html
+        .lines()
+        .find(|l| l.contains("thread-mail card"))
+        .expect("会话页须渲染卡片链接");
+    for expected in ["unread=1", "page=3", "sort=date_asc"] {
+        assert!(card.contains(expected), "会话卡片链接须携带 {expected}：{card}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn r23_contacts_clear_search_keeps_per_and_sort() {
+    let (state, dir) = temp_state("r23-contact-clear");
+    state.set_batch(&[(keys::ACCOUNT_PREFIX, "demo")]).unwrap();
+    let html = body(&route(
+        &state,
+        &assets(),
+        &req_q(
+            "GET",
+            "/contacts",
+            "q=%E5%BC%A0&per=100&sort=name",
+            b"",
+        ),
+        &FakeTester { smtp_ok: true, imap_ok: true },
+    ));
+    let line = html
+        .lines()
+        .find(|l| l.contains("search-clear"))
+        .expect("搜索态联系人须渲染清除链接");
+    assert!(line.contains("per=100"), "清除须保留 per=100：{line}");
+    assert!(line.contains("sort=name"), "清除须保留 sort=name：{line}");
+    assert!(!line.contains("q="), "清除链接不得再带搜索词：{line}");
+    cleanup(&dir);
+}
+
+#[test]
+fn r23_batch_delete_file_io_outside_store_lock() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mail/mod.rs"),
+    )
+    .expect("mail/mod.rs 可读");
+    let at = src.find("pub fn batch_apply(").expect("批量函数存在");
+    let end = src[at..]
+        .find("\n}\n")
+        .map(|p| at + p)
+        .unwrap_or(src.len());
+    let body = &src[at..end];
+    let close = body.find("})?;").expect("with_conn 闭包结束点");
+    let io = body.find("remove_file(").expect("附件文件删除点");
+    let prune = body.find("prune_empty_dirs(").expect("目录回收点");
+    assert!(
+        io > close && prune > close,
+        "批量删除的文件 IO 必须在全局 store 锁外：{body}"
+    );
+}

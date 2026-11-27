@@ -360,6 +360,9 @@ struct ThreadCtx {
     /// 所属文件夹（取组内最新一封；frame 侧栏高亮 + 返回列表目标）
     folder: String,
     back_href: String,
+    /// R23 P3：同一列表上下文（不含 `?`）——卡片点进单封详情时携带，
+    /// 否则详情页 detail_back_href 只能用 folder fallback 重建，筛选/页码丢失
+    list_query: String,
 }
 
 /// 撰写页（新邮件 / 回复预填 / 草稿编辑共用）
@@ -1283,6 +1286,7 @@ fn thread_detail_page(state: &AppState, req: &Req) -> Option<Resp> {
             detail,
             folder,
             back_href,
+            list_query,
         },
     ))
 }
@@ -1717,6 +1721,9 @@ struct ContactsCtx {
     pages: i64,
     /// 翻页链接前缀（含 per/q/sort；模板拼 page=N）
     page_base: String,
+    /// R23 P3：清除搜索关键词链接——只去 q，保留 per/sort，与邮件列表
+    /// clear_q_href 同口径；contact_page_base("",per,sort) 天然只含 per/sort
+    clear_q_href: String,
     /// 排序键回显（recent/hits/name；模板选中态比较）
     sort: String,
     /// 手动保存结果（B3；空串 = 无提示）
@@ -1885,6 +1892,7 @@ fn contacts_ctx_full(
         page,
         pages,
         page_base: contact_page_base(opts.q, per, sort.key()),
+        clear_q_href: contact_page_base("", per, sort.key()),
         sort: sort.key().to_string(),
         notice: notice.to_string(),
         error: error_text,

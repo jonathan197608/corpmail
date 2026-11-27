@@ -1718,7 +1718,7 @@ pub fn batch_apply(
     // C5：批量「标记已读」必须与单封 mark_read 同口径——同事务写 seen_pending
     // 与归属账号，提交后唤醒 worker；否则服务器 \Seen 永不回写
     let account = state.current_account();
-    let n = state.with_conn(|conn| {
+    let (n, files) = state.with_conn(|conn| {
         let tx = conn.transaction().map_err(e)?;
         let mut changed = 0usize;
         let mut files: Vec<String> = Vec::new();
@@ -1807,15 +1807,18 @@ pub fn batch_apply(
             }
         }
         tx.commit().map_err(e)?;
-        // 提交后删文件（与单删/clean 同模式：失败残留由孤儿回收兜底）
-        if action == BatchAction::Delete {
-            for rel in &files {
-                let _ = std::fs::remove_file(root.join(rel));
-            }
-            prune_empty_dirs(&root);
-        }
-        Ok::<usize, String>(changed)
+        Ok::<_, String>((changed, files))
     })?;
+    // R23 P2：与单封 delete 同口径——with_conn 闭包内只留 DB 操作，
+    // 逐个 remove_file 与 prune_empty_dirs 的整棵递归 readdir 挪到锁外。
+    // 批量删除（跨页全选可达数万封）若持全局 store 锁做这些慢 IO，会阻塞
+    // 收件入库/发信派发/列表查询（失败残留由孤儿回收兜底）。
+    if action == BatchAction::Delete {
+        for rel in &files {
+            let _ = std::fs::remove_file(root.join(rel));
+        }
+        prune_empty_dirs(&root);
+    }
     // 提交后唤醒 seen worker（单封 mark_read 也是这个时机；n>0 才唤醒，
     // 避免全选空集时无谓起线程）
     if action == BatchAction::MarkRead && n > 0 {

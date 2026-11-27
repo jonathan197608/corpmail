@@ -16,16 +16,41 @@ const STATE_RS: &str = include_str!("../state.rs");
 const LIB_RS: &str = include_str!("../lib.rs");
 const STORAGE_TPL: &str = include_str!("../templates/settings_pane_storage.html");
 
+/// R23 P2：JS 行注释剥离——只去掉整行 `//` 注释，防「改坏生产代码 + 原行留注释」
+/// 命中全文件 contains 的假绿。URL 里的 `//` 不在行首，不会被误伤。
+fn js_strip_line_comments(js: &str) -> String {
+    js.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn migration_start_response_is_fully_consumed() {
+    // R23 P2：改运行时读取（include_str! 变异期缓存）+ 收窄到 mbxMoveDataDir
+    // 函数体 + 剥注释。旧的全文件 contains 会在「await res.text() 改成 '' 且原行
+    // 留作注释」时仍绿——同步完成/校验失败分支拿到空 pane，用户看到错误文案。
+    let js = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui-dist/app.js"),
+    )
+    .expect("app.js 可读");
+    let at = js
+        .find("async function mbxMoveDataDir(")
+        .expect("迁移启动函数存在");
+    let end = js[at..]
+        .find("\nasync function ")
+        .or_else(|| js[at..].find("\nfunction "))
+        .map(|p| at + p)
+        .unwrap_or(js.len());
+    let body = js_strip_line_comments(&js[at..end]);
     // fetch 的响应必须被读取：只读 status 或不读都会让校验失败/同步完成卡在模态里
-    assert!(APP_JS.contains("await res.text()"), "必须读取响应体");
+    assert!(body.contains("await res.text()"), "必须读取响应体：{body}");
     assert!(
-        APP_JS.contains("mbxMigApplyPane(text)"),
+        body.contains("mbxMigApplyPane(text)"),
         "HTML pane 必须落到页面"
     );
     assert!(
-        APP_JS.contains("res.headers.get('X-CorpMail-Migration')"),
+        body.contains("res.headers.get('X-CorpMail-Migration')"),
         "必须按后台标记分支，不能一律等事件"
     );
     assert!(
@@ -34,8 +59,8 @@ fn migration_start_response_is_fully_consumed() {
     );
     assert_eq!(MIGRATION_BACKGROUND_HEADER, "X-CorpMail-Migration");
     assert!(
-        APP_JS.contains("mbxMigCloseModal();\n            return;"),
-        "同步完成/校验失败后必须关闭模态"
+        body.contains("mbxMigCloseModal();\n            return;"),
+        "同步完成/校验失败后必须关闭模态并立即返回"
     );
 }
 

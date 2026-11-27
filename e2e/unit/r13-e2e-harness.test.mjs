@@ -44,3 +44,19 @@ test('T2 六 pane 几何循环须有 stale-DOM 守卫（旧 pane 首帧）', () 
     assert.match(body, /\.settings-tabs \.stab\.on/, '须等目标 tab 高亮，证明新 DOM 已挂载');
     assert.match(body, /tabLabels\[tab\]/, '须按 tab 断对应文案，不能只断元素存在');
 });
+
+test('R23 T2 第二组几何循环与 templates 块也须有 stale-DOM 守卫', () => {
+    const src = read('e2e/specs/03-settings.spec.mjs');
+    // 第二组 receive/sync 循环
+    const loop = src.indexOf("for (const tab of ['receive', 'sync'])");
+    assert.ok(loop >= 0, '第二组几何循环存在');
+    const body = src.slice(loop, src.indexOf('paneMetrics[tab]', loop));
+    assert.match(body, /\.settings-tabs \.stab\.on/, '第二组须等目标 tab 高亮');
+    assert.match(body, /tabLabels\[tab\]/, '第二组须按 tab 断文案');
+    // templates 块
+    const tpl = src.indexOf("await goto('/settings/templates')");
+    assert.ok(tpl >= 0, 'templates 块存在');
+    const tplBody = src.slice(tpl, src.indexOf('const tpl =', tpl));
+    assert.match(tplBody, /\.settings-tabs \.stab\.on/, 'templates 块须等 tab 高亮');
+    assert.match(tplBody, /tabLabels\.templates/, 'templates 块须断 templates 文案');
+});

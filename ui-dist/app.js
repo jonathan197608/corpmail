@@ -1281,6 +1281,15 @@ function mbxInitContacts() {
         // 旧定时器仍会到期隐藏建议框，mbxContactKey 首行见 hidden 直接 return，
         // 键盘选人失效。focus/新 blur 都先清掉在途 blurTimer。
         inp.addEventListener('blur', () => {
+            // R23 P2：防抖窗口内就 blur 时，state.timer 仍会在 200ms 后发出查询，
+            // 其 fetch 返回时 seq 未变 → 无条件重弹建议框（此时焦点已在其他字段）。
+            // 用户误点会把联系人插进已离开的输入框（如 to_addrs 错收件人）。
+            // blur 即清在途防抖并递 seq 作废在途/迟到响应。不调 mbxContactInvalidate
+            // 是为了保留 items 供 R17「150ms 内重新 focus 用方向键选人」——
+            // 只递增 seq：响应回来即被 seq 校验丢弃，但已有 items 仍可键盘选中。
+            clearTimeout(state.timer);
+            state.timer = 0;
+            state.seq += 1;
             clearTimeout(state.blurTimer);
             state.blurTimer = setTimeout(() => { box.hidden = true; }, 150);
         });

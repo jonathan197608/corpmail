@@ -235,6 +235,16 @@ describe('03 设置与收件状态', () => {
     const paneMetrics = {}
     for (const tab of ['receive', 'sync']) {
       await goto(`/settings/${tab}`)
+      // R23 P2：与第一组同款的 stale-DOM 守卫——ui:// 首帧可能仍是上一 tab 的
+      // #settings-pane，waitPaneVisible 只看尺寸/display 会立即通过，量到旧 pane
+      // 上同构布局值恒真。必须等目标 tab 高亮证明新 DOM 已挂载。
+      await browser.waitUntil(
+        async () => {
+          const on = await $('.settings-tabs .stab.on')
+          return (await on.isExisting()) && (await on.getText()) === tabLabels[tab]
+        },
+        { timeout: 20000, timeoutMsg: `设置 tab「${tab}」未激活（旧 DOM 残留）` },
+      )
       await waitPaneVisible()
       paneMetrics[tab] = await browser.execute(() => {
         const pane = document.getElementById('settings-pane')
@@ -281,6 +291,14 @@ describe('03 设置与收件状态', () => {
     // templates：跨列形态契约——首列仍 148px、动作行 flex-end、
     // 内容控件占满整行（右缘 = pane 内容右缘）
     await goto('/settings/templates')
+    // R23 P2：同上，templates 块切 tab 也需 stale-DOM 守卫
+    await browser.waitUntil(
+      async () => {
+        const on = await $('.settings-tabs .stab.on')
+        return (await on.isExisting()) && (await on.getText()) === tabLabels.templates
+      },
+      { timeout: 20000, timeoutMsg: '设置 tab「模板」未激活（旧 DOM 残留）' },
+    )
     await waitPaneVisible()
     const tpl = await browser.execute(() => {
       const pane = document.getElementById('settings-pane')

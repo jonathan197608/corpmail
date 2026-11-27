@@ -18,7 +18,7 @@
         <div class="thread-list">
             {% for m in detail.items %}
             <div class="thread-mail-wrap">
-            <a class="thread-mail card" href="/emails/{{ m.id }}">
+            <a class="thread-mail card" href="/emails/{{ m.id }}{% if list_query %}?{{ list_query }}{% endif %}">
                 <div class="tm-head">
                     <span class="tm-who">{{ m.from_display }}</span>
                     <span class="tm-time">{{ m.time_label }}</span>
